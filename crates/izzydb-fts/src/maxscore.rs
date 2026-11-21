@@ -4,13 +4,13 @@ use std::collections::{BinaryHeap, HashMap};
 use alyze::analyze::ReusableBuffer;
 use roaring::RoaringBitmap;
 
-use izzydb_core::config::{AttrId, DocId, FTS_BLOCK_SIZE, FtsBlockId, FtsDocId, make_fts_doc_id};
+use izzydb_core::config::{AttrId, DocId, FTS_BLOCK_SIZE, FtsBlockId, FtsDocId, TermId, make_fts_doc_id};
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::rank::{Bm25Overrides, RankBy};
 use izzydb_core::schema::{CollectionSchema, FullTextSearchConfig};
 
 use crate::analyzer::FtsAnalyzer;
-use crate::block::{DocLenBlockView, FtsMeta, PostingBlockHeader, PostingBlockView, TermStats};
+use crate::block::{DocLenBlockView, FtsMeta, PostingBlockView, TermRecord};
 use crate::bm25::Bm25TermScorer;
 use crate::simd::{
     SimdTier, filter_ge_256, max_score_256, merge_add_256, merge_max_256, prepare_dl_norm_256,
@@ -25,10 +25,15 @@ pub struct Bm25Result {
     pub score: f32,
 }
 
-/// Cursor over a single term's posting blocks (`cf_fts_postings`) sorted by ascending `block_id`.
-pub trait FtsBlockCursor {
+/// Cursor over a single term's Block-Max skip summary (`cf_fts_skips` or inline `TermRecord`)
+/// sorted by ascending `block_id`.
+pub trait FtsSkipCursor {
     fn current_block_id(&self) -> Option<FtsBlockId>;
-    fn current_block_bytes(&self) -> &[u8];
+    fn current_block_bounds(&self) -> (u32, f32);
+    fn inline_posting_bytes(&self) -> Option<&[u8]>;
+    fn current_posting_bytes(&mut self) -> Result<Option<&[u8]>> {
+        Ok(None)
+    }
     fn next_block(&mut self) -> Result<()>;
     fn seek_block(&mut self, target: FtsBlockId) -> Result<()>;
 }
@@ -40,7 +45,7 @@ pub trait FtsDocLenCursor {
 
 /// Storage abstraction consumed by MAXSCORE and FTS filter evaluation.
 pub trait FtsPostingSource {
-    type Cursor<'a>: FtsBlockCursor + 'a
+    type SkipCursor<'a>: FtsSkipCursor + 'a
     where
         Self: 'a;
 
@@ -48,23 +53,37 @@ pub trait FtsPostingSource {
     where
         Self: 'a;
 
+    type PostingGuard<'a>: AsRef<[u8]> + 'a
+    where
+        Self: 'a;
+
     fn get_fts_meta(&self) -> Result<Option<FtsMeta>>;
-    fn multi_get_term_stats(
+    fn multi_get_term_records(
         &self,
         attr_id: AttrId,
         tokens: &[String],
-    ) -> Result<Vec<Option<TermStats>>>;
+    ) -> Result<Vec<Option<TermRecord>>>;
     fn scan_prefix_terms(
         &self,
         attr_id: AttrId,
         prefix: &str,
         limit: usize,
-    ) -> Result<Vec<(String, TermStats)>>;
-    fn open_posting_cursor<'a>(
+    ) -> Result<Vec<(String, TermRecord)>>;
+    fn open_skip_cursor<'a>(&'a self, record: TermRecord) -> Result<Self::SkipCursor<'a>>;
+    fn open_skip_cursors<'a>(
         &'a self,
-        attr_id: AttrId,
-        token: &str,
-    ) -> Result<Self::Cursor<'a>>;
+        records: Vec<TermRecord>,
+    ) -> Result<Vec<Self::SkipCursor<'a>>> {
+        records
+            .into_iter()
+            .map(|r| self.open_skip_cursor(r))
+            .collect()
+    }
+    fn get_posting_block<'a>(
+        &'a self,
+        term_id: TermId,
+        block_id: FtsBlockId,
+    ) -> Result<Option<Self::PostingGuard<'a>>>;
     fn open_doc_len_cursor<'a>(&'a self, attr_id: AttrId) -> Result<Self::DocLenCursor<'a>>;
     fn multi_get_doc_ids(&self, fts_doc_ids: &[FtsDocId]) -> Result<Vec<Option<DocId>>>;
 }
@@ -143,9 +162,10 @@ impl<'a, S: FtsPostingSource + 'a> DlNormCache<'a, S> {
 }
 
 struct TermStream<'a, S: FtsPostingSource + 'a> {
+    term_id: TermId,
     scorer: Bm25TermScorer,
     dl_group: usize,
-    cursor: S::Cursor<'a>,
+    cursor: S::SkipCursor<'a>,
 }
 
 impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
@@ -155,9 +175,9 @@ impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
     }
 
     #[inline]
-    fn block_upper_bound(&self) -> Result<f32> {
-        let header = PostingBlockHeader::parse(self.cursor.current_block_bytes())?;
-        Ok(self.scorer.upper_bound(header.max_tf, header.min_dl_over_tf))
+    fn block_upper_bound(&self) -> f32 {
+        let (max_tf, min_dl_over_tf) = self.cursor.current_block_bounds();
+        self.scorer.upper_bound(max_tf, min_dl_over_tf)
     }
 
     #[inline]
@@ -175,6 +195,64 @@ impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
         if self.cursor.current_block_id() == Some(block_id) {
             self.cursor.next_block()?;
         }
+        Ok(())
+    }
+
+    #[inline]
+    fn accumulate(
+        &mut self,
+        target: FtsBlockId,
+        scores: &mut [f32; FTS_BLOCK_SIZE],
+        touched: &mut [u64; 4],
+        dl_cache: &mut DlNormCache<'a, S>,
+        source: &'a S,
+        tier: SimdTier,
+    ) -> Result<()> {
+        let dl_norm = dl_cache.get_or_load(source, tier, self.dl_group, target)?;
+        if let Some(bytes) = self.cursor.current_posting_bytes()? {
+            let view = PostingBlockView::parse(bytes)?;
+            self.scorer
+                .accumulate_block_simd(tier, &view, dl_norm, scores, touched);
+            return Ok(());
+        }
+        let Some(guard) = source.get_posting_block(self.term_id, target)? else {
+            return Err(TreeError::CorruptedData(format!(
+                "missing posting block for term_id {} block {target}",
+                self.term_id
+            )));
+        };
+        let view = PostingBlockView::parse(guard.as_ref())?;
+        self.scorer
+            .accumulate_block_simd(tier, &view, dl_norm, scores, touched);
+        Ok(())
+    }
+
+    #[inline]
+    fn accumulate_masked(
+        &mut self,
+        target: FtsBlockId,
+        mask: &[u64; 4],
+        scores: &mut [f32; FTS_BLOCK_SIZE],
+        dl_cache: &mut DlNormCache<'a, S>,
+        source: &'a S,
+        tier: SimdTier,
+    ) -> Result<()> {
+        let dl_norm = dl_cache.get_or_load(source, tier, self.dl_group, target)?;
+        if let Some(bytes) = self.cursor.current_posting_bytes()? {
+            let view = PostingBlockView::parse(bytes)?;
+            self.scorer
+                .accumulate_block_masked_simd(tier, &view, dl_norm, mask, scores);
+            return Ok(());
+        }
+        let Some(guard) = source.get_posting_block(self.term_id, target)? else {
+            return Err(TreeError::CorruptedData(format!(
+                "missing posting block for term_id {} block {target}",
+                self.term_id
+            )));
+        };
+        let view = PostingBlockView::parse(guard.as_ref())?;
+        self.scorer
+            .accumulate_block_masked_simd(tier, &view, dl_norm, mask, scores);
         Ok(())
     }
 }
@@ -203,36 +281,36 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
         }
     }
 
-    fn block_upper_bound(&self, target: FtsBlockId) -> Result<f32> {
+    fn block_upper_bound(&self, target: FtsBlockId) -> f32 {
         match &self.kind {
             ClauseKind::Single(t) => {
                 if t.current_block_id() == Some(target) {
                     t.block_upper_bound()
                 } else {
-                    Ok(0.0)
+                    0.0
                 }
             }
             ClauseKind::PrefixMax(ts) => {
                 let mut best = 0.0f32;
                 for t in ts {
                     if t.current_block_id() == Some(target) {
-                        best = best.max(t.block_upper_bound()?);
+                        best = best.max(t.block_upper_bound());
                     }
                 }
-                Ok(best)
+                best
             }
             ClauseKind::MaxBranches(branches) => {
                 let mut best = 0.0f32;
                 for branch in branches {
                     let mut sum = 0.0f32;
                     for c in branch {
-                        sum += c.block_upper_bound(target)?;
+                        sum += c.block_upper_bound(target);
                     }
                     if sum > best {
                         best = sum;
                     }
                 }
-                Ok(best)
+                best
             }
         }
     }
@@ -278,7 +356,7 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
     }
 
     fn accumulate_block(
-        &self,
+        &mut self,
         target: FtsBlockId,
         scores: &mut [f32; FTS_BLOCK_SIZE],
         touched: &mut [u64; 4],
@@ -286,13 +364,10 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
         source: &'a S,
         tier: SimdTier,
     ) -> Result<()> {
-        match &self.kind {
+        match &mut self.kind {
             ClauseKind::Single(t) => {
                 if t.current_block_id() == Some(target) && !t.scorer.is_zero() {
-                    let view = PostingBlockView::parse(t.cursor.current_block_bytes())?;
-                    let dl_norm = dl_cache.get_or_load(source, tier, t.dl_group, target)?;
-                    t.scorer
-                        .accumulate_block_simd(tier, &view, dl_norm, scores, touched);
+                    t.accumulate(target, scores, touched, dl_cache, source, tier)?;
                 }
                 Ok(())
             }
@@ -306,44 +381,26 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
                 }
                 if matching == 1 {
                     let t = ts
-                        .iter()
+                        .iter_mut()
                         .find(|t| t.current_block_id() == Some(target) && !t.scorer.is_zero())
                         .unwrap();
-                    let view = PostingBlockView::parse(t.cursor.current_block_bytes())?;
-                    let dl_norm = dl_cache.get_or_load(source, tier, t.dl_group, target)?;
-                    t.scorer
-                        .accumulate_block_simd(tier, &view, dl_norm, scores, touched);
-                    return Ok(());
+                    return t.accumulate(target, scores, touched, dl_cache, source, tier);
                 }
 
                 let mut local = [0.0f32; FTS_BLOCK_SIZE];
                 let mut tmp = [0.0f32; FTS_BLOCK_SIZE];
                 let mut local_touched = [0u64; 4];
                 let mut first = true;
-                for t in ts {
+                for t in ts.iter_mut() {
                     if t.current_block_id() != Some(target) || t.scorer.is_zero() {
                         continue;
                     }
-                    let view = PostingBlockView::parse(t.cursor.current_block_bytes())?;
-                    let dl_norm = dl_cache.get_or_load(source, tier, t.dl_group, target)?;
                     if first {
-                        t.scorer.accumulate_block_simd(
-                            tier,
-                            &view,
-                            dl_norm,
-                            &mut local,
-                            &mut local_touched,
-                        );
+                        t.accumulate(target, &mut local, &mut local_touched, dl_cache, source, tier)?;
                         first = false;
                     } else {
                         tmp.fill(0.0);
-                        t.scorer.accumulate_block_simd(
-                            tier,
-                            &view,
-                            dl_norm,
-                            &mut tmp,
-                            &mut local_touched,
-                        );
+                        t.accumulate(target, &mut tmp, &mut local_touched, dl_cache, source, tier)?;
                         merge_max_256(tier, &mut local, &tmp);
                     }
                 }
@@ -363,10 +420,10 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
                 }
                 if matching_branches == 1 {
                     let branch = branches
-                        .iter()
+                        .iter_mut()
                         .find(|b| b.iter().any(|c| c.next_block_id() == Some(target)))
                         .unwrap();
-                    for c in branch {
+                    for c in branch.iter_mut() {
                         if c.next_block_id() == Some(target) {
                             c.accumulate_block(target, scores, touched, dl_cache, source, tier)?;
                         }
@@ -378,12 +435,12 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
                 let mut branch_scores = [0.0f32; FTS_BLOCK_SIZE];
                 let mut any_touched = [0u64; 4];
                 let mut first = true;
-                for branch in branches {
+                for branch in branches.iter_mut() {
                     if !branch.iter().any(|c| c.next_block_id() == Some(target)) {
                         continue;
                     }
                     if first {
-                        for c in branch {
+                        for c in branch.iter_mut() {
                             if c.next_block_id() == Some(target) {
                                 c.accumulate_block(
                                     target,
@@ -398,7 +455,7 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
                         first = false;
                     } else {
                         branch_scores.fill(0.0);
-                        for c in branch {
+                        for c in branch.iter_mut() {
                             if c.next_block_id() == Some(target) {
                                 c.accumulate_block(
                                     target,
@@ -423,7 +480,7 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
     }
 
     fn accumulate_block_masked(
-        &self,
+        &mut self,
         target: FtsBlockId,
         mask: &[u64; 4],
         scores: &mut [f32; FTS_BLOCK_SIZE],
@@ -431,13 +488,10 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
         source: &'a S,
         tier: SimdTier,
     ) -> Result<()> {
-        match &self.kind {
+        match &mut self.kind {
             ClauseKind::Single(t) => {
                 if t.current_block_id() == Some(target) && !t.scorer.is_zero() {
-                    let view = PostingBlockView::parse(t.cursor.current_block_bytes())?;
-                    let dl_norm = dl_cache.get_or_load(source, tier, t.dl_group, target)?;
-                    t.scorer
-                        .accumulate_block_masked_simd(tier, &view, dl_norm, mask, scores);
+                    t.accumulate_masked(target, mask, scores, dl_cache, source, tier)?;
                 }
                 Ok(())
             }
@@ -451,38 +505,25 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
                 }
                 if matching == 1 {
                     let t = ts
-                        .iter()
+                        .iter_mut()
                         .find(|t| t.current_block_id() == Some(target) && !t.scorer.is_zero())
                         .unwrap();
-                    let view = PostingBlockView::parse(t.cursor.current_block_bytes())?;
-                    let dl_norm = dl_cache.get_or_load(source, tier, t.dl_group, target)?;
-                    t.scorer
-                        .accumulate_block_masked_simd(tier, &view, dl_norm, mask, scores);
-                    return Ok(());
+                    return t.accumulate_masked(target, mask, scores, dl_cache, source, tier);
                 }
 
                 let mut local = [0.0f32; FTS_BLOCK_SIZE];
                 let mut tmp = [0.0f32; FTS_BLOCK_SIZE];
                 let mut first = true;
-                for t in ts {
+                for t in ts.iter_mut() {
                     if t.current_block_id() != Some(target) || t.scorer.is_zero() {
                         continue;
                     }
-                    let view = PostingBlockView::parse(t.cursor.current_block_bytes())?;
-                    let dl_norm = dl_cache.get_or_load(source, tier, t.dl_group, target)?;
                     if first {
-                        t.scorer.accumulate_block_masked_simd(
-                            tier,
-                            &view,
-                            dl_norm,
-                            mask,
-                            &mut local,
-                        );
+                        t.accumulate_masked(target, mask, &mut local, dl_cache, source, tier)?;
                         first = false;
                     } else {
                         tmp.fill(0.0);
-                        t.scorer
-                            .accumulate_block_masked_simd(tier, &view, dl_norm, mask, &mut tmp);
+                        t.accumulate_masked(target, mask, &mut tmp, dl_cache, source, tier)?;
                         merge_max_256(tier, &mut local, &tmp);
                     }
                 }
@@ -499,10 +540,10 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
                 }
                 if matching_branches == 1 {
                     let branch = branches
-                        .iter()
+                        .iter_mut()
                         .find(|b| b.iter().any(|c| c.next_block_id() == Some(target)))
                         .unwrap();
-                    for c in branch {
+                    for c in branch.iter_mut() {
                         if c.next_block_id() == Some(target) {
                             c.accumulate_block_masked(
                                 target, mask, scores, dl_cache, source, tier,
@@ -515,12 +556,12 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
                 let mut best = [0.0f32; FTS_BLOCK_SIZE];
                 let mut branch_scores = [0.0f32; FTS_BLOCK_SIZE];
                 let mut first = true;
-                for branch in branches {
+                for branch in branches.iter_mut() {
                     if !branch.iter().any(|c| c.next_block_id() == Some(target)) {
                         continue;
                     }
                     if first {
-                        for c in branch {
+                        for c in branch.iter_mut() {
                             if c.next_block_id() == Some(target) {
                                 c.accumulate_block_masked(
                                     target, mask, &mut best, dl_cache, source, tier,
@@ -530,7 +571,7 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
                         first = false;
                     } else {
                         branch_scores.fill(0.0);
-                        for c in branch {
+                        for c in branch.iter_mut() {
                             if c.next_block_id() == Some(target) {
                                 c.accumulate_block_masked(
                                     target,
@@ -652,78 +693,99 @@ fn compile_clauses<'a, S: FtsPostingSource>(
                         qtfs.push(1);
                     }
                 }
-                let stats_list = source.multi_get_term_stats(entry.id, &keys)?;
-                for ((token, qtf), opt_stats) in
-                    keys.into_iter().zip(qtfs).zip(stats_list)
-                {
-                    let Some(ts) = opt_stats else {
+                let records = source.multi_get_term_records(entry.id, &keys)?;
+                let mut active_meta: Vec<(TermId, Bm25TermScorer, f32, usize)> =
+                    Vec::with_capacity(keys.len());
+                let mut active_recs: Vec<TermRecord> = Vec::with_capacity(keys.len());
+                for (qtf, opt_rec) in qtfs.into_iter().zip(records) {
+                    let Some(rec) = opt_rec else {
                         continue;
                     };
-                    if ts.doc_freq == 0 {
+                    if rec.stats.doc_freq == 0 {
                         continue;
                     }
                     let scorer = Bm25TermScorer::new(
                         weight,
                         attr_stats.doc_count,
                         attr_stats.total_tokens,
-                        ts.doc_freq,
+                        rec.stats.doc_freq,
                         qtf,
                         k1,
                         b,
                         k3,
                     );
-                    let ub = scorer.upper_bound(ts.max_tf, ts.min_dl_over_tf);
+                    let ub = scorer.upper_bound(rec.stats.max_tf, rec.stats.min_dl_over_tf);
                     if ub <= 0.0 {
                         continue;
                     }
-                    let cursor = source.open_posting_cursor(entry.id, &token)?;
-                    if cursor.current_block_id().is_some() {
-                        let dl_group = dl_cache.intern(entry.id, &scorer);
-                        out.push(Clause {
-                            term_max: ub,
-                            kind: ClauseKind::Single(TermStream {
-                                scorer,
-                                dl_group,
-                                cursor,
-                            }),
-                        });
+                    let dl_group = dl_cache.intern(entry.id, &scorer);
+                    active_meta.push((rec.term_id, scorer, ub, dl_group));
+                    active_recs.push(rec);
+                }
+                if !active_recs.is_empty() {
+                    let cursors = source.open_skip_cursors(active_recs)?;
+                    for ((term_id, scorer, ub, dl_group), cursor) in
+                        active_meta.into_iter().zip(cursors)
+                    {
+                        if cursor.current_block_id().is_some() {
+                            out.push(Clause {
+                                term_max: ub,
+                                kind: ClauseKind::Single(TermStream {
+                                    term_id,
+                                    scorer,
+                                    dl_group,
+                                    cursor,
+                                }),
+                            });
+                        }
                     }
                 }
             }
 
             if let Some(prefix) = prefix_token {
                 let expanded = source.scan_prefix_terms(entry.id, &prefix, max_exp)?;
-                let mut streams = Vec::with_capacity(expanded.len());
-                let mut max_ub = 0.0f32;
-                for (token, ts) in expanded {
-                    if ts.doc_freq == 0 {
+                let mut p_meta: Vec<(TermId, Bm25TermScorer, f32, usize)> =
+                    Vec::with_capacity(expanded.len());
+                let mut p_recs: Vec<TermRecord> = Vec::with_capacity(expanded.len());
+                for (_token, rec) in expanded {
+                    if rec.stats.doc_freq == 0 {
                         continue;
                     }
                     let scorer = Bm25TermScorer::new(
                         weight,
                         attr_stats.doc_count,
                         attr_stats.total_tokens,
-                        ts.doc_freq,
+                        rec.stats.doc_freq,
                         1,
                         k1,
                         b,
                         k3,
                     );
-                    let ub = scorer.upper_bound(ts.max_tf, ts.min_dl_over_tf);
+                    let ub = scorer.upper_bound(rec.stats.max_tf, rec.stats.min_dl_over_tf);
                     if ub <= 0.0 {
                         continue;
                     }
-                    let cursor = source.open_posting_cursor(entry.id, &token)?;
-                    if cursor.current_block_id().is_some() {
-                        if ub > max_ub {
-                            max_ub = ub;
+                    let dl_group = dl_cache.intern(entry.id, &scorer);
+                    p_meta.push((rec.term_id, scorer, ub, dl_group));
+                    p_recs.push(rec);
+                }
+                let mut streams = Vec::with_capacity(p_recs.len());
+                let mut max_ub = 0.0f32;
+                if !p_recs.is_empty() {
+                    let cursors = source.open_skip_cursors(p_recs)?;
+                    for ((term_id, scorer, ub, dl_group), cursor) in p_meta.into_iter().zip(cursors)
+                    {
+                        if cursor.current_block_id().is_some() {
+                            if ub > max_ub {
+                                max_ub = ub;
+                            }
+                            streams.push(TermStream {
+                                term_id,
+                                scorer,
+                                dl_group,
+                                cursor,
+                            });
                         }
-                        let dl_group = dl_cache.intern(entry.id, &scorer);
-                        streams.push(TermStream {
-                            scorer,
-                            dl_group,
-                            cursor,
-                        });
                     }
                 }
                 if !streams.is_empty() {
@@ -922,11 +984,11 @@ pub fn execute_rank_by<S: FtsPostingSource>(
             0.0
         };
 
-        // Block-Max header pruning before decoding any posting lists or doc_len blocks.
+        // Block-Max skip pruning BEFORE reading any posting blocks or doc_len blocks.
         if theta > 0.0 {
             let mut ess_block_ub = 0.0f64;
             for c in &clauses[essential_start..] {
-                ess_block_ub += c.block_upper_bound(block_id)? as f64;
+                ess_block_ub += c.block_upper_bound(block_id) as f64;
             }
             let block_ub = (ess_block_ub + non_ess_ub as f64) as f32;
             let eps = block_ub * 1e-6 + 1e-7;
@@ -965,10 +1027,10 @@ pub fn execute_rank_by<S: FtsPostingSource>(
                     non_ess_ubs.clear();
                     let mut non_ess_block_ub = 0.0f64;
                     let mut pruned_early = false;
-                    // Seek descending by global term_max so absent/tighter clauses prune early.
+                    // Seek descending by global term_max using out-of-line skip cursors only.
                     for j in (0..essential_start).rev() {
                         clauses[j].seek_to(block_id)?;
-                        let ub = clauses[j].block_upper_bound(block_id)?;
+                        let ub = clauses[j].block_upper_bound(block_id);
                         non_ess_ubs.push(ub);
                         non_ess_block_ub += ub as f64;
                         if theta > 0.0 {
@@ -986,7 +1048,6 @@ pub fn execute_rank_by<S: FtsPostingSource>(
                         let tight_ub = (max_ess as f64 + non_ess_block_ub) as f32;
                         let tight_eps = tight_ub * 1e-6 + 1e-7;
                         let mut rem_ub = non_ess_block_ub;
-                        // `non_ess_ubs` is already ordered descending (`essential_start - 1 ..= 0`).
                         for (idx, j) in (0..essential_start).rev().enumerate() {
                             let ub_j = non_ess_ubs[idx];
                             if ub_j <= 0.0 {
@@ -1083,7 +1144,6 @@ pub fn execute_rank_by<S: FtsPostingSource>(
                             });
                             theta = heap.peek().unwrap().score;
                         } else if s == theta {
-                            // Exact tie-breaking on ascending DocId.
                             let Some(new_doc_id) = opt_doc_id else {
                                 continue;
                             };
@@ -1170,7 +1230,7 @@ pub fn execute_rank_by<S: FtsPostingSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::{DocLenBlock, PackedPostingBlock};
+    use crate::block::{DocLenBlock, PackedPostingBlock, PostingBlockHeader};
     use izzydb_core::config::{DistanceMetric, TreeConfig, fts_block_id, fts_slot};
     use izzydb_core::schema::{AttributeType, CollectionConfig};
     use rand::rngs::SmallRng;
@@ -1179,26 +1239,53 @@ mod tests {
     struct MemSource {
         meta: FtsMeta,
         docs: HashMap<FtsDocId, DocId>,
-        terms: HashMap<(AttrId, String), TermStats>,
-        postings: HashMap<(AttrId, String), Vec<(FtsBlockId, Vec<u8>)>>,
+        terms: HashMap<(AttrId, String), TermRecord>,
+        postings: HashMap<TermId, Vec<(FtsBlockId, Vec<u8>)>>,
         doc_lens: HashMap<(AttrId, FtsBlockId), Vec<u8>>,
     }
 
-    struct MemCursor {
-        blocks: Vec<(FtsBlockId, Vec<u8>)>,
+    struct MemSkipCursor {
+        blocks: Vec<(FtsBlockId, u32, f32)>,
+        inline: Option<(FtsBlockId, Vec<u8>)>,
         idx: usize,
     }
 
-    impl FtsBlockCursor for MemCursor {
+    impl FtsSkipCursor for MemSkipCursor {
         fn current_block_id(&self) -> Option<FtsBlockId> {
-            self.blocks.get(self.idx).map(|(id, _)| *id)
+            if let Some((bid, _)) = &self.inline {
+                if self.idx == 0 {
+                    return Some(*bid);
+                }
+                return None;
+            }
+            self.blocks.get(self.idx).map(|(id, _, _)| *id)
         }
 
-        fn current_block_bytes(&self) -> &[u8] {
-            &self.blocks[self.idx].1
+        fn current_block_bounds(&self) -> (u32, f32) {
+            if let Some((_, bytes)) = &self.inline {
+                let hdr = PostingBlockHeader::parse(bytes).unwrap();
+                return (hdr.max_tf, hdr.min_dl_over_tf);
+            }
+            let (_, max_tf, min_ratio) = self.blocks[self.idx];
+            (max_tf, min_ratio)
+        }
+
+        fn inline_posting_bytes(&self) -> Option<&[u8]> {
+            self.inline
+                .as_ref()
+                .filter(|_| self.idx == 0)
+                .map(|(_, b)| b.as_slice())
+        }
+
+        fn current_posting_bytes(&mut self) -> Result<Option<&[u8]>> {
+            Ok(self.inline_posting_bytes())
         }
 
         fn next_block(&mut self) -> Result<()> {
+            if self.inline.is_some() {
+                self.idx = 1;
+                return Ok(());
+            }
             if self.idx < self.blocks.len() {
                 self.idx += 1;
             }
@@ -1206,6 +1293,12 @@ mod tests {
         }
 
         fn seek_block(&mut self, target: FtsBlockId) -> Result<()> {
+            if let Some((bid, _)) = &self.inline {
+                if *bid < target {
+                    self.idx = 1;
+                }
+                return Ok(());
+            }
             while self.idx < self.blocks.len() && self.blocks[self.idx].0 < target {
                 self.idx += 1;
             }
@@ -1228,22 +1321,30 @@ mod tests {
         }
     }
 
+    struct MemGuard<'a>(&'a [u8]);
+    impl AsRef<[u8]> for MemGuard<'_> {
+        fn as_ref(&self) -> &[u8] {
+            self.0
+        }
+    }
+
     impl FtsPostingSource for MemSource {
-        type Cursor<'a> = MemCursor;
+        type SkipCursor<'a> = MemSkipCursor;
         type DocLenCursor<'a> = MemDocLenCursor<'a>;
+        type PostingGuard<'a> = MemGuard<'a>;
 
         fn get_fts_meta(&self) -> Result<Option<FtsMeta>> {
             Ok(Some(self.meta.clone()))
         }
 
-        fn multi_get_term_stats(
+        fn multi_get_term_records(
             &self,
             attr_id: AttrId,
             tokens: &[String],
-        ) -> Result<Vec<Option<TermStats>>> {
+        ) -> Result<Vec<Option<TermRecord>>> {
             Ok(tokens
                 .iter()
-                .map(|t| self.terms.get(&(attr_id, t.clone())).copied())
+                .map(|t| self.terms.get(&(attr_id, t.clone())).cloned())
                 .collect())
         }
 
@@ -1252,34 +1353,61 @@ mod tests {
             attr_id: AttrId,
             prefix: &str,
             limit: usize,
-        ) -> Result<Vec<(String, TermStats)>> {
-            let mut matches: Vec<(String, TermStats)> = self
+        ) -> Result<Vec<(String, TermRecord)>> {
+            let mut matches: Vec<(String, TermRecord)> = self
                 .terms
                 .iter()
                 .filter(|((aid, tok), _)| *aid == attr_id && tok.starts_with(prefix))
-                .map(|((_, tok), &ts)| (tok.clone(), ts))
+                .map(|((_, tok), rec)| (tok.clone(), rec.clone()))
                 .collect();
             matches.sort_by(|a, b| {
                 (a.0 != prefix)
                     .cmp(&(b.0 != prefix))
-                    .then_with(|| b.1.doc_freq.cmp(&a.1.doc_freq))
+                    .then_with(|| b.1.stats.doc_freq.cmp(&a.1.stats.doc_freq))
                     .then_with(|| a.0.cmp(&b.0))
             });
             matches.truncate(limit);
             Ok(matches)
         }
 
-        fn open_posting_cursor<'a>(
-            &'a self,
-            attr_id: AttrId,
-            token: &str,
-        ) -> Result<Self::Cursor<'a>> {
+        fn open_skip_cursor<'a>(&'a self, record: TermRecord) -> Result<Self::SkipCursor<'a>> {
+            if let Some((bid, bytes)) = record.inline_block {
+                return Ok(MemSkipCursor {
+                    blocks: Vec::new(),
+                    inline: Some((bid, bytes)),
+                    idx: 0,
+                });
+            }
             let blocks = self
                 .postings
-                .get(&(attr_id, token.to_owned()))
-                .cloned()
+                .get(&record.term_id)
+                .map(|v| {
+                    v.iter()
+                        .map(|(bid, bytes)| {
+                            let hdr = PostingBlockHeader::parse(bytes).unwrap();
+                            (*bid, hdr.max_tf, hdr.min_dl_over_tf)
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
-            Ok(MemCursor { blocks, idx: 0 })
+            Ok(MemSkipCursor {
+                blocks,
+                inline: None,
+                idx: 0,
+            })
+        }
+
+        fn get_posting_block<'a>(
+            &'a self,
+            term_id: TermId,
+            block_id: FtsBlockId,
+        ) -> Result<Option<Self::PostingGuard<'a>>> {
+            let Some(v) = self.postings.get(&term_id) else {
+                return Ok(None);
+            };
+            Ok(v.iter()
+                .find(|(bid, _)| *bid == block_id)
+                .map(|(_, bytes)| MemGuard(bytes.as_slice())))
         }
 
         fn open_doc_len_cursor<'a>(&'a self, attr_id: AttrId) -> Result<Self::DocLenCursor<'a>> {
@@ -1315,18 +1443,17 @@ mod tests {
         let mut dl_acc: HashMap<(AttrId, FtsBlockId), DocLenBlock> = HashMap::new();
         let mut block_acc: HashMap<(AttrId, String, FtsBlockId), PackedPostingBlock> =
             HashMap::new();
-        let mut term_stats: HashMap<(AttrId, String), TermStats> = HashMap::new();
+        let mut term_records: HashMap<(AttrId, String), TermRecord> = HashMap::new();
 
         let title_analyzer = FtsAnalyzer::new(FullTextSearchConfig::default());
         let body_analyzer = FtsAnalyzer::new(FullTextSearchConfig::default());
 
         for i in 0..n_docs {
-            let doc_id = (n_docs - i) as DocId * 3; // non-monotonic DocIds to test tie-breaking!
+            let doc_id = (n_docs - i) as DocId * 3;
             let fts_id = meta.alloc_doc_id().unwrap();
             docs_map.insert(fts_id, doc_id);
 
             let title = if i < 20 {
-                // Force exact ties among first 20 docs
                 "w0 w1".to_string()
             } else {
                 let len = rng.random_range(1..=4);
@@ -1361,21 +1488,21 @@ mod tests {
                         .entry((attr_id, tok.clone(), bid))
                         .or_default()
                         .upsert(slot, term.tf, dls);
-                    let ts = term_stats.entry((attr_id, tok.clone())).or_default();
-                    ts.doc_freq += 1;
-                    ts.observe(term.tf, ad.doc_len);
+                    let rec = term_records
+                        .entry((attr_id, tok.clone()))
+                        .or_insert_with(|| TermRecord::new(meta.alloc_term_id().unwrap()));
+                    rec.stats.doc_freq += 1;
+                    rec.stats.observe(term.tf, ad.doc_len);
                 }
             }
             raw_docs.push((doc_id, title, body));
         }
 
-        let mut postings: HashMap<(AttrId, String), Vec<(FtsBlockId, Vec<u8>)>> = HashMap::new();
+        let mut postings: HashMap<TermId, Vec<(FtsBlockId, Vec<u8>)>> = HashMap::new();
         for ((aid, tok, bid), mut blk) in block_acc {
             blk.recompute_bounds(&dl_acc[&(aid, bid)]);
-            postings
-                .entry((aid, tok))
-                .or_default()
-                .push((bid, blk.encode()));
+            let tid = term_records[&(aid, tok)].term_id;
+            postings.entry(tid).or_default().push((bid, blk.encode()));
         }
         for blocks in postings.values_mut() {
             blocks.sort_by_key(|(bid, _)| *bid);
@@ -1389,12 +1516,11 @@ mod tests {
         let source = MemSource {
             meta: meta.clone(),
             docs: docs_map,
-            terms: term_stats.clone(),
+            terms: term_records.clone(),
             postings,
             doc_lens,
         };
 
-        // Long 30-term LLM-style query + weighted multi-field Sum
         let query_str: String = (0..30)
             .map(|i| vocab[i % vocab.len()].as_str())
             .collect::<Vec<_>>()
@@ -1406,7 +1532,6 @@ mod tests {
 
         let got = execute_rank_by(&source, &schema, &rank_by, 15, None, None, &mut buf).unwrap();
 
-        // Brute-force reference
         let fts = FullTextSearchConfig::default();
         let q_tokens: Vec<String> = query_str.split_whitespace().map(str::to_owned).collect();
         let mut qtf_map: std::collections::BTreeMap<String, u32> =
@@ -1424,13 +1549,13 @@ mod tests {
                     let mut sum = 0.0f32;
                     for (tok, &qtf) in &qtf_map {
                         if let Some(at) = ad.terms.get(tok)
-                            && let Some(ts) = term_stats.get(&(aid, tok.clone()))
+                            && let Some(rec) = term_records.get(&(aid, tok.clone()))
                         {
                             let scorer = Bm25TermScorer::new(
                                 w,
                                 st.doc_count,
                                 st.total_tokens,
-                                ts.doc_freq,
+                                rec.stats.doc_freq,
                                 qtf,
                                 fts.k1,
                                 fts.b,

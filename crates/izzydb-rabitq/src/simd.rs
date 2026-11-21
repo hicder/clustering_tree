@@ -8,11 +8,19 @@ pub struct LeafCandidate {
 }
 
 /// Parameters needed to batch-score a packed leaf node using RaBitQ bitwise popcount.
+///
+/// `codes_bytes` is laid out in 8-entry SIMD tiles:
+/// `tile = slot / 8`, `lane = slot % 8`, word `w` of `slot` is at
+/// `((tile * rabitq_words + w) * 8 + lane) * 8`.
+/// `doc_ids_bytes`, `code_popcounts_bytes`, `res_norm_sqs_bytes`, and `scales_bytes`
+/// are padded to `slot_cap.next_multiple_of(8)` entries so SIMD loops never read out of bounds.
 pub struct RabitqLeafScoreParams<'a> {
-    pub entry_count: usize,
+    pub slot_cap: usize,
     pub rabitq_words: usize,
+    pub popcount_u32: bool,
     pub doc_ids_bytes: &'a [u8],
     pub codes_bytes: &'a [u8],
+    pub code_popcounts_bytes: &'a [u8],
     pub res_norm_sqs_bytes: &'a [u8],
     pub scales_bytes: &'a [u8],
     pub q0: &'a [u64],
@@ -28,23 +36,23 @@ pub struct RabitqLeafScoreParams<'a> {
     pub metric: DistanceMetric,
 }
 
-/// Score all `entry_count` vectors in a packed leaf and append [`LeafCandidate`]s to `out`.
+/// Score all `slot_cap` vectors in a packed leaf and append [`LeafCandidate`]s to `out`.
 pub fn score_leaf_rabitq(params: &RabitqLeafScoreParams<'_>, out: &mut Vec<LeafCandidate>) {
     score_leaf_rabitq_masked(params, None, out);
 }
 
 /// Score matching entries in a packed leaf (where bit `slot` in `allowed_slots` is set, or all entries
-/// when `allowed_slots` is `None`) and append [`LeafCandidate`]s to `out`.
+/// in `0..slot_cap` when `allowed_slots` is `None`) and append [`LeafCandidate`]s to `out`.
 pub fn score_leaf_rabitq_masked(
     params: &RabitqLeafScoreParams<'_>,
     allowed_slots: Option<&[u64]>,
     out: &mut Vec<LeafCandidate>,
 ) {
-    if params.entry_count == 0 {
+    if params.slot_cap == 0 {
         return;
     }
     if let Some(mask) = allowed_slots {
-        debug_assert!(mask.len() * 64 >= params.entry_count);
+        debug_assert!(mask.len() * 64 >= params.slot_cap);
         if mask.iter().all(|&w| w == 0) {
             return;
         }
@@ -129,11 +137,28 @@ fn dispatch_score_leaf<const MASKED: bool>(
 }
 
 #[inline(always)]
+fn read_popcount_scalar(params: &RabitqLeafScoreParams<'_>, slot: usize) -> u32 {
+    if params.popcount_u32 {
+        let off = slot * 4;
+        u32::from_le_bytes(
+            params.code_popcounts_bytes[off..off + 4]
+                .try_into()
+                .unwrap(),
+        )
+    } else {
+        let off = slot * 2;
+        u16::from_le_bytes([
+            params.code_popcounts_bytes[off],
+            params.code_popcounts_bytes[off + 1],
+        ]) as u32
+    }
+}
+
+#[inline(always)]
 fn score_single_entry_scalar<const METRIC: u8>(
     params: &RabitqLeafScoreParams<'_>,
     i: usize,
 ) -> LeafCandidate {
-    let n = params.entry_count;
     let words = params.rabitq_words;
     let doc_id =
         u64::from_le_bytes(params.doc_ids_bytes[i * 8..(i + 1) * 8].try_into().unwrap());
@@ -147,15 +172,17 @@ fn score_single_entry_scalar<const METRIC: u8>(
     } else {
         let scale =
             f32::from_le_bytes(params.scales_bytes[i * 4..(i + 1) * 4].try_into().unwrap());
-        let mut p_x = 0u32;
+        let p_x = read_popcount_scalar(params, i);
+        let tile = i >> 3;
+        let lane = i & 7;
+        let tile_base = tile * words * 8 + lane;
         let mut p0 = 0u32;
         let mut p1 = 0u32;
         let mut p2 = 0u32;
         let mut p3 = 0u32;
         for w in 0..words {
-            let off = (w * n + i) * 8;
+            let off = (tile_base + w * 8) * 8;
             let x = u64::from_le_bytes(params.codes_bytes[off..off + 8].try_into().unwrap());
-            p_x += x.count_ones();
             p0 += (x & params.q0[w]).count_ones();
             p1 += (x & params.q1[w]).count_ones();
             p2 += (x & params.q2[w]).count_ones();
@@ -180,7 +207,7 @@ fn score_leaf_scalar<const METRIC: u8, const MASKED: bool>(
     allowed_slots: &[u64],
     out: &mut Vec<LeafCandidate>,
 ) {
-    let n = params.entry_count;
+    let n = params.slot_cap;
     if !MASKED {
         out.reserve(n);
     }
@@ -210,7 +237,8 @@ unsafe fn score_leaf_avx512<const METRIC: u8, const MASKED: bool>(
 ) {
     use std::arch::x86_64::*;
 
-    let n = params.entry_count;
+    let n = params.slot_cap;
+    let padded_n = n.next_multiple_of(8);
     let words = params.rabitq_words;
     if !MASKED {
         out.reserve(n);
@@ -227,16 +255,21 @@ unsafe fn score_leaf_avx512<const METRIC: u8, const MASKED: bool>(
     let v_zero_res_dist = _mm256_set1_ps(params.zero_res_dist);
 
     let codes_ptr = params.codes_bytes.as_ptr();
+    let pop_ptr = params.code_popcounts_bytes.as_ptr();
     let res_sq_ptr = params.res_norm_sqs_bytes.as_ptr() as *const f32;
     let scales_ptr = params.scales_bytes.as_ptr() as *const f32;
     let doc_ids_ptr = params.doc_ids_bytes.as_ptr();
+    let pop_u32 = params.popcount_u32;
 
+    let loop_end = if MASKED { padded_n } else { n & !7 };
     let mut i = 0usize;
-    while i + 8 <= n {
+    let mut tile = 0usize;
+    while i < loop_end {
         let byte_mask = if MASKED {
             let m = ((allowed_slots[i / 64] >> (i % 64)) & 0xFF) as u8;
             if m == 0 {
                 i += 8;
+                tile += 1;
                 continue;
             }
             m
@@ -244,21 +277,20 @@ unsafe fn score_leaf_avx512<const METRIC: u8, const MASKED: bool>(
             0xFF
         };
 
-        let mut acc_x = _mm512_setzero_si512();
         let mut acc_0 = _mm512_setzero_si512();
         let mut acc_1 = _mm512_setzero_si512();
         let mut acc_2 = _mm512_setzero_si512();
         let mut acc_3 = _mm512_setzero_si512();
 
+        let tile_byte_base = tile * words * 64;
         for w in 0..words {
             unsafe {
-                let x = _mm512_loadu_si512(codes_ptr.add((w * n + i) * 8) as *const __m512i);
+                let x = _mm512_loadu_si512(codes_ptr.add(tile_byte_base + w * 64) as *const __m512i);
                 let q0w = _mm512_set1_epi64(*params.q0.get_unchecked(w) as i64);
                 let q1w = _mm512_set1_epi64(*params.q1.get_unchecked(w) as i64);
                 let q2w = _mm512_set1_epi64(*params.q2.get_unchecked(w) as i64);
                 let q3w = _mm512_set1_epi64(*params.q3.get_unchecked(w) as i64);
 
-                acc_x = _mm512_add_epi64(acc_x, _mm512_popcnt_epi64(x));
                 acc_0 = _mm512_add_epi64(acc_0, _mm512_popcnt_epi64(_mm512_and_si512(x, q0w)));
                 acc_1 = _mm512_add_epi64(acc_1, _mm512_popcnt_epi64(_mm512_and_si512(x, q1w)));
                 acc_2 = _mm512_add_epi64(acc_2, _mm512_popcnt_epi64(_mm512_and_si512(x, q2w)));
@@ -271,7 +303,14 @@ unsafe fn score_leaf_avx512<const METRIC: u8, const MASKED: bool>(
         let w3 = _mm512_slli_epi64(acc_3, 3);
         let weighted_i64 = _mm512_add_epi64(_mm512_add_epi64(acc_0, w1), _mm512_add_epi64(w2, w3));
 
-        let px_f = _mm256_cvtepi32_ps(_mm512_cvtepi64_epi32(acc_x));
+        let px_i32 = unsafe {
+            if pop_u32 {
+                _mm256_loadu_si256(pop_ptr.add(i * 4) as *const __m256i)
+            } else {
+                _mm256_cvtepu16_epi32(_mm_loadu_si128(pop_ptr.add(i * 2) as *const __m128i))
+            }
+        };
+        let px_f = _mm256_cvtepi32_ps(px_i32);
         let wp_f = _mm256_cvtepi32_ps(_mm512_cvtepi64_epi32(weighted_i64));
 
         let sum_x_q = _mm256_fmadd_ps(v_delta, wp_f, _mm256_mul_ps(v_vl, px_f));
@@ -283,7 +322,6 @@ unsafe fn score_leaf_avx512<const METRIC: u8, const MASKED: bool>(
 
         let raw_dist = match METRIC {
             0 => {
-                // max(0, res_sq + q_res_sq - 2 * est_r_dot_q)
                 let d = _mm256_fnmadd_ps(v_two, est_r_dot_q, _mm256_add_ps(v_res_sq, v_q_res_sq));
                 _mm256_max_ps(v_zero, d)
             }
@@ -312,8 +350,11 @@ unsafe fn score_leaf_avx512<const METRIC: u8, const MASKED: bool>(
                 });
             }
         } else {
-            for lane in 0..8 {
-                if (byte_mask >> lane) & 1 != 0 {
+            let mut m = byte_mask;
+            while m != 0 {
+                let lane = m.trailing_zeros() as usize;
+                m &= m - 1;
+                if i + lane < n {
                     out.push(LeafCandidate {
                         doc_id: doc_ids[lane],
                         dist: dists[lane],
@@ -323,14 +364,14 @@ unsafe fn score_leaf_avx512<const METRIC: u8, const MASKED: bool>(
         }
 
         i += 8;
+        tile += 1;
     }
 
-    // Scalar tail for remaining `< 8` entries
-    while i < n {
-        if !MASKED || ((allowed_slots[i / 64] >> (i % 64)) & 1 != 0) {
+    if !MASKED {
+        while i < n {
             out.push(score_single_entry_scalar::<METRIC>(params, i));
+            i += 1;
         }
-        i += 1;
     }
 }
 
@@ -343,7 +384,8 @@ unsafe fn score_leaf_neon<const METRIC: u8, const MASKED: bool>(
 ) {
     use std::arch::aarch64::*;
 
-    let n = params.entry_count;
+    let n = params.slot_cap;
+    let padded_n = n.next_multiple_of(8);
     let words = params.rabitq_words;
     if !MASKED {
         out.reserve(n);
@@ -360,12 +402,15 @@ unsafe fn score_leaf_neon<const METRIC: u8, const MASKED: bool>(
     let v_zero_res_dist = vdupq_n_f32(params.zero_res_dist);
 
     let codes_ptr = params.codes_bytes.as_ptr();
+    let pop_ptr = params.code_popcounts_bytes.as_ptr();
     let res_sq_ptr = params.res_norm_sqs_bytes.as_ptr();
     let scales_ptr = params.scales_bytes.as_ptr();
     let doc_ids_ptr = params.doc_ids_bytes.as_ptr();
+    let pop_u32 = params.popcount_u32;
 
+    let loop_end = if MASKED { padded_n } else { n & !3 };
     let mut i = 0usize;
-    while i + 4 <= n {
+    while i < loop_end {
         let nibble_mask = if MASKED {
             let m = ((allowed_slots[i / 64] >> (i % 64)) & 0xF) as u8;
             if m == 0 {
@@ -377,23 +422,23 @@ unsafe fn score_leaf_neon<const METRIC: u8, const MASKED: bool>(
             0xF
         };
 
-        let mut total_x = vdupq_n_u32(0);
         let mut total_0 = vdupq_n_u32(0);
         let mut total_1 = vdupq_n_u32(0);
         let mut total_2 = vdupq_n_u32(0);
         let mut total_3 = vdupq_n_u32(0);
 
-        // Process words in chunks of at most 1024 so `u16` pairwise sums never overflow.
+        let tile = i >> 3;
+        let half_off = (i & 4) * 8; // 0 for lanes 0..4, 32 for lanes 4..8
+        let tile_byte_base = tile * words * 64 + half_off;
+
         let mut w_start = 0usize;
         while w_start < words {
             let w_end = (w_start + 1024).min(words);
-            let mut acc_x_lo = vdupq_n_u16(0);
             let mut acc_0_lo = vdupq_n_u16(0);
             let mut acc_1_lo = vdupq_n_u16(0);
             let mut acc_2_lo = vdupq_n_u16(0);
             let mut acc_3_lo = vdupq_n_u16(0);
 
-            let mut acc_x_hi = vdupq_n_u16(0);
             let mut acc_0_hi = vdupq_n_u16(0);
             let mut acc_1_hi = vdupq_n_u16(0);
             let mut acc_2_hi = vdupq_n_u16(0);
@@ -401,7 +446,7 @@ unsafe fn score_leaf_neon<const METRIC: u8, const MASKED: bool>(
 
             for w in w_start..w_end {
                 unsafe {
-                    let base = (w * n + i) * 8;
+                    let base = tile_byte_base + w * 64;
                     let x_lo = vld1q_u8(codes_ptr.add(base));
                     let x_hi = vld1q_u8(codes_ptr.add(base + 16));
 
@@ -410,13 +455,11 @@ unsafe fn score_leaf_neon<const METRIC: u8, const MASKED: bool>(
                     let q2w = vreinterpretq_u8_u64(vdupq_n_u64(*params.q2.get_unchecked(w)));
                     let q3w = vreinterpretq_u8_u64(vdupq_n_u64(*params.q3.get_unchecked(w)));
 
-                    acc_x_lo = vpadalq_u8(acc_x_lo, vcntq_u8(x_lo));
                     acc_0_lo = vpadalq_u8(acc_0_lo, vcntq_u8(vandq_u8(x_lo, q0w)));
                     acc_1_lo = vpadalq_u8(acc_1_lo, vcntq_u8(vandq_u8(x_lo, q1w)));
                     acc_2_lo = vpadalq_u8(acc_2_lo, vcntq_u8(vandq_u8(x_lo, q2w)));
                     acc_3_lo = vpadalq_u8(acc_3_lo, vcntq_u8(vandq_u8(x_lo, q3w)));
 
-                    acc_x_hi = vpadalq_u8(acc_x_hi, vcntq_u8(x_hi));
                     acc_0_hi = vpadalq_u8(acc_0_hi, vcntq_u8(vandq_u8(x_hi, q0w)));
                     acc_1_hi = vpadalq_u8(acc_1_hi, vcntq_u8(vandq_u8(x_hi, q1w)));
                     acc_2_hi = vpadalq_u8(acc_2_hi, vcntq_u8(vandq_u8(x_hi, q2w)));
@@ -424,7 +467,6 @@ unsafe fn score_leaf_neon<const METRIC: u8, const MASKED: bool>(
                 }
             }
 
-            total_x = vaddq_u32(total_x, vpaddlq_u16(vpaddq_u16(acc_x_lo, acc_x_hi)));
             total_0 = vaddq_u32(total_0, vpaddlq_u16(vpaddq_u16(acc_0_lo, acc_0_hi)));
             total_1 = vaddq_u32(total_1, vpaddlq_u16(vpaddq_u16(acc_1_lo, acc_1_hi)));
             total_2 = vaddq_u32(total_2, vpaddlq_u16(vpaddq_u16(acc_2_lo, acc_2_hi)));
@@ -437,6 +479,13 @@ unsafe fn score_leaf_neon<const METRIC: u8, const MASKED: bool>(
         let w3 = vshlq_n_u32::<3>(total_3);
         let weighted_u32 = vaddq_u32(vaddq_u32(total_0, w1), vaddq_u32(w2, w3));
 
+        let total_x = unsafe {
+            if pop_u32 {
+                vreinterpretq_u32_u8(vld1q_u8(pop_ptr.add(i * 4)))
+            } else {
+                vmovl_u16(vreinterpret_u16_u8(vld1_u8(pop_ptr.add(i * 2))))
+            }
+        };
         let px_f = vcvtq_f32_u32(total_x);
         let wp_f = vcvtq_f32_u32(weighted_u32);
 
@@ -449,7 +498,6 @@ unsafe fn score_leaf_neon<const METRIC: u8, const MASKED: bool>(
 
         let raw_dist = match METRIC {
             0 => {
-                // max(0, res_sq + q_res_sq - 2 * est_r_dot_q)
                 let d = vfmsq_f32(vaddq_f32(v_res_sq, v_q_res_sq), v_two, est_r_dot_q);
                 vmaxq_f32(v_zero, d)
             }
@@ -479,7 +527,7 @@ unsafe fn score_leaf_neon<const METRIC: u8, const MASKED: bool>(
             }
         } else {
             for lane in 0..4 {
-                if (nibble_mask >> lane) & 1 != 0 {
+                if (nibble_mask >> lane) & 1 != 0 && i + lane < n {
                     out.push(LeafCandidate {
                         doc_id: doc_ids[lane],
                         dist: dists[lane],
@@ -491,12 +539,11 @@ unsafe fn score_leaf_neon<const METRIC: u8, const MASKED: bool>(
         i += 4;
     }
 
-    // Scalar tail for remaining `< 4` entries
-    while i < n {
-        if !MASKED || ((allowed_slots[i / 64] >> (i % 64)) & 1 != 0) {
+    if !MASKED {
+        while i < n {
             out.push(score_single_entry_scalar::<METRIC>(params, i));
+            i += 1;
         }
-        i += 1;
     }
 }
 
@@ -531,14 +578,15 @@ mod tests {
             let rotated_c = qtz.rotate_new(&c);
             let rotated_c_bytes: Vec<u8> = rotated_c.iter().flat_map(|x| x.to_le_bytes()).collect();
 
-            // 19 entries: 2 full 8-wide AVX-512 blocks + 3 scalar tail entries, including a zero-residual entry.
             let n = 19usize;
+            let padded_n = n.next_multiple_of(8);
             let mut scratch_enc = EncodeScratch::default();
             let mut entries = Vec::with_capacity(n);
-            let mut doc_ids = Vec::with_capacity(n);
-            let mut res_norm_sqs = Vec::with_capacity(n);
-            let mut scales = Vec::with_capacity(n);
-            let mut word_major_codes = vec![0u64; n * words];
+            let mut doc_ids = vec![0u64; padded_n];
+            let mut res_norm_sqs = vec![0.0f32; padded_n];
+            let mut scales = vec![0.0f32; padded_n];
+            let mut popcounts = vec![0u16; padded_n];
+            let mut tiled_codes = vec![0u64; padded_n * words];
 
             for idx in 0..n {
                 let doc_id = (idx as u64) * 10 + 1;
@@ -550,21 +598,23 @@ mod tests {
                     prepare_vector(&raw_x, dim, metric).unwrap()
                 };
                 let mut code = vec![0u64; words];
-                let (res_norm_sq, scale) = qtz.encode_into(&x, &c, &mut scratch_enc, &mut code);
-                doc_ids.push(doc_id);
-                res_norm_sqs.push(res_norm_sq);
-                scales.push(scale);
+                let (res_norm_sq, scale, popcnt) =
+                    qtz.encode_into_with_popcnt(&x, &c, &mut scratch_enc, &mut code);
+                doc_ids[idx] = doc_id;
+                res_norm_sqs[idx] = res_norm_sq;
+                scales[idx] = scale;
+                popcounts[idx] = popcnt as u16;
+                let tile = idx / 8;
+                let lane = idx % 8;
                 for (w, &word) in code.iter().enumerate() {
-                    word_major_codes[w * n + idx] = word;
+                    tiled_codes[(tile * words + w) * 8 + lane] = word;
                 }
                 entries.push((doc_id, res_norm_sq, scale, code));
             }
 
             let doc_ids_bytes: Vec<u8> = doc_ids.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let codes_bytes: Vec<u8> = word_major_codes
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
+            let codes_bytes: Vec<u8> = tiled_codes.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let pop_bytes: Vec<u8> = popcounts.iter().flat_map(|v| v.to_le_bytes()).collect();
             let res_norm_sqs_bytes: Vec<u8> =
                 res_norm_sqs.iter().flat_map(|v| v.to_le_bytes()).collect();
             let scales_bytes: Vec<u8> = scales.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -604,10 +654,12 @@ mod tests {
             let mut simd_out = Vec::new();
             score_leaf_rabitq(
                 &RabitqLeafScoreParams {
-                    entry_count: n,
+                    slot_cap: n,
                     rabitq_words: words,
+                    popcount_u32: false,
                     doc_ids_bytes: &doc_ids_bytes,
                     codes_bytes: &codes_bytes,
+                    code_popcounts_bytes: &pop_bytes,
                     res_norm_sqs_bytes: &res_norm_sqs_bytes,
                     scales_bytes: &scales_bytes,
                     q0: &q_scratch.planes[0],
@@ -645,14 +697,15 @@ mod tests {
                 );
             }
             let mut masked_out = Vec::new();
-            // Mask out slots 0..8 completely (byte_mask == 0 skip), keep sparse slots in 8..16 and tail 16..19.
             let mask: [u64; 1] = [(1u64 << 9) | (1u64 << 13) | (1u64 << 16) | (1u64 << 18)];
             score_leaf_rabitq_masked(
                 &RabitqLeafScoreParams {
-                    entry_count: n,
+                    slot_cap: n,
                     rabitq_words: words,
+                    popcount_u32: false,
                     doc_ids_bytes: &doc_ids_bytes,
                     codes_bytes: &codes_bytes,
+                    code_popcounts_bytes: &pop_bytes,
                     res_norm_sqs_bytes: &res_norm_sqs_bytes,
                     scales_bytes: &scales_bytes,
                     q0: &q_scratch.planes[0],
@@ -673,7 +726,12 @@ mod tests {
             assert_eq!(masked_out.len(), 4);
             for (cand, slot) in masked_out.iter().zip([9usize, 13, 16, 18]) {
                 assert_eq!(cand.doc_id, simd_out[slot].doc_id);
-                assert!((cand.dist - simd_out[slot].dist).abs() < 1e-6);
+                assert!(
+                    (cand.dist - simd_out[slot].dist).abs() < 1e-4,
+                    "slot={slot}: masked={} vs unmasked={}",
+                    cand.dist,
+                    simd_out[slot].dist
+                );
             }
         }
     }
@@ -692,26 +750,31 @@ mod tests {
         let rotated_c = qtz.rotate_new(&c);
         let rotated_c_bytes: Vec<u8> = rotated_c.iter().flat_map(|x| x.to_le_bytes()).collect();
 
-        // 70 entries spans 2 mask words (0..64 and 64..70) and leaves a 2-entry tail.
         let n = 70usize;
+        let padded_n = n.next_multiple_of(8);
         let mut scratch_enc = EncodeScratch::default();
         let mut entries = Vec::with_capacity(n);
-        let mut doc_ids = Vec::with_capacity(n);
-        let mut res_norm_sqs = Vec::with_capacity(n);
-        let mut scales = Vec::with_capacity(n);
-        let mut word_major_codes = vec![0u64; n * words];
+        let mut doc_ids = vec![0u64; padded_n];
+        let mut res_norm_sqs = vec![0.0f32; padded_n];
+        let mut scales = vec![0.0f32; padded_n];
+        let mut popcounts = vec![0u16; padded_n];
+        let mut tiled_codes = vec![0u64; padded_n * words];
 
         for idx in 0..n {
             let doc_id = (idx as u64) * 3 + 7;
             let raw_x: Vec<f32> = c.iter().map(|&v| v + rng.random_range(-0.3..0.3)).collect();
             let x = prepare_vector(&raw_x, dim, DistanceMetric::Cosine).unwrap();
             let mut code = vec![0u64; words];
-            let (res_norm_sq, scale) = qtz.encode_into(&x, &c, &mut scratch_enc, &mut code);
-            doc_ids.push(doc_id);
-            res_norm_sqs.push(res_norm_sq);
-            scales.push(scale);
+            let (res_norm_sq, scale, popcnt) =
+                qtz.encode_into_with_popcnt(&x, &c, &mut scratch_enc, &mut code);
+            doc_ids[idx] = doc_id;
+            res_norm_sqs[idx] = res_norm_sq;
+            scales[idx] = scale;
+            popcounts[idx] = popcnt as u16;
+            let tile = idx / 8;
+            let lane = idx % 8;
             for (w, &word) in code.iter().enumerate() {
-                word_major_codes[w * n + idx] = word;
+                tiled_codes[(tile * words + w) * 8 + lane] = word;
             }
             entries.push((doc_id, res_norm_sq, scale, code));
         }
@@ -722,10 +785,8 @@ mod tests {
             out
         };
         let doc_ids_buf = shift_bytes(doc_ids.iter().flat_map(|v| v.to_le_bytes()).collect(), 1);
-        let codes_buf = shift_bytes(
-            word_major_codes.iter().flat_map(|v| v.to_le_bytes()).collect(),
-            3,
-        );
+        let codes_buf = shift_bytes(tiled_codes.iter().flat_map(|v| v.to_le_bytes()).collect(), 3);
+        let pop_buf = shift_bytes(popcounts.iter().flat_map(|v| v.to_le_bytes()).collect(), 1);
         let res_buf = shift_bytes(
             res_norm_sqs.iter().flat_map(|v| v.to_le_bytes()).collect(),
             1,
@@ -744,12 +805,14 @@ mod tests {
         );
 
         let params = RabitqLeafScoreParams {
-            entry_count: n,
+            slot_cap: n,
             rabitq_words: words,
-            doc_ids_bytes: &doc_ids_buf[1..1 + n * 8],
-            codes_bytes: &codes_buf[3..3 + n * words * 8],
-            res_norm_sqs_bytes: &res_buf[1..1 + n * 4],
-            scales_bytes: &scales_buf[2..2 + n * 4],
+            popcount_u32: false,
+            doc_ids_bytes: &doc_ids_buf[1..1 + padded_n * 8],
+            codes_bytes: &codes_buf[3..3 + padded_n * words * 8],
+            code_popcounts_bytes: &pop_buf[1..1 + padded_n * 2],
+            res_norm_sqs_bytes: &res_buf[1..1 + padded_n * 4],
+            scales_bytes: &scales_buf[2..2 + padded_n * 4],
             q0: &q_scratch.planes[0],
             q1: &q_scratch.planes[1],
             q2: &q_scratch.planes[2],

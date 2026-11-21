@@ -134,6 +134,19 @@ impl RabitqQuantizer {
         scratch: &mut EncodeScratch,
         code_out: &mut [u64],
     ) -> (f32, f32) {
+        let (res_norm_sq, scale, _) = self.encode_into_with_popcnt(vec, centroid, scratch, code_out);
+        (res_norm_sq, scale)
+    }
+
+    /// Quantize `vec` relative to its leaf `centroid`, writing packed words into `code_out`
+    /// and returning `(res_norm_sq, scale, code_popcount)` without heap allocations.
+    pub fn encode_into_with_popcnt(
+        &self,
+        vec: &[f32],
+        centroid: &[f32],
+        scratch: &mut EncodeScratch,
+        code_out: &mut [u64],
+    ) -> (f32, f32, u32) {
         debug_assert_eq!(vec.len(), self.dim);
         debug_assert_eq!(centroid.len(), self.dim);
         debug_assert_eq!(code_out.len(), self.num_words);
@@ -148,7 +161,7 @@ impl RabitqQuantizer {
 
         if norm_sq <= 0.0 {
             code_out.fill(0);
-            return (0.0, 0.0);
+            return (0.0, 0.0, 0);
         }
 
         let norm = norm_sq.sqrt();
@@ -160,6 +173,7 @@ impl RabitqQuantizer {
         self.rotate_into(&scratch.residual, &mut scratch.rotated);
 
         let mut abs_sum = 0.0f64;
+        let mut popcnt = 0u32;
         for (word_idx, chunk) in scratch.rotated.as_chunks::<64>().0.iter().enumerate() {
             let mut word = 0u64;
             for (bit, &val) in chunk.iter().enumerate() {
@@ -168,12 +182,13 @@ impl RabitqQuantizer {
                     word |= 1u64 << bit;
                 }
             }
+            popcnt += word.count_ones();
             code_out[word_idx] = word;
         }
 
         let o_bar_dot_o = (abs_sum * (self.inv_sqrt_padded_dim as f64)).max(1e-12);
         let scale = (norm / o_bar_dot_o) as f32;
-        (norm_sq as f32, scale)
+        (norm_sq as f32, scale, popcnt)
     }
 
     /// Quantize `vec` relative to its leaf `centroid`.

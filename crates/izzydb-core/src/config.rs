@@ -15,11 +15,38 @@ pub type AttrId = u16;
 /// Dense monotonic document identifier used by the FTS inverted index (`block_id = fts_doc_id >> 8`).
 pub type FtsDocId = u32;
 
+/// Unique numeric identifier assigned to each `(AttrId, token)` term in the FTS inverted index.
+pub type TermId = u32;
+
 /// 256-document posting block identifier (`fts_doc_id >> 8`).
 pub type FtsBlockId = u32;
 
+/// 256-block skip summary chunk identifier (`block_id >> 8`).
+pub type FtsSkipChunkId = u32;
+
 /// Number of documents per fixed FTS posting block.
 pub const FTS_BLOCK_SIZE: usize = 256;
+
+/// Number of posting blocks per FTS skip summary chunk.
+pub const FTS_SKIP_CHUNK_SIZE: usize = 256;
+
+/// Extract the skip chunk ID for an [`FtsBlockId`].
+#[inline]
+pub const fn fts_skip_chunk_id(block_id: FtsBlockId) -> FtsSkipChunkId {
+    block_id >> 8
+}
+
+/// Extract the intra-chunk block offset (`0..=255`) for an [`FtsBlockId`].
+#[inline]
+pub const fn fts_skip_slot(block_id: FtsBlockId) -> u8 {
+    (block_id & 0xFF) as u8
+}
+
+/// Combine a skip chunk ID and intra-chunk offset into an [`FtsBlockId`].
+#[inline]
+pub const fn make_fts_block_id(chunk_id: FtsSkipChunkId, rel_slot: u8) -> FtsBlockId {
+    (chunk_id << 8) | (rel_slot as u32)
+}
 
 /// Extract the posting block ID for an [`FtsDocId`].
 #[inline]

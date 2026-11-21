@@ -7,17 +7,154 @@ use izzydb_core::error::Result;
 use izzydb_core::filter::{Filter, FtsPredicateKind};
 use izzydb_core::schema::{AttributeValue, Attributes, CollectionSchema, ScalarValue};
 use izzydb_storage::codec::{
-    decode_attribute_entries, encode_attr_prefix, encode_present_cluster_key,
-    encode_scalar_cluster_key, extract_index_keys, extract_index_keys_from_entries,
-    make_posting_key, ordered_type_tag,
+    LeafPostingView, decode_attribute_entries, encode_present_cluster_key,
+    encode_scalar_cluster_key, encode_scalar_val_bytes, extract_index_keys,
+    extract_index_keys_from_entries, make_posting_key, ordered_type_tag,
 };
 use izzydb_storage::node::LeafNodeView;
-use izzydb_storage::{Storage, TxContext};
+use izzydb_storage::{DBPinnableSlice, Storage, TxContext};
 
 use crate::fts_index::FtsIndex;
 use crate::tree::ClusterDelta;
 
-/// Conservative cluster-level pruning result from `cf_attr_clusters`.
+/// Compact slot-indexed bitmask for a single leaf node.
+/// Stores up to 256 slots inline without heap allocation.
+#[derive(Debug, Clone, Default)]
+pub struct LeafMask {
+    inline: [u64; 4],
+    overflow: Vec<u64>,
+    len: usize,
+}
+
+impl LeafMask {
+    #[inline]
+    pub fn empty(word_count: usize) -> Self {
+        if word_count <= 4 {
+            Self {
+                inline: [0u64; 4],
+                overflow: Vec::new(),
+                len: word_count,
+            }
+        } else {
+            Self {
+                inline: [0u64; 4],
+                overflow: vec![0u64; word_count],
+                len: word_count,
+            }
+        }
+    }
+
+    #[inline]
+    pub fn from_live_mask_bytes(bytes: &[u8], slot_cap: usize) -> Self {
+        let word_count = slot_cap.div_ceil(64);
+        let mut mask = Self::empty(word_count);
+        let dst = mask.as_mut_slice();
+        for (i, chunk) in bytes.chunks_exact(8).take(word_count).enumerate() {
+            dst[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+        }
+        let rem = slot_cap % 64;
+        if rem != 0 && word_count > 0 {
+            dst[word_count - 1] &= (1u64 << rem) - 1;
+        }
+        mask
+    }
+
+    #[inline]
+    pub fn from_words_padded(src: &[u64], word_count: usize) -> Self {
+        let mut mask = Self::empty(word_count);
+        let copy_len = src.len().min(word_count);
+        mask.as_mut_slice()[..copy_len].copy_from_slice(&src[..copy_len]);
+        mask
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u64] {
+        if self.len <= 4 {
+            &self.inline[..self.len]
+        } else {
+            &self.overflow
+        }
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u64] {
+        if self.len <= 4 {
+            &mut self.inline[..self.len]
+        } else {
+            &mut self.overflow
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().iter().all(|&w| w == 0)
+    }
+
+    #[inline]
+    pub fn and_assign(&mut self, other: &Self) {
+        let a = self.as_mut_slice();
+        let b = other.as_slice();
+        let n = a.len().min(b.len());
+        for i in 0..n {
+            a[i] &= b[i];
+        }
+        for v in &mut a[n..] {
+            *v = 0;
+        }
+    }
+
+    #[inline]
+    pub fn or_assign(&mut self, other: &Self) {
+        let a = self.as_mut_slice();
+        let b = other.as_slice();
+        let n = a.len().min(b.len());
+        for i in 0..n {
+            a[i] |= b[i];
+        }
+    }
+
+    #[inline]
+    pub fn and_not_assign(&mut self, other: &Self) {
+        let a = self.as_mut_slice();
+        let b = other.as_slice();
+        let n = a.len().min(b.len());
+        for i in 0..n {
+            a[i] &= !b[i];
+        }
+    }
+
+    #[inline]
+    pub fn and_live_mask_bytes(&mut self, bytes: &[u8]) {
+        let a = self.as_mut_slice();
+        let avail = bytes.len() / 8;
+        let n = a.len().min(avail);
+        for i in 0..n {
+            let w = u64::from_le_bytes(bytes[i * 8..(i + 1) * 8].try_into().unwrap());
+            a[i] &= w;
+        }
+        for v in &mut a[n..] {
+            *v = 0;
+        }
+    }
+
+    #[inline]
+    pub fn for_each_set_bit(&self, slot_cap: usize, mut f: impl FnMut(usize)) {
+        for (wi, &word) in self.as_slice().iter().enumerate() {
+            let mut w = word;
+            let base = wi * 64;
+            while w != 0 {
+                let tz = w.trailing_zeros() as usize;
+                let slot = base + tz;
+                if slot < slot_cap {
+                    f(slot);
+                }
+                w &= w - 1;
+            }
+        }
+    }
+}
+
+/// Conservative cluster-level pruning result from `cf_attr_clusters` and `cf_attr_zones`.
 #[derive(Debug, Clone)]
 pub enum ClusterCandidates {
     /// Filter cannot safely prune clusters (e.g., top-level `Not(...)`).
@@ -49,8 +186,16 @@ enum PreparedNode {
     Not(Box<PreparedNode>),
     /// Union of `(cluster_key, cluster_bitmap)` entries.
     Keys(Vec<(Vec<u8>, RoaringBitmap)>),
-    /// Pre-resolved per-leaf `local_id` bitmaps (used for FTS predicates).
-    LeafLocalMasks(HashMap<NodeId, RoaringBitmap>),
+    /// Range predicate over cluster-first `cf_attr_postings`, pruned via `cf_attr_zones`.
+    Range {
+        attr_id: AttrId,
+        type_tag: u8,
+        lo: Option<(Vec<u8>, bool)>,
+        hi: Option<(Vec<u8>, bool)>,
+        cands: RoaringBitmap,
+    },
+    /// Pre-resolved per-leaf slot word bitmasks (used for FTS predicates).
+    LeafSlotMasks(HashMap<NodeId, Vec<u64>>),
 }
 
 /// Cluster-aware inverted attribute index backed by `cf_attr_clusters` and `cf_attr_postings`.
@@ -253,30 +398,28 @@ impl AttributeIndex {
         })
     }
 
-    /// Evaluate exact matching `local_id` bitmaps for a batch of `(leaf_id, Option<&LeafNodeView>)`
-    /// using a single `batched_multi_get_cf` on `cf_attr_postings`.
+    /// Evaluate exact matching slot bitmasks for a batch of `(leaf_id, Option<&LeafNodeView>)`
+    /// using a single `batched_multi_get_cf` on `cf_attr_postings` plus prefix-bounded range scans.
     pub fn eval_leaves_masks<'a>(
         &self,
         storage: &Storage,
         prepared: &PreparedFilter,
         leaves: &[(NodeId, Option<&LeafNodeView<'a>>)],
-    ) -> Result<Vec<RoaringBitmap>> {
+    ) -> Result<Vec<LeafMask>> {
         if leaves.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut leaf_ids: Vec<NodeId> = Vec::with_capacity(leaves.len());
-        for (idx, &(leaf_id, ref view_opt)) in leaves.iter().enumerate() {
+        for &(leaf_id, ref view_opt) in leaves {
             if let Some(view) = view_opt
-                && view.entry_count > 0
+                && view.live_count > 0
             {
                 leaf_ids.push(leaf_id);
-            } else {
-                let _ = idx;
             }
         }
         if leaf_ids.is_empty() {
-            return Ok(vec![RoaringBitmap::new(); leaves.len()]);
+            return Ok(vec![LeafMask::default(); leaves.len()]);
         }
 
         let mut needed_keys: Vec<Vec<u8>> = Vec::new();
@@ -284,40 +427,26 @@ impl AttributeIndex {
         needed_keys.sort_unstable();
         needed_keys.dedup();
 
-        let fetched = storage.multi_get_attr_posting_bitmaps(&needed_keys)?;
-        let mut postings: HashMap<Vec<u8>, RoaringBitmap> = HashMap::with_capacity(needed_keys.len());
-        for (key, opt_bm) in needed_keys.into_iter().zip(fetched) {
-            if let Some(bm) = opt_bm {
-                postings.insert(key, bm);
-            }
-        }
+        let fetched = storage.multi_get_attr_posting_slices(&needed_keys)?;
 
-        let needs_all_mask = node_needs_complement(&prepared.root);
         let mut out = Vec::with_capacity(leaves.len());
         for &(leaf_id, ref view_opt) in leaves {
             let Some(view) = view_opt else {
-                out.push(RoaringBitmap::new());
+                out.push(LeafMask::default());
                 continue;
             };
-            if view.entry_count == 0 {
-                out.push(RoaringBitmap::new());
+            if view.live_count == 0 {
+                out.push(LeafMask::default());
                 continue;
             }
-            let all_local = if needs_all_mask {
-                let mut bm = RoaringBitmap::new();
-                for slot in 0..view.entry_count {
-                    bm.insert(view.local_id(slot));
-                }
-                Some(bm)
-            } else {
-                None
-            };
             out.push(eval_prepared_leaf(
+                storage,
                 &prepared.root,
                 leaf_id,
-                &postings,
-                all_local.as_ref(),
-            ));
+                view,
+                &needed_keys,
+                &fetched,
+            )?);
         }
         Ok(out)
     }
@@ -378,7 +507,8 @@ fn eval_cluster_node(
                 return Ok((ClusterCandidates::All, PreparedNode::True));
             }
             let mut combined: Option<RoaringBitmap> = None;
-            let mut prep_children = Vec::with_capacity(children.len());
+            let mut non_range = Vec::with_capacity(children.len());
+            let mut ranges: Vec<PreparedNode> = Vec::new();
             for child in children {
                 let (cands, pnode) = eval_cluster_node(storage, schema, child, fts_index)?;
                 match cands {
@@ -405,13 +535,54 @@ fn eval_cluster_node(
                         }
                     }
                 }
-                prep_children.push(pnode);
+                match pnode {
+                    PreparedNode::True => {}
+                    PreparedNode::False => {
+                        return Ok((
+                            ClusterCandidates::Subset(RoaringBitmap::new()),
+                            PreparedNode::False,
+                        ));
+                    }
+                    PreparedNode::And(sub) => {
+                        for item in sub {
+                            push_and_child(item, &mut non_range, &mut ranges);
+                        }
+                    }
+                    other => push_and_child(other, &mut non_range, &mut ranges),
+                }
             }
+            // Validate coalesced ranges (e.g., Gte(200) && Lte(400) or contradictory bounds).
+            for r in &ranges {
+                if let PreparedNode::Range {
+                    lo: Some((lo_b, lo_inc)),
+                    hi: Some((hi_b, hi_inc)),
+                    cands,
+                    ..
+                } = r
+                    && (cands.is_empty()
+                        || lo_b > hi_b
+                        || (lo_b == hi_b && (!*lo_inc || !*hi_inc)))
+                {
+                    return Ok((
+                        ClusterCandidates::Subset(RoaringBitmap::new()),
+                        PreparedNode::False,
+                    ));
+                }
+            }
+            // Evaluate non-range predicates before range scans so cheap equality/FTS masks short-circuit ranges.
+            non_range.extend(ranges);
             let cands = match combined {
                 Some(bm) => ClusterCandidates::Subset(bm),
                 None => ClusterCandidates::All,
             };
-            Ok((cands, PreparedNode::And(prep_children)))
+            let node = if non_range.is_empty() {
+                PreparedNode::True
+            } else if non_range.len() == 1 {
+                non_range.pop().unwrap()
+            } else {
+                PreparedNode::And(non_range)
+            };
+            Ok((cands, node))
         }
         Filter::Or(children) => {
             if children.is_empty() {
@@ -551,39 +722,51 @@ fn eval_cluster_node(
         | Filter::Gte(attr, val) => {
             let entry = schema.get_by_name(attr).unwrap();
             let type_tag = ordered_type_tag(entry.attr_type)?;
-            let prefix = encode_attr_prefix(entry.id, type_tag);
-            let bound = encode_scalar_cluster_key(entry.id, val)?;
+            let mut bound_bytes = Vec::with_capacity(16);
+            let val_tag = encode_scalar_val_bytes(val, &mut bound_bytes)?;
+            if val_tag != type_tag {
+                return Ok((
+                    ClusterCandidates::Subset(RoaringBitmap::new()),
+                    PreparedNode::False,
+                ));
+            }
 
-            let entries = match filter {
-                Filter::Lt(_, _) => {
-                    storage.scan_attr_cluster_range(prefix, &prefix, true, Some(&bound), false)?
-                }
-                Filter::Lte(_, _) => {
-                    storage.scan_attr_cluster_range(prefix, &prefix, true, Some(&bound), true)?
-                }
-                Filter::Gt(_, _) => {
-                    storage.scan_attr_cluster_range(prefix, &bound, false, None, false)?
-                }
-                Filter::Gte(_, _) => {
-                    storage.scan_attr_cluster_range(prefix, &bound, true, None, false)?
-                }
-                _ => unreachable!(),
-            };
-
-            let mut union_bm = RoaringBitmap::new();
-            let mut items = Vec::with_capacity(entries.len());
-            for (k, bm) in entries {
-                if !bm.is_empty() {
-                    union_bm |= &bm;
-                    items.push((k, bm));
+            let zones = storage.get_attr_zones_cached()?;
+            let mut bm = RoaringBitmap::new();
+            if let Some(zmap) = zones.get(&(entry.id, type_tag)) {
+                for (&leaf_id, (min_b, max_b)) in zmap {
+                    let overlaps = match filter {
+                        Filter::Lt(_, _) => min_b.as_slice() < bound_bytes.as_slice(),
+                        Filter::Lte(_, _) => min_b.as_slice() <= bound_bytes.as_slice(),
+                        Filter::Gt(_, _) => max_b.as_slice() > bound_bytes.as_slice(),
+                        Filter::Gte(_, _) => max_b.as_slice() >= bound_bytes.as_slice(),
+                        _ => unreachable!(),
+                    };
+                    if overlaps {
+                        bm.insert(leaf_id);
+                    }
                 }
             }
-            let node = if items.is_empty() {
-                PreparedNode::False
-            } else {
-                PreparedNode::Keys(items)
+            if bm.is_empty() {
+                return Ok((ClusterCandidates::Subset(bm), PreparedNode::False));
+            }
+            let (lo, hi) = match filter {
+                Filter::Lt(_, _) => (None, Some((bound_bytes, false))),
+                Filter::Lte(_, _) => (None, Some((bound_bytes, true))),
+                Filter::Gt(_, _) => (Some((bound_bytes, false)), None),
+                Filter::Gte(_, _) => (Some((bound_bytes, true)), None),
+                _ => unreachable!(),
             };
-            Ok((ClusterCandidates::Subset(union_bm), node))
+            Ok((
+                ClusterCandidates::Subset(bm.clone()),
+                PreparedNode::Range {
+                    attr_id: entry.id,
+                    type_tag,
+                    lo,
+                    hi,
+                    cands: bm,
+                },
+            ))
         }
         Filter::IsNull(attr) => {
             let attr_id = schema.get_by_name(attr).unwrap().id;
@@ -670,25 +853,7 @@ fn eval_fts_cluster_node(
             PreparedNode::False,
         ));
     }
-    let fts_ids: Vec<u32> = fts_bm.iter().collect();
-    let opt_doc_ids = storage.multi_get_doc_ids_from_fts(&fts_ids)?;
-    let doc_ids: Vec<DocId> = opt_doc_ids.into_iter().flatten().collect();
-    if doc_ids.is_empty() {
-        return Ok((
-            ClusterCandidates::Subset(RoaringBitmap::new()),
-            PreparedNode::False,
-        ));
-    }
-    let locs = storage.multi_get_doc_locs(&doc_ids)?;
-    let mut leaf_bm = RoaringBitmap::new();
-    let mut per_leaf: HashMap<NodeId, RoaringBitmap> = HashMap::new();
-    for loc in locs.into_iter().flatten() {
-        leaf_bm.insert(loc.leaf_id);
-        per_leaf
-            .entry(loc.leaf_id)
-            .or_default()
-            .insert(loc.local_id);
-    }
+    let (leaf_bm, per_leaf) = storage.resolve_fts_bitmap_to_leaf_masks(&fts_bm)?;
     if leaf_bm.is_empty() {
         Ok((
             ClusterCandidates::Subset(RoaringBitmap::new()),
@@ -697,8 +862,66 @@ fn eval_fts_cluster_node(
     } else {
         Ok((
             ClusterCandidates::Subset(leaf_bm),
-            PreparedNode::LeafLocalMasks(per_leaf),
+            PreparedNode::LeafSlotMasks(per_leaf),
         ))
+    }
+}
+
+fn push_and_child(
+    node: PreparedNode,
+    non_range: &mut Vec<PreparedNode>,
+    ranges: &mut Vec<PreparedNode>,
+) {
+    if let PreparedNode::Range {
+        attr_id,
+        type_tag,
+        lo,
+        hi,
+        cands,
+    } = node
+    {
+        for existing in ranges.iter_mut() {
+            if let PreparedNode::Range {
+                attr_id: ea,
+                type_tag: et,
+                lo: elo,
+                hi: ehi,
+                cands: ecands,
+            } = existing
+                && *ea == attr_id
+                && *et == type_tag
+            {
+                *elo = match (elo.take(), lo) {
+                    (Some((a, ai)), Some((b, bi))) => match a.cmp(&b) {
+                        std::cmp::Ordering::Greater => Some((a, ai)),
+                        std::cmp::Ordering::Less => Some((b, bi)),
+                        std::cmp::Ordering::Equal => Some((a, ai && bi)),
+                    },
+                    (Some(x), None) | (None, Some(x)) => Some(x),
+                    (None, None) => None,
+                };
+                *ehi = match (ehi.take(), hi) {
+                    (Some((a, ai)), Some((b, bi))) => match a.cmp(&b) {
+                        std::cmp::Ordering::Less => Some((a, ai)),
+                        std::cmp::Ordering::Greater => Some((b, bi)),
+                        std::cmp::Ordering::Equal => Some((a, ai && bi)),
+                    },
+                    (Some(x), None) | (None, Some(x)) => Some(x),
+                    (None, None) => None,
+                };
+                *ecands &= &cands;
+                return;
+            }
+        }
+        ranges.push(PreparedNode::Range {
+            attr_id,
+            type_tag,
+            lo,
+            hi,
+            cands,
+        });
+    } else {
+        non_range.push(node);
     }
 }
 
@@ -714,7 +937,10 @@ fn eval_is_null_node(storage: &Storage, attr_id: AttrId) -> Result<PreparedNode>
 
 fn collect_posting_keys(node: &PreparedNode, leaf_ids: &[NodeId], out: &mut Vec<Vec<u8>>) {
     match node {
-        PreparedNode::True | PreparedNode::False | PreparedNode::LeafLocalMasks(_) => {}
+        PreparedNode::True
+        | PreparedNode::False
+        | PreparedNode::Range { .. }
+        | PreparedNode::LeafSlotMasks(_) => {}
         PreparedNode::And(children) | PreparedNode::Or(children) => {
             for c in children {
                 collect_posting_keys(c, leaf_ids, out);
@@ -733,70 +959,94 @@ fn collect_posting_keys(node: &PreparedNode, leaf_ids: &[NodeId], out: &mut Vec<
     }
 }
 
-fn node_needs_complement(node: &PreparedNode) -> bool {
-    match node {
-        PreparedNode::True | PreparedNode::Not(_) => true,
-        PreparedNode::False | PreparedNode::Keys(_) | PreparedNode::LeafLocalMasks(_) => false,
-        PreparedNode::And(children) | PreparedNode::Or(children) => {
-            children.iter().any(node_needs_complement)
-        }
-    }
-}
-
 fn eval_prepared_leaf(
+    storage: &Storage,
     node: &PreparedNode,
     leaf_id: NodeId,
-    postings: &HashMap<Vec<u8>, RoaringBitmap>,
-    all_local: Option<&RoaringBitmap>,
-) -> RoaringBitmap {
+    view: &LeafNodeView<'_>,
+    needed_keys: &[Vec<u8>],
+    fetched: &[Option<DBPinnableSlice<'_>>],
+) -> Result<LeafMask> {
+    let word_count = view.slot_cap.div_ceil(64);
     match node {
-        PreparedNode::True => all_local.cloned().unwrap_or_default(),
-        PreparedNode::False => RoaringBitmap::new(),
-        PreparedNode::LeafLocalMasks(map) => map.get(&leaf_id).cloned().unwrap_or_default(),
+        PreparedNode::True => Ok(LeafMask::from_live_mask_bytes(
+            view.live_mask_bytes,
+            view.slot_cap,
+        )),
+        PreparedNode::False => Ok(LeafMask::empty(word_count)),
+        PreparedNode::LeafSlotMasks(map) => match map.get(&leaf_id) {
+            Some(words) => Ok(LeafMask::from_words_padded(words, word_count)),
+            None => Ok(LeafMask::empty(word_count)),
+        },
+        PreparedNode::Range {
+            attr_id,
+            type_tag,
+            lo,
+            hi,
+            cands,
+        } => {
+            let mut acc = LeafMask::empty(word_count);
+            if cands.contains(leaf_id) {
+                storage.scan_attr_posting_range_into_words(
+                    *attr_id,
+                    *type_tag,
+                    leaf_id,
+                    lo.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                    hi.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                    acc.as_mut_slice(),
+                )?;
+            }
+            Ok(acc)
+        }
         PreparedNode::And(children) => {
-            let mut acc: Option<RoaringBitmap> = None;
+            let mut acc: Option<LeafMask> = None;
             for child in children {
-                let bm = eval_prepared_leaf(child, leaf_id, postings, all_local);
-                if bm.is_empty() {
-                    return RoaringBitmap::new();
+                let mask = eval_prepared_leaf(storage, child, leaf_id, view, needed_keys, fetched)?;
+                if mask.is_empty() {
+                    return Ok(LeafMask::empty(word_count));
                 }
                 acc = Some(match acc {
                     Some(mut cur) => {
-                        cur &= &bm;
+                        cur.and_assign(&mask);
                         if cur.is_empty() {
-                            return RoaringBitmap::new();
+                            return Ok(LeafMask::empty(word_count));
                         }
                         cur
                     }
-                    None => bm,
+                    None => mask,
                 });
             }
-            acc.unwrap_or_else(|| all_local.cloned().unwrap_or_default())
+            Ok(acc.unwrap_or_else(|| {
+                LeafMask::from_live_mask_bytes(view.live_mask_bytes, view.slot_cap)
+            }))
         }
         PreparedNode::Or(children) => {
-            let mut acc = RoaringBitmap::new();
+            let mut acc = LeafMask::empty(word_count);
             for child in children {
-                acc |= &eval_prepared_leaf(child, leaf_id, postings, all_local);
+                let mask = eval_prepared_leaf(storage, child, leaf_id, view, needed_keys, fetched)?;
+                acc.or_assign(&mask);
             }
-            acc
+            Ok(acc)
         }
         PreparedNode::Not(child) => {
-            let sub = eval_prepared_leaf(child, leaf_id, postings, all_local);
-            let mut out = all_local.cloned().unwrap_or_default();
-            out -= &sub;
-            out
+            let sub = eval_prepared_leaf(storage, child, leaf_id, view, needed_keys, fetched)?;
+            let mut out = LeafMask::from_live_mask_bytes(view.live_mask_bytes, view.slot_cap);
+            out.and_not_assign(&sub);
+            Ok(out)
         }
         PreparedNode::Keys(items) => {
-            let mut acc = RoaringBitmap::new();
+            let mut acc = LeafMask::empty(word_count);
             for (cluster_key, cluster_bm) in items {
                 if cluster_bm.contains(leaf_id) {
                     let pkey = make_posting_key(cluster_key, leaf_id);
-                    if let Some(bm) = postings.get(&pkey) {
-                        acc |= bm;
+                    if let Ok(idx) = needed_keys.binary_search(&pkey)
+                        && let Some(slice) = &fetched[idx]
+                    {
+                        LeafPostingView::parse(slice)?.or_into_words(acc.as_mut_slice())?;
                     }
                 }
             }
-            acc
+            Ok(acc)
         }
     }
 }

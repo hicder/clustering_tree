@@ -6,16 +6,25 @@ use crate::metric::{cluster_distance, compute_mean_centroid_flat};
 use crate::node::{LeafNodeView, decode_f32_slice};
 use crate::rabitq::EncodeScratch;
 use crate::search;
-use crate::storage::TxContext;
+use crate::storage::{DocLoc, TxContext};
 use crate::tree::{
-    ClusteringTree, SplitPair, handle_underflow, propagate_centroid_upward, split_node,
+    ClusterDelta, ClusteringTree, SplitPair, handle_underflow, propagate_centroid_upward,
+    split_node,
 };
 
 const MAX_LIRE_ROUNDS: usize = 4;
 
-/// Run SPFresh LIRE boundary reassignment after a leaf split, using a bounded
-/// maintenance queue to resolve any resulting overflows or underflows.
-pub(crate) fn run_lire(tree: &mut ClusteringTree, initial_split: SplitPair) -> Result<()> {
+/// Run SPFresh LIRE boundary reassignment after a leaf split, invoking `on_delta`
+/// inside each atomic `TxContext` before commit so external indexes (e.g. `AttributeIndex`)
+/// stay synchronized with every reassignment, split, and underflow merge/redistribution.
+pub(crate) fn run_lire_with_hook<F>(
+    tree: &mut ClusteringTree,
+    initial_split: SplitPair,
+    mut on_delta: F,
+) -> Result<()>
+where
+    F: FnMut(&mut TxContext<'_>, &ClusterDelta) -> Result<()>,
+{
     if tree.config.lire_neighbor_count == 0 {
         return Ok(());
     }
@@ -30,7 +39,7 @@ pub(crate) fn run_lire(tree: &mut ClusteringTree, initial_split: SplitPair) -> R
                 break;
             }
             lire_rounds += 1;
-            reassign_split_pair(tree, pair, &mut maintenance)?;
+            reassign_split_pair(tree, pair, &mut maintenance, &mut on_delta)?;
         }
 
         while let Some(leaf_id) = maintenance.pop_front() {
@@ -39,9 +48,23 @@ pub(crate) fn run_lire(tree: &mut ClusteringTree, initial_split: SplitPair) -> R
             };
             let count = leaf.entry_count();
             if count > tree.config.max_leaf_size {
-                let mut tx =
-                    TxContext::new(&tree.storage, &mut tree.internal_cache, tree.meta.clone());
-                let split_pair = split_node(&mut tx, leaf_id, &tree.config, &tree.quantizer)?;
+                let mut tx = TxContext::new(
+                    &tree.storage,
+                    &mut tree.internal_cache,
+                    &mut tree.leaf_parent,
+                    tree.meta.clone(),
+                );
+                let mut delta = ClusterDelta::default();
+                let split_pair = split_node(
+                    &mut tx,
+                    leaf_id,
+                    &tree.config,
+                    &tree.quantizer,
+                    &mut delta,
+                )?;
+                if !delta.is_empty() {
+                    on_delta(&mut tx, &delta)?;
+                }
                 tree.meta = tx.commit()?;
 
                 for child_id in [split_pair.left_id, split_pair.right_id] {
@@ -57,9 +80,23 @@ pub(crate) fn run_lire(tree: &mut ClusteringTree, initial_split: SplitPair) -> R
                     break;
                 }
             } else if leaf_id != tree.meta.root_id && count < tree.config.min_leaf_size {
-                let mut tx =
-                    TxContext::new(&tree.storage, &mut tree.internal_cache, tree.meta.clone());
-                handle_underflow(&mut tx, leaf_id, &tree.config, &tree.quantizer)?;
+                let mut tx = TxContext::new(
+                    &tree.storage,
+                    &mut tree.internal_cache,
+                    &mut tree.leaf_parent,
+                    tree.meta.clone(),
+                );
+                let mut delta = ClusterDelta::default();
+                handle_underflow(
+                    &mut tx,
+                    leaf_id,
+                    &tree.config,
+                    &tree.quantizer,
+                    &mut delta,
+                )?;
+                if !delta.is_empty() {
+                    on_delta(&mut tx, &delta)?;
+                }
                 tree.meta = tx.commit()?;
             }
         }
@@ -68,11 +105,15 @@ pub(crate) fn run_lire(tree: &mut ClusteringTree, initial_split: SplitPair) -> R
     Ok(())
 }
 
-fn reassign_split_pair(
+fn reassign_split_pair<F>(
     tree: &mut ClusteringTree,
     pair: SplitPair,
     maintenance: &mut VecDeque<NodeId>,
-) -> Result<()> {
+    on_delta: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut TxContext<'_>, &ClusterDelta) -> Result<()>,
+{
     let Some(u_leaf) = tree.storage.get_leaf_node(pair.left_id)? else {
         return Ok(());
     };
@@ -106,18 +147,20 @@ fn reassign_split_pair(
     let padded_dim = tree.quantizer.padded_dim();
     let words = tree.quantizer.num_words();
 
-    let neighbor_slices = tree.storage.multi_get_leaf_nodes_pinned(&neighbor_ids)?;
     let mut neighbor_centroids: HashMap<NodeId, Vec<f32>> = HashMap::new();
     let mut neighbor_doc_ids: HashMap<NodeId, Vec<DocId>> = HashMap::new();
-    for (&nid, opt_slice) in neighbor_ids.iter().zip(neighbor_slices.iter()) {
-        if let Some(slice) = opt_slice {
-            let view = LeafNodeView::parse(slice, dim, padded_dim, words)?;
-            neighbor_centroids.insert(nid, view.centroid_cow(dim)?.into_owned());
-            let mut doc_ids = Vec::with_capacity(view.entry_count);
-            for &chunk in view.doc_ids_bytes.as_chunks::<8>().0 {
-                doc_ids.push(u64::from_le_bytes(chunk));
+    {
+        let neighbor_slices = tree.storage.multi_get_leaf_nodes_pinned(&neighbor_ids)?;
+        for (&nid, opt_slice) in neighbor_ids.iter().zip(neighbor_slices.iter()) {
+            if let Some(slice) = opt_slice {
+                let view = LeafNodeView::parse(slice, dim, padded_dim, words)?;
+                neighbor_centroids.insert(nid, view.centroid_cow(dim)?.into_owned());
+                let mut doc_ids = Vec::with_capacity(view.entry_count);
+                for &chunk in view.doc_ids_bytes.as_chunks::<8>().0 {
+                    doc_ids.push(u64::from_le_bytes(chunk));
+                }
+                neighbor_doc_ids.insert(nid, doc_ids);
             }
-            neighbor_doc_ids.insert(nid, doc_ids);
         }
     }
     if neighbor_centroids.is_empty() {
@@ -151,13 +194,15 @@ fn reassign_split_pair(
     required_doc_ids.sort_unstable();
     required_doc_ids.dedup();
 
-    let vec_slices = tree.storage.multi_get_vectors_pinned(&required_doc_ids)?;
     let mut vecs_by_id: HashMap<DocId, Vec<f32>> = HashMap::with_capacity(required_doc_ids.len());
-    for (&doc_id, opt_slice) in required_doc_ids.iter().zip(vec_slices.iter()) {
-        let slice = opt_slice.as_ref().ok_or_else(|| {
-            TreeError::CorruptedData(format!("missing vector {doc_id} in cf_vectors"))
-        })?;
-        vecs_by_id.insert(doc_id, decode_f32_slice(slice, dim)?);
+    {
+        let vec_slices = tree.storage.multi_get_vectors_pinned(&required_doc_ids)?;
+        for (&doc_id, opt_slice) in required_doc_ids.iter().zip(vec_slices.iter()) {
+            let slice = opt_slice.as_ref().ok_or_else(|| {
+                TreeError::CorruptedData(format!("missing vector {doc_id} in cf_vectors"))
+            })?;
+            vecs_by_id.insert(doc_id, decode_f32_slice(slice, dim)?);
+        }
     }
 
     let mut moves: Vec<(DocId, NodeId, NodeId)> = Vec::new();
@@ -213,8 +258,28 @@ fn reassign_split_pair(
         return Ok(());
     }
 
-    let mut tx = TxContext::new(&tree.storage, &mut tree.internal_cache, tree.meta.clone());
+    let max_leaf_size = tree.config.max_leaf_size;
+    let min_leaf_size = tree.config.min_leaf_size;
+    let mut tx = TxContext::new(
+        &tree.storage,
+        &mut tree.internal_cache,
+        &mut tree.leaf_parent,
+        tree.meta.clone(),
+    );
     let mut touched_leaves = BTreeSet::new();
+    for &(_, from_leaf_id, to_leaf_id) in &moves {
+        touched_leaves.insert(from_leaf_id);
+        touched_leaves.insert(to_leaf_id);
+    }
+
+    // Record pre-move (doc_id, leaf_id, local_id) for all touched leaves before mutating.
+    let mut delta = ClusterDelta::default();
+    for &leaf_id in &touched_leaves {
+        let leaf = tx.get_leaf_node(leaf_id)?;
+        for (&did, &lid) in leaf.doc_ids.iter().zip(leaf.local_ids.iter()) {
+            delta.removed.push((did, leaf_id, lid));
+        }
+    }
 
     for &(doc_id, from_leaf_id, to_leaf_id) in &moves {
         let mut from_leaf = tx.get_leaf_node(from_leaf_id)?;
@@ -230,10 +295,6 @@ fn reassign_split_pair(
             to_leaf.doc_ids.insert(pos, doc_id);
         }
         tx.put_leaf_node(to_leaf_id, to_leaf);
-
-        tx.put_doc_loc(doc_id, to_leaf_id);
-        touched_leaves.insert(from_leaf_id);
-        touched_leaves.insert(to_leaf_id);
     }
 
     let mut scratch = EncodeScratch::default();
@@ -246,6 +307,8 @@ fn reassign_split_pair(
         if count == 0 {
             leaf.centroid = vec![0.0; dim];
             leaf.rotated_centroid.fill(0.0);
+            leaf.local_ids.clear();
+            leaf.next_local_id = 0;
             leaf.res_norm_sqs.clear();
             leaf.scales.clear();
             leaf.codes.clear();
@@ -268,7 +331,11 @@ fn reassign_split_pair(
                 }
             }
             leaf.centroid = compute_mean_centroid_flat(&flat_vecs, count, dim, metric);
-            leaf.re_encode_all(&doc_ids, &flat_vecs, &tree.quantizer, dim, &mut scratch);
+            leaf.reset_and_encode(&doc_ids, &flat_vecs, &tree.quantizer, dim, &mut scratch);
+            for (&did, &lid) in leaf.doc_ids.iter().zip(leaf.local_ids.iter()) {
+                tx.put_doc_loc(did, DocLoc { leaf_id, local_id: lid });
+                delta.added.push((did, leaf_id, lid));
+            }
         }
 
         let parent_id = leaf.parent_id;
@@ -278,16 +345,27 @@ fn reassign_split_pair(
         if count > 0
             && let Some(pid) = parent_id
         {
-            propagate_centroid_upward(&mut tx, leaf_id, pid, count as u64, &old_c, &new_c, &tree.config)?;
+            propagate_centroid_upward(
+                &mut tx,
+                leaf_id,
+                pid,
+                count as u64,
+                &old_c,
+                &new_c,
+                &tree.config,
+            )?;
         }
 
-        if count > tree.config.max_leaf_size
-            || (leaf_id != tx.meta().root_id && count < tree.config.min_leaf_size)
+        if count > max_leaf_size
+            || (leaf_id != tx.meta().root_id && count < min_leaf_size)
         {
             maintenance.push_back(leaf_id);
         }
     }
 
+    if !delta.is_empty() {
+        on_delta(&mut tx, &delta)?;
+    }
     tree.meta = tx.commit()?;
     Ok(())
 }

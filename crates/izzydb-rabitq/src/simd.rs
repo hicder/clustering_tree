@@ -30,9 +30,36 @@ pub struct RabitqLeafScoreParams<'a> {
 
 /// Score all `entry_count` vectors in a packed leaf and append [`LeafCandidate`]s to `out`.
 pub fn score_leaf_rabitq(params: &RabitqLeafScoreParams<'_>, out: &mut Vec<LeafCandidate>) {
+    score_leaf_rabitq_masked(params, None, out);
+}
+
+/// Score matching entries in a packed leaf (where bit `slot` in `allowed_slots` is set, or all entries
+/// when `allowed_slots` is `None`) and append [`LeafCandidate`]s to `out`.
+pub fn score_leaf_rabitq_masked(
+    params: &RabitqLeafScoreParams<'_>,
+    allowed_slots: Option<&[u64]>,
+    out: &mut Vec<LeafCandidate>,
+) {
     if params.entry_count == 0 {
         return;
     }
+    if let Some(mask) = allowed_slots {
+        debug_assert!(mask.len() * 64 >= params.entry_count);
+        if mask.iter().all(|&w| w == 0) {
+            return;
+        }
+        dispatch_score_leaf::<true>(params, mask, out);
+    } else {
+        dispatch_score_leaf::<false>(params, &[], out);
+    }
+}
+
+#[inline]
+fn dispatch_score_leaf<const MASKED: bool>(
+    params: &RabitqLeafScoreParams<'_>,
+    allowed_slots: &[u64],
+    out: &mut Vec<LeafCandidate>,
+) {
     #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
     {
         if is_x86_feature_detected!("avx512f")
@@ -43,9 +70,15 @@ pub fn score_leaf_rabitq(params: &RabitqLeafScoreParams<'_>, out: &mut Vec<LeafC
             // Safety: runtime-checked AVX-512F + VPOPCNTDQ + AVX2 + FMA; slices validated by caller.
             unsafe {
                 match params.metric {
-                    DistanceMetric::L2Squared => score_leaf_avx512::<0>(params, out),
-                    DistanceMetric::Cosine => score_leaf_avx512::<1>(params, out),
-                    DistanceMetric::DotProduct => score_leaf_avx512::<2>(params, out),
+                    DistanceMetric::L2Squared => {
+                        score_leaf_avx512::<0, MASKED>(params, allowed_slots, out)
+                    }
+                    DistanceMetric::Cosine => {
+                        score_leaf_avx512::<1, MASKED>(params, allowed_slots, out)
+                    }
+                    DistanceMetric::DotProduct => {
+                        score_leaf_avx512::<2, MASKED>(params, allowed_slots, out)
+                    }
                 }
             }
             return;
@@ -54,18 +87,24 @@ pub fn score_leaf_rabitq(params: &RabitqLeafScoreParams<'_>, out: &mut Vec<LeafC
             // Safety: runtime-checked POPCNT.
             unsafe {
                 match params.metric {
-                    DistanceMetric::L2Squared => score_leaf_popcnt::<0>(params, out),
-                    DistanceMetric::Cosine => score_leaf_popcnt::<1>(params, out),
-                    DistanceMetric::DotProduct => score_leaf_popcnt::<2>(params, out),
+                    DistanceMetric::L2Squared => {
+                        score_leaf_popcnt::<0, MASKED>(params, allowed_slots, out)
+                    }
+                    DistanceMetric::Cosine => {
+                        score_leaf_popcnt::<1, MASKED>(params, allowed_slots, out)
+                    }
+                    DistanceMetric::DotProduct => {
+                        score_leaf_popcnt::<2, MASKED>(params, allowed_slots, out)
+                    }
                 }
             }
             return;
         }
     }
     match params.metric {
-        DistanceMetric::L2Squared => score_leaf_scalar::<0>(params, out),
-        DistanceMetric::Cosine => score_leaf_scalar::<1>(params, out),
-        DistanceMetric::DotProduct => score_leaf_scalar::<2>(params, out),
+        DistanceMetric::L2Squared => score_leaf_scalar::<0, MASKED>(params, allowed_slots, out),
+        DistanceMetric::Cosine => score_leaf_scalar::<1, MASKED>(params, allowed_slots, out),
+        DistanceMetric::DotProduct => score_leaf_scalar::<2, MASKED>(params, allowed_slots, out),
     }
 }
 
@@ -116,37 +155,46 @@ fn score_single_entry_scalar<const METRIC: u8>(
 }
 
 #[inline]
-fn score_leaf_scalar<const METRIC: u8>(
+fn score_leaf_scalar<const METRIC: u8, const MASKED: bool>(
     params: &RabitqLeafScoreParams<'_>,
+    allowed_slots: &[u64],
     out: &mut Vec<LeafCandidate>,
 ) {
     let n = params.entry_count;
-    out.reserve(n);
+    if !MASKED {
+        out.reserve(n);
+    }
     for i in 0..n {
-        out.push(score_single_entry_scalar::<METRIC>(params, i));
+        if !MASKED || ((allowed_slots[i / 64] >> (i % 64)) & 1 != 0) {
+            out.push(score_single_entry_scalar::<METRIC>(params, i));
+        }
     }
 }
 
 #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
 #[target_feature(enable = "popcnt")]
-unsafe fn score_leaf_popcnt<const METRIC: u8>(
+unsafe fn score_leaf_popcnt<const METRIC: u8, const MASKED: bool>(
     params: &RabitqLeafScoreParams<'_>,
+    allowed_slots: &[u64],
     out: &mut Vec<LeafCandidate>,
 ) {
-    score_leaf_scalar::<METRIC>(params, out);
+    score_leaf_scalar::<METRIC, MASKED>(params, allowed_slots, out);
 }
 
 #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
 #[target_feature(enable = "avx512f,avx512vpopcntdq,avx2,fma")]
-unsafe fn score_leaf_avx512<const METRIC: u8>(
+unsafe fn score_leaf_avx512<const METRIC: u8, const MASKED: bool>(
     params: &RabitqLeafScoreParams<'_>,
+    allowed_slots: &[u64],
     out: &mut Vec<LeafCandidate>,
 ) {
     use std::arch::x86_64::*;
 
     let n = params.entry_count;
     let words = params.rabitq_words;
-    out.reserve(n);
+    if !MASKED {
+        out.reserve(n);
+    }
 
     let v_vl = _mm256_set1_ps(params.vl);
     let v_delta = _mm256_set1_ps(params.delta);
@@ -165,6 +213,17 @@ unsafe fn score_leaf_avx512<const METRIC: u8>(
 
     let mut i = 0usize;
     while i + 8 <= n {
+        let byte_mask = if MASKED {
+            let m = ((allowed_slots[i / 64] >> (i % 64)) & 0xFF) as u8;
+            if m == 0 {
+                i += 8;
+                continue;
+            }
+            m
+        } else {
+            0xFF
+        };
+
         let mut acc_x = _mm512_setzero_si512();
         let mut acc_0 = _mm512_setzero_si512();
         let mut acc_1 = _mm512_setzero_si512();
@@ -225,11 +284,22 @@ unsafe fn score_leaf_avx512<const METRIC: u8>(
             std::ptr::copy_nonoverlapping(doc_ids_ptr.add(i * 8), doc_ids.as_mut_ptr() as *mut u8, 64);
         }
 
-        for lane in 0..8 {
-            out.push(LeafCandidate {
-                doc_id: doc_ids[lane],
-                dist: dists[lane],
-            });
+        if !MASKED || byte_mask == 0xFF {
+            for lane in 0..8 {
+                out.push(LeafCandidate {
+                    doc_id: doc_ids[lane],
+                    dist: dists[lane],
+                });
+            }
+        } else {
+            for lane in 0..8 {
+                if (byte_mask >> lane) & 1 != 0 {
+                    out.push(LeafCandidate {
+                        doc_id: doc_ids[lane],
+                        dist: dists[lane],
+                    });
+                }
+            }
         }
 
         i += 8;
@@ -237,7 +307,9 @@ unsafe fn score_leaf_avx512<const METRIC: u8>(
 
     // Scalar tail for remaining `< 8` entries
     while i < n {
-        out.push(score_single_entry_scalar::<METRIC>(params, i));
+        if !MASKED || ((allowed_slots[i / 64] >> (i % 64)) & 1 != 0) {
+            out.push(score_single_entry_scalar::<METRIC>(params, i));
+        }
         i += 1;
     }
 }
@@ -385,6 +457,37 @@ mod tests {
                     "metric={metric:?}, doc={doc_id}: simd={} vs ref={ref_dist}",
                     cand.dist
                 );
+            }
+            let mut masked_out = Vec::new();
+            // Mask out slots 0..8 completely (byte_mask == 0 skip), keep sparse slots in 8..16 and tail 16..19.
+            let mask: [u64; 1] = [(1u64 << 9) | (1u64 << 13) | (1u64 << 16) | (1u64 << 18)];
+            score_leaf_rabitq_masked(
+                &RabitqLeafScoreParams {
+                    entry_count: n,
+                    rabitq_words: words,
+                    doc_ids_bytes: &doc_ids_bytes,
+                    codes_bytes: &codes_bytes,
+                    res_norm_sqs_bytes: &res_norm_sqs_bytes,
+                    scales_bytes: &scales_bytes,
+                    q0: &q_scratch.planes[0],
+                    q1: &q_scratch.planes[1],
+                    q2: &q_scratch.planes[2],
+                    q3: &q_scratch.planes[3],
+                    vl: q_meta.vl,
+                    delta: q_meta.delta,
+                    sum_q: q_meta.sum_q,
+                    inv_sqrt_padded_dim: qtz.inv_sqrt_padded_dim(),
+                    q_res_norm_sq,
+                    zero_res_dist,
+                    metric,
+                },
+                Some(&mask),
+                &mut masked_out,
+            );
+            assert_eq!(masked_out.len(), 4);
+            for (cand, slot) in masked_out.iter().zip([9usize, 13, 16, 18]) {
+                assert_eq!(cand.doc_id, simd_out[slot].doc_id);
+                assert!((cand.dist - simd_out[slot].dist).abs() < 1e-6);
             }
         }
     }

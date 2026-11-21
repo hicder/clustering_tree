@@ -4,7 +4,13 @@ use crate::error::{Result, TreeError};
 pub type DocId = u64;
 
 /// Internal tree node identifier.
-pub type NodeId = u64;
+pub type NodeId = u32;
+
+/// Dense per-leaf local identifier assigned to documents in a leaf.
+pub type LocalId = u32;
+
+/// Compact numeric identifier assigned to each attribute in a [`CollectionSchema`](crate::schema::CollectionSchema).
+pub type AttrId = u16;
 
 /// Distance metric used for clustering and nearest neighbor search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

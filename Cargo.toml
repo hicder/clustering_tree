@@ -9,6 +9,7 @@ edition = "2024"
 [workspace.dependencies]
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 rand = "0.9"
+roaring = "0.11"
 rocksdb = "0.23"
 tempfile = "3"
 thiserror = "2"

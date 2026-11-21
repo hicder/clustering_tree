@@ -71,6 +71,6 @@ Implemented in [`src/rabitq.rs`](../src/rabitq.rs):
 1. Deletes from `cf_leaf_entries`, `cf_doc_loc`, and `cf_vectors`, and decrements `num_vectors`.
 2. Recomputes the leaf centroid from remaining full vectors. If the leaf does not underflow (or is the root), re-quantizes remaining entries when `new_count <= 16` or centroid drift exceeds `centroid_drift_eps`, then propagates upward.
 3. If a non-root node falls below `min_leaf_size` / `min_internal_fanout`, `handle_underflow` picks the closest sibling:
-   - **Merge** if combined entries $\le \text{max\_size}$ (recomputing centroid and re-quantizing merged leaf entries).
+   - **Merge** if combined entries <= `max_size` (recomputing centroid and re-quantizing merged leaf entries).
    - **Redistribute** via `balanced_two_means` otherwise.
    - Collapses internal roots down via `collapse_root` if a root ends up with a single child.

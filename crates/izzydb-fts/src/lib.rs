@@ -16,6 +16,7 @@ pub use block::{
 };
 pub use bm25::{Bm25TermScorer, bm25_idf, bm25_qtf_norm};
 pub use maxscore::{
-    Bm25Result, DEFAULT_MAX_PREFIX_EXPANSIONS, FtsBlockCursor, FtsPostingSource, execute_rank_by,
+    Bm25Result, DEFAULT_MAX_PREFIX_EXPANSIONS, FtsBlockCursor, FtsDocLenCursor, FtsPostingSource,
+    execute_rank_by,
 };
 pub use simd::SimdTier;

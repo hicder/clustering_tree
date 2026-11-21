@@ -37,7 +37,11 @@ Prior to this change, `FtsIndex` already executed Block-Max MAXSCORE over 256-do
 - Replaced `min_dl: u32` with `min_dl_over_tf: f32` in both `TermStats` (`cf_fts_terms`) and `PostingBlockHeader`.
 - `dl_over_tf_lower_bound(dl, tf)` computes `(dl as f64) / (tf as f64)` and applies `f32::next_down()` whenever `(r as f64) > exact`, ensuring `min_dl_over_tf <= dl / tf` for every posting in the term or block.
 - `Bm25TermScorer::upper_bound(max_tf, min_dl_over_tf)` evaluates:
-  $$\text{ub} = \frac{\text{num\_scale}}{1 + \frac{k_1(1 - b)}{\text{max\_tf}} + \frac{k_1 b}{\text{avgdl}} \cdot \text{min\_dl\_over\_tf}}$$
+
+  ```math
+  \text{ub} = \frac{\text{num\_scale}}{1 + \frac{k_1(1 - b)}{\text{max\_tf}} + \frac{k_1 b}{\text{avgdl}} \cdot \text{min\_dl\_over\_tf}}
+  ```
+
   in `f64` before casting to `f32`, giving a mathematically sound upper bound that is significantly tighter when high-`tf` documents are longer than the block's shortest document.
 
 ### 4. Runtime-Dispatched SIMD Kernels
@@ -62,28 +66,34 @@ Prior to this change, `FtsIndex` already executed Block-Max MAXSCORE over 256-do
 - **Zero-allocation cursor seek:** `RocksPostingCursor::seek_block` reuses a pre-reserved `seek_buf` (`truncate(prefix_len)` + `extend_from_slice(&target.to_be_bytes())`).
 - **Invariant verification:** `verify_collection_invariants` checks `cf_fts_doc_lens` parity and `min_dl_over_tf` bounds against `cf_docs`.
 
+### 6. Follow-Up Hot-Path Optimizations
+([`crates/izzydb-storage/src/storage.rs`](../../crates/izzydb-storage/src/storage.rs), [`crates/izzydb-fts/src/maxscore.rs`](../../crates/izzydb-fts/src/maxscore.rs), [`crates/izzydb-fts/src/simd.rs`](../../crates/izzydb-fts/src/simd.rs), [`crates/izzydb/src/fts_index.rs`](../../crates/izzydb/src/fts_index.rs))
+
+- **Per-attribute `DocLenBlock` cache (`RocksDocLenCursor`):** `Storage::fts_doc_lens_cache` lazily caches each attribute's `cf_fts_doc_lens` vector as an `Arc<Vec<Option<Box<[u8]>>>>` on first query and updates it write-through in `TxContext::commit`, replacing per-block RocksDB `get_pinned_cf` lookups (~204 µs at `n = 100,000`) with lock-free array indexing.
+- **Cached cursor `current_block` & `cur + 1` single-step `next()`:** `RocksPostingCursor` caches `current_block: Option<FtsBlockId>` (eliminating repeated `iter.key()`/`iter.valid()` FFI calls) and uses a single `iter.next()` instead of `iter.seek(...)` in `seek_block` whenever `cur + 1 == target`.
+- **Descending early-exit non-essential seeking & loop fusion:** `execute_rank_by` fuses essential cursor advancement into the accumulation loop, seeks non-essential clauses in descending `term_max` order so absent/tighter clauses stop seeking remaining terms early, and skips `filter_ge_256` when `ub_j <= 0.0`.
+- **Small-mask & sorted term-stats fast paths:** `simd.rs` adds `mask_pop_le_8` scalar fast paths for sparse masked accumulation, `max_score_256`, and `filter_ge_256`; `compile_clauses` avoids `HashMap` allocations and decodes `TermStats` directly from `batched_multi_get_cf(..., sorted)`.
+
 ---
 
 ## Benchmark & Speedup
 
-Measured via `cargo run --release --example fts_bench` (`n = 10,000` docs, `vocab = 1,000` with Zipf-like skew producing dense and sparse blocks, `top_k = 10` with exact top-10 ID agreement verified against exhaustive BM25 scoring) on an **AMD Ryzen 9 7950X (`SimdTier::Avx512`)**:
+Measured apples-to-apples via `cargo run --release --example fts_bench` (1 warmup + 25 timed runs, `vocab = 1,000`, `top_k = 10` with exact top-10 ID agreement verified against exhaustive BM25 scoring) on an **AMD Ryzen 9 7950X (`SimdTier::Avx512`)**:
 
-### Live Benchmark Run (`n = 10,000`, `tier = Avx512`)
+### `n = 10,000`, `vocab = 1,000`
 
-| Query | `SIMD-MAXSCORE` | Exhaustive Baseline | Speedup vs. Exhaustive |
-|---|---:|---:|---:|
-| Short 3-term query | **90.6 µs** | 1,636.5 µs | **18.1×** |
-| Medium 8-term query | **114.8 µs** | 3,586.4 µs | **31.2×** |
-| Long 50-term LLM query | **516.3 µs** | 13,431.4 µs | **26.0×** |
+| Query | `66d8ec00~1` (pre-SIMD) | `7251f2b` (initial v2) | Current (`Avx512`) | Exhaustive | Speedup vs. `66d8ec00~1` | Speedup vs. Exhaustive |
+|---|---:|---:|---:|---:|---:|---:|
+| Short 3-term | 76.1 µs | 85.0 µs | **72.8 µs** | 1,766.7 µs | **1.05×** | **24.3×** |
+| Medium 8-term | 88.3 µs | 106.1 µs | 100.0 µs | 3,464.6 µs | 0.88× (`1.06×` vs `7251f2b`) | **34.6×** |
+| Long 50-term LLM | 532.6 µs | 533.3 µs | **479.1 µs** | 13,527.8 µs | **1.11×** | **28.2×** |
 
-### Commit `66d8ec00` Recorded Benchmark (`n = 10,000`, `AVX-512F`)
+### `n = 100,000`, `vocab = 1,000`
 
-Commit [`66d8ec00`](../../crates/izzydb/examples/fts_bench.rs) also recorded a direct 3-term comparison against the pre-SIMD Block-Max MAXSCORE baseline:
+| Query | `66d8ec00~1` (pre-SIMD) | `7251f2b` (initial v2) | Current (`Avx512`) | Exhaustive | Speedup vs. `66d8ec00~1` | Speedup vs. Exhaustive |
+|---|---:|---:|---:|---:|---:|---:|
+| Short 3-term | 963.0 µs | 1,316.5 µs | **519.7 µs** | 55,252.3 µs | **1.85×** | **106.3×** |
+| Medium 8-term | 1,434.1 µs | 1,959.9 µs | **734.2 µs** | 76,369.3 µs | **1.95×** | **104.0×** |
+| Long 50-term LLM | 4,799.2 µs | 5,252.5 µs | **3,156.3 µs** | 163,742.2 µs | **1.52×** | **51.9×** |
 
-| Query | Baseline MAXSCORE | `SIMD-MAXSCORE` | Exhaustive | Speedup vs. Baseline MAXSCORE | Speedup vs. Exhaustive |
-|---|---:|---:|---:|---:|---:|
-| Short 3-term | 93.4 µs | **86.6 µs** | 2,168.3 µs | **1.08×** (-7.3%) | **25.1×** |
-| Medium 8-term | — | **109.3 µs** | 3,586.8 µs | — | **32.8×** |
-| Long 50-term LLM | — | **555.1 µs** | 13,364.8 µs | — | **24.1×** |
-
-*(Note: `Avx2` and `aarch64` `Neon` kernels are compiled and unit-tested against `Scalar` parity in [`crates/izzydb-fts/src/simd.rs`](../../crates/izzydb-fts/src/simd.rs), though hardware benchmarks above reflect `Avx512` on AMD Ryzen 9 7950X.)*
+*(Note on `66d8ec00` commit history: the original `66d8ec00` commit message listed only the 3-term `93.4 µs` baseline—measured on the older `fts_bench` without a warmup iteration—because Medium 8-term was newly added in `66d8ec00` and the unwarmed 50-term baseline `562.8 µs` was omitted. `Avx2` and `aarch64` `Neon` kernels are compiled and unit-tested against `Scalar` parity in [`crates/izzydb-fts/src/simd.rs`](../../crates/izzydb-fts/src/simd.rs), while hardware benchmarks above reflect `Avx512` on AMD Ryzen 9 7950X.)*

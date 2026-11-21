@@ -177,6 +177,16 @@ pub fn accumulate_sparse(
     }
 }
 
+#[inline]
+fn mask_pop_le_8(mask: &[u64; 4]) -> bool {
+    let mut sum = mask[0].count_ones() + mask[1].count_ones();
+    if sum > 8 {
+        return false;
+    }
+    sum += mask[2].count_ones() + mask[3].count_ones();
+    sum <= 8
+}
+
 /// Accumulate BM25 scores for a sparse posting block only on slots where `mask` is set.
 #[inline]
 #[allow(clippy::too_many_arguments)]
@@ -194,36 +204,64 @@ pub fn accumulate_sparse_masked(
     if num_scale <= 0.0 || slots.is_empty() {
         return;
     }
+    if slots.len() < 8 || slots.len() > POSTING_DENSE_THRESHOLD || mask_pop_le_8(mask) {
+        match width {
+            IntWidth::U8 => {
+                for (i, &slot) in slots.iter().enumerate() {
+                    if ((mask[(slot >> 6) as usize] >> (slot & 63)) & 1) != 0 {
+                        let tf_f = tfs_bytes[i] as f32;
+                        let idx = slot as usize;
+                        scores[idx] += (num_scale * tf_f) / (tf_f + dl_norm[idx]);
+                    }
+                }
+            }
+            IntWidth::U16 => {
+                for (i, &slot) in slots.iter().enumerate() {
+                    if ((mask[(slot >> 6) as usize] >> (slot & 63)) & 1) != 0 {
+                        let off = i * 2;
+                        let tf_f =
+                            u16::from_le_bytes([tfs_bytes[off], tfs_bytes[off + 1]]) as f32;
+                        let idx = slot as usize;
+                        scores[idx] += (num_scale * tf_f) / (tf_f + dl_norm[idx]);
+                    }
+                }
+            }
+            IntWidth::U32 => {
+                for (i, &slot) in slots.iter().enumerate() {
+                    if ((mask[(slot >> 6) as usize] >> (slot & 63)) & 1) != 0 {
+                        let off = i * 4;
+                        let tf_f = u32::from_le_bytes(
+                            tfs_bytes[off..off + 4].try_into().unwrap(),
+                        ) as f32;
+                        let idx = slot as usize;
+                        scores[idx] += (num_scale * tf_f) / (tf_f + dl_norm[idx]);
+                    }
+                }
+            }
+        }
+        return;
+    }
     let mut matched_slots = [0u8; POSTING_DENSE_THRESHOLD];
     let mut matched_tfs = [0u32; POSTING_DENSE_THRESHOLD];
     let mut m = 0usize;
-    if slots.len() <= POSTING_DENSE_THRESHOLD {
-        for (i, &slot) in slots.iter().enumerate() {
-            if ((mask[(slot >> 6) as usize] >> (slot & 63)) & 1) != 0 {
-                matched_slots[m] = slot;
-                matched_tfs[m] = read_tf_at(width, tfs_bytes, i);
-                m += 1;
-            }
-        }
-        if m == 0 {
-            return;
-        }
-        accumulate_u32_pairs(
-            tier,
-            &matched_slots[..m],
-            &matched_tfs[..m],
-            num_scale,
-            dl_norm,
-            scores,
-        );
-    } else {
-        for (i, &slot) in slots.iter().enumerate() {
-            if ((mask[(slot >> 6) as usize] >> (slot & 63)) & 1) != 0 {
-                let tf_f = read_tf_at(width, tfs_bytes, i) as f32;
-                scores[slot as usize] += (num_scale * tf_f) / (tf_f + dl_norm[slot as usize]);
-            }
+    for (i, &slot) in slots.iter().enumerate() {
+        if ((mask[(slot >> 6) as usize] >> (slot & 63)) & 1) != 0 {
+            matched_slots[m] = slot;
+            matched_tfs[m] = read_tf_at(width, tfs_bytes, i);
+            m += 1;
         }
     }
+    if m == 0 {
+        return;
+    }
+    accumulate_u32_pairs(
+        tier,
+        &matched_slots[..m],
+        &matched_tfs[..m],
+        num_scale,
+        dl_norm,
+        scores,
+    );
 }
 
 /// Return the maximum `scores[slot]` among slots where `mask` bit is 1 (0.0 if empty).
@@ -231,6 +269,9 @@ pub fn accumulate_sparse_masked(
 pub fn max_score_256(tier: SimdTier, scores: &[f32; FTS_BLOCK_SIZE], mask: &[u64; 4]) -> f32 {
     if *mask == [0u64; 4] {
         return 0.0;
+    }
+    if mask_pop_le_8(mask) {
+        return max_score_256_scalar(scores, mask);
     }
     match tier {
         #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
@@ -253,6 +294,9 @@ pub fn filter_ge_256(
 ) -> [u64; 4] {
     if *mask == [0u64; 4] {
         return [0u64; 4];
+    }
+    if mask_pop_le_8(mask) {
+        return filter_ge_256_scalar(scores, mask, threshold);
     }
     match tier {
         #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
@@ -377,11 +421,33 @@ fn accumulate_sparse_scalar(
     scores: &mut [f32; FTS_BLOCK_SIZE],
     touched: &mut [u64; 4],
 ) {
-    for (i, &slot) in slots.iter().enumerate() {
-        let tf_f = read_tf_at(width, tfs_bytes, i) as f32;
-        let idx = slot as usize;
-        scores[idx] += (num_scale * tf_f) / (tf_f + dl_norm[idx]);
-        touched[(slot >> 6) as usize] |= 1u64 << (slot & 63);
+    match width {
+        IntWidth::U8 => {
+            for (i, &slot) in slots.iter().enumerate() {
+                let tf_f = tfs_bytes[i] as f32;
+                let idx = slot as usize;
+                scores[idx] += (num_scale * tf_f) / (tf_f + dl_norm[idx]);
+                touched[(slot >> 6) as usize] |= 1u64 << (slot & 63);
+            }
+        }
+        IntWidth::U16 => {
+            for (i, &slot) in slots.iter().enumerate() {
+                let off = i * 2;
+                let tf_f = u16::from_le_bytes([tfs_bytes[off], tfs_bytes[off + 1]]) as f32;
+                let idx = slot as usize;
+                scores[idx] += (num_scale * tf_f) / (tf_f + dl_norm[idx]);
+                touched[(slot >> 6) as usize] |= 1u64 << (slot & 63);
+            }
+        }
+        IntWidth::U32 => {
+            for (i, &slot) in slots.iter().enumerate() {
+                let off = i * 4;
+                let tf_f = u32::from_le_bytes(tfs_bytes[off..off + 4].try_into().unwrap()) as f32;
+                let idx = slot as usize;
+                scores[idx] += (num_scale * tf_f) / (tf_f + dl_norm[idx]);
+                touched[(slot >> 6) as usize] |= 1u64 << (slot & 63);
+            }
+        }
     }
 }
 

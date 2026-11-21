@@ -884,10 +884,12 @@ fn test_fts_recycling_term_stats_tightening_and_null_empty_transitions() {
             meta.next_fts_doc_id
         );
         let outlier_key = izzydb::codec::encode_fts_term_key(1, "outlier");
-        let ts = izzydb::fts::TermStats::decode(&storage.get_fts_term_bytes(&outlier_key).unwrap().unwrap())
-            .unwrap();
-        assert_eq!(ts.max_tf, 1);
-        assert_eq!(ts.min_dl_over_tf, 6.0);
+        let rec = izzydb::fts::TermRecord::decode(
+            &storage.get_fts_term_bytes(&outlier_key).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rec.stats.max_tf, 1);
+        assert_eq!(rec.stats.min_dl_over_tf, 6.0);
     }
 
     // Drain all remaining docs and confirm next_fts_doc_id shrinks back to 0 and free list is empty.

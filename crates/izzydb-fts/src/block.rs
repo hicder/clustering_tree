@@ -1,22 +1,30 @@
 use std::collections::BTreeMap;
 
-use izzydb_core::config::{AttrId, FTS_BLOCK_SIZE, FtsDocId};
+use izzydb_core::config::{AttrId, FTS_BLOCK_SIZE, FTS_SKIP_CHUNK_SIZE, FtsBlockId, FtsDocId, TermId};
 use izzydb_core::error::{Result, TreeError};
 
 pub const POSTING_BLOCK_HEADER_LEN: usize = 12;
 pub const DOC_LEN_BLOCK_HEADER_LEN: usize = 4;
+pub const SKIP_BLOCK_HEADER_LEN: usize = 4;
 pub const TERM_STATS_LEN: usize = 16;
+pub const TERM_RECORD_HEADER_LEN: usize = 21;
 
-/// Minimum posting count in a 256-doc block at which v2 encoding switches from Sparse to Dense.
+/// Minimum posting count in a 256-doc block at which posting encoding switches from Sparse to Dense.
 pub const POSTING_DENSE_THRESHOLD: usize = 96;
 
-const POSTING_VERSION_V2: u16 = 0x0200;
+/// Maximum `doc_freq` (within a single block) for inlining a posting block directly inside `TermRecord`.
+pub const INLINE_TERM_MAX_DF: usize = 8;
+
+const POSTING_VERSION_V3: u16 = 0x0300;
 const POSTING_VERSION_MASK: u16 = 0xFF00;
 const FLAG_DENSE: u16 = 0x0001;
 const WIDTH_SHIFT: u16 = 1;
 const WIDTH_MASK: u16 = 0x0006;
 
-/// Compact integer width tag shared by `PackedPostingBlock` (`tf`) and `DocLenBlock` (`dl`).
+const TERM_FLAG_INLINE: u8 = 0x01;
+const POS_FLAG_U32_OFFSETS: u8 = 0x01;
+
+/// Compact integer width tag shared by `PackedPostingBlock` (`tf`), `DocLenBlock` (`dl`), and `SkipBlock` (`max_tf`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum IntWidth {
@@ -85,22 +93,34 @@ pub struct AttrFtsStats {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FtsMeta {
     pub next_fts_doc_id: FtsDocId,
+    pub next_term_id: TermId,
     pub per_attr_stats: BTreeMap<AttrId, AttrFtsStats>,
 }
 
 impl FtsMeta {
     pub fn alloc_doc_id(&mut self) -> Result<FtsDocId> {
         let id = self.next_fts_doc_id;
-        self.next_fts_doc_id = self
-            .next_fts_doc_id
+        // Reserve FtsDocId::MAX (u32::MAX) as sentinel for "absent" in DocLoc.
+        if id == FtsDocId::MAX {
+            return Err(TreeError::Storage("FtsDocId u32 space exhausted".into()));
+        }
+        self.next_fts_doc_id = id + 1;
+        Ok(id)
+    }
+
+    pub fn alloc_term_id(&mut self) -> Result<TermId> {
+        let id = self.next_term_id;
+        self.next_term_id = self
+            .next_term_id
             .checked_add(1)
-            .ok_or_else(|| TreeError::Storage("FtsDocId u32 space exhausted".into()))?;
+            .ok_or_else(|| TreeError::Storage("TermId u32 space exhausted".into()))?;
         Ok(id)
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(8 + self.per_attr_stats.len() * 18);
+        let mut buf = Vec::with_capacity(12 + self.per_attr_stats.len() * 18);
         buf.extend_from_slice(&self.next_fts_doc_id.to_le_bytes());
+        buf.extend_from_slice(&self.next_term_id.to_le_bytes());
         buf.extend_from_slice(&(self.per_attr_stats.len() as u32).to_le_bytes());
         for (&attr_id, stats) in &self.per_attr_stats {
             buf.extend_from_slice(&attr_id.to_le_bytes());
@@ -111,22 +131,23 @@ impl FtsMeta {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 8 {
+        if bytes.len() < 12 {
             return Err(TreeError::CorruptedData(
                 "FtsMeta payload too short".into(),
             ));
         }
         let next_fts_doc_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-        if bytes.len() != 8 + count * 18 {
+        let next_term_id = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        if bytes.len() != 12 + count * 18 {
             return Err(TreeError::CorruptedData(format!(
                 "FtsMeta expected {} bytes, got {}",
-                8 + count * 18,
+                12 + count * 18,
                 bytes.len()
             )));
         }
         let mut per_attr_stats = BTreeMap::new();
-        let mut off = 8;
+        let mut off = 12;
         for _ in 0..count {
             let attr_id = u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap());
             let doc_count = u64::from_le_bytes(bytes[off + 2..off + 10].try_into().unwrap());
@@ -142,12 +163,13 @@ impl FtsMeta {
         }
         Ok(Self {
             next_fts_doc_id,
+            next_term_id,
             per_attr_stats,
         })
     }
 }
 
-/// Term-level statistics stored in `cf_fts_terms`.
+/// Term-level BM25 statistics.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TermStats {
     pub doc_freq: u64,
@@ -200,6 +222,284 @@ impl TermStats {
             doc_freq: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
             max_tf: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
             min_dl_over_tf,
+        })
+    }
+}
+
+/// Term dictionary entry stored in `cf_fts_terms` with numeric `TermId`, `TermStats`,
+/// and optional inline single-block posting payload for rare terms (`doc_freq <= INLINE_TERM_MAX_DF`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TermRecord {
+    pub term_id: TermId,
+    pub stats: TermStats,
+    pub inline_block: Option<(FtsBlockId, Vec<u8>)>,
+}
+
+impl TermRecord {
+    pub fn new(term_id: TermId) -> Self {
+        Self {
+            term_id,
+            stats: TermStats::default(),
+            inline_block: None,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let inline_len = self
+            .inline_block
+            .as_ref()
+            .map_or(0, |(_, bytes)| 4 + bytes.len());
+        let mut buf = Vec::with_capacity(TERM_RECORD_HEADER_LEN + inline_len);
+        buf.extend_from_slice(&self.term_id.to_le_bytes());
+        buf.extend_from_slice(&self.stats.encode());
+        match &self.inline_block {
+            Some((block_id, posting_bytes)) => {
+                buf.push(TERM_FLAG_INLINE);
+                buf.extend_from_slice(&block_id.to_le_bytes());
+                buf.extend_from_slice(posting_bytes);
+            }
+            None => {
+                buf.push(0);
+            }
+        }
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < TERM_RECORD_HEADER_LEN {
+            return Err(TreeError::CorruptedData(format!(
+                "TermRecord expected >= {TERM_RECORD_HEADER_LEN} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let term_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let stats = TermStats::decode(&bytes[4..20])?;
+        let flags = bytes[20];
+        let inline_block = match flags {
+            0 => {
+                if bytes.len() != TERM_RECORD_HEADER_LEN {
+                    return Err(TreeError::CorruptedData(format!(
+                        "non-inline TermRecord expected {TERM_RECORD_HEADER_LEN} bytes, got {}",
+                        bytes.len()
+                    )));
+                }
+                None
+            }
+            TERM_FLAG_INLINE => {
+                if bytes.len() < TERM_RECORD_HEADER_LEN + 4 + POSTING_BLOCK_HEADER_LEN {
+                    return Err(TreeError::CorruptedData(
+                        "inline TermRecord payload truncated".into(),
+                    ));
+                }
+                let block_id = u32::from_le_bytes(bytes[21..25].try_into().unwrap());
+                let posting_bytes = bytes[25..].to_vec();
+                let _ = PostingBlockView::parse(&posting_bytes)?;
+                Some((block_id, posting_bytes))
+            }
+            other => {
+                return Err(TreeError::CorruptedData(format!(
+                    "unknown TermRecord flags: {other:#04x}"
+                )));
+            }
+        };
+        Ok(Self {
+            term_id,
+            stats,
+            inline_block,
+        })
+    }
+}
+
+/// Pre-validated offsets for a [`SkipBlockView`] so intra-chunk steps avoid re-parsing headers.
+#[derive(Debug, Clone, Copy)]
+pub struct SkipBlockLayout {
+    pub width: IntWidth,
+    pub count: usize,
+    pub max_tf_off: usize,
+    pub rel_off: usize,
+}
+
+impl SkipBlockLayout {
+    #[inline]
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < SKIP_BLOCK_HEADER_LEN {
+            return Err(TreeError::CorruptedData(format!(
+                "SkipBlock header too short: {}",
+                bytes.len()
+            )));
+        }
+        let width = IntWidth::from_tag(bytes[0])?;
+        if bytes[1] != 0 {
+            return Err(TreeError::CorruptedData(format!(
+                "unknown SkipBlock reserved byte: {}",
+                bytes[1]
+            )));
+        }
+        let count = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
+        if count == 0 || count > FTS_SKIP_CHUNK_SIZE {
+            return Err(TreeError::CorruptedData(format!(
+                "invalid SkipBlock count: {count}"
+            )));
+        }
+        let expected = SKIP_BLOCK_HEADER_LEN + count * (4 + width.byte_size() + 1);
+        if bytes.len() != expected {
+            return Err(TreeError::CorruptedData(format!(
+                "SkipBlock expected {expected} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let max_tf_off = SKIP_BLOCK_HEADER_LEN + count * 4;
+        let rel_off = max_tf_off + count * width.byte_size();
+        Ok(Self {
+            width,
+            count,
+            max_tf_off,
+            rel_off,
+        })
+    }
+
+    #[inline]
+    pub fn view(self, bytes: &[u8]) -> SkipBlockView<'_> {
+        SkipBlockView {
+            width: self.width,
+            count: self.count,
+            min_dl_over_tfs_bytes: &bytes[SKIP_BLOCK_HEADER_LEN..self.max_tf_off],
+            max_tfs_bytes: &bytes[self.max_tf_off..self.rel_off],
+            rel_block_ids: &bytes[self.rel_off..],
+        }
+    }
+}
+
+/// Zero-copy view over an encoded [`SkipBlock`] in `cf_fts_skips`.
+#[derive(Debug, Clone, Copy)]
+pub struct SkipBlockView<'a> {
+    pub width: IntWidth,
+    pub count: usize,
+    pub min_dl_over_tfs_bytes: &'a [u8],
+    pub max_tfs_bytes: &'a [u8],
+    pub rel_block_ids: &'a [u8],
+}
+
+impl<'a> SkipBlockView<'a> {
+    #[inline]
+    pub fn parse(bytes: &'a [u8]) -> Result<Self> {
+        let layout = SkipBlockLayout::parse(bytes)?;
+        Ok(layout.view(bytes))
+    }
+
+    #[inline]
+    pub fn rel_block_id(&self, idx: usize) -> u8 {
+        self.rel_block_ids[idx]
+    }
+
+    #[inline]
+    pub fn max_tf(&self, idx: usize) -> u32 {
+        read_tf_at(self.width, self.max_tfs_bytes, idx)
+    }
+
+    #[inline]
+    pub fn min_dl_over_tf(&self, idx: usize) -> f32 {
+        let off = idx * 4;
+        f32::from_le_bytes(self.min_dl_over_tfs_bytes[off..off + 4].try_into().unwrap())
+    }
+
+    #[inline]
+    pub fn find_ge(&self, target_rel: u8) -> Option<usize> {
+        let idx = self.rel_block_ids.partition_point(|&b| b < target_rel);
+        if idx < self.count {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+}
+
+/// Mutable 256-block Block-Max skip summary chunk for `cf_fts_skips`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SkipBlock {
+    pub rel_block_ids: Vec<u8>,
+    pub max_tfs: Vec<u32>,
+    pub min_dl_over_tfs: Vec<f32>,
+}
+
+impl SkipBlock {
+    pub fn is_empty(&self) -> bool {
+        self.rel_block_ids.is_empty()
+    }
+
+    pub fn upsert(&mut self, rel_slot: u8, max_tf: u32, min_dl_over_tf: f32) {
+        match self.rel_block_ids.binary_search(&rel_slot) {
+            Ok(idx) => {
+                self.max_tfs[idx] = max_tf;
+                self.min_dl_over_tfs[idx] = min_dl_over_tf;
+            }
+            Err(idx) => {
+                self.rel_block_ids.insert(idx, rel_slot);
+                self.max_tfs.insert(idx, max_tf);
+                self.min_dl_over_tfs.insert(idx, min_dl_over_tf);
+            }
+        }
+    }
+
+    pub fn remove(&mut self, rel_slot: u8) -> bool {
+        let Ok(idx) = self.rel_block_ids.binary_search(&rel_slot) else {
+            return false;
+        };
+        self.rel_block_ids.remove(idx);
+        self.max_tfs.remove(idx);
+        self.min_dl_over_tfs.remove(idx);
+        true
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        debug_assert!(
+            !self.rel_block_ids.is_empty() && self.rel_block_ids.len() <= FTS_SKIP_CHUNK_SIZE
+        );
+        let count = self.rel_block_ids.len();
+        let max_tf = self.max_tfs.iter().copied().max().unwrap_or(0);
+        let width = IntWidth::min_for_max(max_tf);
+        let mut buf = Vec::with_capacity(
+            SKIP_BLOCK_HEADER_LEN + count * (4 + width.byte_size() + 1),
+        );
+        buf.push(width as u8);
+        buf.push(0);
+        buf.extend_from_slice(&(count as u16).to_le_bytes());
+        for &r in &self.min_dl_over_tfs {
+            buf.extend_from_slice(&r.to_le_bytes());
+        }
+        match width {
+            IntWidth::U8 => {
+                for &tf in &self.max_tfs {
+                    buf.push(tf as u8);
+                }
+            }
+            IntWidth::U16 => {
+                for &tf in &self.max_tfs {
+                    buf.extend_from_slice(&(tf as u16).to_le_bytes());
+                }
+            }
+            IntWidth::U32 => {
+                for &tf in &self.max_tfs {
+                    buf.extend_from_slice(&tf.to_le_bytes());
+                }
+            }
+        }
+        buf.extend_from_slice(&self.rel_block_ids);
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let view = SkipBlockView::parse(bytes)?;
+        let mut max_tfs = Vec::with_capacity(view.count);
+        let mut min_dl_over_tfs = Vec::with_capacity(view.count);
+        for i in 0..view.count {
+            max_tfs.push(view.max_tf(i));
+            min_dl_over_tfs.push(view.min_dl_over_tf(i));
+        }
+        Ok(Self {
+            rel_block_ids: view.rel_block_ids.to_vec(),
+            max_tfs,
+            min_dl_over_tfs,
         })
     }
 }
@@ -365,7 +665,7 @@ impl DocLenBlock {
     }
 }
 
-/// 12-byte header of a v2 [`PackedPostingBlock`].
+/// 12-byte header of a v3 [`PackedPostingBlock`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PostingBlockHeader {
     pub count: u16,
@@ -392,7 +692,7 @@ impl PostingBlockHeader {
                 "invalid PostingBlock count: {count}"
             )));
         }
-        if (flags & POSTING_VERSION_MASK) != POSTING_VERSION_V2 {
+        if (flags & POSTING_VERSION_MASK) != POSTING_VERSION_V3 {
             return Err(TreeError::CorruptedData(format!(
                 "unsupported PostingBlock flags/version: {flags:#06x}"
             )));
@@ -432,7 +732,7 @@ impl PostingBlockHeader {
     }
 }
 
-/// Decoded payload slice of a v2 [`PostingBlockView`].
+/// Decoded payload slice of a v3 [`PostingBlockView`].
 #[derive(Debug, Clone, Copy)]
 pub enum PostingBlockPayload<'a> {
     Sparse {
@@ -445,7 +745,7 @@ pub enum PostingBlockPayload<'a> {
     },
 }
 
-/// Zero-copy view over an encoded v2 [`PackedPostingBlock`].
+/// Zero-copy view over an encoded v3 [`PackedPostingBlock`].
 #[derive(Debug, Clone, Copy)]
 pub struct PostingBlockView<'a> {
     pub header: PostingBlockHeader,
@@ -485,19 +785,20 @@ impl<'a> PostingBlockView<'a> {
                 tfs_bytes: &bytes[POSTING_BLOCK_HEADER_LEN + 32..],
             }
         } else {
+            // v3 Sparse: tfs stored first (4-byte aligned after 12-byte header), followed by slots.
             let n = header.count as usize;
-            let expected = POSTING_BLOCK_HEADER_LEN + n + n * wbytes;
+            let expected = POSTING_BLOCK_HEADER_LEN + n * wbytes + n;
             if bytes.len() != expected {
                 return Err(TreeError::CorruptedData(format!(
                     "Sparse PostingBlock expected {expected} bytes, got {}",
                     bytes.len()
                 )));
             }
-            let slots_start = POSTING_BLOCK_HEADER_LEN;
-            let tfs_start = slots_start + n;
+            let tfs_start = POSTING_BLOCK_HEADER_LEN;
+            let slots_start = tfs_start + n * wbytes;
             PostingBlockPayload::Sparse {
-                slots: &bytes[slots_start..tfs_start],
-                tfs_bytes: &bytes[tfs_start..],
+                tfs_bytes: &bytes[tfs_start..slots_start],
+                slots: &bytes[slots_start..],
             }
         };
         Ok(Self {
@@ -640,7 +941,7 @@ impl PackedPostingBlock {
         let dense = n >= POSTING_DENSE_THRESHOLD;
         let max_tf = self.tfs.iter().copied().max().unwrap_or(0);
         let tf_width = IntWidth::min_for_max(max_tf);
-        let flags = POSTING_VERSION_V2
+        let flags = POSTING_VERSION_V3
             | ((tf_width as u16) << WIDTH_SHIFT)
             | if dense { FLAG_DENSE } else { 0 };
 
@@ -681,12 +982,11 @@ impl PackedPostingBlock {
             buf
         } else {
             let mut buf =
-                Vec::with_capacity(POSTING_BLOCK_HEADER_LEN + n + n * tf_width.byte_size());
+                Vec::with_capacity(POSTING_BLOCK_HEADER_LEN + n * tf_width.byte_size() + n);
             buf.extend_from_slice(&(n as u16).to_le_bytes());
             buf.extend_from_slice(&flags.to_le_bytes());
             buf.extend_from_slice(&self.max_tf.to_le_bytes());
             buf.extend_from_slice(&self.min_dl_over_tf.to_le_bytes());
-            buf.extend_from_slice(&self.slots);
             match tf_width {
                 IntWidth::U8 => {
                     for &tf in &self.tfs {
@@ -704,6 +1004,7 @@ impl PackedPostingBlock {
                     }
                 }
             }
+            buf.extend_from_slice(&self.slots);
             buf
         }
     }
@@ -748,6 +1049,7 @@ impl PackedPostingBlock {
 /// Zero-copy view over an encoded [`PackedPositionBlock`].
 #[derive(Debug, Clone, Copy)]
 pub struct PositionBlockView<'a> {
+    pub u32_offsets: bool,
     pub slots: &'a [u8],
     pub pos_offsets_bytes: &'a [u8],
     pub delta_varints: &'a [u8],
@@ -760,15 +1062,18 @@ impl<'a> PositionBlockView<'a> {
                 "PositionBlock header too short".into(),
             ));
         }
-        let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
-        if count == 0 || count > FTS_BLOCK_SIZE {
+        let flags = bytes[0];
+        if (flags & !POS_FLAG_U32_OFFSETS) != 0 {
             return Err(TreeError::CorruptedData(format!(
-                "invalid PositionBlock count: {count}"
+                "unknown PositionBlock flags: {flags:#04x}"
             )));
         }
+        let u32_offsets = (flags & POS_FLAG_U32_OFFSETS) != 0;
+        let off_width = if u32_offsets { 4usize } else { 2usize };
+        let count = (bytes[1] as usize) + 1;
         let slots_start = 2;
         let offsets_start = slots_start + count;
-        let varints_start = offsets_start + (count + 1) * 4;
+        let varints_start = offsets_start + (count + 1) * off_width;
         if bytes.len() < varints_start {
             return Err(TreeError::CorruptedData(
                 "PositionBlock offsets truncated".into(),
@@ -777,11 +1082,7 @@ impl<'a> PositionBlockView<'a> {
         let slots = &bytes[slots_start..offsets_start];
         let pos_offsets_bytes = &bytes[offsets_start..varints_start];
         let delta_varints = &bytes[varints_start..];
-        let last_off = u32::from_le_bytes(
-            pos_offsets_bytes[count * 4..(count + 1) * 4]
-                .try_into()
-                .unwrap(),
-        ) as usize;
+        let last_off = read_pos_offset(u32_offsets, pos_offsets_bytes, count);
         if last_off != delta_varints.len() {
             return Err(TreeError::CorruptedData(format!(
                 "PositionBlock varint length mismatch: header {last_off} vs actual {}",
@@ -789,32 +1090,68 @@ impl<'a> PositionBlockView<'a> {
             )));
         }
         Ok(Self {
+            u32_offsets,
             slots,
             pos_offsets_bytes,
             delta_varints,
         })
     }
 
+    #[inline]
     pub fn slot_positions(&self, slot: u8) -> Result<Option<Vec<u32>>> {
         let Ok(idx) = self.slots.binary_search(&slot) else {
             return Ok(None);
         };
-        let start = u32::from_le_bytes(
-            self.pos_offsets_bytes[idx * 4..(idx + 1) * 4]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        let end = u32::from_le_bytes(
-            self.pos_offsets_bytes[(idx + 1) * 4..(idx + 2) * 4]
-                .try_into()
-                .unwrap(),
-        ) as usize;
+        let start = read_pos_offset(self.u32_offsets, self.pos_offsets_bytes, idx);
+        let end = read_pos_offset(self.u32_offsets, self.pos_offsets_bytes, idx + 1);
         if end < start || end > self.delta_varints.len() {
             return Err(TreeError::CorruptedData(
                 "PositionBlock offset out of bounds".into(),
             ));
         }
         decode_delta_varints(&self.delta_varints[start..end]).map(Some)
+    }
+
+    /// Check whether `slot` contains `target_pos` without allocating a `Vec<u32>`.
+    #[inline]
+    pub fn slot_contains_pos(&self, slot: u8, target_pos: u32) -> Result<bool> {
+        let Ok(idx) = self.slots.binary_search(&slot) else {
+            return Ok(false);
+        };
+        let start = read_pos_offset(self.u32_offsets, self.pos_offsets_bytes, idx);
+        let end = read_pos_offset(self.u32_offsets, self.pos_offsets_bytes, idx + 1);
+        if end < start || end > self.delta_varints.len() {
+            return Err(TreeError::CorruptedData(
+                "PositionBlock offset out of bounds".into(),
+            ));
+        }
+        let slice = &self.delta_varints[start..end];
+        let mut off = 0usize;
+        let mut acc = 0u32;
+        while off < slice.len() {
+            let delta = decode_varint_u32(slice, &mut off)?;
+            acc = acc
+                .checked_add(delta)
+                .ok_or_else(|| TreeError::CorruptedData("position varint overflow".into()))?;
+            if acc == target_pos {
+                return Ok(true);
+            }
+            if acc > target_pos {
+                return Ok(false);
+            }
+        }
+        Ok(false)
+    }
+}
+
+#[inline]
+fn read_pos_offset(u32_offsets: bool, bytes: &[u8], idx: usize) -> usize {
+    if u32_offsets {
+        let off = idx * 4;
+        u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize
+    } else {
+        let off = idx * 2;
+        u16::from_le_bytes([bytes[off], bytes[off + 1]]) as usize
     }
 }
 
@@ -862,11 +1199,21 @@ impl PackedPositionBlock {
             offsets.push(varints.len() as u32);
         }
 
-        let mut buf = Vec::with_capacity(2 + count + (count + 1) * 4 + varints.len());
-        buf.extend_from_slice(&(count as u16).to_le_bytes());
+        let u32_offsets = varints.len() > u16::MAX as usize;
+        let off_width = if u32_offsets { 4usize } else { 2usize };
+        let flags = if u32_offsets { POS_FLAG_U32_OFFSETS } else { 0 };
+        let mut buf = Vec::with_capacity(2 + count + (count + 1) * off_width + varints.len());
+        buf.push(flags);
+        buf.push((count - 1) as u8);
         buf.extend_from_slice(&self.slots);
-        for off in offsets {
-            buf.extend_from_slice(&off.to_le_bytes());
+        if u32_offsets {
+            for off in offsets {
+                buf.extend_from_slice(&off.to_le_bytes());
+            }
+        } else {
+            for off in offsets {
+                buf.extend_from_slice(&(off as u16).to_le_bytes());
+            }
         }
         buf.extend_from_slice(&varints);
         buf
@@ -877,16 +1224,8 @@ impl PackedPositionBlock {
         let count = view.slots.len();
         let mut positions = Vec::with_capacity(count);
         for idx in 0..count {
-            let start = u32::from_le_bytes(
-                view.pos_offsets_bytes[idx * 4..(idx + 1) * 4]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            let end = u32::from_le_bytes(
-                view.pos_offsets_bytes[(idx + 1) * 4..(idx + 2) * 4]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
+            let start = read_pos_offset(view.u32_offsets, view.pos_offsets_bytes, idx);
+            let end = read_pos_offset(view.u32_offsets, view.pos_offsets_bytes, idx + 1);
             if end < start || end > view.delta_varints.len() {
                 return Err(TreeError::CorruptedData(
                     "PositionBlock offset out of bounds".into(),
@@ -959,10 +1298,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fts_meta_and_term_stats_roundtrip() {
+    fn test_fts_meta_and_term_record_roundtrip() {
         let mut meta = FtsMeta::default();
         assert_eq!(meta.alloc_doc_id().unwrap(), 0);
         assert_eq!(meta.alloc_doc_id().unwrap(), 1);
+        assert_eq!(meta.alloc_term_id().unwrap(), 0);
+        assert_eq!(meta.alloc_term_id().unwrap(), 1);
         meta.per_attr_stats.insert(
             2,
             AttrFtsStats {
@@ -981,6 +1322,42 @@ mod tests {
         assert_eq!(ts.max_tf, 9);
         assert!((ts.min_dl_over_tf - 3.0).abs() < 1e-6);
         assert_eq!(TermStats::decode(&ts.encode()).unwrap(), ts);
+
+        let rec = TermRecord {
+            term_id: 17,
+            stats: ts,
+            inline_block: None,
+        };
+        assert_eq!(TermRecord::decode(&rec.encode()).unwrap(), rec);
+
+        let mut dls = DocLenBlock::default();
+        dls.set(3, 10);
+        let mut blk = PackedPostingBlock::default();
+        blk.upsert(3, 2, &dls);
+        let rec_inline = TermRecord {
+            term_id: 18,
+            stats: ts,
+            inline_block: Some((4, blk.encode())),
+        };
+        assert_eq!(TermRecord::decode(&rec_inline.encode()).unwrap(), rec_inline);
+    }
+
+    #[test]
+    fn test_skip_block_roundtrip() {
+        let mut sb = SkipBlock::default();
+        sb.upsert(12, 4, 3.5);
+        sb.upsert(2, 120, 1.25);
+        sb.upsert(250, 2, 10.0);
+        let enc = sb.encode();
+        let dec = SkipBlock::decode(&enc).unwrap();
+        assert_eq!(dec, sb);
+        let view = SkipBlockView::parse(&enc).unwrap();
+        assert_eq!(view.find_ge(0), Some(0));
+        assert_eq!(view.find_ge(3), Some(1));
+        assert_eq!(view.find_ge(251), None);
+        assert!(sb.remove(12));
+        assert!(!sb.remove(99));
+        assert_eq!(sb.rel_block_ids, vec![2, 250]);
     }
 
     #[test]
@@ -1062,8 +1439,11 @@ mod tests {
         pblk.upsert(1, vec![2, 4]);
         let enc = pblk.encode();
         let view = PositionBlockView::parse(&enc).unwrap();
+        assert!(!view.u32_offsets);
         assert_eq!(view.slot_positions(1).unwrap(), Some(vec![2, 4]));
         assert_eq!(view.slot_positions(5).unwrap(), Some(vec![0, 3, 128, 300]));
+        assert!(view.slot_contains_pos(5, 128).unwrap());
+        assert!(!view.slot_contains_pos(5, 129).unwrap());
         assert_eq!(view.slot_positions(9).unwrap(), None);
         assert_eq!(PackedPositionBlock::decode(&enc).unwrap(), pblk);
     }

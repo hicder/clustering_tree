@@ -383,6 +383,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "izzydb-core",
+ "izzydb-fts",
  "izzydb-rabitq",
  "rand",
  "roaring",

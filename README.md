@@ -2,9 +2,9 @@
 
 An embedded, RocksDB-backed hybrid search engine in Rust for vector, full-text, and filtered queries.
 
-- **Vector search:** Mutable ~100x-fanout clustering tree (inspired by turbopuffer ANN v3 and SPFresh LIRE) with 1-bit RaBitQ quantization and optional exact reranking.
-- **Attribute filtering:** Typed document schemas with cluster-aware `RoaringBitmap` indexes for filtered vector and BM25 search.
-- **Full-text & hybrid:** Block-Max MAXSCORE BM25 with stemming, phrase matching, and Reciprocal Rank Fusion (`hybrid_search`).
+- **Vector search:** Mutable ~100x-fanout clustering tree (inspired by turbopuffer ANN v3 and SPFresh LIRE) with 1-bit RaBitQ quantization (8-wide SIMD-tiled codes, pre-stored popcounts) and optional exact reranking.
+- **Attribute filtering:** Typed document schemas with cluster-aware inverted indexes (`cf_attr_clusters`, cluster-first `cf_attr_postings` with compact `LeafPosting` bitsets, cached per-leaf `AttrZoneMap`s) and zero-copy `DocView` lazy evaluation.
+- **Full-text & hybrid:** `TermId`-indexed Block-Max MAXSCORE BM25 with out-of-line `cf_fts_skips`, inline rare-term postings, stemming, phrase matching, and Reciprocal Rank Fusion (`hybrid_search`).
 - **Persistent & accelerated:** Atomic RocksDB `WriteBatch` commits and runtime-dispatched SIMD (`x86_64` AVX2/AVX-512, `aarch64` NEON).
 
 ## Workspace Crates
@@ -207,9 +207,9 @@ let complex = Filter::Or(vec![
 - [Key & Binary Encoding](docs/architecture/key-encoding.md) — RocksDB column families, big-endian key formats, packed SoA node/vector layouts, and RaBitQ bit-packing.
 - [Index Path](docs/architecture/index-path.md) — write path, RocksDB layout, RaBitQ quantization, splits, merges, and LIRE.
 - [Search Path](docs/architecture/search-path.md) — beam traversal, asymmetric 4-bit RaBitQ `popcount` scanning, cluster-aware filtering, and full-vector reranking.
-- [Filtering & Inverted Index](docs/architecture/filtering-and-inverted-index.md) — schema & filter semantics, order-preserving encodings, two-level `RoaringBitmap` index, `LocalId` lifecycle, and filtered execution.
-- [Full-Text Search Architecture](docs/architecture/fts-architecture.md) — `FtsIndex`, cluster-decoupled 256-doc posting blocks, Block-Max MAXSCORE BM25, FTS filters, and hybrid RRF.
-- [SIMD Block-Max MAXSCORE & Data Layout](docs/architecture/blockmax-simd.md) — 256-slot block geometry, out-of-line `DocLenBlock`, v2 Sparse/Dense posting layouts, `min_dl_over_tf` bounds, and runtime-dispatched SIMD kernels.
+- [Filtering & Inverted Index](docs/architecture/filtering-and-inverted-index.md) — schema & filter semantics, order-preserving cluster-first encodings, `AttrZoneMap` range pruning, slot-indexed `local_id == slot` lifecycle, and filtered execution.
+- [Full-Text Search Architecture](docs/architecture/fts-architecture.md) — `FtsIndex`, `TermRecord` inline rare terms, `cf_fts_skips`, v3 256-doc posting blocks, Block-Max MAXSCORE BM25, FTS filters, and hybrid RRF.
+- [SIMD Block-Max MAXSCORE & Data Layout](docs/architecture/blockmax-simd.md) — 256-slot block geometry, out-of-line `DocLenBlock` & `SkipBlock`, v3 Sparse/Dense posting layouts, `min_dl_over_tf` bounds, and runtime-dispatched SIMD kernels.
 - [ANN Latency Optimization](docs/perf/2026-11-20-latency-optimization.md) — packed node blobs, internal node cache, single-FWHT query path, and SIMD RaBitQ scoring.
 - [SIMD Block-Max MAXSCORE](docs/perf/2026-11-21-simd-maxscore.md) — out-of-line `DocLenBlock`, v2 TF-only Sparse/Dense posting blocks, `min_dl_over_tf` bounds, and runtime-dispatched FTS SIMD kernels.
 
@@ -220,6 +220,7 @@ cargo test
 cargo run --release -p izzydb --example recall_bench
 cargo run --release -p izzydb --example filtered_bench
 cargo run --release -p izzydb --example fts_bench
+cargo run --release -p izzydb --example encoding_bench
 ```
 
 ## License

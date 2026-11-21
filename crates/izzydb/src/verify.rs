@@ -3,19 +3,22 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use roaring::RoaringBitmap;
 
 use crate::codec::{
-    decode_attribute_entries, encode_fts_doc_len_key, encode_fts_posting_key, encode_fts_term_key,
-    extract_index_keys_from_entries, make_posting_key,
+    LeafPosting, decode_attribute_entries, encode_fts_doc_len_key, encode_fts_term_id_key,
+    encode_fts_term_key, extract_index_keys_from_entries, make_posting_key, split_posting_key,
 };
-use crate::config::{AttrId, DocId, LocalId, NodeId, TreeConfig, fts_block_id, fts_slot};
+use crate::config::{
+    AttrId, DocId, LocalId, NodeId, TermId, TreeConfig, fts_block_id, fts_skip_chunk_id,
+    fts_skip_slot, fts_slot,
+};
 use crate::error::{Result, TreeError};
 use crate::fts_index::INLINE_TERM_STATS_RECOMPUTE_MAX_BLOCKS;
 use crate::node::{PackedInternalNode, TreeMeta};
 use crate::schema::{AttributeValue, CollectionSchema};
-use crate::storage::{DocLoc, Storage};
-use crate::tree::local_id_compaction_threshold;
+use crate::storage::{AttrZoneMap, DocLoc, Storage};
 use izzydb_fts::{
-    AttrFtsStats, DocLenBlock, FtsAnalyzer, FtsMeta, PackedPositionBlock, PackedPostingBlock,
-    ReusableBuffer, TermStats, dl_over_tf_lower_bound,
+    AttrFtsStats, DocLenBlock, FtsAnalyzer, FtsMeta, INLINE_TERM_MAX_DF, PackedPositionBlock,
+    PackedPostingBlock, PostingBlockHeader, ReusableBuffer, SkipBlock, TermRecord,
+    dl_over_tf_lower_bound,
 };
 
 /// Summary statistics collected by [`crate::ClusteringTree::verify_invariants`].
@@ -102,7 +105,7 @@ pub fn verify_invariants(
     let mut visited_internal = HashSet::new();
     let mut visited_leaves = HashSet::new();
     let mut expected_leaf_parent: HashMap<NodeId, NodeId> = HashMap::new();
-    let mut seen_docs: HashMap<DocId, DocLoc> = HashMap::new();
+    let mut seen_docs: HashMap<DocId, (NodeId, LocalId)> = HashMap::new();
     let mut min_leaf = usize::MAX;
     let mut max_leaf = 0usize;
     let mut min_internal = usize::MAX;
@@ -147,17 +150,10 @@ pub fn verify_invariants(
             }
 
             let count = leaf.entry_count();
-            let compaction_bound = local_id_compaction_threshold(config);
-            if leaf.next_local_id >= compaction_bound {
+            if leaf.slot_cap > config.max_leaf_size {
                 return Err(TreeError::InvariantViolation(format!(
-                    "leaf {node_id} next_local_id {} >= compaction bound {compaction_bound}",
-                    leaf.next_local_id
-                )));
-            }
-            if leaf.local_ids.len() != count {
-                return Err(TreeError::InvariantViolation(format!(
-                    "leaf {node_id} local_ids.len() {} != entry_count {count}",
-                    leaf.local_ids.len()
+                    "leaf {node_id} slot_cap {} > max_leaf_size {}",
+                    leaf.slot_cap, config.max_leaf_size
                 )));
             }
             if is_root {
@@ -177,21 +173,14 @@ pub fn verify_invariants(
             min_leaf = min_leaf.min(count);
             max_leaf = max_leaf.max(count);
 
-            let mut seen_locals: HashSet<LocalId> = HashSet::with_capacity(count);
-            for (i, (&doc_id, &local_id)) in
-                leaf.doc_ids.iter().zip(leaf.local_ids.iter()).enumerate()
-            {
-                if local_id >= leaf.next_local_id {
-                    return Err(TreeError::InvariantViolation(format!(
-                        "leaf {node_id} doc {doc_id} has local_id {local_id} >= next_local_id {}",
-                        leaf.next_local_id
-                    )));
+            let mut live_seen = 0usize;
+            for slot in 0..leaf.slot_cap {
+                if !leaf.is_live(slot) {
+                    continue;
                 }
-                if !seen_locals.insert(local_id) {
-                    return Err(TreeError::InvariantViolation(format!(
-                        "duplicate local_id {local_id} in leaf {node_id}"
-                    )));
-                }
+                live_seen += 1;
+                let doc_id = leaf.doc_ids[slot];
+                let local_id = slot as LocalId;
                 let vec = disk_vectors.get(&doc_id).ok_or_else(|| {
                     TreeError::InvariantViolation(format!(
                         "missing vector for doc {doc_id} (leaf {node_id}) in cf_vectors"
@@ -202,8 +191,8 @@ pub fn verify_invariants(
                         "doc {doc_id} in cf_vectors has invalid vector"
                     )));
                 }
-                let res_norm_sq = leaf.res_norm_sqs[i];
-                let scale = leaf.scales[i];
+                let res_norm_sq = leaf.res_norm_sqs[slot];
+                let scale = leaf.scales[slot];
                 if !res_norm_sq.is_finite()
                     || res_norm_sq < 0.0
                     || !scale.is_finite()
@@ -214,16 +203,16 @@ pub fn verify_invariants(
                         "doc {doc_id} in leaf {node_id} has invalid quantized entry"
                     )));
                 }
-                let loc = DocLoc {
-                    leaf_id: node_id,
-                    local_id,
-                };
-                if let Some(prev_loc) = seen_docs.insert(doc_id, loc) {
+                if let Some((prev_leaf, _)) = seen_docs.insert(doc_id, (node_id, local_id)) {
                     return Err(TreeError::InvariantViolation(format!(
-                        "duplicate doc_id {doc_id} in leaves {} and {node_id}",
-                        prev_loc.leaf_id
+                        "duplicate doc_id {doc_id} in leaves {prev_leaf} and {node_id}",
                     )));
                 }
+            }
+            if live_seen != count {
+                return Err(TreeError::InvariantViolation(format!(
+                    "leaf {node_id} live_mask count {live_seen} != live_count {count}"
+                )));
             }
         } else {
             visited_internal.insert(node_id);
@@ -313,10 +302,10 @@ pub fn verify_invariants(
     }
     for (doc_id, loc) in doc_locs {
         match seen_docs.get(&doc_id) {
-            Some(&actual_loc) if actual_loc == loc => {}
-            Some(&actual_loc) => {
+            Some(&actual_pos) if actual_pos == (loc.leaf_id, loc.local_id) => {}
+            Some(&actual_pos) => {
                 return Err(TreeError::InvariantViolation(format!(
-                    "cf_doc_loc[{doc_id}] = {loc:?}, but doc resides at {actual_loc:?}"
+                    "cf_doc_loc[{doc_id}] = {loc:?}, but doc resides at {actual_pos:?}"
                 )));
             }
             None => {
@@ -414,7 +403,8 @@ pub fn verify_collection_invariants(
     }
 
     let mut expected_clusters: HashMap<Vec<u8>, RoaringBitmap> = HashMap::new();
-    let mut expected_postings: HashMap<Vec<u8>, RoaringBitmap> = HashMap::new();
+    let mut expected_postings: HashMap<Vec<u8>, LeafPosting> = HashMap::new();
+    let mut expected_zones: HashMap<Vec<u8>, AttrZoneMap> = HashMap::new();
 
     for (&doc_id, raw_bytes) in &docs_bytes {
         let loc = doc_locs.get(&doc_id).ok_or_else(|| {
@@ -435,12 +425,37 @@ pub fn verify_collection_invariants(
         }
     }
 
-    let disk_postings: HashMap<Vec<u8>, RoaringBitmap> =
+    for (pkey, posting) in &expected_postings {
+        if posting.is_empty() {
+            continue;
+        }
+        let (attr_id, type_tag, leaf_id, val_bytes) = split_posting_key(pkey)?;
+        if type_tag == crate::codec::TAG_PRESENT || type_tag == crate::codec::TAG_BOOL {
+            continue;
+        }
+        let zkey = crate::codec::encode_attr_prefix(attr_id, type_tag);
+        let zmap = expected_zones.entry(zkey.to_vec()).or_default();
+        match zmap.get_mut(&leaf_id) {
+            Some((min_b, max_b)) => {
+                if val_bytes < min_b.as_slice() {
+                    *min_b = val_bytes.to_vec();
+                }
+                if val_bytes > max_b.as_slice() {
+                    *max_b = val_bytes.to_vec();
+                }
+            }
+            None => {
+                zmap.insert(leaf_id, (val_bytes.to_vec(), val_bytes.to_vec()));
+            }
+        }
+    }
+
+    let disk_postings: HashMap<Vec<u8>, LeafPosting> =
         storage.all_attr_postings()?.into_iter().collect();
-    for (k, bm) in &disk_postings {
-        if bm.is_empty() {
+    for (k, lp) in &disk_postings {
+        if lp.is_empty() {
             return Err(TreeError::InvariantViolation(format!(
-                "empty bitmap persisted in cf_attr_postings for key {k:?}"
+                "empty posting persisted in cf_attr_postings for key {k:?}"
             )));
         }
     }
@@ -449,6 +464,15 @@ pub fn verify_collection_invariants(
             "cf_attr_postings mismatch: disk has {} entries, expected {}",
             disk_postings.len(),
             expected_postings.len()
+        )));
+    }
+
+    let disk_zones: HashMap<Vec<u8>, AttrZoneMap> = storage.all_attr_zones()?.into_iter().collect();
+    if disk_zones != expected_zones {
+        return Err(TreeError::InvariantViolation(format!(
+            "cf_attr_zones mismatch: disk has {} entries, expected {}",
+            disk_zones.len(),
+            expected_zones.len()
         )));
     }
 
@@ -470,7 +494,7 @@ pub fn verify_collection_invariants(
     }
 
     let (num_fts_docs, num_fts_terms, num_fts_postings, num_fts_positions) =
-        verify_fts_invariants(storage, mem_schema, &docs_bytes)?;
+        verify_fts_invariants(storage, mem_schema, &doc_locs, &docs_bytes)?;
 
     Ok(CollectionStats {
         tree,
@@ -487,11 +511,18 @@ pub fn verify_collection_invariants(
 fn verify_fts_invariants(
     storage: &Storage,
     schema: &CollectionSchema,
+    doc_locs: &HashMap<DocId, DocLoc>,
     docs_bytes: &HashMap<DocId, Vec<u8>>,
 ) -> Result<(usize, usize, usize, usize)> {
-    let disk_doc_map = storage.all_fts_doc_map()?;
-    let disk_rev_map = storage.all_fts_rev_doc_map()?;
+    let mut disk_doc_map: Vec<(DocId, u32)> = Vec::new();
+    for (&doc_id, loc) in doc_locs {
+        if let Some(fid) = loc.fts_doc_id {
+            disk_doc_map.push((doc_id, fid));
+        }
+    }
+    let disk_rev_blocks = storage.all_fts_rev_blocks()?;
     let disk_terms = storage.all_fts_terms()?;
+    let disk_skips = storage.all_fts_skips()?;
     let disk_postings = storage.all_fts_postings()?;
     let disk_positions = storage.all_fts_positions()?;
     let disk_doc_lens = storage.all_fts_doc_lens()?;
@@ -499,8 +530,9 @@ fn verify_fts_invariants(
 
     if !schema.has_fts() {
         if !disk_doc_map.is_empty()
-            || !disk_rev_map.is_empty()
+            || !disk_rev_blocks.is_empty()
             || !disk_terms.is_empty()
+            || !disk_skips.is_empty()
             || !disk_postings.is_empty()
             || !disk_positions.is_empty()
             || !disk_doc_lens.is_empty()
@@ -515,8 +547,9 @@ fn verify_fts_invariants(
 
     if docs_bytes.is_empty()
         && disk_doc_map.is_empty()
-        && disk_rev_map.is_empty()
+        && disk_rev_blocks.is_empty()
         && disk_terms.is_empty()
+        && disk_skips.is_empty()
         && disk_postings.is_empty()
         && disk_positions.is_empty()
         && disk_doc_lens.is_empty()
@@ -547,17 +580,35 @@ fn verify_fts_invariants(
         }
     };
 
-    if disk_doc_map.len() != docs_bytes.len() || disk_rev_map.len() != docs_bytes.len() {
+    let mut rev_to_entry: HashMap<u32, (DocId, NodeId, LocalId)> = HashMap::new();
+    for (bid, blk) in &disk_rev_blocks {
+        if blk.is_empty() {
+            return Err(TreeError::InvariantViolation(format!(
+                "empty FtsRevBlock {bid} persisted"
+            )));
+        }
+        for slot in 0..=u8::MAX {
+            if let Some(entry) = blk.get(slot) {
+                let fts_id = crate::config::make_fts_doc_id(*bid, slot);
+                if rev_to_entry.insert(fts_id, entry).is_some() {
+                    return Err(TreeError::InvariantViolation(format!(
+                        "duplicate fts_doc_id {fts_id} in cf_fts_rev_doc_map"
+                    )));
+                }
+            }
+        }
+    }
+
+    if disk_doc_map.len() != docs_bytes.len() || rev_to_entry.len() != docs_bytes.len() {
         return Err(TreeError::InvariantViolation(format!(
             "FTS doc map counts ({}, {}) != cf_docs count ({})",
             disk_doc_map.len(),
-            disk_rev_map.len(),
+            rev_to_entry.len(),
             docs_bytes.len()
         )));
     }
 
     let doc_to_fts: HashMap<DocId, u32> = disk_doc_map.into_iter().collect();
-    let rev_to_doc: HashMap<u32, DocId> = disk_rev_map.into_iter().collect();
 
     for free_id in free_ids.iter() {
         if free_id >= fts_meta.next_fts_doc_id {
@@ -566,7 +617,7 @@ fn verify_fts_invariants(
                 fts_meta.next_fts_doc_id
             )));
         }
-        if rev_to_doc.contains_key(&free_id) {
+        if rev_to_entry.contains_key(&free_id) {
             return Err(TreeError::InvariantViolation(format!(
                 "fts_free_ids contains live fts_doc_id {free_id}"
             )));
@@ -582,7 +633,7 @@ fn verify_fts_invariants(
     for (&doc_id, &fts_id) in &doc_to_fts {
         if !docs_bytes.contains_key(&doc_id) {
             return Err(TreeError::InvariantViolation(format!(
-                "orphaned cf_fts_doc_map entry for doc {doc_id}"
+                "orphaned cf_doc_loc fts_doc_id for doc {doc_id}"
             )));
         }
         if fts_id >= fts_meta.next_fts_doc_id {
@@ -596,7 +647,8 @@ fn verify_fts_invariants(
                 "live fts_doc_id {fts_id} also present in fts_free_ids"
             )));
         }
-        if rev_to_doc.get(&fts_id) != Some(&doc_id) {
+        let loc = doc_locs[&doc_id];
+        if rev_to_entry.get(&fts_id) != Some(&(doc_id, loc.leaf_id, loc.local_id)) {
             return Err(TreeError::InvariantViolation(format!(
                 "FTS doc map bijection broken for doc {doc_id} <-> fts_doc_id {fts_id}"
             )));
@@ -605,17 +657,18 @@ fn verify_fts_invariants(
 
     let mut expected_attr_stats: BTreeMap<AttrId, AttrFtsStats> = BTreeMap::new();
     let mut expected_terms: HashMap<Vec<u8>, (u64, u32, f32)> = HashMap::new();
-    let mut expected_term_blocks: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut expected_term_postings: HashMap<Vec<u8>, BTreeMap<u32, PackedPostingBlock>> =
+        HashMap::new();
+    let mut expected_term_positions: HashMap<Vec<u8>, BTreeMap<u32, PackedPositionBlock>> =
+        HashMap::new();
     let mut expected_doc_lens: HashMap<[u8; 6], DocLenBlock> = HashMap::new();
-    let mut expected_postings: HashMap<Vec<u8>, PackedPostingBlock> = HashMap::new();
-    let mut expected_positions: HashMap<Vec<u8>, PackedPositionBlock> = HashMap::new();
 
     let mut buf = ReusableBuffer::new();
     let fts_entries: Vec<_> = schema.fts_entries().collect();
 
     for (&doc_id, raw_bytes) in docs_bytes {
         let fts_id = *doc_to_fts.get(&doc_id).ok_or_else(|| {
-            TreeError::InvariantViolation(format!("missing doc {doc_id} in cf_fts_doc_map"))
+            TreeError::InvariantViolation(format!("missing doc {doc_id} fts_doc_id in cf_doc_loc"))
         })?;
         let block_id = fts_block_id(fts_id);
         let slot = fts_slot(fts_id);
@@ -649,19 +702,17 @@ fn verify_fts_invariants(
                     te.1 = te.1.max(term.tf);
                     te.2 = te.2.min(dl_over_tf_lower_bound(analyzed.doc_len, term.tf));
 
-                    let pkey = encode_fts_posting_key(schema_entry.id, &tok, block_id);
-                    use std::collections::hash_map::Entry;
-                    let blk = match expected_postings.entry(pkey.clone()) {
-                        Entry::Occupied(o) => o.into_mut(),
-                        Entry::Vacant(v) => {
-                            *expected_term_blocks.entry(tkey).or_insert(0) += 1;
-                            v.insert(PackedPostingBlock::default())
-                        }
-                    };
-                    blk.upsert(slot, term.tf, dl_blk_ref);
+                    expected_term_postings
+                        .entry(tkey.clone())
+                        .or_default()
+                        .entry(block_id)
+                        .or_default()
+                        .upsert(slot, term.tf, dl_blk_ref);
                     if fts_cfg.index_positions {
-                        expected_positions
-                            .entry(pkey)
+                        expected_term_positions
+                            .entry(tkey)
+                            .or_default()
+                            .entry(block_id)
                             .or_default()
                             .upsert(slot, term.positions);
                     }
@@ -716,13 +767,39 @@ fn verify_fts_invariants(
             expected_terms.len()
         )));
     }
-    for (k, (exp_df, exp_max_tf, exp_min_dl_over_tf)) in &expected_terms {
-        let Some(raw) = disk_terms_map.get(k) else {
+
+    let disk_skips_map: HashMap<[u8; 8], Vec<u8>> = disk_skips
+        .into_iter()
+        .map(|(k, v)| (k.try_into().expect("8B skip key"), v))
+        .collect();
+    let disk_postings_map: HashMap<[u8; 8], Vec<u8>> = disk_postings
+        .into_iter()
+        .map(|(k, v)| (k.try_into().expect("8B posting key"), v))
+        .collect();
+    let disk_positions_map: HashMap<[u8; 8], Vec<u8>> = disk_positions
+        .into_iter()
+        .map(|(k, v)| (k.try_into().expect("8B position key"), v))
+        .collect();
+
+    let mut expected_posting_count = 0usize;
+    let mut expected_skip_count = 0usize;
+    let mut expected_position_count = 0usize;
+    let mut seen_term_ids: HashSet<TermId> = HashSet::with_capacity(expected_terms.len());
+
+    for (tkey, (exp_df, exp_max_tf, exp_min_dl_over_tf)) in &expected_terms {
+        let Some(raw) = disk_terms_map.get(tkey) else {
             return Err(TreeError::InvariantViolation(
                 "missing expected key in cf_fts_terms".into(),
             ));
         };
-        let ts = TermStats::decode(raw)?;
+        let rec = TermRecord::decode(raw)?;
+        if rec.term_id >= fts_meta.next_term_id || !seen_term_ids.insert(rec.term_id) {
+            return Err(TreeError::InvariantViolation(format!(
+                "invalid or duplicate term_id {} in cf_fts_terms",
+                rec.term_id
+            )));
+        }
+        let ts = rec.stats;
         if ts.doc_freq != *exp_df
             || ts.max_tf < *exp_max_tf
             || ts.min_dl_over_tf > *exp_min_dl_over_tf
@@ -731,7 +808,9 @@ fn verify_fts_invariants(
                 "cf_fts_terms stats mismatch: disk {ts:?} vs expected (df={exp_df}, max_tf>={exp_max_tf}, min_dl_over_tf<={exp_min_dl_over_tf})"
             )));
         }
-        let block_count = expected_term_blocks.get(k).copied().unwrap_or(0);
+
+        let exp_blocks = &expected_term_postings[tkey];
+        let block_count = exp_blocks.len();
         if block_count <= INLINE_TERM_STATS_RECOMPUTE_MAX_BLOCKS
             && (ts.max_tf != *exp_max_tf || ts.min_dl_over_tf != *exp_min_dl_over_tf)
         {
@@ -739,50 +818,103 @@ fn verify_fts_invariants(
                 "cf_fts_terms stats not tight for {block_count}-block term: disk {ts:?} vs exact (max_tf={exp_max_tf}, min_dl_over_tf={exp_min_dl_over_tf})"
             )));
         }
-    }
 
-    let disk_postings_map: HashMap<Vec<u8>, Vec<u8>> = disk_postings.into_iter().collect();
-    if disk_postings_map.len() != expected_postings.len() {
-        return Err(TreeError::InvariantViolation(format!(
-            "cf_fts_postings count {} != expected {}",
-            disk_postings_map.len(),
-            expected_postings.len()
-        )));
-    }
-    for (k, exp_blk) in &expected_postings {
-        let Some(raw) = disk_postings_map.get(k) else {
-            return Err(TreeError::InvariantViolation(
-                "missing expected key in cf_fts_postings".into(),
-            ));
-        };
-        let disk_blk = PackedPostingBlock::decode(raw)?;
-        if &disk_blk != exp_blk {
-            return Err(TreeError::InvariantViolation(
-                "cf_fts_postings block mismatch against reconstructed documents".into(),
-            ));
+        if let Some((ib_id, ref ib_bytes)) = rec.inline_block {
+            if exp_blocks.len() != 1 || *exp_df > INLINE_TERM_MAX_DF as u64 {
+                return Err(TreeError::InvariantViolation(format!(
+                    "term_id {} unexpectedly inlined with {} blocks, df={}",
+                    rec.term_id,
+                    exp_blocks.len(),
+                    exp_df
+                )));
+            }
+            let Some(exp_blk) = exp_blocks.get(&ib_id) else {
+                return Err(TreeError::InvariantViolation(format!(
+                    "inline TermRecord block_id {ib_id} missing from expected blocks"
+                )));
+            };
+            let disk_blk = PackedPostingBlock::decode(ib_bytes)?;
+            if &disk_blk != exp_blk {
+                return Err(TreeError::InvariantViolation(
+                    "inline TermRecord posting block mismatch against reconstructed documents"
+                        .into(),
+                ));
+            }
+        } else {
+            let mut expected_skips_for_term: BTreeMap<u32, SkipBlock> = BTreeMap::new();
+            for (&block_id, exp_blk) in exp_blocks {
+                expected_posting_count += 1;
+                let pkey = encode_fts_term_id_key(rec.term_id, block_id);
+                let Some(raw_p) = disk_postings_map.get(&pkey) else {
+                    return Err(TreeError::InvariantViolation(
+                        "missing expected key in cf_fts_postings".into(),
+                    ));
+                };
+                let disk_blk = PackedPostingBlock::decode(raw_p)?;
+                if &disk_blk != exp_blk {
+                    return Err(TreeError::InvariantViolation(
+                        "cf_fts_postings block mismatch against reconstructed documents".into(),
+                    ));
+                }
+                let hdr = PostingBlockHeader::parse(raw_p)?;
+                expected_skips_for_term
+                    .entry(fts_skip_chunk_id(block_id))
+                    .or_default()
+                    .upsert(fts_skip_slot(block_id), hdr.max_tf, hdr.min_dl_over_tf);
+            }
+            for (chunk_id, exp_skip) in expected_skips_for_term {
+                expected_skip_count += 1;
+                let skey = encode_fts_term_id_key(rec.term_id, chunk_id);
+                let Some(raw_s) = disk_skips_map.get(&skey) else {
+                    return Err(TreeError::InvariantViolation(
+                        "missing expected key in cf_fts_skips".into(),
+                    ));
+                };
+                let disk_skip = SkipBlock::decode(raw_s)?;
+                if disk_skip != exp_skip {
+                    return Err(TreeError::InvariantViolation(
+                        "cf_fts_skips block mismatch against posting headers".into(),
+                    ));
+                }
+            }
+        }
+
+        if let Some(exp_pos_blocks) = expected_term_positions.get(tkey) {
+            for (&block_id, exp_pblk) in exp_pos_blocks {
+                expected_position_count += 1;
+                let pkey = encode_fts_term_id_key(rec.term_id, block_id);
+                let Some(raw_pos) = disk_positions_map.get(&pkey) else {
+                    return Err(TreeError::InvariantViolation(
+                        "missing expected key in cf_fts_positions".into(),
+                    ));
+                };
+                let disk_pblk = PackedPositionBlock::decode(raw_pos)?;
+                if &disk_pblk != exp_pblk {
+                    return Err(TreeError::InvariantViolation(
+                        "cf_fts_positions block mismatch against reconstructed documents".into(),
+                    ));
+                }
+            }
         }
     }
 
-    let disk_positions_map: HashMap<Vec<u8>, Vec<u8>> = disk_positions.into_iter().collect();
-    if disk_positions_map.len() != expected_positions.len() {
+    if disk_postings_map.len() != expected_posting_count {
         return Err(TreeError::InvariantViolation(format!(
-            "cf_fts_positions count {} != expected {}",
-            disk_positions_map.len(),
-            expected_positions.len()
+            "cf_fts_postings count {} != expected {expected_posting_count}",
+            disk_postings_map.len()
         )));
     }
-    for (k, exp_pblk) in &expected_positions {
-        let Some(raw) = disk_positions_map.get(k) else {
-            return Err(TreeError::InvariantViolation(
-                "missing expected key in cf_fts_positions".into(),
-            ));
-        };
-        let disk_pblk = PackedPositionBlock::decode(raw)?;
-        if &disk_pblk != exp_pblk {
-            return Err(TreeError::InvariantViolation(
-                "cf_fts_positions block mismatch against reconstructed documents".into(),
-            ));
-        }
+    if disk_skips_map.len() != expected_skip_count {
+        return Err(TreeError::InvariantViolation(format!(
+            "cf_fts_skips count {} != expected {expected_skip_count}",
+            disk_skips_map.len()
+        )));
+    }
+    if disk_positions_map.len() != expected_position_count {
+        return Err(TreeError::InvariantViolation(format!(
+            "cf_fts_positions count {} != expected {expected_position_count}",
+            disk_positions_map.len()
+        )));
     }
 
     Ok((

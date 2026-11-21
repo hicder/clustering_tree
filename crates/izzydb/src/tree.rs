@@ -24,12 +24,11 @@ pub(crate) struct SplitPair {
     pub old_centroid: Vec<f32>,
 }
 
-/// Threshold on `PackedLeafNode::next_local_id` at which per-leaf `LocalId`s are compacted to `0..n`.
+/// Returns true when a leaf should compact its slots to `0..live_count`.
 #[inline]
-pub(crate) fn local_id_compaction_threshold(config: &TreeConfig) -> LocalId {
-    (config.max_leaf_size.saturating_mul(4))
-        .max(1024)
-        .min(LocalId::MAX as usize) as LocalId
+pub(crate) fn needs_leaf_compaction(leaf: &PackedLeafNode, config: &TreeConfig) -> bool {
+    leaf.slot_cap > config.max_leaf_size
+        || (leaf.slot_cap > 32 && leaf.live_count.saturating_mul(2) <= leaf.slot_cap)
 }
 
 /// Outcome of updating an existing document's vector inside `TxContext`.
@@ -284,19 +283,15 @@ fn compact_leaf_in_tx(
     scratch: &mut EncodeScratch,
     delta: &mut ClusterDelta,
 ) {
-    for (&did, &lid) in leaf.doc_ids.iter().zip(leaf.local_ids.iter()) {
+    let pairs = leaf.live_slot_doc_pairs();
+    let mut doc_ids = Vec::with_capacity(pairs.len());
+    for &(lid, did) in &pairs {
         delta.removed.push((did, leaf_id, lid));
+        doc_ids.push(did);
     }
-    let doc_ids = leaf.doc_ids.clone();
     leaf.reset_and_encode(&doc_ids, flat_vecs, quantizer, dim, scratch);
-    for (&did, &lid) in leaf.doc_ids.iter().zip(leaf.local_ids.iter()) {
-        tx.put_doc_loc(
-            did,
-            DocLoc {
-                leaf_id,
-                local_id: lid,
-            },
-        );
+    for (lid, did) in leaf.live_slot_doc_pairs() {
+        tx.put_doc_pos(did, leaf_id, lid);
         delta.added.push((did, leaf_id, lid));
     }
 }
@@ -322,13 +317,14 @@ pub(crate) fn update_vector_in_tx(
         let mut leaf = tx.get_leaf_node(old_loc.leaf_id)?;
         let old_centroid = leaf.centroid.clone();
         let count = leaf.entry_count();
-        let flat_vecs = tx.get_vectors_flat(&leaf.doc_ids)?;
+        let live_docs = leaf.live_doc_ids();
+        let flat_vecs = tx.get_vectors_flat(&live_docs)?;
         leaf.centroid = compute_mean_centroid_flat(&flat_vecs, count, config.dim, config.metric);
         let drifted = cluster_distance(config.metric, &old_centroid, &leaf.centroid)
             > config.centroid_drift_eps;
 
         let mut delta = ClusterDelta::default();
-        if leaf.next_local_id >= local_id_compaction_threshold(config) {
+        if needs_leaf_compaction(&leaf, config) {
             let mut scratch = EncodeScratch::default();
             compact_leaf_in_tx(
                 tx,
@@ -345,9 +341,20 @@ pub(crate) fn update_vector_in_tx(
             leaf.re_encode_existing(&flat_vecs, quantizer, config.dim, &mut scratch);
         } else {
             quantizer.rotate_into(&leaf.centroid, &mut leaf.rotated_centroid);
-            let q = quantizer.encode(new_vec, &leaf.centroid);
-            let local_id =
-                leaf.upsert_entry(id, q.res_norm_sq, q.scale, &q.code, quantizer.num_words());
+            let words = quantizer.num_words();
+            let mut scratch = EncodeScratch::default();
+            let mut code = vec![0u64; words];
+            let (res_norm_sq, scale, popcnt) =
+                quantizer.encode_into_with_popcnt(new_vec, &leaf.centroid, &mut scratch, &mut code);
+            let local_id = leaf.upsert_entry(
+                id,
+                Some(old_loc.local_id),
+                res_norm_sq,
+                scale,
+                &code,
+                popcnt,
+                words,
+            );
             debug_assert_eq!(local_id, old_loc.local_id);
         }
 
@@ -398,7 +405,7 @@ pub(crate) fn remove_existing_in_tx(
     let mut leaf = tx.get_leaf_node(loc.leaf_id)?;
     let old_centroid = leaf.centroid.clone();
 
-    leaf.remove_entry(id, quantizer.num_words());
+    leaf.remove_entry(id, Some(loc.local_id), quantizer.num_words());
     tx.delete_vector(id);
     tx.delete_doc_loc(id);
     tx.meta_mut().num_vectors = tx.meta().num_vectors.saturating_sub(1);
@@ -410,14 +417,15 @@ pub(crate) fn remove_existing_in_tx(
         leaf.centroid = vec![0.0; config.dim];
         leaf.rotated_centroid.fill(0.0);
     } else if !will_underflow {
-        let flat_vecs = tx.get_vectors_flat(&leaf.doc_ids)?;
+        let live_docs = leaf.live_doc_ids();
+        let flat_vecs = tx.get_vectors_flat(&live_docs)?;
         leaf.centroid = compute_mean_centroid_flat(
             &flat_vecs,
             new_count,
             config.dim,
             config.metric,
         );
-        if leaf.next_local_id >= local_id_compaction_threshold(config) {
+        if needs_leaf_compaction(&leaf, config) {
             let mut scratch = EncodeScratch::default();
             compact_leaf_in_tx(
                 tx,
@@ -483,11 +491,11 @@ pub(crate) fn remove_many_in_tx(
 
     let locs = tx.multi_get_doc_locs(&unique_ids)?;
     let mut removed_docs: Vec<(DocId, DocLoc)> = Vec::with_capacity(unique_ids.len());
-    let mut by_leaf: BTreeMap<NodeId, Vec<DocId>> = BTreeMap::new();
+    let mut by_leaf: BTreeMap<NodeId, Vec<(DocId, LocalId)>> = BTreeMap::new();
     for (doc_id, opt_loc) in unique_ids.into_iter().zip(locs) {
         if let Some(loc) = opt_loc {
             removed_docs.push((doc_id, loc));
-            by_leaf.entry(loc.leaf_id).or_default().push(doc_id);
+            by_leaf.entry(loc.leaf_id).or_default().push((doc_id, loc.local_id));
         }
     }
     if removed_docs.is_empty() {
@@ -495,17 +503,16 @@ pub(crate) fn remove_many_in_tx(
     }
 
     let words = quantizer.num_words();
-    let threshold = local_id_compaction_threshold(config);
     let mut underflow_leaves: Vec<NodeId> = Vec::new();
     let mut compaction_candidates: Vec<NodeId> = Vec::new();
     let mut scratch = EncodeScratch::default();
 
-    for (leaf_id, doc_ids) in by_leaf {
+    for (leaf_id, doc_entries) in by_leaf {
         let mut leaf = tx.get_leaf_node(leaf_id)?;
         let old_centroid = leaf.centroid.clone();
 
-        for doc_id in doc_ids {
-            leaf.remove_entry(doc_id, words);
+        for (doc_id, local_id) in doc_entries {
+            leaf.remove_entry(doc_id, Some(local_id), words);
             tx.delete_vector(doc_id);
             tx.delete_doc_loc(doc_id);
             tx.meta_mut().num_vectors = tx.meta().num_vectors.saturating_sub(1);
@@ -517,7 +524,8 @@ pub(crate) fn remove_many_in_tx(
             leaf.centroid = vec![0.0; config.dim];
             leaf.rotated_centroid.fill(0.0);
         } else if !will_underflow {
-            let flat_vecs = tx.get_vectors_flat(&leaf.doc_ids)?;
+            let live_docs = leaf.live_doc_ids();
+            let flat_vecs = tx.get_vectors_flat(&live_docs)?;
             leaf.centroid = compute_mean_centroid_flat(
                 &flat_vecs,
                 new_count,
@@ -532,7 +540,7 @@ pub(crate) fn remove_many_in_tx(
             } else {
                 quantizer.rotate_into(&leaf.centroid, &mut leaf.rotated_centroid);
             }
-            if leaf.next_local_id >= threshold {
+            if needs_leaf_compaction(&leaf, config) {
                 compaction_candidates.push(leaf_id);
             }
         }
@@ -575,8 +583,9 @@ pub(crate) fn remove_many_in_tx(
         let Some(mut leaf) = tx.try_get_leaf_node(leaf_id)? else {
             continue;
         };
-        if leaf.entry_count() > 0 && leaf.next_local_id >= threshold {
-            let flat_vecs = tx.get_vectors_flat(&leaf.doc_ids)?;
+        if leaf.entry_count() > 0 && needs_leaf_compaction(&leaf, config) {
+            let live_docs = leaf.live_doc_ids();
+            let flat_vecs = tx.get_vectors_flat(&live_docs)?;
             compact_leaf_in_tx(
                 tx,
                 leaf_id,
@@ -619,47 +628,44 @@ pub(crate) fn insert_in_tx(
     let words = quantizer.num_words();
     if new_count <= config.max_leaf_size {
         let mut delta = ClusterDelta::default();
-        let needs_compact =
-            leaf.next_local_id >= local_id_compaction_threshold(config).saturating_sub(1);
+        let needs_compact = leaf.slot_cap > config.max_leaf_size;
         let local_id = if new_count == 1 {
             leaf.centroid = vec.to_vec();
             quantizer.rotate_into(&leaf.centroid, &mut leaf.rotated_centroid);
-            let q = quantizer.encode(vec, &leaf.centroid);
-            leaf.upsert_entry(id, q.res_norm_sq, q.scale, &q.code, words)
+            let mut scratch = EncodeScratch::default();
+            let mut code = vec![0u64; words];
+            let (res_norm_sq, scale, popcnt) =
+                quantizer.encode_into_with_popcnt(vec, &leaf.centroid, &mut scratch, &mut code);
+            leaf.upsert_entry(id, None, res_norm_sq, scale, &code, popcnt, words)
         } else if needs_compact {
-            for (&did, &lid) in leaf.doc_ids.iter().zip(leaf.local_ids.iter()) {
+            for (lid, did) in leaf.live_slot_doc_pairs() {
                 delta.removed.push((did, target_leaf, lid));
             }
             leaf.insert_slot_for_reencode(id, words);
-            let flat_vecs = tx.get_vectors_flat(&leaf.doc_ids)?;
+            let doc_ids = leaf.live_doc_ids();
+            let flat_vecs = tx.get_vectors_flat(&doc_ids)?;
             leaf.centroid = compute_mean_centroid_flat(
                 &flat_vecs,
                 new_count,
                 config.dim,
                 config.metric,
             );
-            let doc_ids = leaf.doc_ids.clone();
             let mut scratch = EncodeScratch::default();
             leaf.reset_and_encode(&doc_ids, &flat_vecs, quantizer, config.dim, &mut scratch);
             let mut new_id_local = 0;
-            for (&did, &lid) in leaf.doc_ids.iter().zip(leaf.local_ids.iter()) {
+            for (lid, did) in leaf.live_slot_doc_pairs() {
                 if did == id {
                     new_id_local = lid;
                 } else {
-                    tx.put_doc_loc(
-                        did,
-                        DocLoc {
-                            leaf_id: target_leaf,
-                            local_id: lid,
-                        },
-                    );
+                    tx.put_doc_pos(did, target_leaf, lid);
                     delta.added.push((did, target_leaf, lid));
                 }
             }
             new_id_local
         } else if new_count.is_multiple_of(16) {
             let lid = leaf.insert_slot_for_reencode(id, words);
-            let flat_vecs = tx.get_vectors_flat(&leaf.doc_ids)?;
+            let live_docs = leaf.live_doc_ids();
+            let flat_vecs = tx.get_vectors_flat(&live_docs)?;
             leaf.centroid = compute_mean_centroid_flat(
                 &flat_vecs,
                 new_count,
@@ -675,22 +681,27 @@ pub(crate) fn insert_in_tx(
                 > config.centroid_drift_eps;
             if new_count <= 16 || drifted {
                 let lid = leaf.insert_slot_for_reencode(id, words);
-                let flat_vecs = tx.get_vectors_flat(&leaf.doc_ids)?;
+                let live_docs = leaf.live_doc_ids();
+                let flat_vecs = tx.get_vectors_flat(&live_docs)?;
                 let mut scratch = EncodeScratch::default();
                 leaf.re_encode_existing(&flat_vecs, quantizer, config.dim, &mut scratch);
                 lid
             } else {
                 quantizer.rotate_into(&leaf.centroid, &mut leaf.rotated_centroid);
-                let q = quantizer.encode(vec, &leaf.centroid);
-                leaf.upsert_entry(id, q.res_norm_sq, q.scale, &q.code, words)
+                let mut scratch = EncodeScratch::default();
+                let mut code = vec![0u64; words];
+                let (res_norm_sq, scale, popcnt) =
+                    quantizer.encode_into_with_popcnt(vec, &leaf.centroid, &mut scratch, &mut code);
+                leaf.upsert_entry(id, None, res_norm_sq, scale, &code, popcnt, words)
             }
         };
 
         let doc_loc = DocLoc {
             leaf_id: target_leaf,
             local_id,
+            fts_doc_id: None,
         };
-        tx.put_doc_loc(id, doc_loc);
+        tx.put_doc_pos(id, target_leaf, local_id);
 
         let parent_id = leaf.parent_id;
         let new_centroid = leaf.centroid.clone();
@@ -718,7 +729,11 @@ pub(crate) fn insert_in_tx(
         let mut doc_loc = None;
         delta.added.retain(|&(doc_id, leaf_id, local_id)| {
             if doc_id == id {
-                doc_loc = Some(DocLoc { leaf_id, local_id });
+                doc_loc = Some(DocLoc {
+                    leaf_id,
+                    local_id,
+                    fts_doc_id: None,
+                });
                 false
             } else {
                 true
@@ -791,11 +806,14 @@ pub(crate) fn split_node(
 
     if !is_internal {
         let leaf = tx.get_leaf_node(node_id)?;
-        for (&did, &lid) in leaf.doc_ids.iter().zip(leaf.local_ids.iter()) {
+        let live_pairs = leaf.live_slot_doc_pairs();
+        let mut live_doc_ids = Vec::with_capacity(live_pairs.len());
+        for &(lid, did) in &live_pairs {
             delta.removed.push((did, node_id, lid));
+            live_doc_ids.push(did);
         }
 
-        let flat_vecs = tx.get_vectors_flat(&leaf.doc_ids)?;
+        let flat_vecs = tx.get_vectors_flat(&live_doc_ids)?;
         let parent_id = leaf.parent_id;
         let old_centroid = leaf.centroid;
         let dim = config.dim;
@@ -818,14 +836,14 @@ pub(crate) fn split_node(
         let mut left_doc_ids = Vec::with_capacity(split.part1.len());
         let mut left_vecs = Vec::with_capacity(split.part1.len() * dim);
         for &idx in &split.part1 {
-            left_doc_ids.push(leaf.doc_ids[idx]);
+            left_doc_ids.push(live_doc_ids[idx]);
             left_vecs.extend_from_slice(&flat_vecs[idx * dim..(idx + 1) * dim]);
         }
 
         let mut right_doc_ids = Vec::with_capacity(split.part2.len());
         let mut right_vecs = Vec::with_capacity(split.part2.len() * dim);
         for &idx in &split.part2 {
-            right_doc_ids.push(leaf.doc_ids[idx]);
+            right_doc_ids.push(live_doc_ids[idx]);
             right_vecs.extend_from_slice(&flat_vecs[idx * dim..(idx + 1) * dim]);
         }
 
@@ -833,16 +851,16 @@ pub(crate) fn split_node(
         let mut left_leaf = PackedLeafNode::empty(parent_id, dim, padded_dim);
         left_leaf.centroid = split.centroid1;
         left_leaf.reset_and_encode(&left_doc_ids, &left_vecs, quantizer, dim, &mut scratch);
-        for (&did, &lid) in left_leaf.doc_ids.iter().zip(left_leaf.local_ids.iter()) {
-            tx.put_doc_loc(did, DocLoc { leaf_id: node_id, local_id: lid });
+        for (lid, did) in left_leaf.live_slot_doc_pairs() {
+            tx.put_doc_pos(did, node_id, lid);
             delta.added.push((did, node_id, lid));
         }
 
         let mut right_leaf = PackedLeafNode::empty(parent_id, dim, padded_dim);
         right_leaf.centroid = split.centroid2;
         right_leaf.reset_and_encode(&right_doc_ids, &right_vecs, quantizer, dim, &mut scratch);
-        for (&did, &lid) in right_leaf.doc_ids.iter().zip(right_leaf.local_ids.iter()) {
-            tx.put_doc_loc(did, DocLoc { leaf_id: right_id, local_id: lid });
+        for (lid, did) in right_leaf.live_slot_doc_pairs() {
+            tx.put_doc_pos(did, right_id, lid);
             delta.added.push((did, right_id, lid));
         }
 
@@ -1180,42 +1198,36 @@ pub(crate) fn handle_underflow(
         let mut left_leaf = tx.get_leaf_node(node_id)?;
         let mut sib_leaf = tx.get_leaf_node(sib_id)?;
 
-        for (&did, &lid) in left_leaf.doc_ids.iter().zip(left_leaf.local_ids.iter()) {
+        let left_pairs = left_leaf.live_slot_doc_pairs();
+        let sib_pairs = sib_leaf.live_slot_doc_pairs();
+        for &(lid, did) in &left_pairs {
             delta.removed.push((did, node_id, lid));
         }
-        for (&did, &lid) in sib_leaf.doc_ids.iter().zip(sib_leaf.local_ids.iter()) {
+        for &(lid, did) in &sib_pairs {
             delta.removed.push((did, sib_id, lid));
         }
 
-        let left_vecs = tx.get_vectors_flat(&left_leaf.doc_ids)?;
-        let sib_vecs = tx.get_vectors_flat(&sib_leaf.doc_ids)?;
-        let total = left_leaf.entry_count() + sib_leaf.entry_count();
+        let left_ids: Vec<DocId> = left_pairs.iter().map(|&(_, d)| d).collect();
+        let sib_ids: Vec<DocId> = sib_pairs.iter().map(|&(_, d)| d).collect();
+        let left_vecs = tx.get_vectors_flat(&left_ids)?;
+        let sib_vecs = tx.get_vectors_flat(&sib_ids)?;
+        let total = left_ids.len() + sib_ids.len();
+
+        let mut combined: Vec<(DocId, &[f32])> = Vec::with_capacity(total);
+        for (i, &did) in left_ids.iter().enumerate() {
+            combined.push((did, &left_vecs[i * dim..(i + 1) * dim]));
+        }
+        for (i, &did) in sib_ids.iter().enumerate() {
+            combined.push((did, &sib_vecs[i * dim..(i + 1) * dim]));
+        }
+        combined.sort_unstable_by_key(|&(did, _)| did);
 
         if total <= max_size {
             let mut merged_doc_ids = Vec::with_capacity(total);
             let mut merged_vecs = Vec::with_capacity(total * dim);
-            let mut i = 0;
-            let mut j = 0;
-            while i < left_leaf.doc_ids.len() && j < sib_leaf.doc_ids.len() {
-                if left_leaf.doc_ids[i] < sib_leaf.doc_ids[j] {
-                    merged_doc_ids.push(left_leaf.doc_ids[i]);
-                    merged_vecs.extend_from_slice(&left_vecs[i * dim..(i + 1) * dim]);
-                    i += 1;
-                } else {
-                    merged_doc_ids.push(sib_leaf.doc_ids[j]);
-                    merged_vecs.extend_from_slice(&sib_vecs[j * dim..(j + 1) * dim]);
-                    j += 1;
-                }
-            }
-            while i < left_leaf.doc_ids.len() {
-                merged_doc_ids.push(left_leaf.doc_ids[i]);
-                merged_vecs.extend_from_slice(&left_vecs[i * dim..(i + 1) * dim]);
-                i += 1;
-            }
-            while j < sib_leaf.doc_ids.len() {
-                merged_doc_ids.push(sib_leaf.doc_ids[j]);
-                merged_vecs.extend_from_slice(&sib_vecs[j * dim..(j + 1) * dim]);
-                j += 1;
+            for (did, v) in combined {
+                merged_doc_ids.push(did);
+                merged_vecs.extend_from_slice(v);
             }
 
             sib_leaf.centroid = compute_mean_centroid_flat(
@@ -1226,8 +1238,8 @@ pub(crate) fn handle_underflow(
             );
             let mut scratch = EncodeScratch::default();
             sib_leaf.reset_and_encode(&merged_doc_ids, &merged_vecs, quantizer, dim, &mut scratch);
-            for (&did, &lid) in sib_leaf.doc_ids.iter().zip(sib_leaf.local_ids.iter()) {
-                tx.put_doc_loc(did, DocLoc { leaf_id: sib_id, local_id: lid });
+            for (lid, did) in sib_leaf.live_slot_doc_pairs() {
+                tx.put_doc_pos(did, sib_id, lid);
                 delta.added.push((did, sib_id, lid));
             }
 
@@ -1243,15 +1255,6 @@ pub(crate) fn handle_underflow(
 
             refresh_parent_after_removal(tx, parent_id, config, quantizer, delta)?;
         } else {
-            let mut combined: Vec<(DocId, &[f32])> = Vec::with_capacity(total);
-            for (i, &did) in left_leaf.doc_ids.iter().enumerate() {
-                combined.push((did, &left_vecs[i * dim..(i + 1) * dim]));
-            }
-            for (i, &did) in sib_leaf.doc_ids.iter().enumerate() {
-                combined.push((did, &sib_vecs[i * dim..(i + 1) * dim]));
-            }
-            combined.sort_unstable_by_key(|&(did, _)| did);
-
             let weighted: Vec<(&[f32], u64)> = combined.iter().map(|&(_, v)| (v, 1u64)).collect();
             let mut split = balanced_two_means(&weighted, min_size, max_size, dim, config.metric);
             split.part1.sort_unstable();
@@ -1276,15 +1279,15 @@ pub(crate) fn handle_underflow(
             let mut scratch = EncodeScratch::default();
             left_leaf.centroid = split.centroid1;
             left_leaf.reset_and_encode(&new_left_ids, &new_left_vecs, quantizer, dim, &mut scratch);
-            for (&did, &lid) in left_leaf.doc_ids.iter().zip(left_leaf.local_ids.iter()) {
-                tx.put_doc_loc(did, DocLoc { leaf_id: node_id, local_id: lid });
+            for (lid, did) in left_leaf.live_slot_doc_pairs() {
+                tx.put_doc_pos(did, node_id, lid);
                 delta.added.push((did, node_id, lid));
             }
 
             sib_leaf.centroid = split.centroid2;
             sib_leaf.reset_and_encode(&new_right_ids, &new_right_vecs, quantizer, dim, &mut scratch);
-            for (&did, &lid) in sib_leaf.doc_ids.iter().zip(sib_leaf.local_ids.iter()) {
-                tx.put_doc_loc(did, DocLoc { leaf_id: sib_id, local_id: lid });
+            for (lid, did) in sib_leaf.live_slot_doc_pairs() {
+                tx.put_doc_pos(did, sib_id, lid);
                 delta.added.push((did, sib_id, lid));
             }
 

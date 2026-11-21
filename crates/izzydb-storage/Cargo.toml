@@ -8,6 +8,7 @@ description = "RocksDB-backed packed node storage and atomic transaction context
 [dependencies]
 bytemuck.workspace = true
 izzydb-core.workspace = true
+izzydb-fts.workspace = true
 izzydb-rabitq.workspace = true
 rand.workspace = true
 roaring.workspace = true

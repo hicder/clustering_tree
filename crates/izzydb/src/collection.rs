@@ -6,7 +6,7 @@ use std::sync::Arc;
 use roaring::RoaringBitmap;
 
 use crate::attr_index::{AttributeIndex, ClusterCandidates};
-use crate::codec::{decode_attribute_entries, decode_attributes, encode_attributes};
+use crate::codec::{DocView, decode_attribute_entries, decode_attributes, encode_attributes};
 use crate::config::{DocId, FtsDocId, NodeId, TreeConfig};
 use crate::error::{Result, TreeError};
 use crate::filter::Filter;
@@ -732,11 +732,11 @@ impl Collection {
                     continue;
                 }
                 if let Some(view) = view_opt {
-                    for slot in 0..view.entry_count {
-                        if mask.contains(view.local_id(slot)) {
+                    mask.for_each_set_bit(view.slot_cap, |slot| {
+                        if view.is_live(slot) {
                             doc_ids.push(view.doc_id(slot));
                         }
-                    }
+                    });
                 }
             }
         }
@@ -931,11 +931,16 @@ impl Collection {
             )
         } else {
             let mut lazy = |doc_id: DocId| -> Result<bool> {
-                let Some(bytes) = self.storage.get_doc_bytes(doc_id)? else {
+                let Some(slice) = self.storage.get_doc_bytes_pinned(doc_id)? else {
                     return Ok(false);
                 };
-                let attrs = decode_attributes(&self.schema, &bytes)?;
-                Ok(self.fts_index.matches_filter(&self.schema, f, &attrs))
+                if !f.has_fts() {
+                    DocView::parse(&slice)?
+                        .matches_filter(&self.schema, f, &mut |_, _, _, _, _| false)
+                } else {
+                    let attrs = decode_attributes(&self.schema, &slice)?;
+                    Ok(self.fts_index.matches_filter(&self.schema, f, &attrs))
+                }
             };
             self.fts_index.query_bm25(
                 &self.storage,
@@ -1154,11 +1159,11 @@ impl Collection {
                                 continue;
                             }
                             if let Some(view) = view_opt {
-                                for slot in 0..view.entry_count {
-                                    if mask.contains(view.local_id(slot)) {
+                                mask.for_each_set_bit(view.slot_cap, |slot| {
+                                    if view.is_live(slot) {
                                         doc_ids.push(view.doc_id(slot));
                                     }
-                                }
+                                });
                             }
                         }
                         if doc_ids.is_empty() {

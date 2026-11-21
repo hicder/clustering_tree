@@ -229,18 +229,25 @@ pub fn search(
 
     let mut candidates: Vec<LeafCandidate> =
         Vec::with_capacity(leaf_ids.len() * config.max_leaf_size);
+    let mut live_mask_buf: Vec<u64> = Vec::new();
 
     for (leaf_id, opt_slice) in leaf_ids.iter().copied().zip(leaf_slices.iter()) {
         let slice = opt_slice.as_ref().ok_or_else(|| {
             TreeError::CorruptedData(format!("missing leaf blob for leaf {leaf_id}"))
         })?;
         let view = LeafNodeView::parse(slice, dim, padded_dim, rabitq_words)?;
-        if view.entry_count == 0 {
+        if view.live_count == 0 {
             continue;
         }
+        let allowed_slots = if view.has_tombstones() {
+            view.copy_live_mask_into(&mut live_mask_buf);
+            Some(live_mask_buf.as_slice())
+        } else {
+            None
+        };
         score_leaf_view(
             &view,
-            None,
+            allowed_slots,
             &q,
             &mut scratch,
             dot_q_meta,
@@ -328,11 +335,11 @@ pub fn search_filtered(
                 continue;
             }
             if let Some(view) = view_opt {
-                for slot in 0..view.entry_count {
-                    if mask.contains(view.local_id(slot)) {
+                mask.for_each_set_bit(view.slot_cap, |slot| {
+                    if view.is_live(slot) {
                         matching_doc_ids.push(view.doc_id(slot));
                     }
-                }
+                });
             }
         }
         if matching_doc_ids.is_empty() {
@@ -425,7 +432,6 @@ pub fn search_filtered(
     let mut batch_target = opts.beam_width;
     let mut candidates: Vec<LeafCandidate> = Vec::with_capacity(target.max(opts.beam_width * 16));
     let mut batch_leaves: Vec<NodeId> = Vec::new();
-    let mut slot_mask_words: Vec<u64> = Vec::new();
 
     while probed_leaves < max_expanded && !heap.is_empty() {
         let take_limit = batch_target.min(max_expanded - probed_leaves);
@@ -487,33 +493,23 @@ pub fn search_filtered(
             .collect();
         let masks = attr_index.eval_leaves_masks(storage, &prepared, &leaf_pairs)?;
 
-        for (view_opt, local_mask) in parsed_views.iter().zip(masks.iter()) {
-            if local_mask.is_empty() {
-                continue;
-            }
+        for (view_opt, mut mask) in parsed_views.iter().zip(masks) {
             let Some(view) = view_opt else {
                 continue;
             };
-            if view.entry_count == 0 {
+            if view.live_count == 0 {
                 continue;
             }
-            let word_count = view.entry_count.div_ceil(64);
-            slot_mask_words.clear();
-            slot_mask_words.resize(word_count, 0);
-            let mut any_match = false;
-            for slot in 0..view.entry_count {
-                if local_mask.contains(view.local_id(slot)) {
-                    slot_mask_words[slot / 64] |= 1u64 << (slot % 64);
-                    any_match = true;
-                }
+            if view.has_tombstones() {
+                mask.and_live_mask_bytes(view.live_mask_bytes);
             }
-            if !any_match {
+            if mask.is_empty() {
                 continue;
             }
 
             score_leaf_view(
                 view,
-                Some(&slot_mask_words),
+                Some(mask.as_slice()),
                 &q,
                 &mut scratch,
                 dot_q_meta,
@@ -586,10 +582,12 @@ fn score_leaf_view(
 
     simd::score_leaf_rabitq_masked(
         &simd::RabitqLeafScoreParams {
-            entry_count: view.entry_count,
+            slot_cap: view.slot_cap,
             rabitq_words,
+            popcount_u32: view.popcount_u32,
             doc_ids_bytes: view.doc_ids_bytes,
             codes_bytes: view.codes_bytes,
+            code_popcounts_bytes: view.code_popcounts_bytes,
             res_norm_sqs_bytes: view.res_norm_sqs_bytes,
             scales_bytes: view.scales_bytes,
             q0: &scratch.planes[0],

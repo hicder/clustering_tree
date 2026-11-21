@@ -4,7 +4,7 @@ This document describes how `ClusteringTree` executes approximate nearest neighb
 
 ## Entry Points
 
-Defined on `ClusteringTree` in [`src/tree.rs`](../src/tree.rs) and implemented in [`src/search.rs`](../src/search.rs):
+Defined on `ClusteringTree` in [`crates/izzydb/src/tree.rs`](../crates/izzydb/src/tree.rs) and implemented in [`crates/izzydb/src/search.rs`](../crates/izzydb/src/search.rs):
 
 - `search(query, k, beam_width)` — Stage 1 only. Scores candidates exclusively from quantized codes in `cf_leaf_entries` without reading `cf_vectors`.
 - `search_with_rerank(query, k, beam_width, rerank_candidates)` — Stage 1 RaBitQ shortlist + Stage 2 exact reranking against full vectors in `cf_vectors`.
@@ -30,7 +30,7 @@ Starting at `frontier = [(meta.root_id, 0.0)]` and `level = meta.root_level`:
 For each selected leaf in `frontier`:
 
 1. **Fetch leaf centroid:** Reads `NodeHeader` from `cf_node_header` so distances are estimated against the exact centroid used when quantizing that leaf's entries.
-2. **Prepare asymmetric 4-bit query state (`RabitqQuantizer::prepare_leaf_query` in [`src/rabitq.rs`](../src/rabitq.rs)):**
+2. **Prepare asymmetric 4-bit query state (`RabitqQuantizer::prepare_leaf_query` in [`crates/izzydb-rabitq/src/quantizer.rs`](../crates/izzydb-rabitq/src/quantizer.rs)):**
    - **`L2Squared` & `Cosine`:** Centers query residual $q_r = q - c$, computes $\|q_r\|_2^2$, and rotates $q_r$ via the 3-round sign-flip + normalized FWHT ($\tilde{q} = P^{-1} q_r$).
    - **`DotProduct`:** Reuses a single rotated query $\tilde{q} = P^{-1} q$ computed once per search (`prepare_dot_query`), and records $-\langle c, q \rangle$ for the leaf.
    - **4-bit scalar quantization:** Quantizes $\tilde{q}$ uniformly over $[\min \tilde{q}, \max \tilde{q}]$ into 4-bit integers $q_{u,i} \in \{0, \dots, 15\}$ split across 4 bit-planes (`planes[0..4]`) of `padded_dim / 64` `u64` words, along with `vl`, `delta`, and `sum_q`.

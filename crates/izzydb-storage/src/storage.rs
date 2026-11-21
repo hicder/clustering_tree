@@ -6,12 +6,17 @@ use rocksdb::{
     DBPinnableSlice, IteratorMode, Options, WriteBatch, DB, DEFAULT_COLUMN_FAMILY_NAME,
 };
 
-use crate::config::{DocId, NodeId, TreeConfig};
-use crate::error::{Result, TreeError};
+use izzydb_core::config::{DocId, NodeId, TreeConfig};
+use izzydb_core::error::{Result, TreeError};
 use crate::node::{
     PackedInternalNode, PackedLeafNode, TreeMeta, decode_f32_into, decode_f32_slice,
     encode_f32_slice,
 };
+
+#[inline]
+fn map_db_err(err: rocksdb::Error) -> TreeError {
+    TreeError::Storage(err.to_string())
+}
 
 pub const CF_META: &str = "cf_meta";
 pub const CF_INTERNAL_NODES: &str = "cf_internal_nodes";
@@ -49,7 +54,7 @@ impl Storage {
             ColumnFamilyDescriptor::new(CF_DOC_LOC, point_lookup_cf_opts(&block_cache, false)),
         ];
 
-        let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
+        let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors).map_err(map_db_err)?;
         let padded_dim = config.dim.next_power_of_two().max(64);
         let rabitq_words = padded_dim / 64;
         let storage = Self {
@@ -127,13 +132,13 @@ impl Storage {
     }
 
     pub fn write_batch(&self, batch: StorageBatch<'_>) -> Result<()> {
-        self.db.write(batch.batch)?;
+        self.db.write(batch.batch).map_err(map_db_err)?;
         Ok(())
     }
 
     pub fn get_meta(&self) -> Result<Option<TreeMeta>> {
         let cf = self.cf(CF_META)?;
-        match self.db.get_cf(cf, META_KEY)? {
+        match self.db.get_cf(cf, META_KEY).map_err(map_db_err)? {
             Some(bytes) => Ok(Some(TreeMeta::decode(&bytes)?)),
             None => Ok(None),
         }
@@ -141,7 +146,7 @@ impl Storage {
 
     pub fn get_doc_loc(&self, doc_id: DocId) -> Result<Option<NodeId>> {
         let cf = self.cf(CF_DOC_LOC)?;
-        match self.db.get_pinned_cf(cf, node_key(doc_id))? {
+        match self.db.get_pinned_cf(cf, node_key(doc_id)).map_err(map_db_err)? {
             Some(bytes) => Ok(Some(decode_u64_key(&bytes)?)),
             None => Ok(None),
         }
@@ -149,7 +154,7 @@ impl Storage {
 
     pub fn get_vector(&self, doc_id: DocId) -> Result<Option<Vec<f32>>> {
         let cf = self.cf(CF_VECTORS)?;
-        match self.db.get_pinned_cf(cf, node_key(doc_id))? {
+        match self.db.get_pinned_cf(cf, node_key(doc_id)).map_err(map_db_err)? {
             Some(slice) => Ok(Some(decode_f32_slice(&slice, self.dim)?)),
             None => Ok(None),
         }
@@ -157,7 +162,7 @@ impl Storage {
 
     pub fn get_internal_node(&self, node_id: NodeId) -> Result<Option<PackedInternalNode>> {
         let cf = self.cf(CF_INTERNAL_NODES)?;
-        match self.db.get_pinned_cf(cf, node_key(node_id))? {
+        match self.db.get_pinned_cf(cf, node_key(node_id)).map_err(map_db_err)? {
             Some(bytes) => Ok(Some(PackedInternalNode::decode(&bytes, self.dim)?)),
             None => Ok(None),
         }
@@ -165,7 +170,7 @@ impl Storage {
 
     pub fn get_leaf_node(&self, leaf_id: NodeId) -> Result<Option<PackedLeafNode>> {
         let cf = self.cf(CF_LEAF_ENTRIES)?;
-        match self.db.get_pinned_cf(cf, node_key(leaf_id))? {
+        match self.db.get_pinned_cf(cf, node_key(leaf_id)).map_err(map_db_err)? {
             Some(bytes) => Ok(Some(PackedLeafNode::decode(
                 &bytes,
                 self.dim,
@@ -206,7 +211,7 @@ impl Storage {
         let results = self.db.batched_multi_get_cf(cf, keys.iter(), sorted_input);
         let mut out = Vec::with_capacity(ids.len());
         for res in results {
-            out.push(res?);
+            out.push(res.map_err(map_db_err)?);
         }
         Ok(out)
     }
@@ -215,7 +220,7 @@ impl Storage {
         let cf = self.cf(CF_INTERNAL_NODES)?;
         let mut out = Vec::new();
         for item in self.db.iterator_cf(cf, IteratorMode::Start) {
-            let (k, v) = item?;
+            let (k, v) = item.map_err(map_db_err)?;
             out.push((
                 decode_u64_key(&k)?,
                 PackedInternalNode::decode(&v, self.dim)?,
@@ -228,7 +233,7 @@ impl Storage {
         let cf = self.cf(CF_LEAF_ENTRIES)?;
         let mut out = Vec::new();
         for item in self.db.iterator_cf(cf, IteratorMode::Start) {
-            let (k, v) = item?;
+            let (k, v) = item.map_err(map_db_err)?;
             out.push((
                 decode_u64_key(&k)?,
                 PackedLeafNode::decode(&v, self.dim, self.padded_dim, self.rabitq_words)?,
@@ -241,7 +246,7 @@ impl Storage {
         let cf = self.cf(CF_VECTORS)?;
         let mut out = Vec::new();
         for item in self.db.iterator_cf(cf, IteratorMode::Start) {
-            let (k, v) = item?;
+            let (k, v) = item.map_err(map_db_err)?;
             out.push((decode_u64_key(&k)?, decode_f32_slice(&v, self.dim)?));
         }
         Ok(out)
@@ -251,7 +256,7 @@ impl Storage {
         let cf = self.cf(CF_DOC_LOC)?;
         let mut out = Vec::new();
         for item in self.db.iterator_cf(cf, IteratorMode::Start) {
-            let (k, v) = item?;
+            let (k, v) = item.map_err(map_db_err)?;
             out.push((decode_u64_key(&k)?, decode_u64_key(&v)?));
         }
         Ok(out)
@@ -579,7 +584,7 @@ impl<'a> TxContext<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DistanceMetric;
+    use izzydb_core::config::DistanceMetric;
     use tempfile::TempDir;
 
     #[test]

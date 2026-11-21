@@ -1,6 +1,6 @@
 # Latency Optimization Note (2026-11-20)
 
-This note documents the storage layout, caching, algorithmic, and SIMD changes made to reduce ANN query latency (targeting `beam = 4`) and index build time in `clustering_tree`.
+This note documents the storage layout, caching, algorithmic, and SIMD changes made to reduce ANN query latency (targeting `beam = 4`) and index build time in `izzydb` (formerly `clustering_tree`).
 
 ## Bottlenecks in the Baseline
 
@@ -16,28 +16,28 @@ Before these changes, running `cargo run --release --example recall_bench` on an
 
 ## Changes Implemented
 
-### 1. Packed Node Blobs & Leaf-Grouped Full Vectors ([`src/node.rs`](../src/node.rs), [`src/storage.rs`](../src/storage.rs))
+### 1. Packed Node Blobs & Leaf-Grouped Full Vectors ([`crates/izzydb-storage/src/node.rs`](../crates/izzydb-storage/src/node.rs), [`crates/izzydb-storage/src/storage.rs`](../crates/izzydb-storage/src/storage.rs))
 
 Replaced per-entry column families (`cf_node_header`, `cf_internal_entries`, `cf_leaf_entries`, `cf_vectors`) with one packed blob per node:
 
 - **`cf_internal_nodes` (`node_id -> PackedInternalNode`):** Packs node metadata (`level`, `parent_id`, `subtree_count`, `centroid`) together with sorted `child_ids`, `child_subtree_counts`, and contiguous `child_centroids`.
-- **`cf_leaf_entries` (`leaf_id -> PackedLeafNode`):** Stores a Struct-of-Arrays (SoA) leaf blob containing `parent_id`, `centroid`, pre-rotated `rotated_centroid` ($P^{-1}c$), sorted `doc_ids`, precomputed `res_norm_sqs` ($\|x - c\|_2^2$) and `scales` ($\|x - c\|_2 / \langle \bar{o}, \tilde{o} \rangle$), and word-major 1-bit RaBitQ `codes`. Zero-copy [`LeafNodeView`](../src/node.rs) parses directly over `DBPinnableSlice`.
-- **`cf_leaf_vectors` (`leaf_id -> PackedLeafVectors`):** Co-locates full-precision `f32` vectors by `leaf_id` in the exact same sorted `doc_ids` slot order as `cf_leaf_entries`. `search_with_rerank` now fetches at most `beam_width` (4) blobs instead of 100 individual `doc_id` lookups, and `get_vector(doc_id)` resolves via `cf_doc_loc` + binary search inside [`LeafVectorsView`](../src/node.rs).
+- **`cf_leaf_entries` (`leaf_id -> PackedLeafNode`):** Stores a Struct-of-Arrays (SoA) leaf blob containing `parent_id`, `centroid`, pre-rotated `rotated_centroid` ($P^{-1}c$), sorted `doc_ids`, precomputed `res_norm_sqs` ($\|x - c\|_2^2$) and `scales` ($\|x - c\|_2 / \langle \bar{o}, \tilde{o} \rangle$), and word-major 1-bit RaBitQ `codes`. Zero-copy [`LeafNodeView`](../crates/izzydb-storage/src/node.rs) parses directly over `DBPinnableSlice`.
+- **`cf_leaf_vectors` (`leaf_id -> PackedLeafVectors`):** Co-locates full-precision `f32` vectors by `leaf_id` in the exact same sorted `doc_ids` slot order as `cf_leaf_entries`. `search_with_rerank` now fetches at most `beam_width` (4) blobs instead of 100 individual `doc_id` lookups, and `get_vector(doc_id)` resolves via `cf_doc_loc` + binary search inside [`LeafVectorsView`](../crates/izzydb-storage/src/node.rs).
 - **RocksDB tuning & zero-copy reads:** Switched batched leaf and vector reads to `batched_multi_get_cf` (`sorted_input = true`) and `get_pinned_cf`, added a shared 128 MiB LRU block cache, pinned L0 index/filter blocks in cache, enabled memtable whole-key filtering, and disabled compression on node/vector CFs.
 
-### 2. In-Memory Internal Node Cache ([`src/tree.rs`](../src/tree.rs), [`src/storage.rs`](../src/storage.rs), [`src/lire.rs`](../src/lire.rs), [`src/verify.rs`](../src/verify.rs))
+### 2. In-Memory Internal Node Cache ([`crates/izzydb/src/tree.rs`](../crates/izzydb/src/tree.rs), [`crates/izzydb-storage/src/storage.rs`](../crates/izzydb-storage/src/storage.rs), [`crates/izzydb/src/lire.rs`](../crates/izzydb/src/lire.rs), [`crates/izzydb/src/verify.rs`](../crates/izzydb/src/verify.rs))
 
 - `ClusteringTree` loads all `cf_internal_nodes` entries into `internal_cache: HashMap<NodeId, PackedInternalNode>` on `open()`.
 - `TxContext::commit` writes the RocksDB `WriteBatch` first and updates `internal_cache` only after persistence succeeds.
 - Top-down beam traversal in `search`, `search_with_rerank`, `route_to_leaf`, and `search_leaves` executes entirely in memory with zero RocksDB calls.
 
-### 3. Pre-Rotated Centroids & Zero-Allocation Query Path ([`src/rabitq.rs`](../src/rabitq.rs), [`src/search.rs`](../src/search.rs), [`src/metric.rs`](../src/metric.rs))
+### 3. Pre-Rotated Centroids & Zero-Allocation Query Path ([`crates/izzydb-rabitq/src/quantizer.rs`](../crates/izzydb-rabitq/src/quantizer.rs), [`crates/izzydb/src/search.rs`](../crates/izzydb/src/search.rs), [`crates/izzydb-core/src/metric.rs`](../crates/izzydb-core/src/metric.rs))
 
 - **Single FWHT per query:** Using linearity ($P^{-1}(q - c) = P^{-1}q - P^{-1}c$), `search` runs `rotate_into` once on `q` and subtracts each leaf's precomputed `rotated_centroid` into reusable `QueryScratch` buffers.
 - **Precomputed RaBitQ scalars:** `res_norm_sq` and `scale = norm / o_bar_dot_o` are computed at encode time, removing a per-candidate float division and square in the hot scan loop.
 - **Reduced allocations & partial sorting:** `prepare_vector_cow` borrows non-`Cosine` queries without copying, and `select_top_k` uses `select_nth_unstable_by` + `sort_unstable_by` on only the truncated top elements.
 
-### 4. Runtime-Dispatched SIMD Kernels ([`src/simd.rs`](../src/simd.rs))
+### 4. Runtime-Dispatched SIMD Kernels ([`crates/izzydb-core/src/simd.rs`](../crates/izzydb-core/src/simd.rs), [`crates/izzydb-rabitq/src/simd.rs`](../crates/izzydb-rabitq/src/simd.rs))
 
 Added runtime feature detection (`is_x86_feature_detected!`) with scalar fallbacks so standard `cargo build --release` binaries use native vector instructions automatically:
 

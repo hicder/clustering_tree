@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use clustering_tree::{ClusteringTree, DistanceMetric, DocId, TreeConfig, TreeError};
+use izzydb::{ClusteringTree, DistanceMetric, DocId, TreeConfig, TreeError};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
@@ -26,12 +26,12 @@ fn brute_force_topk(
     k: usize,
     metric: DistanceMetric,
 ) -> Vec<(DocId, f32)> {
-    let q = clustering_tree::metric::prepare_vector(query, query.len(), metric).unwrap();
+    let q = izzydb::metric::prepare_vector(query, query.len(), metric).unwrap();
     let mut scored: Vec<(DocId, f32)> = docs
         .iter()
         .map(|(&id, v)| {
-            let vp = clustering_tree::metric::prepare_vector(v, v.len(), metric).unwrap();
-            (id, clustering_tree::metric::search_distance(metric, &q, &vp))
+            let vp = izzydb::metric::prepare_vector(v, v.len(), metric).unwrap();
+            (id, izzydb::metric::search_distance(metric, &q, &vp))
         })
         .collect();
     scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));

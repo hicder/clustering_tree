@@ -3,12 +3,12 @@ use thiserror::Error;
 /// Result type alias for clustering tree operations.
 pub type Result<T> = std::result::Result<T, TreeError>;
 
-/// Errors returned by [`crate::ClusteringTree`] operations.
+/// Errors returned by clustering tree operations.
 #[derive(Debug, Error)]
 pub enum TreeError {
-    /// Underlying RocksDB error.
-    #[error("RocksDB error: {0}")]
-    RocksDb(#[from] rocksdb::Error),
+    /// Underlying storage backend error.
+    #[error("storage error: {0}")]
+    Storage(String),
 
     /// Invalid configuration parameters.
     #[error("invalid tree config: {0}")]
@@ -22,7 +22,7 @@ pub enum TreeError {
     #[error("vector contains non-finite (NaN or Inf) values")]
     NonFiniteVector,
 
-    /// Reopened database metadata disagrees with provided [`crate::TreeConfig`].
+    /// Reopened database metadata disagrees with provided [`TreeConfig`](crate::TreeConfig).
     #[error("config mismatch for {field}: database has {expected}, config has {actual}")]
     ConfigMismatch {
         field: &'static str,

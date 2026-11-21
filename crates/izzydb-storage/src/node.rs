@@ -1,9 +1,9 @@
 use std::borrow::Cow;
 
-use crate::config::{DistanceMetric, DocId, NodeId};
-use crate::error::{Result, TreeError};
-use crate::metric::compute_weighted_centroid_flat;
-use crate::rabitq::{EncodeScratch, QuantizedEntry, RabitqQuantizer};
+use izzydb_core::config::{DistanceMetric, DocId, NodeId};
+use izzydb_core::error::{Result, TreeError};
+use izzydb_core::metric::compute_weighted_centroid_flat;
+use izzydb_rabitq::{EncodeScratch, QuantizedEntry, RabitqQuantizer};
 
 const META_LEN: usize = 39;
 const INTERNAL_HEADER_LEN: usize = 24;

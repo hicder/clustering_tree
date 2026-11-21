@@ -19,11 +19,11 @@ pub enum DistanceMetric {
 }
 
 impl DistanceMetric {
-    pub(crate) fn as_u8(self) -> u8 {
+    pub fn as_u8(self) -> u8 {
         self as u8
     }
 
-    pub(crate) fn from_u8(val: u8) -> Result<Self> {
+    pub fn from_u8(val: u8) -> Result<Self> {
         match val {
             0 => Ok(Self::L2Squared),
             1 => Ok(Self::Cosine),
@@ -35,7 +35,7 @@ impl DistanceMetric {
     }
 }
 
-/// Configuration for [`crate::ClusteringTree`].
+/// Configuration for a clustering tree database.
 #[derive(Debug, Clone)]
 pub struct TreeConfig {
     /// Vector dimensionality.

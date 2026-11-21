@@ -1,4 +1,4 @@
-# clustering_tree
+# izzydb
 
 A mutable, RocksDB-backed hierarchical clustering tree (~100x fanout) for approximate nearest neighbor search, inspired by turbopuffer ANN v3 and SPFresh (LIRE).
 
@@ -6,10 +6,17 @@ A mutable, RocksDB-backed hierarchical clustering tree (~100x fanout) for approx
 - **Full-vector store:** Full-precision vectors are stored separately in `cf_vectors` for exact tree splits, LIRE reassignment, and optional Stage 2 reranking.
 - **Mutable & persistent:** Supports inserts, upserts, and deletes with balanced 2-means splits, underflow merges/redistributions, SPFresh LIRE boundary reassignment, and atomic `WriteBatch` commits.
 
+## Workspace Crates
+
+- [`izzydb-core`](crates/izzydb-core) — configuration, error types, distance metrics, SIMD vector kernels, and balanced 2-means clustering.
+- [`izzydb-rabitq`](crates/izzydb-rabitq) — 1-bit RaBitQ quantization, randomized FWHT rotation, and SIMD popcount leaf scoring.
+- [`izzydb-storage`](crates/izzydb-storage) — packed node/metadata codecs and RocksDB storage/transaction layer.
+- [`izzydb`](crates/izzydb) — `ClusteringTree` index, search path, SPFresh LIRE reassignment, and structural invariant verification.
+
 ## Quick Start
 
 ```rust
-use clustering_tree::{ClusteringTree, DistanceMetric, TreeConfig};
+use izzydb::{ClusteringTree, DistanceMetric, TreeConfig};
 
 let config = TreeConfig::new(128, DistanceMetric::L2Squared);
 let mut tree = ClusteringTree::open("/tmp/my_tree", config)?;
@@ -29,5 +36,5 @@ let reranked = tree.search_with_rerank(&query, 10, 8, 100)?;
 
 ```bash
 cargo test
-cargo run --release --example recall_bench
+cargo run --release -p izzydb --example recall_bench
 ```

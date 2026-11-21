@@ -1,0 +1,9 @@
+[package]
+name = "izzydb-core"
+version.workspace = true
+edition.workspace = true
+description = "Core configuration, errors, distance metrics, SIMD kernels, and 2-means clustering for izzydb"
+
+[dependencies]
+bytemuck.workspace = true
+thiserror.workspace = true

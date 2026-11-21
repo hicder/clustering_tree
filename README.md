@@ -21,6 +21,7 @@ let reranked = tree.search_with_rerank(&query, 10, 8, 100)?;
 
 ## Documentation
 
+- [Key & Binary Encoding](docs/key-encoding.md) — RocksDB column families, big-endian key formats, packed SoA node/vector layouts, and RaBitQ bit-packing.
 - [Index Path](docs/index-path.md) — write path, RocksDB layout, RaBitQ quantization, splits, merges, and LIRE.
 - [Search Path](docs/search-path.md) — beam traversal, asymmetric 4-bit RaBitQ `popcount` scanning, and full-vector reranking.
 

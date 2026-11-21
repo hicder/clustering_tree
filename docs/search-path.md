@@ -1,59 +1,56 @@
 # Search Path
 
-This document describes how `ClusteringTree` executes approximate nearest neighbor queries using beam traversal over internal nodes, RaBitQ bitwise scanning over leaf posting lists, and optional full-vector reranking.
+This document describes both the unfiltered and attribute-filtered ANN search paths in `Collection` ([`crates/izzydb/src/collection.rs`](../crates/izzydb/src/collection.rs)) and [`crates/izzydb/src/search.rs`](../crates/izzydb/src/search.rs).
 
 ## Entry Points
 
-Defined on `ClusteringTree` in [`crates/izzydb/src/tree.rs`](../crates/izzydb/src/tree.rs) and implemented in [`crates/izzydb/src/search.rs`](../crates/izzydb/src/search.rs):
+- `Collection::search(query, opts, None)` / `ClusteringTree::search*`: unfiltered beam traversal fast path with zero filtering overhead.
+- `Collection::search(query, opts, Some(filter))`: cluster-aware filtered vector search (`search::search_filtered`).
 
-- `search(query, k, beam_width)` — Stage 1 only. Scores candidates exclusively from quantized codes in `cf_leaf_entries` without reading `cf_vectors`.
-- `search_with_rerank(query, k, beam_width, rerank_candidates)` — Stage 1 RaBitQ shortlist + Stage 2 exact reranking against full vectors in `cf_vectors`.
+---
 
-## Step 1: Query Preparation
+## Unfiltered Path (`search::search`)
 
-`prepare_vector(query, config.dim, config.metric)` validates length and finiteness (`NaN`/`Inf` rejected). For `DistanceMetric::Cosine`, the query vector is L2-normalized. If `k == 0` or `num_vectors == 0`, search returns immediately.
+1. **Query preparation:** `prepare_vector_cow(query, config.dim, config.metric)` validates length/finiteness and L2-normalizes for `Cosine`.
+2. **Top-down beam traversal:** Walks `internal_cache` from `meta.root_id` to `level == 0`, keeping the top `opts.beam_width` nodes per level by `search_distance`.
+3. **Stage 1 — Batched RaBitQ leaf scoring:** Sorts leaf IDs, calls `storage.multi_get_leaf_nodes_pinned`, rotates the query once (`QueryScratch`), and runs `score_leaf_rabitq` (AVX-512 VPOPCNTDQ / POPCNT / scalar) over `LeafNodeView`s.
+4. **Stage 2 — Optional full-vector reranking:** When `opts.rerank_candidates` is `Some(r)`, shortlists `r.max(k)` candidates, batch-fetches full vectors from `cf_vectors`, computes exact `search_distance_bytes`, and returns top `k`.
 
-## Step 2: Top-Down Beam Traversal
+---
 
-Starting at `frontier = [(meta.root_id, 0.0)]` and `level = meta.root_level`:
+## Filtered Path (`search::search_filtered`)
 
-1. While `level > 0`, scans `cf_internal_entries` for every node in `frontier` (`Storage::scan_internal_with`).
-2. Computes `search_distance(metric, &q, centroid)` for each child entry:
-   - `L2Squared`: $\sum_i (q_i - c_i)^2$
-   - `Cosine`: $\max(0, 1 - \langle q, c \rangle)$
-   - `DotProduct`: $-\langle q, c \rangle$
-3. Sorts candidates by `(distance, node_id)` and truncates `frontier` to `beam_width`.
-4. Repeats until `level == 0`, leaving `frontier` with up to `beam_width` leaf `(leaf_id, distance)` pairs.
+### Step 1: Cluster-Level Pruning (`AttributeIndex::prepare_filter`)
 
-## Step 3: Stage 1 — RaBitQ Posting-List Scan
+Evaluates the validated `Filter` AST against `cf_attr_clusters` (`RoaringBitmap<NodeId>`) to produce `ClusterCandidates`:
 
-For each selected leaf in `frontier`:
+- `Eq(attr, val)` / `Contains(attr, val)` / `IsNotNull(attr)`: point lookup in `cf_attr_clusters` $\to$ `Subset(bm)`.
+- `In(attr, vals)` / `ContainsAny(attr, vals)`: batched `multi_get_attr_cluster_bitmaps` + bitwise `|` $\to$ `Subset(union)`.
+- `Lt` / `Lte` / `Gt` / `Gte`: prefix-scoped RocksDB range scan (`scan_attr_cluster_range`) over `(attr_id, type_tag, [lo..hi])` + bitwise `|` $\to$ `Subset(union)`, caching matching keys in `PreparedFilter`.
+- `And`: intersects `Subset` bitmaps (`&=`), short-circuiting immediately to empty if any child is empty.
+- `Or`: returns `All` if any child is `All`, otherwise unions `Subset` bitmaps (`|=`).
+- `Not` / `NotEq` / `NotIn` / `IsNull`: returns `All` (except `NotEq(attr, Null)`, which prunes like `IsNotNull`), deferring exact negation to per-leaf evaluation.
 
-1. **Fetch leaf centroid:** Reads `NodeHeader` from `cf_node_header` so distances are estimated against the exact centroid used when quantizing that leaf's entries.
-2. **Prepare asymmetric 4-bit query state (`RabitqQuantizer::prepare_leaf_query` in [`crates/izzydb-rabitq/src/quantizer.rs`](../crates/izzydb-rabitq/src/quantizer.rs)):**
-   - **`L2Squared` & `Cosine`:** Centers query residual $q_r = q - c$, computes $\|q_r\|_2^2$, and rotates $q_r$ via the 3-round sign-flip + normalized FWHT ($\tilde{q} = P^{-1} q_r$).
-   - **`DotProduct`:** Reuses a single rotated query $\tilde{q} = P^{-1} q$ computed once per search (`prepare_dot_query`), and records $-\langle c, q \rangle$ for the leaf.
-   - **4-bit scalar quantization:** Quantizes $\tilde{q}$ uniformly over $[\min \tilde{q}, \max \tilde{q}]$ into 4-bit integers $q_{u,i} \in \{0, \dots, 15\}$ split across 4 bit-planes (`planes[0..4]`) of `padded_dim / 64` `u64` words, along with `vl`, `delta`, and `sum_q`.
-3. **Bitwise leaf scan (`Storage::scan_leaf_codes_with`):**
-   - Streams `cf_leaf_entries` for `leaf_id` using a prefix-bloom-enabled iterator, casting aligned code bytes directly to `&[u64]` with zero copying on little-endian hosts.
-   - For each `(doc_id, residual_norm, o_bar_dot_o, code_words)`:
-     - If `residual_norm == 0.0`, the vector equals the leaf centroid and `estimate_distance` returns the precomputed exact `zero_res_dist`.
-     - Otherwise, computes 5 popcounts per `u64` word:
-       - `p_x = popcount(x)`
-       - `p_b = popcount(x & planes[b])` for $b \in \{0, 1, 2, 3\}$
-     - Reconstructs the unbiased inner-product estimate:
-       $$\widehat{\langle r, q_{\text{target}} \rangle} = \|r\|_2 \cdot \frac{(2 (\text{vl} \cdot p_x + \Delta \sum_{b=0}^{3} 2^b p_b) - S_q) / \sqrt{D_{\text{pad}}}}{\langle \bar{o}, \tilde{o} \rangle}$$
-     - Evaluates metric distance:
-       - `L2Squared`: $\max(0, \|r\|_2^2 + \|q_r\|_2^2 - 2\widehat{\langle r, q_r \rangle})$
-       - `Cosine`: $\max(0, \frac{1}{2}(\|r\|_2^2 + \|q_r\|_2^2 - 2\widehat{\langle r, q_r \rangle}))$
-       - `DotProduct`: $-\langle c, q \rangle - \widehat{\langle r, q \rangle}$
+If `ClusterCandidates::Subset(bm)` is empty, search returns `Ok(Vec::new())` immediately with zero leaf or vector reads.
 
-If reranking is disabled (`search`), candidates are sorted by `(estimated_distance, doc_id)` and truncated to `k`.
+### Step 2: Exhaustive-Scan Crossover (Highly Selective Filters)
 
-## Step 4: Stage 2 — Optional Full-Vector Reranking
+When `ClusterCandidates::Subset(bm)` satisfies `bm.len() <= opts.exhaustive_cluster_threshold` (default `8`):
 
-When called via `search_with_rerank`:
+1. Batch-fetches `PackedLeafNode` blobs for all `bm` leaves.
+2. Evaluates exact per-leaf `local_id` masks via `AttributeIndex::eval_leaves_masks` (one `batched_multi_get_cf` on `cf_attr_postings`).
+3. Maps surviving `(leaf_id, local_id)` pairs to `DocId`s via `LeafNodeView`, batch-fetches full vectors from `cf_vectors`, scores exact `search_distance_bytes`, and returns top `k` (100% exact recall, bypassing tree traversal and RaBitQ).
 
-1. Sorts Stage 1 candidates and truncates to `shortlist_len = rerank_candidates.max(k)`.
-2. Batch-fetches full-precision vectors for all shortlisted `DocId`s in a single `Storage::multi_get_vectors` (`rocksdb::DB::multi_get_cf`) lookup against `cf_vectors`.
-3. Computes exact `search_distance(config.metric, &q, &vec)` for each shortlisted candidate, sorts by `(exact_distance, doc_id)`, and returns the top `k`.
+### Step 3: Pruned Best-First Traversal + Dynamic Cluster Expansion
+
+For broader filters (`All` or `bm.len() > exhaustive_cluster_threshold`):
+
+1. **Ancestor pruning:** When `Subset(bm)` covers `< 50%` of leaves, walks `leaf_parent` and `internal_cache` upward from each qualifying leaf to build `allowed_internal: RoaringBitmap`. Internal subtrees with zero qualifying leaves are skipped.
+2. **Best-first priority queue (`BinaryHeap` min-heap):** Pops closest nodes from `(meta.root_id, 0.0, meta.root_level)`, pushing only allowed internal and leaf children.
+3. **Batched leaf evaluation & masked RaBitQ scoring:**
+   - Pulls batches of closest qualifying leaves (starting at `opts.beam_width` and doubling on subsequent rounds).
+   - Batch-fetches `PackedLeafNode` blobs and evaluates exact `local_id` bitmaps via `AttributeIndex::eval_leaves_masks` (including exact complement `all_local_ids - sub` for `Not` / `NotEq` / `NotIn` / `IsNull`).
+   - Skips leaves whose resulting `local_mask` is empty (e.g., false-positive clusters where `And` terms matched different documents).
+   - Builds an `allowed_slots: Vec<u64>` bitmask over `0..view.entry_count` and runs `score_leaf_rabitq_masked`, which skips 8-entry SIMD chunks whose mask byte is `0`.
+4. **Dynamic expansion:** Continues pulling leaf batches until `candidates.len() >= target && probed_leaves >= opts.beam_width` (where `target = rerank_candidates.unwrap_or(k).max(k)`), the heap is empty, or `probed_leaves >= opts.max_expanded_leaves.unwrap_or(beam_width * 16)`.
+5. **Stage 2 exact reranking:** Identical to unfiltered search (`cf_vectors` batched multi-get + exact `search_distance_bytes`).

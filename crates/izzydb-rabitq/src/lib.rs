@@ -7,4 +7,4 @@ pub use quantizer::{
     EncodeScratch, LeafQueryState, QuantizedEntry, QuantizedQueryBits, QuantizedQueryMeta,
     QueryScratch, RabitqQuantizer, pack_query_bits_from_diff_bytes_into, pack_query_bits_into,
 };
-pub use simd::{LeafCandidate, RabitqLeafScoreParams, score_leaf_rabitq};
+pub use simd::{LeafCandidate, RabitqLeafScoreParams, score_leaf_rabitq, score_leaf_rabitq_masked};

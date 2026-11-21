@@ -8,6 +8,7 @@ description = "A mutable, RocksDB-backed hierarchical clustering tree for approx
 izzydb-core.workspace = true
 izzydb-rabitq.workspace = true
 izzydb-storage.workspace = true
+roaring.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

@@ -37,4 +37,16 @@ pub enum TreeError {
     /// Structural invariant violation detected during verification or mutation.
     #[error("tree invariant violation: {0}")]
     InvariantViolation(String),
+
+    /// Invalid collection schema definition or schema mismatch.
+    #[error("invalid schema: {0}")]
+    InvalidSchema(String),
+
+    /// Document attribute failed schema validation.
+    #[error("invalid attribute '{name}': {reason}")]
+    InvalidAttribute { name: String, reason: String },
+
+    /// Search filter failed validation against collection schema.
+    #[error("invalid filter: {0}")]
+    InvalidFilter(String),
 }

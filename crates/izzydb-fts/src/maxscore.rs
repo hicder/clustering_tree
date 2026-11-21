@@ -33,9 +33,18 @@ pub trait FtsBlockCursor {
     fn seek_block(&mut self, target: FtsBlockId) -> Result<()>;
 }
 
+/// Cursor over document-length blocks (`cf_fts_doc_lens`) for a single `attr_id`.
+pub trait FtsDocLenCursor {
+    fn seek_block_bytes(&mut self, block_id: FtsBlockId) -> Result<Option<&[u8]>>;
+}
+
 /// Storage abstraction consumed by MAXSCORE and FTS filter evaluation.
 pub trait FtsPostingSource {
     type Cursor<'a>: FtsBlockCursor + 'a
+    where
+        Self: 'a;
+
+    type DocLenCursor<'a>: FtsDocLenCursor + 'a
     where
         Self: 'a;
 
@@ -56,28 +65,24 @@ pub trait FtsPostingSource {
         attr_id: AttrId,
         token: &str,
     ) -> Result<Self::Cursor<'a>>;
-    fn read_doc_len_block(
-        &self,
-        attr_id: AttrId,
-        block_id: FtsBlockId,
-        f: &mut dyn FnMut(&[u8]) -> Result<()>,
-    ) -> Result<bool>;
+    fn open_doc_len_cursor<'a>(&'a self, attr_id: AttrId) -> Result<Self::DocLenCursor<'a>>;
     fn multi_get_doc_ids(&self, fts_doc_ids: &[FtsDocId]) -> Result<Vec<Option<DocId>>>;
 }
 
-struct DlNormGroup {
+struct DlNormGroup<'a, S: FtsPostingSource + 'a> {
     attr_id: AttrId,
     c1: f32,
     c2: f32,
     cached_block_id: Option<FtsBlockId>,
+    cursor: Option<S::DocLenCursor<'a>>,
     dl_norm: [f32; FTS_BLOCK_SIZE],
 }
 
-struct DlNormCache {
-    groups: Vec<DlNormGroup>,
+struct DlNormCache<'a, S: FtsPostingSource + 'a> {
+    groups: Vec<DlNormGroup<'a, S>>,
 }
 
-impl DlNormCache {
+impl<'a, S: FtsPostingSource + 'a> DlNormCache<'a, S> {
     fn new() -> Self {
         Self { groups: Vec::new() }
     }
@@ -96,15 +101,16 @@ impl DlNormCache {
             c1,
             c2,
             cached_block_id: None,
+            cursor: None,
             dl_norm: [f32::MIN_POSITIVE; FTS_BLOCK_SIZE],
         });
         id
     }
 
     #[inline]
-    fn get_or_load<S: FtsPostingSource>(
+    fn get_or_load(
         &mut self,
-        source: &S,
+        source: &'a S,
         tier: SimdTier,
         group_id: usize,
         block_id: FtsBlockId,
@@ -112,19 +118,24 @@ impl DlNormCache {
         let group = &mut self.groups[group_id];
         if group.cached_block_id != Some(block_id) {
             let attr_id = group.attr_id;
-            let c1 = group.c1;
-            let c2 = group.c2;
-            let out = &mut group.dl_norm;
-            let found = source.read_doc_len_block(attr_id, block_id, &mut |bytes| {
-                let view = DocLenBlockView::parse(bytes)?;
-                prepare_dl_norm_256(tier, view.width, view.dls_bytes, c1, c2, out);
-                Ok(())
-            })?;
-            if !found {
+            if group.cursor.is_none() {
+                group.cursor = Some(source.open_doc_len_cursor(attr_id)?);
+            }
+            let cursor = group.cursor.as_mut().unwrap();
+            let Some(bytes) = cursor.seek_block_bytes(block_id)? else {
                 return Err(TreeError::CorruptedData(format!(
                     "missing cf_fts_doc_lens block for attr {attr_id} block {block_id}"
                 )));
-            }
+            };
+            let view = DocLenBlockView::parse(bytes)?;
+            prepare_dl_norm_256(
+                tier,
+                view.width,
+                view.dls_bytes,
+                group.c1,
+                group.c2,
+                &mut group.dl_norm,
+            );
             group.cached_block_id = Some(block_id);
         }
         Ok(&self.groups[group_id].dl_norm)
@@ -271,8 +282,8 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
         target: FtsBlockId,
         scores: &mut [f32; FTS_BLOCK_SIZE],
         touched: &mut [u64; 4],
-        dl_cache: &mut DlNormCache,
-        source: &S,
+        dl_cache: &mut DlNormCache<'a, S>,
+        source: &'a S,
         tier: SimdTier,
     ) -> Result<()> {
         match &self.kind {
@@ -416,8 +427,8 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
         target: FtsBlockId,
         mask: &[u64; 4],
         scores: &mut [f32; FTS_BLOCK_SIZE],
-        dl_cache: &mut DlNormCache,
-        source: &S,
+        dl_cache: &mut DlNormCache<'a, S>,
+        source: &'a S,
         tier: SimdTier,
     ) -> Result<()> {
         match &self.kind {
@@ -550,7 +561,7 @@ fn compile_clauses<'a, S: FtsPostingSource>(
     expr: &RankBy,
     weight: f32,
     buffer: &mut ReusableBuffer,
-    dl_cache: &mut DlNormCache,
+    dl_cache: &mut DlNormCache<'a, S>,
     out: &mut Vec<Clause<'a, S>>,
 ) -> Result<()> {
     if weight <= 0.0 {
@@ -627,16 +638,24 @@ fn compile_clauses<'a, S: FtsPostingSource>(
                 (&qtokens[..], None)
             };
 
-            let mut exact_counts: HashMap<String, u32> = HashMap::new();
-            for qt in exact_tokens {
-                *exact_counts.entry(qt.text.clone()).or_insert(0) += 1;
-            }
-            if !exact_counts.is_empty() {
-                let mut token_list: Vec<(String, u32)> = exact_counts.into_iter().collect();
-                token_list.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-                let keys: Vec<String> = token_list.iter().map(|(t, _)| t.clone()).collect();
+            if !exact_tokens.is_empty() {
+                let mut token_refs: Vec<&str> =
+                    exact_tokens.iter().map(|t| t.text.as_str()).collect();
+                token_refs.sort_unstable();
+                let mut keys: Vec<String> = Vec::with_capacity(token_refs.len());
+                let mut qtfs: Vec<u32> = Vec::with_capacity(token_refs.len());
+                for tok in token_refs {
+                    if keys.last().is_some_and(|last| last == tok) {
+                        *qtfs.last_mut().unwrap() += 1;
+                    } else {
+                        keys.push(tok.to_owned());
+                        qtfs.push(1);
+                    }
+                }
                 let stats_list = source.multi_get_term_stats(entry.id, &keys)?;
-                for ((token, qtf), opt_stats) in token_list.into_iter().zip(stats_list) {
+                for ((token, qtf), opt_stats) in
+                    keys.into_iter().zip(qtfs).zip(stats_list)
+                {
                     let Some(ts) = opt_stats else {
                         continue;
                     };
@@ -919,12 +938,14 @@ pub fn execute_rank_by<S: FtsPostingSource>(
             }
         }
 
-        // Accumulate essential clauses into L1-resident [f32; 256] buffer via SIMD.
+        // Accumulate essential clauses into L1-resident [f32; 256] buffer via SIMD,
+        // and advance each processed cursor past `block_id` before shrinking essential_start.
         scores.fill(0.0);
         touched = [0u64; 4];
-        for c in &clauses[essential_start..] {
+        for c in &mut clauses[essential_start..] {
             if c.next_block_id() == Some(block_id) {
                 c.accumulate_block(block_id, &mut scores, &mut touched, &mut dl_cache, source, tier)?;
+                c.advance_past(block_id)?;
             }
         }
 
@@ -943,19 +964,34 @@ pub fn execute_rank_by<S: FtsPostingSource>(
                 if max_ess + non_ess_ub + eps >= theta {
                     non_ess_ubs.clear();
                     let mut non_ess_block_ub = 0.0f64;
-                    for c in &mut clauses[..essential_start] {
-                        c.seek_to(block_id)?;
-                        let ub = c.block_upper_bound(block_id)?;
+                    let mut pruned_early = false;
+                    // Seek descending by global term_max so absent/tighter clauses prune early.
+                    for j in (0..essential_start).rev() {
+                        clauses[j].seek_to(block_id)?;
+                        let ub = clauses[j].block_upper_bound(block_id)?;
                         non_ess_ubs.push(ub);
                         non_ess_block_ub += ub as f64;
+                        if theta > 0.0 {
+                            let rem_global = if j > 0 { prefix_max_sum[j - 1] } else { 0.0 };
+                            let upper =
+                                (max_ess as f64 + non_ess_block_ub + rem_global as f64) as f32;
+                            let upper_eps = upper * 1e-6 + 1e-7;
+                            if upper + upper_eps < theta {
+                                pruned_early = true;
+                                break;
+                            }
+                        }
                     }
-                    let tight_ub = (max_ess as f64 + non_ess_block_ub) as f32;
-                    let tight_eps = tight_ub * 1e-6 + 1e-7;
-                    if tight_ub + tight_eps >= theta {
+                    if !pruned_early {
+                        let tight_ub = (max_ess as f64 + non_ess_block_ub) as f32;
+                        let tight_eps = tight_ub * 1e-6 + 1e-7;
                         let mut rem_ub = non_ess_block_ub;
-                        // Iterate descending by global term_max so rem_ub shrinks fastest.
-                        for j in (0..essential_start).rev() {
-                            let ub_j = non_ess_ubs[j];
+                        // `non_ess_ubs` is already ordered descending (`essential_start - 1 ..= 0`).
+                        for (idx, j) in (0..essential_start).rev().enumerate() {
+                            let ub_j = non_ess_ubs[idx];
+                            if ub_j <= 0.0 {
+                                continue;
+                            }
                             if theta > 0.0 {
                                 let min_needed = (theta - rem_ub as f32) - tight_eps;
                                 if min_needed > 0.0 {
@@ -966,16 +1002,14 @@ pub fn execute_rank_by<S: FtsPostingSource>(
                                     }
                                 }
                             }
-                            if ub_j > 0.0 && clauses[j].next_block_id() == Some(block_id) {
-                                clauses[j].accumulate_block_masked(
-                                    block_id,
-                                    &active_mask,
-                                    &mut scores,
-                                    &mut dl_cache,
-                                    source,
-                                    tier,
-                                )?;
-                            }
+                            clauses[j].accumulate_block_masked(
+                                block_id,
+                                &active_mask,
+                                &mut scores,
+                                &mut dl_cache,
+                                source,
+                                tier,
+                            )?;
                             rem_ub = (rem_ub - ub_j as f64).max(0.0);
                         }
                     } else {
@@ -1079,11 +1113,6 @@ pub fn execute_rank_by<S: FtsPostingSource>(
             }
         }
 
-        // Advance essential clauses processed at `block_id` BEFORE shrinking essential set.
-        for c in &mut clauses[essential_start..] {
-            c.advance_past(block_id)?;
-        }
-
         // Dynamically shrink essential set as theta rises.
         if heap.len() == top_k && theta > 0.0 {
             while essential_start < n_clauses {
@@ -1184,8 +1213,24 @@ mod tests {
         }
     }
 
+    struct MemDocLenCursor<'a> {
+        source: &'a MemSource,
+        attr_id: AttrId,
+    }
+
+    impl FtsDocLenCursor for MemDocLenCursor<'_> {
+        fn seek_block_bytes(&mut self, block_id: FtsBlockId) -> Result<Option<&[u8]>> {
+            Ok(self
+                .source
+                .doc_lens
+                .get(&(self.attr_id, block_id))
+                .map(|v| v.as_slice()))
+        }
+    }
+
     impl FtsPostingSource for MemSource {
         type Cursor<'a> = MemCursor;
+        type DocLenCursor<'a> = MemDocLenCursor<'a>;
 
         fn get_fts_meta(&self) -> Result<Option<FtsMeta>> {
             Ok(Some(self.meta.clone()))
@@ -1237,19 +1282,11 @@ mod tests {
             Ok(MemCursor { blocks, idx: 0 })
         }
 
-        fn read_doc_len_block(
-            &self,
-            attr_id: AttrId,
-            block_id: FtsBlockId,
-            f: &mut dyn FnMut(&[u8]) -> Result<()>,
-        ) -> Result<bool> {
-            match self.doc_lens.get(&(attr_id, block_id)) {
-                Some(bytes) => {
-                    f(bytes)?;
-                    Ok(true)
-                }
-                None => Ok(false),
-            }
+        fn open_doc_len_cursor<'a>(&'a self, attr_id: AttrId) -> Result<Self::DocLenCursor<'a>> {
+            Ok(MemDocLenCursor {
+                source: self,
+                attr_id,
+            })
         }
 
         fn multi_get_doc_ids(&self, fts_doc_ids: &[FtsDocId]) -> Result<Vec<Option<DocId>>> {
@@ -1372,7 +1409,8 @@ mod tests {
         // Brute-force reference
         let fts = FullTextSearchConfig::default();
         let q_tokens: Vec<String> = query_str.split_whitespace().map(str::to_owned).collect();
-        let mut qtf_map: HashMap<String, u32> = HashMap::new();
+        let mut qtf_map: std::collections::BTreeMap<String, u32> =
+            std::collections::BTreeMap::new();
         for t in q_tokens {
             *qtf_map.entry(t).or_insert(0) += 1;
         }

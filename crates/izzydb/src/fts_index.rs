@@ -12,14 +12,14 @@ use izzydb_core::rank::RankBy;
 use izzydb_core::schema::{AttributeValue, Attributes, CollectionSchema};
 use izzydb_fts::{
     AnalyzedDoc, Bm25Result, DEFAULT_MAX_PREFIX_EXPANSIONS, DocLenBlock, FtsAnalyzer,
-    FtsBlockCursor, FtsMeta, FtsPostingSource, PackedPositionBlock, PackedPostingBlock,
-    PostingBlockView, ReusableBuffer, TermStats, execute_rank_by,
+    FtsBlockCursor, FtsDocLenCursor, FtsMeta, FtsPostingSource, PackedPositionBlock,
+    PackedPostingBlock, PostingBlockView, ReusableBuffer, TermStats, execute_rank_by,
 };
 use izzydb_storage::codec::{
     decode_fts_term_key, encode_fts_doc_len_key, encode_fts_posting_key,
     encode_fts_posting_prefix, encode_fts_term_key,
 };
-use izzydb_storage::{RocksPostingCursor, Storage, TxContext};
+use izzydb_storage::{RocksDocLenCursor, RocksPostingCursor, Storage, TxContext};
 
 /// RocksDB-backed [`FtsPostingSource`] adapter over [`Storage`].
 pub struct StorageFtsSource<'a> {
@@ -56,9 +56,23 @@ impl FtsBlockCursor for StorageCursor<'_> {
     }
 }
 
+pub struct StorageDocLenCursor(RocksDocLenCursor);
+
+impl FtsDocLenCursor for StorageDocLenCursor {
+    #[inline]
+    fn seek_block_bytes(&mut self, block_id: FtsBlockId) -> Result<Option<&[u8]>> {
+        self.0.seek_block_bytes(block_id)
+    }
+}
+
 impl FtsPostingSource for StorageFtsSource<'_> {
     type Cursor<'a>
         = StorageCursor<'a>
+    where
+        Self: 'a;
+
+    type DocLenCursor<'a>
+        = StorageDocLenCursor
     where
         Self: 'a;
 
@@ -78,14 +92,15 @@ impl FtsPostingSource for StorageFtsSource<'_> {
             .iter()
             .map(|t| encode_fts_term_key(attr_id, t))
             .collect();
-        let raw = self.storage.multi_get_fts_term_bytes(&keys)?;
-        let mut out = Vec::with_capacity(raw.len());
-        for opt in raw {
-            match opt {
-                Some(bytes) => out.push(Some(TermStats::decode(&bytes)?)),
-                None => out.push(None),
-            }
-        }
+        let mut out = Vec::with_capacity(keys.len());
+        self.storage
+            .multi_get_fts_term_bytes_sorted(&keys, |opt| {
+                match opt {
+                    Some(bytes) => out.push(Some(TermStats::decode(bytes)?)),
+                    None => out.push(None),
+                }
+                Ok(())
+            })?;
         Ok(out)
     }
 
@@ -131,20 +146,10 @@ impl FtsPostingSource for StorageFtsSource<'_> {
         Ok(StorageCursor(self.storage.open_fts_posting_cursor(prefix)?))
     }
 
-    fn read_doc_len_block(
-        &self,
-        attr_id: AttrId,
-        block_id: FtsBlockId,
-        f: &mut dyn FnMut(&[u8]) -> Result<()>,
-    ) -> Result<bool> {
-        let key = encode_fts_doc_len_key(attr_id, block_id);
-        match self.storage.get_fts_doc_len_pinned(&key)? {
-            Some(slice) => {
-                f(&slice)?;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+    fn open_doc_len_cursor<'a>(&'a self, attr_id: AttrId) -> Result<Self::DocLenCursor<'a>> {
+        Ok(StorageDocLenCursor(
+            self.storage.open_fts_doc_len_cursor(attr_id)?,
+        ))
     }
 
     fn multi_get_doc_ids(&self, fts_doc_ids: &[FtsDocId]) -> Result<Vec<Option<DocId>>> {

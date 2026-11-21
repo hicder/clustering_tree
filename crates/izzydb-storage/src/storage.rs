@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 use roaring::RoaringBitmap;
 use rocksdb::{
@@ -84,6 +85,8 @@ impl U32FromBe for u32 {
     }
 }
 
+type DocLenBlockTable = Arc<Vec<Option<Box<[u8]>>>>;
+
 /// RocksDB storage wrapper managing packed node, document, and attribute index column families.
 pub struct Storage {
     db: DB,
@@ -91,6 +94,7 @@ pub struct Storage {
     dim: usize,
     padded_dim: usize,
     rabitq_words: usize,
+    fts_doc_lens_cache: RwLock<HashMap<u16, DocLenBlockTable>>,
 }
 
 impl Storage {
@@ -135,6 +139,7 @@ impl Storage {
             dim: config.dim,
             padded_dim,
             rabitq_words,
+            fts_doc_lens_cache: RwLock::new(HashMap::new()),
         };
 
         let meta = match storage.get_meta()? {
@@ -578,17 +583,24 @@ impl Storage {
         self.db.get_cf(cf, key).map_err(map_db_err)
     }
 
-    pub fn multi_get_fts_term_bytes(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
+    pub fn multi_get_fts_term_bytes_sorted(
+        &self,
+        keys: &[Vec<u8>],
+        mut on_item: impl FnMut(Option<&[u8]>) -> Result<()>,
+    ) -> Result<()> {
         if keys.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let cf = self.cf(CF_FTS_TERMS)?;
-        let results = self.db.batched_multi_get_cf(cf, keys.iter(), false);
-        let mut out = Vec::with_capacity(keys.len());
+        let sorted = keys.windows(2).all(|w| w[0] <= w[1]);
+        let results = self.db.batched_multi_get_cf(cf, keys.iter(), sorted);
         for res in results {
-            out.push(res.map_err(map_db_err)?.map(|s| s.to_vec()));
+            match res.map_err(map_db_err)? {
+                Some(slice) => on_item(Some(&slice))?,
+                None => on_item(None)?,
+            }
         }
-        Ok(out)
+        Ok(())
     }
 
     pub fn scan_fts_term_prefix_bytes(
@@ -640,7 +652,7 @@ impl Storage {
         let cf = self.cf(CF_FTS_POSTINGS)?;
         let mut iter = self.db.raw_iterator_cf(cf);
         iter.seek(&prefix);
-        let valid = check_posting_iter(&iter, &prefix)?;
+        let current_block = read_posting_block_id(&iter, &prefix)?;
         let prefix_len = prefix.len();
         let mut seek_buf = prefix;
         seek_buf.reserve(4);
@@ -648,8 +660,55 @@ impl Storage {
             iter,
             seek_buf,
             prefix_len,
-            valid,
+            current_block,
         })
+    }
+
+    pub fn open_fts_doc_len_cursor(&self, attr_id: u16) -> Result<RocksDocLenCursor> {
+        {
+            let guard = self
+                .fts_doc_lens_cache
+                .read()
+                .expect("fts_doc_lens_cache poisoned");
+            if let Some(blocks) = guard.get(&attr_id) {
+                return Ok(RocksDocLenCursor {
+                    blocks: Arc::clone(blocks),
+                });
+            }
+        }
+
+        let mut write_guard = self
+            .fts_doc_lens_cache
+            .write()
+            .expect("fts_doc_lens_cache poisoned");
+        if let Some(blocks) = write_guard.get(&attr_id) {
+            return Ok(RocksDocLenCursor {
+                blocks: Arc::clone(blocks),
+            });
+        }
+
+        let cf = self.cf(CF_FTS_DOC_LENS)?;
+        let prefix = attr_id.to_be_bytes();
+        let mut iter = self.db.raw_iterator_cf(cf);
+        iter.seek(&prefix);
+        let mut blocks: Vec<Option<Box<[u8]>>> = Vec::new();
+        while let Some(k) = iter.key() {
+            if k.len() != 6 || k[0] != prefix[0] || k[1] != prefix[1] {
+                break;
+            }
+            let block_id = u32::from_be_bytes(k[2..6].try_into().unwrap()) as usize;
+            if let Some(val) = iter.value() {
+                if blocks.len() <= block_id {
+                    blocks.resize_with(block_id + 1, || None);
+                }
+                blocks[block_id] = Some(val.to_vec().into_boxed_slice());
+            }
+            iter.next();
+        }
+        iter.status().map_err(map_db_err)?;
+        let table = Arc::new(blocks);
+        write_guard.insert(attr_id, Arc::clone(&table));
+        Ok(RocksDocLenCursor { blocks: table })
     }
 
     pub fn all_fts_doc_map(&self) -> Result<Vec<(DocId, FtsDocId)>> {
@@ -890,26 +949,18 @@ pub struct RocksPostingCursor<'a> {
     iter: DBRawIteratorWithThreadMode<'a, DB>,
     seek_buf: Vec<u8>,
     prefix_len: usize,
-    valid: bool,
+    current_block: Option<FtsBlockId>,
 }
 
 impl<'a> RocksPostingCursor<'a> {
     #[inline]
     pub fn current_block_id(&self) -> Option<FtsBlockId> {
-        if !self.valid {
-            return None;
-        }
-        let k = self.iter.key()?;
-        let off = self.prefix_len;
-        if k.len() != off + 4 {
-            return None;
-        }
-        Some(u32::from_be_bytes(k[off..off + 4].try_into().unwrap()))
+        self.current_block
     }
 
     #[inline]
     pub fn current_block_bytes(&self) -> &[u8] {
-        if !self.valid {
+        if self.current_block.is_none() {
             return &[];
         }
         self.iter.value().unwrap_or(&[])
@@ -917,37 +968,71 @@ impl<'a> RocksPostingCursor<'a> {
 
     #[inline]
     pub fn next_block(&mut self) -> Result<()> {
-        if !self.valid {
+        if self.current_block.is_none() {
             return Ok(());
         }
         self.iter.next();
-        self.valid = check_posting_iter(&self.iter, &self.seek_buf[..self.prefix_len])?;
+        self.current_block = read_posting_block_id(&self.iter, &self.seek_buf[..self.prefix_len])?;
         Ok(())
     }
 
     #[inline]
     pub fn seek_block(&mut self, target: FtsBlockId) -> Result<()> {
-        if !self.valid {
+        let Some(cur) = self.current_block else {
+            return Ok(());
+        };
+        if cur >= target {
+            return Ok(());
+        }
+        // When advancing to the immediately following block, a single `next()` is
+        // guaranteed to reach `>= target` without risking a fallback `seek()`.
+        if cur + 1 == target {
+            self.iter.next();
+            self.current_block =
+                read_posting_block_id(&self.iter, &self.seek_buf[..self.prefix_len])?;
             return Ok(());
         }
         self.seek_buf.truncate(self.prefix_len);
         self.seek_buf.extend_from_slice(&target.to_be_bytes());
         self.iter.seek(&self.seek_buf);
-        self.valid = check_posting_iter(&self.iter, &self.seek_buf[..self.prefix_len])?;
+        self.current_block =
+            read_posting_block_id(&self.iter, &self.seek_buf[..self.prefix_len])?;
         Ok(())
     }
 }
 
 #[inline]
-fn check_posting_iter(iter: &DBRawIteratorWithThreadMode<'_, DB>, prefix: &[u8]) -> Result<bool> {
-    if !iter.valid() {
-        iter.status().map_err(map_db_err)?;
-        return Ok(false);
-    }
+fn read_posting_block_id(
+    iter: &DBRawIteratorWithThreadMode<'_, DB>,
+    prefix: &[u8],
+) -> Result<Option<FtsBlockId>> {
     let Some(k) = iter.key() else {
-        return Ok(false);
+        iter.status().map_err(map_db_err)?;
+        return Ok(None);
     };
-    Ok(k.starts_with(prefix) && k.len() == prefix.len() + 4)
+    let plen = prefix.len();
+    if k.len() == plen + 4 && k.starts_with(prefix) {
+        Ok(Some(u32::from_be_bytes(
+            k[plen..plen + 4].try_into().unwrap(),
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Cached per-attribute cursor over `cf_fts_doc_lens` document-length blocks.
+pub struct RocksDocLenCursor {
+    blocks: DocLenBlockTable,
+}
+
+impl RocksDocLenCursor {
+    #[inline]
+    pub fn seek_block_bytes(&mut self, block_id: FtsBlockId) -> Result<Option<&[u8]>> {
+        Ok(self
+            .blocks
+            .get(block_id as usize)
+            .and_then(|entry| entry.as_deref()))
+    }
 }
 
 #[inline]
@@ -1510,14 +1595,42 @@ impl<'a> TxContext<'a> {
                 None => batch.delete_fts_position(&key),
             }
         }
-        for (key, opt) in self.dirty_fts_doc_lens {
+        for (key, opt) in &self.dirty_fts_doc_lens {
             match opt {
-                Some(bytes) => batch.put_fts_doc_len(&key, &bytes),
-                None => batch.delete_fts_doc_len(&key),
+                Some(bytes) => batch.put_fts_doc_len(key, bytes),
+                None => batch.delete_fts_doc_len(key),
             }
         }
 
         self.storage.write_batch(batch)?;
+
+        if !self.dirty_fts_doc_lens.is_empty() {
+            let mut cache = self
+                .storage
+                .fts_doc_lens_cache
+                .write()
+                .expect("fts_doc_lens_cache poisoned");
+            for (key, opt) in self.dirty_fts_doc_lens {
+                let attr_id = u16::from_be_bytes([key[0], key[1]]);
+                if let Some(table) = cache.get_mut(&attr_id) {
+                    let blocks = Arc::make_mut(table);
+                    let block_id = u32::from_be_bytes([key[2], key[3], key[4], key[5]]) as usize;
+                    match opt {
+                        Some(bytes) => {
+                            if blocks.len() <= block_id {
+                                blocks.resize_with(block_id + 1, || None);
+                            }
+                            blocks[block_id] = Some(bytes.into_boxed_slice());
+                        }
+                        None => {
+                            if block_id < blocks.len() {
+                                blocks[block_id] = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Update in-memory caches only after RocksDB commit succeeds.
         for node_id in self.dirty_internal {

@@ -1,9 +1,10 @@
 use std::cmp::Ordering;
 
-use crate::config::{DocId, NodeId, TreeConfig};
+use crate::config::{DistanceMetric, DocId, NodeId, TreeConfig};
 use crate::error::{Result, TreeError};
 use crate::metric::{cluster_distance, prepare_vector, search_distance};
 use crate::node::TreeMeta;
+use crate::rabitq::RabitqQuantizer;
 use crate::storage::Storage;
 
 /// Route a prepared (validated and normalized if Cosine) vector to the single closest leaf.
@@ -59,16 +60,29 @@ pub fn search_leaves(
     Ok(frontier)
 }
 
-/// Approximate nearest neighbor search returning up to `k` `(DocId, distance)` pairs
-/// sorted by ascending distance.
+/// Parameters controlling quantized search and optional full-vector reranking.
+#[derive(Debug, Clone, Copy)]
+pub struct SearchOptions {
+    pub k: usize,
+    pub beam_width: usize,
+    pub rerank_candidates: Option<usize>,
+}
+
+/// Approximate nearest neighbor search using RaBitQ-quantized posting lists,
+/// optionally reranking the top `rerank_candidates` results against full vectors.
 pub fn search(
     storage: &Storage,
     meta: &TreeMeta,
+    quantizer: &RabitqQuantizer,
     query: &[f32],
-    k: usize,
-    beam_width: usize,
+    opts: SearchOptions,
     config: &TreeConfig,
 ) -> Result<Vec<(DocId, f32)>> {
+    let SearchOptions {
+        k,
+        beam_width,
+        rerank_candidates,
+    } = opts;
     if beam_width == 0 {
         return Err(TreeError::InvalidConfig(
             "beam_width must be >= 1".into(),
@@ -100,16 +114,48 @@ pub fn search(
         level -= 1;
     }
 
+    let dot_cache = if config.metric == DistanceMetric::DotProduct {
+        Some(quantizer.prepare_dot_query(&q))
+    } else {
+        None
+    };
+
     let mut candidates: Vec<(DocId, f32)> = Vec::new();
     for &(leaf_id, _) in &frontier {
-        storage.scan_leaf_with(leaf_id, |doc_id, vec| {
-            let d = search_distance(config.metric, &q, vec);
+        let leaf_header = storage
+            .get_node_header(leaf_id)?
+            .ok_or_else(|| TreeError::CorruptedData(format!("missing NodeHeader for leaf {leaf_id}")))?;
+        let state = quantizer.prepare_leaf_query(
+            &q,
+            &leaf_header.centroid,
+            config.metric,
+            dot_cache.as_ref(),
+        );
+        storage.scan_leaf_codes_with(leaf_id, |doc_id, residual_norm, o_bar_dot_o, code| {
+            let d = state.estimate_distance(residual_norm, o_bar_dot_o, code);
             candidates.push((doc_id, d));
         })?;
     }
 
-    sort_and_truncate(&mut candidates, k);
-    Ok(candidates)
+    let Some(rerank_k) = rerank_candidates else {
+        sort_and_truncate(&mut candidates, k);
+        return Ok(candidates);
+    };
+
+    let shortlist_len = rerank_k.max(k);
+    sort_and_truncate(&mut candidates, shortlist_len);
+    let ids: Vec<DocId> = candidates.iter().map(|&(id, _)| id).collect();
+    let vecs = storage.multi_get_vectors(&ids)?;
+
+    let mut reranked: Vec<(DocId, f32)> = Vec::with_capacity(ids.len());
+    for (doc_id, opt_vec) in ids.into_iter().zip(vecs) {
+        let vec = opt_vec.ok_or_else(|| {
+            TreeError::CorruptedData(format!("missing full vector for doc {doc_id}"))
+        })?;
+        reranked.push((doc_id, search_distance(config.metric, &q, &vec)));
+    }
+    sort_and_truncate(&mut reranked, k);
+    Ok(reranked)
 }
 
 #[inline]

@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use crate::config::{DistanceMetric, NodeId};
 use crate::error::{Result, TreeError};
 
-const META_LEN: usize = 30;
+const META_LEN: usize = 39;
 const HEADER_PREFIX_LEN: usize = 22;
 
 /// Global tree metadata persisted in `cf_meta`.
@@ -15,6 +15,8 @@ pub struct TreeMeta {
     pub dim: u32,
     pub metric: DistanceMetric,
     pub num_vectors: u64,
+    pub rabitq_seed: u64,
+    pub rabitq_bits: u8,
 }
 
 impl TreeMeta {
@@ -26,6 +28,8 @@ impl TreeMeta {
         buf[17..21].copy_from_slice(&self.dim.to_le_bytes());
         buf[21] = self.metric.as_u8();
         buf[22..30].copy_from_slice(&self.num_vectors.to_le_bytes());
+        buf[30..38].copy_from_slice(&self.rabitq_seed.to_le_bytes());
+        buf[38] = self.rabitq_bits;
         buf
     }
 
@@ -43,6 +47,8 @@ impl TreeMeta {
             dim: u32::from_le_bytes(bytes[17..21].try_into().unwrap()),
             metric: DistanceMetric::from_u8(bytes[21])?,
             num_vectors: u64::from_le_bytes(bytes[22..30].try_into().unwrap()),
+            rabitq_seed: u64::from_le_bytes(bytes[30..38].try_into().unwrap()),
+            rabitq_bits: bytes[38],
         })
     }
 }

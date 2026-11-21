@@ -9,6 +9,7 @@ use crate::metric::{
     prepare_vector, validate_vector,
 };
 use crate::node::{InternalEntry, NodeHeader, TreeMeta};
+use crate::rabitq::RabitqQuantizer;
 use crate::search;
 use crate::storage::{Storage, TxContext};
 use crate::verify::{self, TreeStats};
@@ -21,11 +22,13 @@ pub(crate) struct SplitPair {
     pub old_centroid: Vec<f32>,
 }
 
-/// RocksDB-backed mutable hierarchical clustering tree (~100x fanout).
+/// RocksDB-backed mutable hierarchical clustering tree (~100x fanout)
+/// with RaBitQ-quantized posting lists and full-precision vector storage.
 pub struct ClusteringTree {
     pub(crate) storage: Storage,
     pub(crate) config: TreeConfig,
     pub(crate) meta: TreeMeta,
+    pub(crate) quantizer: RabitqQuantizer,
 }
 
 impl ClusteringTree {
@@ -33,10 +36,12 @@ impl ClusteringTree {
     pub fn open(path: impl AsRef<Path>, config: TreeConfig) -> Result<Self> {
         config.validate()?;
         let (storage, meta) = Storage::open(path, &config)?;
+        let quantizer = RabitqQuantizer::new(config.dim, meta.rabitq_seed);
         Ok(Self {
             storage,
             config,
             meta,
+            quantizer,
         })
     }
 
@@ -55,7 +60,13 @@ impl ClusteringTree {
         self.meta.num_vectors == 0
     }
 
-    /// Insert or update a vector in the tree, triggering splits, LIRE, and root growth as needed.
+    /// Retrieve the stored full-precision vector for `id` from `cf_vectors`.
+    pub fn get_vector(&self, id: DocId) -> Result<Option<Vec<f32>>> {
+        self.storage.get_vector(id)
+    }
+
+    /// Insert or update a vector in the tree, quantizing it for the leaf posting list
+    /// while persisting the full-precision vector in `cf_vectors`.
     pub fn add_leaf(&mut self, id: DocId, embedding: &[f32]) -> Result<()> {
         let vec = prepare_vector(embedding, self.config.dim, self.config.metric)?;
 
@@ -80,7 +91,7 @@ impl ClusteringTree {
         let mut header = tx.get_header(target_leaf)?;
         let old_centroid = header.centroid.clone();
 
-        tx.put_leaf_entry(target_leaf, id, vec.clone());
+        tx.put_vector(id, vec.clone());
         tx.put_doc_loc(id, target_leaf);
         tx.meta_mut().num_vectors += 1;
 
@@ -89,15 +100,40 @@ impl ClusteringTree {
         header.subtree_count = new_count as u64;
 
         if new_count <= self.config.max_leaf_size {
-            // Recompute exact centroid every 16 inserts to avoid floating-point drift;
-            // otherwise use O(dim) incremental mean.
-            header.centroid = if new_count.is_multiple_of(16) {
-                let entries = tx.get_leaf_entries(target_leaf)?;
-                let refs: Vec<&[f32]> = entries.values().map(|v| v.as_slice()).collect();
-                compute_mean_centroid(&refs, self.config.dim, self.config.metric)
+            if new_count == 1 {
+                header.centroid = vec.clone();
+                let q_entry = self.quantizer.encode(&vec, &header.centroid);
+                tx.put_leaf_entry(target_leaf, id, q_entry);
+            } else if new_count.is_multiple_of(16) {
+                // Periodically recompute exact centroid and re-quantize the leaf to prevent drift.
+                let mut doc_ids = tx.get_leaf_doc_ids(target_leaf)?;
+                doc_ids.push(id);
+                let items = tx.get_vectors_batch(&doc_ids)?;
+                let refs: Vec<&[f32]> = items.iter().map(|(_, v)| v.as_slice()).collect();
+                header.centroid = compute_mean_centroid(&refs, self.config.dim, self.config.metric);
+                for (doc_id, v) in items {
+                    let q_entry = self.quantizer.encode(&v, &header.centroid);
+                    tx.put_leaf_entry(target_leaf, doc_id, q_entry);
+                }
             } else {
-                incremental_mean(&header.centroid, &vec, new_count, self.config.metric)
-            };
+                header.centroid =
+                    incremental_mean(&header.centroid, &vec, new_count, self.config.metric);
+                let drifted = cluster_distance(self.config.metric, &old_centroid, &header.centroid)
+                    > self.config.centroid_drift_eps;
+                if new_count <= 16 || drifted {
+                    let mut doc_ids = tx.get_leaf_doc_ids(target_leaf)?;
+                    doc_ids.push(id);
+                    let items = tx.get_vectors_batch(&doc_ids)?;
+                    for (doc_id, v) in items {
+                        let q_entry = self.quantizer.encode(&v, &header.centroid);
+                        tx.put_leaf_entry(target_leaf, doc_id, q_entry);
+                    }
+                } else {
+                    let q_entry = self.quantizer.encode(&vec, &header.centroid);
+                    tx.put_leaf_entry(target_leaf, id, q_entry);
+                }
+            }
+
             tx.put_header(target_leaf, header);
             if target_leaf != tx.meta().root_id {
                 propagate_centroid_upward(&mut tx, target_leaf, &old_centroid, &self.config)?;
@@ -105,8 +141,11 @@ impl ClusteringTree {
             self.meta = tx.commit()?;
             Ok(())
         } else {
+            // Add the new quantized entry so split_node sees all doc_ids in target_leaf.
+            let q_entry = self.quantizer.encode(&vec, &header.centroid);
+            tx.put_leaf_entry(target_leaf, id, q_entry);
             tx.put_header(target_leaf, header);
-            let split_pair = split_node(&mut tx, target_leaf, &self.config)?;
+            let split_pair = split_node(&mut tx, target_leaf, &self.config, &self.quantizer)?;
             self.meta = tx.commit()?;
 
             if self.config.enable_lire && self.meta.root_level > 0 {
@@ -124,9 +163,43 @@ impl ClusteringTree {
         self.remove_doc_internal(id)
     }
 
-    /// Approximate nearest neighbor search using beam search from the root to `beam_width` leaves.
+    /// Approximate nearest neighbor search using RaBitQ-quantized posting lists.
     pub fn search(&self, query: &[f32], k: usize, beam_width: usize) -> Result<Vec<(DocId, f32)>> {
-        search::search(&self.storage, &self.meta, query, k, beam_width, &self.config)
+        search::search(
+            &self.storage,
+            &self.meta,
+            &self.quantizer,
+            query,
+            search::SearchOptions {
+                k,
+                beam_width,
+                rerank_candidates: None,
+            },
+            &self.config,
+        )
+    }
+
+    /// Approximate nearest neighbor search using RaBitQ posting lists for candidate selection,
+    /// followed by exact reranking of the top `rerank_candidates` against stored full vectors.
+    pub fn search_with_rerank(
+        &self,
+        query: &[f32],
+        k: usize,
+        beam_width: usize,
+        rerank_candidates: usize,
+    ) -> Result<Vec<(DocId, f32)>> {
+        search::search(
+            &self.storage,
+            &self.meta,
+            &self.quantizer,
+            query,
+            search::SearchOptions {
+                k,
+                beam_width,
+                rerank_candidates: Some(rerank_candidates),
+            },
+            &self.config,
+        )
     }
 
     /// Exhaustively verify all structural invariants and return tree statistics.
@@ -145,18 +218,32 @@ impl ClusteringTree {
 
         tx.delete_leaf_entry(leaf_id, id);
         tx.delete_doc_loc(id);
+        tx.delete_vector(id);
         tx.meta_mut().num_vectors = tx.meta().num_vectors.saturating_sub(1);
 
-        let entries = tx.get_leaf_entries(leaf_id)?;
-        let new_count = entries.len();
+        let remaining_ids = tx.get_leaf_doc_ids(leaf_id)?;
+        let new_count = remaining_ids.len();
         header.entry_count = new_count as u32;
         header.subtree_count = new_count as u64;
-        header.centroid = if new_count == 0 {
-            vec![0.0; self.config.dim]
+
+        let will_underflow = leaf_id != tx.meta().root_id && new_count < self.config.min_leaf_size;
+        if new_count == 0 {
+            header.centroid = vec![0.0; self.config.dim];
         } else {
-            let refs: Vec<&[f32]> = entries.values().map(|v| v.as_slice()).collect();
-            compute_mean_centroid(&refs, self.config.dim, self.config.metric)
-        };
+            let items = tx.get_vectors_batch(&remaining_ids)?;
+            let refs: Vec<&[f32]> = items.iter().map(|(_, v)| v.as_slice()).collect();
+            header.centroid = compute_mean_centroid(&refs, self.config.dim, self.config.metric);
+            if !will_underflow
+                && (new_count <= 16
+                    || cluster_distance(self.config.metric, &old_centroid, &header.centroid)
+                        > self.config.centroid_drift_eps)
+            {
+                for (doc_id, v) in items {
+                    let q_entry = self.quantizer.encode(&v, &header.centroid);
+                    tx.put_leaf_entry(leaf_id, doc_id, q_entry);
+                }
+            }
+        }
         tx.put_header(leaf_id, header);
 
         if leaf_id == tx.meta().root_id {
@@ -164,8 +251,8 @@ impl ClusteringTree {
             return Ok(());
         }
 
-        if new_count < self.config.min_leaf_size {
-            handle_underflow(&mut tx, leaf_id, &self.config)?;
+        if will_underflow {
+            handle_underflow(&mut tx, leaf_id, &self.config, &self.quantizer)?;
         } else {
             propagate_centroid_upward(&mut tx, leaf_id, &old_centroid, &self.config)?;
         }
@@ -223,6 +310,7 @@ pub(crate) fn split_node(
     tx: &mut TxContext<'_>,
     node_id: NodeId,
     config: &TreeConfig,
+    quantizer: &RabitqQuantizer,
 ) -> Result<SplitPair> {
     let header = tx.get_header(node_id)?;
     let level = header.level;
@@ -231,8 +319,8 @@ pub(crate) fn split_node(
 
     let right_id = tx.alloc_node_id();
     let (left_header, right_header) = if level == 0 {
-        let entries = tx.get_leaf_entries(node_id)?;
-        let items: Vec<(DocId, Vec<f32>)> = entries.into_iter().collect();
+        let doc_ids = tx.get_leaf_doc_ids(node_id)?;
+        let items = tx.get_vectors_batch(&doc_ids)?;
         let weighted: Vec<(&[f32], u64)> =
             items.iter().map(|(_, v)| (v.as_slice(), 1u64)).collect();
         let split = balanced_two_means(
@@ -243,10 +331,14 @@ pub(crate) fn split_node(
             config.metric,
         );
 
+        for &idx in &split.part1 {
+            let (doc_id, ref vec) = items[idx];
+            tx.put_leaf_entry(node_id, doc_id, quantizer.encode(vec, &split.centroid1));
+        }
         for &idx in &split.part2 {
             let (doc_id, ref vec) = items[idx];
             tx.delete_leaf_entry(node_id, doc_id);
-            tx.put_leaf_entry(right_id, doc_id, vec.clone());
+            tx.put_leaf_entry(right_id, doc_id, quantizer.encode(vec, &split.centroid2));
             tx.put_doc_loc(doc_id, right_id);
         }
 
@@ -309,7 +401,15 @@ pub(crate) fn split_node(
         (left_h, right_h)
     };
 
-    attach_split_pair(tx, node_id, left_header, right_id, right_header, config)?;
+    attach_split_pair(
+        tx,
+        node_id,
+        left_header,
+        right_id,
+        right_header,
+        config,
+        quantizer,
+    )?;
 
     Ok(SplitPair {
         left_id: node_id,
@@ -325,6 +425,7 @@ fn attach_split_pair(
     right_id: NodeId,
     mut right_header: NodeHeader,
     config: &TreeConfig,
+    quantizer: &RabitqQuantizer,
 ) -> Result<()> {
     let level = left_header.level;
     match left_header.parent_id {
@@ -404,7 +505,7 @@ fn attach_split_pair(
             tx.put_header(parent_id, parent_header);
 
             if parent_entries.len() > config.max_internal_fanout {
-                split_node(tx, parent_id, config)?;
+                split_node(tx, parent_id, config, quantizer)?;
             } else {
                 propagate_centroid_upward(tx, parent_id, &old_parent_centroid, config)?;
             }
@@ -418,6 +519,7 @@ pub(crate) fn handle_underflow(
     tx: &mut TxContext<'_>,
     node_id: NodeId,
     config: &TreeConfig,
+    quantizer: &RabitqQuantizer,
 ) -> Result<()> {
     if node_id == tx.meta().root_id {
         collapse_root(tx)?;
@@ -449,7 +551,7 @@ pub(crate) fn handle_underflow(
     if header.entry_count == 0 {
         tx.delete_header(node_id);
         tx.delete_internal_entry(parent_id, node_id);
-        refresh_parent_after_removal(tx, parent_id, config)?;
+        refresh_parent_after_removal(tx, parent_id, config, quantizer)?;
         return Ok(());
     }
 
@@ -480,17 +582,23 @@ pub(crate) fn handle_underflow(
     if total <= max_size {
         // Case 1: Merge `node_id` into `sib_id`.
         if level == 0 {
-            let entries = tx.get_leaf_entries(node_id)?;
-            for (doc_id, vec) in entries {
+            let moved_ids = tx.get_leaf_doc_ids(node_id)?;
+            let mut sib_ids = tx.get_leaf_doc_ids(sib_id)?;
+            for &doc_id in &moved_ids {
                 tx.delete_leaf_entry(node_id, doc_id);
-                tx.put_leaf_entry(sib_id, doc_id, vec);
                 tx.put_doc_loc(doc_id, sib_id);
             }
-            let sib_entries = tx.get_leaf_entries(sib_id)?;
-            let refs: Vec<&[f32]> = sib_entries.values().map(|v| v.as_slice()).collect();
-            sib_header.entry_count = sib_entries.len() as u32;
-            sib_header.subtree_count = sib_entries.len() as u64;
+            sib_ids.extend(moved_ids);
+
+            let sib_vecs = tx.get_vectors_batch(&sib_ids)?;
+            let refs: Vec<&[f32]> = sib_vecs.iter().map(|(_, v)| v.as_slice()).collect();
+            sib_header.entry_count = sib_vecs.len() as u32;
+            sib_header.subtree_count = sib_vecs.len() as u64;
             sib_header.centroid = compute_mean_centroid(&refs, config.dim, config.metric);
+
+            for (doc_id, vec) in sib_vecs {
+                tx.put_leaf_entry(sib_id, doc_id, quantizer.encode(&vec, &sib_header.centroid));
+            }
         } else {
             let entries = tx.get_internal_entries(node_id)?;
             for (child_id, entry) in entries {
@@ -519,19 +627,22 @@ pub(crate) fn handle_underflow(
             },
         );
 
-        refresh_parent_after_removal(tx, parent_id, config)?;
+        refresh_parent_after_removal(tx, parent_id, config, quantizer)?;
     } else {
         // Case 2: Redistribute `node_id` and `sib_id` via balanced 2-means.
         let mut left_header = header;
         if level == 0 {
-            let left_entries = tx.get_leaf_entries(node_id)?;
-            let right_entries = tx.get_leaf_entries(sib_id)?;
+            let left_ids = tx.get_leaf_doc_ids(node_id)?;
+            let right_ids = tx.get_leaf_doc_ids(sib_id)?;
+            let left_vecs = tx.get_vectors_batch(&left_ids)?;
+            let right_vecs = tx.get_vectors_batch(&right_ids)?;
+
             let mut combined: Vec<(DocId, Vec<f32>, bool)> =
-                Vec::with_capacity(left_entries.len() + right_entries.len());
-            for (did, v) in left_entries {
+                Vec::with_capacity(left_vecs.len() + right_vecs.len());
+            for (did, v) in left_vecs {
                 combined.push((did, v, true));
             }
-            for (did, v) in right_entries {
+            for (did, v) in right_vecs {
                 combined.push((did, v, false));
             }
 
@@ -543,17 +654,17 @@ pub(crate) fn handle_underflow(
                 let (did, ref v, was_left) = combined[idx];
                 if !was_left {
                     tx.delete_leaf_entry(sib_id, did);
-                    tx.put_leaf_entry(node_id, did, v.clone());
                     tx.put_doc_loc(did, node_id);
                 }
+                tx.put_leaf_entry(node_id, did, quantizer.encode(v, &split.centroid1));
             }
             for &idx in &split.part2 {
                 let (did, ref v, was_left) = combined[idx];
                 if was_left {
                     tx.delete_leaf_entry(node_id, did);
-                    tx.put_leaf_entry(sib_id, did, v.clone());
                     tx.put_doc_loc(did, sib_id);
                 }
+                tx.put_leaf_entry(sib_id, did, quantizer.encode(v, &split.centroid2));
             }
 
             left_header.entry_count = split.part1.len() as u32;
@@ -651,6 +762,7 @@ fn refresh_parent_after_removal(
     tx: &mut TxContext<'_>,
     parent_id: NodeId,
     config: &TreeConfig,
+    quantizer: &RabitqQuantizer,
 ) -> Result<()> {
     let mut parent_header = tx.get_header(parent_id)?;
     let old_parent_centroid = parent_header.centroid.clone();
@@ -666,7 +778,7 @@ fn refresh_parent_after_removal(
             collapse_root(tx)?;
         }
     } else if parent_entries.len() < config.min_internal_fanout {
-        handle_underflow(tx, parent_id, config)?;
+        handle_underflow(tx, parent_id, config, quantizer)?;
     } else {
         propagate_centroid_upward(tx, parent_id, &old_parent_centroid, config)?;
     }

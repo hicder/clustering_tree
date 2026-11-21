@@ -137,10 +137,15 @@ pub fn verify_invariants(
                 )));
             }
 
-            for (doc_id, vec) in leaf_entries {
-                if vec.len() != config.dim || vec.iter().any(|x| !x.is_finite()) {
+            for (doc_id, q_entry) in leaf_entries {
+                if !q_entry.residual_norm.is_finite()
+                    || q_entry.residual_norm < 0.0
+                    || !q_entry.o_bar_dot_o.is_finite()
+                    || q_entry.o_bar_dot_o <= 0.0
+                    || q_entry.code.len() != storage.rabitq_words()
+                {
                     return Err(TreeError::InvariantViolation(format!(
-                        "doc {doc_id} in leaf {node_id} has invalid vector"
+                        "doc {doc_id} in leaf {node_id} has invalid quantized entry"
                     )));
                 }
                 if let Some(prev_leaf) = seen_docs.insert(doc_id, node_id) {
@@ -228,6 +233,28 @@ pub fn verify_invariants(
                     "orphaned cf_doc_loc entry for doc {doc_id} -> {leaf_id}"
                 )));
             }
+        }
+    }
+
+    // Check cf_vectors is a 1-to-1 bijection with seen_docs and all vectors are valid.
+    let stored_vecs = storage.all_vectors()?;
+    if stored_vecs.len() != seen_docs.len() {
+        return Err(TreeError::InvariantViolation(format!(
+            "cf_vectors count {} != leaf entries count {}",
+            stored_vecs.len(),
+            seen_docs.len()
+        )));
+    }
+    for (doc_id, vec) in stored_vecs {
+        if !seen_docs.contains_key(&doc_id) {
+            return Err(TreeError::InvariantViolation(format!(
+                "orphaned cf_vectors entry for doc {doc_id}"
+            )));
+        }
+        if vec.len() != config.dim || vec.iter().any(|x| !x.is_finite()) {
+            return Err(TreeError::InvariantViolation(format!(
+                "doc {doc_id} in cf_vectors has invalid vector"
+            )));
         }
     }
 

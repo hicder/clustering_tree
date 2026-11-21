@@ -7,6 +7,7 @@ pub mod kmeans;
 pub mod lire;
 pub mod metric;
 pub mod node;
+pub mod rabitq;
 pub mod search;
 pub mod storage;
 pub mod tree;

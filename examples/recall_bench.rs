@@ -88,17 +88,32 @@ fn run_bench(name: &str, data: &[Vec<f32>], queries: &[Vec<f32>], enable_lire: b
 
     for beam in [4, 8, 16, 32] {
         let sq = Instant::now();
-        let mut hits = 0usize;
+        let mut q_hits = 0usize;
         for (qi, q) in queries.iter().enumerate() {
             let res = tree.search(q, 10, beam).unwrap();
-            hits += res
+            q_hits += res
                 .iter()
                 .filter(|&&(id, _)| ground_truth[qi].contains(&id))
                 .count();
         }
-        let search_us = sq.elapsed().as_secs_f64() * 1e6 / queries.len() as f64;
-        let recall = hits as f64 / (queries.len() * 10) as f64;
-        println!("  beam={beam:2} -> recall@10={recall:.4}, avg_query={search_us:.1}us");
+        let q_us = sq.elapsed().as_secs_f64() * 1e6 / queries.len() as f64;
+        let q_recall = q_hits as f64 / (queries.len() * 10) as f64;
+
+        let sr = Instant::now();
+        let mut r_hits = 0usize;
+        for (qi, q) in queries.iter().enumerate() {
+            let res = tree.search_with_rerank(q, 10, beam, 100).unwrap();
+            r_hits += res
+                .iter()
+                .filter(|&&(id, _)| ground_truth[qi].contains(&id))
+                .count();
+        }
+        let r_us = sr.elapsed().as_secs_f64() * 1e6 / queries.len() as f64;
+        let r_recall = r_hits as f64 / (queries.len() * 10) as f64;
+
+        println!(
+            "  beam={beam:2} -> rabitq recall@10={q_recall:.4} ({q_us:.1}us) | rerank@100 recall@10={r_recall:.4} ({r_us:.1}us)"
+        );
     }
     let _ = HashMap::<DocId, usize>::new();
 }

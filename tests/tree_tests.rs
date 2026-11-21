@@ -181,11 +181,23 @@ fn test_small_fanout_multi_level_growth_and_collapse() {
             tree.verify_invariants().unwrap();
 
             let q = random_vec(&mut rng, 16);
-            let got = tree.search(&q, 10, 16).unwrap();
+            let got_q = tree.search(&q, 10, 16).unwrap();
+            let got_reranked = tree.search_with_rerank(&q, 10, 16, 40).unwrap();
             let exact = brute_force_topk(&docs, &q, 10, DistanceMetric::L2Squared);
             let exact_ids: HashSet<DocId> = exact.iter().map(|&(id, _)| id).collect();
-            let hits = got.iter().filter(|&&(id, _)| exact_ids.contains(&id)).count();
-            assert!(hits >= 8, "expected >= 8/10 recall with beam=16, got {hits}");
+            let q_hits = got_q.iter().filter(|&&(id, _)| exact_ids.contains(&id)).count();
+            let rerank_hits = got_reranked
+                .iter()
+                .filter(|&&(id, _)| exact_ids.contains(&id))
+                .count();
+            assert!(
+                q_hits >= 5,
+                "expected >= 5/10 pure RaBitQ recall with beam=16, got {q_hits}"
+            );
+            assert!(
+                rerank_hits >= 8,
+                "expected >= 8/10 reranked recall with beam=16, got {rerank_hits}"
+            );
 
             // Delete all vectors and watch tree collapse cleanly back to root_level = 0
             for id in 0..400u64 {
@@ -234,18 +246,33 @@ fn test_all_metrics_search_and_upsert() {
         let stats = tree.verify_invariants().unwrap();
         assert_eq!(stats.num_vectors, 120);
 
-        // Verify recall against brute force on 10 queries
-        let mut total_hits = 0usize;
+        // Verify recall against brute force on 10 queries:
+        // 1) Pure RaBitQ quantized posting-list scan
+        // 2) RaBitQ + full-vector reranking from cf_vectors
+        let mut q_hits = 0usize;
+        let mut rerank_hits = 0usize;
         for _ in 0..10 {
             let q = random_vec(&mut rng, 8);
-            let got = tree.search(&q, 5, 12).unwrap();
+            let got_quantized = tree.search(&q, 5, 12).unwrap();
+            let got_reranked = tree.search_with_rerank(&q, 5, 12, 30).unwrap();
             let exact = brute_force_topk(&docs, &q, 5, metric);
             let exact_ids: HashSet<DocId> = exact.iter().map(|&(id, _)| id).collect();
-            total_hits += got.iter().filter(|&&(id, _)| exact_ids.contains(&id)).count();
+            q_hits += got_quantized
+                .iter()
+                .filter(|&&(id, _)| exact_ids.contains(&id))
+                .count();
+            rerank_hits += got_reranked
+                .iter()
+                .filter(|&&(id, _)| exact_ids.contains(&id))
+                .count();
         }
         assert!(
-            total_hits >= 40,
-            "metric {metric:?} expected >= 40/50 hits with beam=12, got {total_hits}"
+            q_hits >= 25,
+            "metric {metric:?} pure RaBitQ expected >= 25/50 hits with beam=12, got {q_hits}"
+        );
+        assert!(
+            rerank_hits >= 40,
+            "metric {metric:?} reranked expected >= 40/50 hits with beam=12, got {rerank_hits}"
         );
     }
 }
@@ -324,7 +351,8 @@ fn test_clustered_recall_with_lire_and_default_fanout() {
     assert_eq!(stats.num_vectors, 5_000);
     assert!(stats.root_level >= 1);
 
-    let mut hits = 0usize;
+    let mut q_hits = 0usize;
+    let mut rerank_hits = 0usize;
     let queries = 25;
     for q_idx in 0..queries {
         let c = &centers[q_idx % centers.len()];
@@ -332,14 +360,56 @@ fn test_clustered_recall_with_lire_and_default_fanout() {
             .iter()
             .map(|&x| x + rng.random_range(-0.15f32..0.15f32))
             .collect();
-        let got = tree.search(&q, 10, 8).unwrap();
+        let got_q = tree.search(&q, 10, 8).unwrap();
+        let got_rerank = tree.search_with_rerank(&q, 10, 8, 80).unwrap();
         let exact = brute_force_topk(&oracle, &q, 10, DistanceMetric::L2Squared);
         let exact_ids: HashSet<DocId> = exact.iter().map(|&(id, _)| id).collect();
-        hits += got.iter().filter(|&&(id, _)| exact_ids.contains(&id)).count();
+        q_hits += got_q.iter().filter(|&&(id, _)| exact_ids.contains(&id)).count();
+        rerank_hits += got_rerank
+            .iter()
+            .filter(|&&(id, _)| exact_ids.contains(&id))
+            .count();
     }
-    let recall = hits as f64 / (queries * 10) as f64;
+    let q_recall = q_hits as f64 / (queries * 10) as f64;
+    let rerank_recall = rerank_hits as f64 / (queries * 10) as f64;
     assert!(
-        recall >= 0.90,
-        "expected recall@10 >= 0.90 on clustered 5k dataset, got {recall:.3}"
+        q_recall >= 0.55,
+        "expected pure RaBitQ recall@10 >= 0.55 on clustered 5k dataset, got {q_recall:.3}"
     );
+    assert!(
+        rerank_recall >= 0.90,
+        "expected reranked recall@10 >= 0.90 on clustered 5k dataset, got {rerank_recall:.3}"
+    );
+}
+
+#[test]
+fn test_posting_list_stores_quantized_code_and_vectors_cf_stores_full_vector() {
+    let dir = TempDir::new().unwrap();
+    let dim = 128;
+    let cfg = TreeConfig::new(dim, DistanceMetric::L2Squared);
+    let mut tree = ClusteringTree::open(dir.path(), cfg.clone()).unwrap();
+
+    let mut rng = SmallRng::seed_from_u64(777);
+    let v0 = random_vec(&mut rng, dim);
+    let v1 = random_vec(&mut rng, dim);
+    tree.add_leaf(10, &v0).unwrap();
+    tree.add_leaf(20, &v1).unwrap();
+
+    // Full vectors are stored in cf_vectors
+    assert_eq!(tree.get_vector(10).unwrap(), Some(v0.clone()));
+    assert_eq!(tree.get_vector(20).unwrap(), Some(v1.clone()));
+
+    // Upsert updates full vector and remove deletes it
+    tree.add_leaf(10, &v1).unwrap();
+    assert_eq!(tree.get_vector(10).unwrap(), Some(v1.clone()));
+    tree.remove_leaf(10, &v1).unwrap();
+    assert_eq!(tree.get_vector(10).unwrap(), None);
+
+    tree.verify_invariants().unwrap();
+    drop(tree);
+
+    // Reopen and verify persisted RaBitQ seed + full vectors + quantized posting list
+    let tree = ClusteringTree::open(dir.path(), cfg).unwrap();
+    assert_eq!(tree.get_vector(20).unwrap(), Some(v1));
+    tree.verify_invariants().unwrap();
 }

@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use crate::config::{DocId, NodeId};
-use crate::error::Result;
+use crate::error::{Result, TreeError};
 use crate::metric::{cluster_distance, compute_mean_centroid};
 use crate::search;
 use crate::storage::TxContext;
@@ -41,7 +41,7 @@ pub(crate) fn run_lire(tree: &mut ClusteringTree, initial_split: SplitPair) -> R
             let count = header.entry_count as usize;
             if count > tree.config.max_leaf_size {
                 let mut tx = TxContext::new(&tree.storage, tree.meta.clone());
-                let split_pair = split_node(&mut tx, leaf_id, &tree.config)?;
+                let split_pair = split_node(&mut tx, leaf_id, &tree.config, &tree.quantizer)?;
                 tree.meta = tx.commit()?;
 
                 // If the leaf had > 2 * max_leaf_size entries, either half could still exceed max.
@@ -59,13 +59,26 @@ pub(crate) fn run_lire(tree: &mut ClusteringTree, initial_split: SplitPair) -> R
                 }
             } else if leaf_id != tree.meta.root_id && count < tree.config.min_leaf_size {
                 let mut tx = TxContext::new(&tree.storage, tree.meta.clone());
-                handle_underflow(&mut tx, leaf_id, &tree.config)?;
+                handle_underflow(&mut tx, leaf_id, &tree.config, &tree.quantizer)?;
                 tree.meta = tx.commit()?;
             }
         }
     }
 
     Ok(())
+}
+
+fn fetch_leaf_vectors(tree: &ClusteringTree, leaf_id: NodeId) -> Result<Vec<(DocId, Vec<f32>)>> {
+    let doc_ids = tree.storage.scan_leaf_doc_ids(leaf_id)?;
+    let vecs = tree.storage.multi_get_vectors(&doc_ids)?;
+    let mut out = Vec::with_capacity(doc_ids.len());
+    for (doc_id, opt_vec) in doc_ids.into_iter().zip(vecs) {
+        let vec = opt_vec.ok_or_else(|| {
+            TreeError::CorruptedData(format!("missing full vector for doc {doc_id}"))
+        })?;
+        out.push((doc_id, vec));
+    }
+    Ok(out)
 }
 
 fn reassign_split_pair(
@@ -121,12 +134,12 @@ fn reassign_split_pair(
     let c_u = &u_header.centroid;
     let c_v = &v_header.centroid;
 
-    // Collect `(doc_id, vec, from_leaf, to_leaf)` across outward and inward checks.
-    let mut moves: Vec<(DocId, Vec<f32>, NodeId, NodeId)> = Vec::new();
+    // Collect `(doc_id, from_leaf, to_leaf)` across outward and inward checks.
+    let mut moves: Vec<(DocId, NodeId, NodeId)> = Vec::new();
 
     // 1. Outward check: vectors in U and V that are closer to a neighbor leaf's centroid.
     for (src_id, src_centroid) in [(pair.left_id, c_u), (pair.right_id, c_v)] {
-        let entries = tree.storage.scan_leaf_entries(src_id)?;
+        let entries = fetch_leaf_vectors(tree, src_id)?;
         for (doc_id, vec) in entries {
             let d_self = cluster_distance(metric, &vec, src_centroid);
             let mut best_neighbor: Option<(NodeId, f32)> = None;
@@ -142,7 +155,7 @@ fn reassign_split_pair(
                 }
             }
             if let Some((to_id, _)) = best_neighbor {
-                moves.push((doc_id, vec, src_id, to_id));
+                moves.push((doc_id, src_id, to_id));
             }
         }
     }
@@ -155,7 +168,7 @@ fn reassign_split_pair(
             continue;
         }
 
-        let entries = tree.storage.scan_leaf_entries(nid)?;
+        let entries = fetch_leaf_vectors(tree, nid)?;
         for (doc_id, vec) in entries {
             let d_n = cluster_distance(metric, &vec, c_n);
             let d_u = cluster_distance(metric, &vec, c_u);
@@ -166,7 +179,7 @@ fn reassign_split_pair(
                 } else {
                     pair.right_id
                 };
-                moves.push((doc_id, vec, nid, to_id));
+                moves.push((doc_id, nid, to_id));
             }
         }
     }
@@ -177,28 +190,44 @@ fn reassign_split_pair(
 
     let mut tx = TxContext::new(&tree.storage, tree.meta.clone());
     let mut touched_leaves = BTreeSet::new();
+    let mut leaf_docs: HashMap<NodeId, BTreeSet<DocId>> = HashMap::new();
 
-    for (doc_id, vec, from_leaf, to_leaf) in moves {
+    for &(doc_id, from_leaf, to_leaf) in &moves {
+        if let std::collections::hash_map::Entry::Vacant(e) = leaf_docs.entry(from_leaf) {
+            let ids: BTreeSet<DocId> = tx.get_leaf_doc_ids(from_leaf)?.into_iter().collect();
+            e.insert(ids);
+        }
+        if let std::collections::hash_map::Entry::Vacant(e) = leaf_docs.entry(to_leaf) {
+            let ids: BTreeSet<DocId> = tx.get_leaf_doc_ids(to_leaf)?.into_iter().collect();
+            e.insert(ids);
+        }
+        leaf_docs.get_mut(&from_leaf).unwrap().remove(&doc_id);
+        leaf_docs.get_mut(&to_leaf).unwrap().insert(doc_id);
+
         tx.delete_leaf_entry(from_leaf, doc_id);
-        tx.put_leaf_entry(to_leaf, doc_id, vec);
         tx.put_doc_loc(doc_id, to_leaf);
         touched_leaves.insert(from_leaf);
         touched_leaves.insert(to_leaf);
     }
 
     for leaf_id in touched_leaves {
-        let entries = tx.get_leaf_entries(leaf_id)?;
+        let doc_ids: Vec<DocId> = leaf_docs[&leaf_id].iter().copied().collect();
         let mut header = tx.get_header(leaf_id)?;
         let old_c = header.centroid.clone();
-        let count = entries.len();
+        let count = doc_ids.len();
         header.entry_count = count as u32;
         header.subtree_count = count as u64;
-        header.centroid = if count == 0 {
-            vec![0.0; tree.config.dim]
+        if count == 0 {
+            header.centroid = vec![0.0; tree.config.dim];
         } else {
-            let refs: Vec<&[f32]> = entries.values().map(|v| v.as_slice()).collect();
-            compute_mean_centroid(&refs, tree.config.dim, metric)
-        };
+            let vecs = tx.get_vectors_batch(&doc_ids)?;
+            let refs: Vec<&[f32]> = vecs.iter().map(|(_, v)| v.as_slice()).collect();
+            header.centroid = compute_mean_centroid(&refs, tree.config.dim, metric);
+            for (doc_id, vec) in vecs {
+                let q_entry = tree.quantizer.encode(&vec, &header.centroid);
+                tx.put_leaf_entry(leaf_id, doc_id, q_entry);
+            }
+        }
         tx.put_header(leaf_id, header);
 
         if count > 0 && leaf_id != tx.meta().root_id {

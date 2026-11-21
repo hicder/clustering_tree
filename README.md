@@ -102,6 +102,7 @@ let complex = Filter::Or(vec![
 - [Key & Binary Encoding](docs/key-encoding.md) — RocksDB column families, big-endian key formats, packed SoA node/vector layouts, and RaBitQ bit-packing.
 - [Index Path](docs/index-path.md) — write path, RocksDB layout, RaBitQ quantization, splits, merges, and LIRE.
 - [Search Path](docs/search-path.md) — beam traversal, asymmetric 4-bit RaBitQ `popcount` scanning, cluster-aware filtering, and full-vector reranking.
+- [Filtering & Inverted Index](docs/filtering-and-inverted-index.md) — schema & filter semantics, order-preserving encodings, two-level `RoaringBitmap` index, `LocalId` lifecycle, and filtered execution.
 
 ## Tests & Benchmarks
 

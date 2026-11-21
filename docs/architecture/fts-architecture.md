@@ -12,16 +12,22 @@
   - `bm25.rs`: BM25 IDF/TF/QTF scoring, `min_dl_over_tf`-based upper bounds, and SIMD block scatter/dense accumulators.
   - `maxscore.rs`: SIMD Vectorized Block-Max MAXSCORE top-$k$ execution supporting `Sum`, `Max`, `Product`, `last_as_prefix` disjunctions, progressive non-essential slot pruning, pushdown `RoaringBitmap<FtsDocId>` masks, and lazy filter predicates.
 - **`izzydb-storage`:** 6 FTS RocksDB column families (`cf_fts_doc_map`, `cf_fts_rev_doc_map`, `cf_fts_terms`, `cf_fts_postings`, `cf_fts_positions`, `cf_fts_doc_lens`), prefix-bounded `RocksPostingCursor` with reusable seek buffer, and atomic `TxContext` overlays.
-- **`izzydb`:** `FtsIndex`, `Collection::query_bm25` / `Collection::query`, `Collection::hybrid_search`, FTS filter integration in `Collection::search`, and exhaustive `verify_collection_invariants` parity checks.
+- **`izzydb`:** `FtsIndex`, `Collection::query_bm25` / `Collection::query`, `Collection::hybrid_search`, `Collection::compact_fts_stats`, FTS filter integration in `Collection::search` and `Collection::resolve_filter_doc_ids`, and exhaustive `verify_collection_invariants` parity checks.
 
-## 2. Cluster-Decoupled Posting Blocks
+## 2. Cluster-Decoupled Posting Blocks & `FtsDocId` Recycling
 
-Rather than keying FTS postings by vector `(cluster_id, local_id)` (which causes heavy write amplification during vector tree splits, merges, and LIRE boundary reassignments), `FtsIndex` assigns each document a dense monotonic `FtsDocId: u32`:
+Rather than keying FTS postings by vector `(cluster_id, local_id)` (which causes heavy write amplification during vector tree splits, merges, and LIRE boundary reassignments), `FtsIndex` assigns each document a compact `FtsDocId: u32`:
 
 - `block_id = fts_doc_id >> 8`
 - `slot = (fts_doc_id & 0xFF) as u8`
 
+To avoid block fragmentation under churn, deleted `FtsDocId`s are persisted in `cf_meta["fts_free_ids"]` (`RoaringBitmap`, managed transactionally via `TxContext`):
+- **Deallocation (`remove_doc`):** inserts `fts_doc_id` into `fts_free_ids` and shrinks `meta.next_fts_doc_id` while `next_fts_doc_id - 1` is present in `fts_free_ids`. When tail blocks empty out, `TxContext::commit` trims trailing `None` entries from `Storage::fts_doc_lens_cache`.
+- **Allocation (`upsert_doc`):** pops `fts_free_ids.min()` first to refill earlier 256-slot blocks densely before advancing `meta.next_fts_doc_id`.
+
 Document lengths are stored once per `(attr_id, block_id)` in `cf_fts_doc_lens` (`DocLenBlock`), while each `(attr_id, token, block_id)` maps to a v2 `PackedPostingBlock` storing only `tf` (switching automatically between sparse `(slots, tfs)` and dense `(bitmap, [tf; 256])` at `POSTING_DENSE_THRESHOLD = 96`) plus exact `(max_tf, min_dl_over_tf)` block-max bounds. Because `avgdl` is only supplied at query time, block upper bounds remain mathematically sound across arbitrary inserts and deletes without background re-indexing.
+
+When a delete or update lowers a posting's `(tf, dl/tf)` contribution at a term's current `TermStats` extreme (`max_tf` or `min_dl_over_tf`) and the term spans `<= 64` posting blocks (`INLINE_TERM_STATS_RECOMPUTE_MAX_BLOCKS`), `FtsIndex` recomputes exact `TermStats` inline from the 12-byte `PostingBlockHeader`s; `Collection::compact_fts_stats` recomputes exact bounds across all terms on demand. Updates whose FTS attributes did not change skip `FtsIndex` analysis and I/O altogether.
 
 ## 3. Query Execution & Hybrid Search
 

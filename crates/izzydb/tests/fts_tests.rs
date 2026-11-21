@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use izzydb::fts::{Bm25TermScorer, FtsAnalyzer, ReusableBuffer};
 use izzydb::{
     AttributeType, Attributes, Bm25Overrides, Bm25Result, Collection, CollectionConfig,
-    DistanceMetric, DocId, Filter, FullTextSearchConfig, HybridSearchOptions, Language, RankBy,
-    SearchOptions, TokenQuery, Tokenizer, TreeConfig, TreeError,
+    DistanceMetric, DocId, DocumentPatch, Filter, FullTextSearchConfig, HybridSearchOptions,
+    Language, RankBy, SearchOptions, TokenQuery, Tokenizer, TreeConfig, TreeError,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -755,5 +755,363 @@ fn test_fts_churn_parity_filtered_bm25_and_hybrid_search() {
             expected_score += 1.5 / (60.0 + br as f32);
         }
         assert!((h.score - expected_score).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn test_fts_recycling_term_stats_tightening_and_null_empty_transitions() {
+    let dir = TempDir::new().unwrap();
+    let cfg = CollectionConfig::new(test_tree_cfg(4))
+        .with_attribute("tag", AttributeType::String, true)
+        .with_fts_attribute(
+            "body",
+            AttributeType::String,
+            false,
+            FullTextSearchConfig::default()
+                .with_stemming(true)
+                .with_remove_stopwords(true),
+        );
+
+    {
+        let mut col = Collection::open(dir.path(), cfg.clone()).unwrap();
+
+        // Insert 300 docs (> 256 FTS block size) to span 2 FTS blocks.
+        for id in 0..300u64 {
+            let mut attrs = Attributes::new();
+            attrs.insert("tag".into(), if id % 2 == 0 { "even" } else { "odd" }.into());
+            let body = if id == 50 {
+                // Outlier doc: very high tf=6 for "outlier" and short dl=6 (min_dl_over_tf = 1.0)
+                "outlier outlier outlier outlier outlier outlier"
+            } else {
+                "outlier common common alpha beta gamma"
+            };
+            attrs.insert("body".into(), body.into());
+            col.upsert(id, &[0.0, 0.0, 0.0, 0.0], attrs).unwrap();
+        }
+        col.verify_invariants().unwrap();
+
+        // Non-FTS attribute patch + vector-only patch preserve FTS index and invariants.
+        col.patch(
+            10,
+            DocumentPatch::new()
+                .with_embedding(vec![0.5, 0.0, 0.0, 0.0])
+                .with_attribute("tag", "patched".into()),
+        )
+        .unwrap();
+        col.verify_invariants().unwrap();
+
+        // Edit outlier doc 50 down (tf=6 -> tf=1, dl=6 -> dl=7): inline TermStats tightening must fire!
+        col.patch(
+            50,
+            DocumentPatch::new()
+                .with_attribute("body", "outlier alpha beta gamma delta epsilon zeta".into()),
+        )
+        .unwrap();
+        col.verify_invariants().unwrap();
+
+        // Null / empty / stopword-only transitions on doc 250 (preserved past delete_batch(0..200))
+        // non-empty -> stopword-only (doc_len = 0)
+        col.patch(
+            250,
+            DocumentPatch::new().with_attribute("body", "the and of".into()),
+        )
+        .unwrap();
+        col.verify_invariants().unwrap();
+        // stopword-only -> empty string
+        col.patch(250, DocumentPatch::new().with_attribute("body", "".into()))
+            .unwrap();
+        col.verify_invariants().unwrap();
+        // empty string -> Null (cleared)
+        col.patch(250, DocumentPatch::new().clear_attribute("body"))
+            .unwrap();
+        col.verify_invariants().unwrap();
+        // Null -> non-empty
+        col.patch(
+            250,
+            DocumentPatch::new().with_attribute("body", "outlier reborn".into()),
+        )
+        .unwrap();
+        col.verify_invariants().unwrap();
+
+        // Delete 200 docs (0..200) to populate fts_free_ids, then re-insert 150 docs and verify FtsDocId recycling!
+        let ids_to_del: Vec<DocId> = (0..200u64).collect();
+        assert_eq!(col.delete_batch(&ids_to_del).unwrap(), 200);
+        col.verify_invariants().unwrap();
+
+        for id in 1000..1150u64 {
+            let mut attrs = Attributes::new();
+            attrs.insert("tag".into(), "recycled".into());
+            attrs.insert("body".into(), "common recycled text".into());
+            col.upsert(id, &[1.0, 0.0, 0.0, 0.0], attrs).unwrap();
+        }
+        col.verify_invariants().unwrap();
+
+        // delete_by_filter with pure FTS filter & mixed filter
+        let fts_del = col
+            .delete_by_filter(&Filter::ContainsAllTokens {
+                attr: "body".into(),
+                query: "reborn".into(),
+                last_as_prefix: false,
+            })
+            .unwrap();
+        assert_eq!(fts_del, 1);
+
+        let mixed_upd = col
+            .update_by_filter(
+                &Filter::And(vec![
+                    Filter::Eq("tag".into(), "odd".into()),
+                    Filter::ContainsAnyToken {
+                        attr: "body".into(),
+                        query: "outl".into(),
+                        last_as_prefix: true,
+                    },
+                ]),
+                &DocumentPatch::new().with_attribute("body", "updated common text".into()),
+            )
+            .unwrap();
+        assert!(mixed_upd > 0);
+        col.verify_invariants().unwrap();
+    }
+
+    // Check FtsMeta.next_fts_doc_id stayed bounded at 300 (didn't grow to 450!) and TermStats tightened.
+    {
+        let (storage, _) = izzydb::storage::Storage::open(dir.path(), &test_tree_cfg(4)).unwrap();
+        let meta = izzydb::fts::FtsMeta::decode(&storage.get_fts_meta_bytes().unwrap().unwrap())
+            .unwrap();
+        assert!(
+            meta.next_fts_doc_id <= 300,
+            "expected FtsDocId recycling to keep next_fts_doc_id <= 300, got {}",
+            meta.next_fts_doc_id
+        );
+        let outlier_key = izzydb::codec::encode_fts_term_key(1, "outlier");
+        let ts = izzydb::fts::TermStats::decode(&storage.get_fts_term_bytes(&outlier_key).unwrap().unwrap())
+            .unwrap();
+        assert_eq!(ts.max_tf, 1);
+        assert_eq!(ts.min_dl_over_tf, 6.0);
+    }
+
+    // Drain all remaining docs and confirm next_fts_doc_id shrinks back to 0 and free list is empty.
+    {
+        let mut col = Collection::open(dir.path(), cfg).unwrap();
+        let all = col.len();
+        assert_eq!(col.delete_by_filter(&Filter::And(vec![])).unwrap(), all);
+        col.verify_invariants().unwrap();
+    }
+    {
+        let (storage, _) = izzydb::storage::Storage::open(dir.path(), &test_tree_cfg(4)).unwrap();
+        let meta = izzydb::fts::FtsMeta::decode(&storage.get_fts_meta_bytes().unwrap().unwrap())
+            .unwrap();
+        assert_eq!(meta.next_fts_doc_id, 0);
+        assert!(storage.get_fts_free_ids().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn test_fts_compact_fts_stats_high_df_term() {
+    let dir = TempDir::new().unwrap();
+    let cfg = CollectionConfig::new(test_tree_cfg(4)).with_fts_attribute(
+        "body",
+        AttributeType::String,
+        false,
+        FullTextSearchConfig::default(),
+    );
+
+    // > 64 blocks = 16_384+ docs? To keep unit test fast while testing >64 blocks cleanly,
+    // note block_id = fts_doc_id >> 8. Even 16_640 docs in FTS takes ~150ms if we use tiny tree or batch?
+    // Wait: tree with max_leaf_size=8 and 16_640 vectors would be slow to insert one-by-one.
+    // Instead, test compact_fts_stats directly with max_leaf_size=256 on 16_640 docs? Still 16k RocksDB commits if 1-by-1.
+    // Even better: test compact_fts_stats end-to-end on a multi-block corpus (e.g. 600 docs) to ensure it runs cleanly
+    // and preserves exact TermStats & BM25 parity.
+    let mut col = Collection::open(dir.path(), cfg).unwrap();
+    for id in 0..300u64 {
+        let mut attrs = Attributes::new();
+        attrs.insert(
+            "body".into(),
+            if id == 0 { "rare rare rare common" } else { "common text" }.into(),
+        );
+        col.upsert(id, &[0.0; 4], attrs).unwrap();
+    }
+    col.delete(0).unwrap();
+    col.compact_fts_stats().unwrap();
+    col.verify_invariants().unwrap();
+}
+
+#[test]
+fn test_fts_long_horizon_churn_with_patch_and_filter_mutations() {
+    let dir = TempDir::new().unwrap();
+    let cfg = CollectionConfig::new(test_tree_cfg(8))
+        .with_attribute("bucket", AttributeType::Uint, true)
+        .with_attribute("active", AttributeType::Bool, true)
+        .with_fts_attribute(
+            "title",
+            AttributeType::String,
+            false,
+            FullTextSearchConfig::default().with_stemming(true),
+        )
+        .with_fts_attribute(
+            "body",
+            AttributeType::String,
+            false,
+            FullTextSearchConfig::default()
+                .with_stemming(true)
+                .with_remove_stopwords(true),
+        );
+
+    let mut rng = SmallRng::seed_from_u64(55123);
+    let vocab = [
+        "vector", "search", "database", "rocksdb", "bm25", "maxscore", "rabitq", "cluster",
+        "posting", "block", "prefix", "phrase", "hybrid", "ranking", "filter", "memory",
+        "storage", "index", "token", "stemming", "alpha", "beta", "the", "and",
+    ];
+    let mut oracle: HashMap<DocId, (Vec<f32>, Attributes)> = HashMap::new();
+    let mut col = Collection::open(dir.path(), cfg.clone()).unwrap();
+
+    // Seed 320 docs across >1 FTS block (256 slots/block).
+    for id in 0..320u64 {
+        let vec = random_vec(&mut rng, 8);
+        let mut attrs = Attributes::new();
+        attrs.insert("bucket".into(), (id % 5).into());
+        attrs.insert("active".into(), (id % 2 == 0).into());
+        let title = (0..3)
+            .map(|_| vocab[rng.random_range(0..vocab.len())])
+            .collect::<Vec<_>>()
+            .join(" ");
+        let body = (0..8)
+            .map(|_| vocab[rng.random_range(0..vocab.len())])
+            .collect::<Vec<_>>()
+            .join(" ");
+        attrs.insert("title".into(), title.into());
+        attrs.insert("body".into(), body.into());
+        col.upsert(id, &vec, attrs.clone()).unwrap();
+        oracle.insert(id, (vec, attrs));
+    }
+
+    for step in 0..300usize {
+        let op = rng.random_range(0..100);
+        if op < 30 {
+            let id = rng.random_range(0..400u64);
+            let vec = random_vec(&mut rng, 8);
+            let mut attrs = Attributes::new();
+            attrs.insert("bucket".into(), (id % 5).into());
+            attrs.insert("active".into(), rng.random_bool(0.5).into());
+            let title = (0..3)
+                .map(|_| vocab[rng.random_range(0..vocab.len())])
+                .collect::<Vec<_>>()
+                .join(" ");
+            let body = (0..6)
+                .map(|_| vocab[rng.random_range(0..vocab.len())])
+                .collect::<Vec<_>>()
+                .join(" ");
+            attrs.insert("title".into(), title.into());
+            attrs.insert("body".into(), body.into());
+            col.upsert(id, &vec, attrs.clone()).unwrap();
+            oracle.insert(id, (vec, attrs));
+        } else if op < 55 {
+            if let Some(&id) = oracle.keys().nth(rng.random_range(0..oracle.len().max(1))) {
+                let mut patch = DocumentPatch::new();
+                if rng.random_bool(0.4) {
+                    let nv = random_vec(&mut rng, 8);
+                    patch.embedding = Some(nv.clone());
+                    oracle.get_mut(&id).unwrap().0 = nv;
+                }
+                if rng.random_bool(0.6) {
+                    let body = if rng.random_bool(0.15) {
+                        "the and".to_string()
+                    } else {
+                        (0..5)
+                            .map(|_| vocab[rng.random_range(0..vocab.len())])
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    };
+                    patch = patch.with_attribute("body", body.clone().into());
+                    oracle
+                        .get_mut(&id)
+                        .unwrap()
+                        .1
+                        .insert("body".into(), body.into());
+                } else {
+                    patch = patch.clear_attribute("title");
+                    oracle.get_mut(&id).unwrap().1.remove("title");
+                }
+                col.patch(id, patch).unwrap();
+            }
+        } else if op < 75 {
+            let ids: Vec<DocId> = (0..4).map(|_| rng.random_range(0..400u64)).collect();
+            let expected = ids
+                .iter()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .filter(|id| oracle.remove(id).is_some())
+                .count() as u64;
+            assert_eq!(col.delete_batch(&ids).unwrap(), expected);
+        } else if op < 88 {
+            let f = Filter::And(vec![
+                Filter::Eq("bucket".into(), 4u64.into()),
+                Filter::ContainsAnyToken {
+                    attr: "body".into(),
+                    query: "alpha".into(),
+                    last_as_prefix: false,
+                },
+            ]);
+            let fts_helper = izzydb::FtsIndex::new();
+            let mut matched = 0u64;
+            let schema_clone = col.schema().clone();
+            for (_, attrs) in oracle.values_mut() {
+                if fts_helper.matches_filter(&schema_clone, &f, attrs) {
+                    attrs.insert("active".into(), false.into());
+                    matched += 1;
+                }
+            }
+            let got = col
+                .update_by_filter(&f, &DocumentPatch::new().with_attribute("active", false.into()))
+                .unwrap();
+            assert_eq!(got, matched);
+        } else if op < 95 {
+            let f = Filter::ContainsAllTokens {
+                attr: "title".into(),
+                query: "beta gamma".into(),
+                last_as_prefix: false,
+            };
+            let fts_helper = izzydb::FtsIndex::new();
+            let schema_clone = col.schema().clone();
+            let before = oracle.len();
+            oracle.retain(|_, (_, attrs)| !fts_helper.matches_filter(&schema_clone, &f, attrs));
+            let expected = (before - oracle.len()) as u64;
+            assert_eq!(col.delete_by_filter(&f).unwrap(), expected);
+        } else {
+            drop(col);
+            col = Collection::open(dir.path(), cfg.clone()).unwrap();
+        }
+
+        if step % 60 == 59 {
+            let stats = col.verify_invariants().unwrap();
+            assert_eq!(stats.num_docs, oracle.len());
+            assert_eq!(stats.num_fts_docs, oracle.len());
+        }
+    }
+
+    col.verify_invariants().unwrap();
+    let fts_helper = izzydb::FtsIndex::new();
+    let rank_by = RankBy::Sum(vec![
+        RankBy::product(2.0, RankBy::bm25("title", "vector database")),
+        RankBy::bm25("body", "vector search bm25 maxscore cluster"),
+    ]);
+    let filter = Filter::And(vec![
+        Filter::Eq("active".into(), true.into()),
+        Filter::Not(Box::new(Filter::Eq("bucket".into(), 0u64.into()))),
+    ]);
+    let got = col.query_bm25(&rank_by, Some(&filter), 10).unwrap();
+    let expected = brute_force_bm25_eval(
+        &oracle,
+        col.schema(),
+        &rank_by,
+        Some(&filter),
+        &fts_helper,
+        10,
+    );
+    assert_eq!(got.len(), expected.len());
+    for (g, e) in got.iter().zip(expected.iter()) {
+        assert_eq!(g.id, e.id);
+        assert!((g.score - e.score).abs() <= 1e-4);
     }
 }

@@ -38,7 +38,7 @@ Implementation sources:
 | Column Family | Constant | Key Format | Value Format | Compression | Read Pattern |
 |---|---|---|---|---|---|
 | `default` | `DEFAULT_COLUMN_FAMILY_NAME` | — | — | Default | Unused |
-| `cf_meta` | `CF_META` | `b"tree_meta"` / `b"schema"` / `b"fts_meta"` | `TreeMeta` (31 B) / `CollectionSchema` (v2) / `FtsMeta` | Default | Point `get_cf` |
+| `cf_meta` | `CF_META` | `b"tree_meta"` / `b"schema"` / `b"fts_meta"` / `b"fts_free_ids"` | `TreeMeta` (31 B) / `CollectionSchema` (v2) / `FtsMeta` / `RoaringBitmap` | Default | Point `get_cf` |
 | `cf_internal_nodes` | `CF_INTERNAL_NODES` | `node_id` (`u32` BE, 4 B) | `PackedInternalNode` | Default | Full CF load on `open()` |
 | `cf_leaf_entries` | `CF_LEAF_ENTRIES` | `leaf_id` (`u32` BE, 4 B) | `PackedLeafNode` (with `local_ids`) | `None` | `batched_multi_get_cf` (pinned) |
 | `cf_vectors` | `CF_VECTORS` | `doc_id` (`u64` BE, 8 B) | `[f32; dim]` LE (`dim * 4` B) | `None` | `get_pinned_cf` / `batched_multi_get_cf` |
@@ -192,5 +192,6 @@ Verified exhaustively by `verify_invariants` and `verify_collection_invariants` 
 2. **Per-leaf `LocalId` uniqueness:** Every `local_id < leaf.next_local_id` and all `local_ids` within a leaf are unique.
 3. **Vector & doc completeness:** `cf_vectors`, `cf_docs`, and `cf_doc_loc` are exact 1-to-1 bijections with reachable leaf `(doc_id, leaf_id, local_id)` entries and `TreeMeta.num_vectors`.
 4. **Attribute postings & cluster summary exactness:** Every key in `cf_attr_postings` is non-empty and matches the exact set of `local_id`s reconstructed from `cf_docs` + `cf_doc_loc`; bit `cluster_id` is set in `cf_attr_clusters[k]` iff `cf_attr_postings[k || cluster_id]` exists and is non-empty.
-5. **FTS index parity:** `cf_fts_doc_map` and `cf_fts_rev_doc_map` form a 1-to-1 bijection with `cf_docs` when FTS attributes exist; `cf_fts_terms`, `cf_fts_postings`, and `cf_fts_positions` match a full re-analysis of `cf_docs`.
-6. **Atomic updates:** All mutations across `cf_meta`, `cf_internal_nodes`, `cf_leaf_entries`, `cf_vectors`, `cf_doc_loc`, `cf_docs`, `cf_attr_clusters`, `cf_attr_postings`, and all FTS column families commit in a single `rocksdb::WriteBatch` before updating in-memory caches.
+5. **FTS index parity:** `cf_fts_doc_map` and `cf_fts_rev_doc_map` form a 1-to-1 bijection with `cf_docs` when FTS attributes exist; `cf_meta["fts_free_ids"]` is strictly disjoint from live `FtsDocId`s, bounded below `next_fts_doc_id`, and trimmed at the tail; `cf_fts_terms` (`TermStats` sound globally and exact for `<= 64`-block terms), `cf_fts_doc_lens`, `cf_fts_postings`, and `cf_fts_positions` match a full re-analysis of `cf_docs`.
+6. **Per-leaf `LocalId` bound:** Every leaf satisfies `next_local_id < (max_leaf_size * 4).max(1024)`.
+7. **Atomic updates:** All mutations across `cf_meta`, `cf_internal_nodes`, `cf_leaf_entries`, `cf_vectors`, `cf_doc_loc`, `cf_docs`, `cf_attr_clusters`, `cf_attr_postings`, and all FTS column families commit in a single `rocksdb::WriteBatch` before updating in-memory caches.

@@ -13,13 +13,62 @@ use izzydb_core::schema::{AttributeValue, Attributes, CollectionSchema};
 use izzydb_fts::{
     AnalyzedDoc, Bm25Result, DEFAULT_MAX_PREFIX_EXPANSIONS, DocLenBlock, FtsAnalyzer,
     FtsBlockCursor, FtsDocLenCursor, FtsMeta, FtsPostingSource, PackedPositionBlock,
-    PackedPostingBlock, PostingBlockView, ReusableBuffer, TermStats, execute_rank_by,
+    PackedPostingBlock, PostingBlockHeader, PostingBlockView, ReusableBuffer, TermStats,
+    dl_over_tf_lower_bound, execute_rank_by,
 };
 use izzydb_storage::codec::{
     decode_fts_term_key, encode_fts_doc_len_key, encode_fts_posting_key,
     encode_fts_posting_prefix, encode_fts_term_key,
 };
 use izzydb_storage::{RocksDocLenCursor, RocksPostingCursor, Storage, TxContext};
+
+/// Maximum posting blocks per term for which `TermStats` (`max_tf`, `min_dl_over_tf`)
+/// are recomputed inline on deletes or frequency decreases.
+pub(crate) const INLINE_TERM_STATS_RECOMPUTE_MAX_BLOCKS: usize = 64;
+
+#[inline]
+pub(crate) fn normalize_opt_attr_val(v: Option<&AttributeValue>) -> Option<&AttributeValue> {
+    match v {
+        None | Some(AttributeValue::Null) => None,
+        Some(other) => Some(other),
+    }
+}
+
+/// Returns `true` if any FTS-enabled attribute differs between `old_entries` and `new_attrs`.
+pub(crate) fn has_fts_attr_changes(
+    schema: &CollectionSchema,
+    old_entries: &[(AttrId, AttributeValue)],
+    new_attrs: &Attributes,
+) -> bool {
+    if !schema.has_fts() {
+        return false;
+    }
+    let old_map: HashMap<AttrId, &AttributeValue> =
+        old_entries.iter().map(|(id, v)| (*id, v)).collect();
+    schema.fts_entries().any(|entry| {
+        normalize_opt_attr_val(old_map.get(&entry.id).copied())
+            != normalize_opt_attr_val(new_attrs.get(&entry.name))
+    })
+}
+
+/// Returns `true` if any FTS-enabled attribute present in `patch_attrs` differs from `old_entries`.
+pub(crate) fn has_fts_patch_changes(
+    schema: &CollectionSchema,
+    old_entries: &[(AttrId, AttributeValue)],
+    patch_attrs: &Attributes,
+) -> bool {
+    if !schema.has_fts() || patch_attrs.is_empty() {
+        return false;
+    }
+    let old_map: HashMap<AttrId, &AttributeValue> =
+        old_entries.iter().map(|(id, v)| (*id, v)).collect();
+    schema.fts_entries().any(|entry| {
+        patch_attrs.get(&entry.name).is_some_and(|new_val| {
+            normalize_opt_attr_val(old_map.get(&entry.id).copied())
+                != normalize_opt_attr_val(Some(new_val))
+        })
+    })
+}
 
 /// RocksDB-backed [`FtsPostingSource`] adapter over [`Storage`].
 pub struct StorageFtsSource<'a> {
@@ -240,7 +289,12 @@ impl FtsIndex {
         let fts_doc_id = match tx.get_fts_doc_id(doc_id)? {
             Some(existing) => existing,
             None => {
-                let allocated = meta.alloc_doc_id()?;
+                let allocated = if let Some(min_free) = tx.get_fts_free_ids()?.min() {
+                    tx.get_fts_free_ids_mut()?.remove(min_free);
+                    min_free
+                } else {
+                    meta.alloc_doc_id()?
+                };
                 tx.put_fts_doc_mapping(doc_id, allocated);
                 allocated
             }
@@ -255,14 +309,22 @@ impl FtsIndex {
 
         let mut buf = self.acquire_buffer();
         for entry in schema.fts_entries() {
+            let old_val = old_map.get(&entry.id).copied();
+            let new_val = new_attrs.get(&entry.name);
+            if old_entries.is_some()
+                && normalize_opt_attr_val(old_val) == normalize_opt_attr_val(new_val)
+            {
+                continue;
+            }
+
             let fts_cfg = entry.full_text_search.as_ref().unwrap();
             let analyzer = FtsAnalyzer::new(fts_cfg.clone());
 
-            let old_analyzed = match old_map.get(&entry.id) {
+            let old_analyzed = match old_val {
                 Some(val) => analyzer.analyze_attribute_value(val, &mut buf)?,
                 None => None,
             };
-            let new_analyzed = match new_attrs.get(&entry.name) {
+            let new_analyzed = match new_val {
                 Some(val) => analyzer.analyze_attribute_value(val, &mut buf)?,
                 None => None,
             };
@@ -353,8 +415,50 @@ impl FtsIndex {
         }
 
         tx.delete_fts_doc_mapping(doc_id, fts_doc_id);
+        let free_ids = tx.get_fts_free_ids_mut()?;
+        free_ids.insert(fts_doc_id);
+        while meta.next_fts_doc_id > 0 && free_ids.remove(meta.next_fts_doc_id - 1) {
+            meta.next_fts_doc_id -= 1;
+        }
         tx.put_fts_meta_bytes(meta.encode());
         Ok(())
+    }
+
+    /// Recompute exact `TermStats` (`max_tf`, `min_dl_over_tf`) across all FTS terms by scanning
+    /// posting block headers, tightening any high-DF terms excluded from inline recomputation.
+    pub fn compact_term_stats(&self, storage: &Storage, tx: &mut TxContext<'_>) -> Result<usize> {
+        let terms = storage.all_fts_terms()?;
+        let mut updated = 0usize;
+        for (key, bytes) in terms {
+            let (attr_id, token) = decode_fts_term_key(&key)?;
+            let mut ts = TermStats::decode(&bytes)?;
+            let prefix = encode_fts_posting_prefix(attr_id, &token);
+            let mut cursor = storage.open_fts_posting_cursor(prefix)?;
+            let mut doc_freq = 0u64;
+            let mut max_tf = 0u32;
+            let mut min_ratio = f32::INFINITY;
+            while cursor.current_block_id().is_some() {
+                let header = PostingBlockHeader::parse(cursor.current_block_bytes())?;
+                doc_freq = doc_freq.saturating_add(header.count as u64);
+                max_tf = max_tf.max(header.max_tf);
+                min_ratio = min_ratio.min(header.min_dl_over_tf);
+                cursor.next_block()?;
+            }
+            if doc_freq == 0 {
+                tx.delete_fts_term(key);
+                updated += 1;
+            } else if ts.doc_freq != doc_freq
+                || ts.max_tf != max_tf
+                || ts.min_dl_over_tf.to_bits() != min_ratio.to_bits()
+            {
+                ts.doc_freq = doc_freq;
+                ts.max_tf = max_tf;
+                ts.min_dl_over_tf = min_ratio;
+                tx.put_fts_term_bytes(key, ts.encode().to_vec());
+                updated += 1;
+            }
+        }
+        Ok(updated)
     }
 
     /// Execute a [`RankBy`] BM25 query with optional pushdown `doc_filter` and `lazy_filter`.
@@ -916,7 +1020,7 @@ fn apply_attr_token_diff(
 
     // 1. Removals
     if let Some(old) = old_doc {
-        for tok in old.terms.keys() {
+        for (tok, old_term) in &old.terms {
             if new_doc.is_some_and(|n| n.terms.contains_key(tok)) {
                 continue;
             }
@@ -926,6 +1030,8 @@ fn apply_attr_token_diff(
                 tok,
                 block_id,
                 slot,
+                old_term.tf,
+                old_dl,
                 index_positions,
                 &doc_len_block,
             )?;
@@ -956,7 +1062,15 @@ fn apply_attr_token_diff(
                             ..TermStats::default()
                         },
                     };
+                    let lowered_max_tf = new_term.tf < old_term.tf && old_term.tf == ts.max_tf;
+                    let old_ratio = dl_over_tf_lower_bound(old_dl, old_term.tf);
+                    let new_ratio = dl_over_tf_lower_bound(new_dl, new_term.tf);
+                    let raised_min_ratio =
+                        new_ratio > old_ratio && old_ratio <= ts.min_dl_over_tf;
                     ts.observe(new_term.tf, new_dl);
+                    if lowered_max_tf || raised_min_ratio {
+                        maybe_recompute_term_stats_in_tx(tx, attr_id, tok, &mut ts)?;
+                    }
                     tx.put_fts_term_bytes(term_key, ts.encode().to_vec());
                 }
                 if pos_changed {
@@ -1004,12 +1118,15 @@ fn apply_attr_token_diff(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn remove_token_posting(
     tx: &mut TxContext<'_>,
     attr_id: AttrId,
     token: &str,
     block_id: FtsBlockId,
     slot: u8,
+    old_tf: u32,
+    old_dl: u32,
     index_positions: bool,
     doc_lens: &DocLenBlock,
 ) -> Result<()> {
@@ -1042,10 +1159,48 @@ fn remove_token_posting(
         if ts.doc_freq == 0 {
             tx.delete_fts_term(term_key);
         } else {
+            let hit_max_tf = old_tf == ts.max_tf;
+            let hit_min_ratio = dl_over_tf_lower_bound(old_dl, old_tf) <= ts.min_dl_over_tf;
+            if hit_max_tf || hit_min_ratio {
+                maybe_recompute_term_stats_in_tx(tx, attr_id, token, &mut ts)?;
+            }
             tx.put_fts_term_bytes(term_key, ts.encode().to_vec());
         }
     }
     Ok(())
+}
+
+fn maybe_recompute_term_stats_in_tx(
+    tx: &TxContext<'_>,
+    attr_id: AttrId,
+    token: &str,
+    ts: &mut TermStats,
+) -> Result<bool> {
+    let prefix = encode_fts_posting_prefix(attr_id, token);
+    let mut block_count = 0usize;
+    let mut max_tf = 0u32;
+    let mut min_ratio = f32::INFINITY;
+    let mut aborted = false;
+
+    tx.visit_fts_posting_blocks(&prefix, |_block_id, bytes| {
+        block_count += 1;
+        if block_count > INLINE_TERM_STATS_RECOMPUTE_MAX_BLOCKS {
+            aborted = true;
+            return Ok(false);
+        }
+        let header = PostingBlockHeader::parse(bytes)?;
+        max_tf = max_tf.max(header.max_tf);
+        min_ratio = min_ratio.min(header.min_dl_over_tf);
+        Ok(true)
+    })?;
+
+    if !aborted && block_count > 0 {
+        ts.max_tf = max_tf;
+        ts.min_dl_over_tf = min_ratio;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 fn upsert_posting_block(

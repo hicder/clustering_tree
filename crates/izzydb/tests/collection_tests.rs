@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use izzydb::{
     AttributeType, AttributeValue, Attributes, Collection, CollectionConfig, DistanceMetric, DocId,
-    Filter, SearchOptions, TreeConfig, TreeError,
+    DocumentPatch, Filter, SearchOptions, TreeConfig, TreeError,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -624,4 +624,380 @@ fn test_all_filter_operators_and_selectivities_recall() {
         )
         .unwrap();
     assert!(empty_res.is_empty());
+}
+
+#[test]
+fn test_patch_and_patch_batch_semantics_and_atomicity() {
+    let dir = TempDir::new().unwrap();
+    let cfg = small_collection_config(4, DistanceMetric::L2Squared, true);
+
+    // Seed two well-separated clusters so we can test same-leaf vs cross-leaf vector patches.
+    let loc1_before;
+    let loc2_before;
+    {
+        let mut col = Collection::open(dir.path(), cfg.clone()).unwrap();
+        for id in 1..=4u64 {
+            let mut attrs = Attributes::new();
+            attrs.insert("category".into(), "near".into());
+            attrs.insert("rank".into(), (id as i64).into());
+            attrs.insert("tags".into(), vec!["t1".to_string(), "t2".to_string()].into());
+            attrs.insert("note".into(), format!("note_{id}").into());
+            col.upsert(id, &[0.0 + (id as f32) * 0.01, 0.0, 0.0, 0.0], attrs)
+                .unwrap();
+        }
+        for id in 101..=104u64 {
+            let mut attrs = Attributes::new();
+            attrs.insert("category".into(), "far".into());
+            attrs.insert("rank".into(), (id as i64).into());
+            col.upsert(id, &[50.0 + ((id - 100) as f32) * 0.01, 0.0, 0.0, 0.0], attrs)
+                .unwrap();
+        }
+        col.verify_invariants().unwrap();
+    }
+    {
+        let (storage, _) = izzydb::storage::Storage::open(dir.path(), &cfg.tree).unwrap();
+        loc1_before = storage.get_doc_loc(1).unwrap().unwrap();
+        loc2_before = storage.get_doc_loc(2).unwrap().unwrap();
+    }
+
+    {
+        let mut col = Collection::open(dir.path(), cfg.clone()).unwrap();
+
+        // 1. Attribute-only patch preserves vector & DocLoc, clears fields with Null, keeps omitted fields.
+        col.patch(
+            1,
+            DocumentPatch::new()
+                .with_attribute("category", "updated".into())
+                .clear_attribute("tags")
+                .clear_attribute("note"),
+        )
+        .unwrap();
+        let d1 = col.get(1).unwrap().unwrap();
+        assert_eq!(d1.embedding, vec![0.01, 0.0, 0.0, 0.0]);
+        assert_eq!(
+            d1.attributes.get("category"),
+            Some(&AttributeValue::String("updated".into()))
+        );
+        assert_eq!(d1.attributes.get("rank"), Some(&AttributeValue::Int(1)));
+        assert_eq!(d1.attributes.get("tags"), None);
+        assert_eq!(d1.attributes.get("note"), None);
+
+        // Old tag/category filters no longer match doc 1; IsNull("tags") now matches doc 1.
+        assert!(col.resolve_filter_doc_ids(&Filter::Eq("category".into(), "near".into())).unwrap().len() == 3);
+        assert_eq!(
+            col.resolve_filter_doc_ids(&Filter::Contains("tags".into(), "t1".into()))
+                .unwrap(),
+            vec![2, 3, 4]
+        );
+        assert!(
+            col.resolve_filter_doc_ids(&Filter::IsNull("tags".into()))
+                .unwrap()
+                .contains(&1)
+        );
+
+        // 2. Vector-only same-leaf patch preserves DocLoc.
+        col.patch(2, DocumentPatch::new().with_embedding(vec![0.025, 0.0, 0.0, 0.0]))
+            .unwrap();
+        assert_eq!(
+            col.get(2).unwrap().unwrap().embedding,
+            vec![0.025, 0.0, 0.0, 0.0]
+        );
+
+        // 3. Vector-only cross-leaf patch moves doc 3 to far cluster and preserves attributes.
+        col.patch(3, DocumentPatch::new().with_embedding(vec![50.05, 0.0, 0.0, 0.0]))
+            .unwrap();
+        let d3 = col.get(3).unwrap().unwrap();
+        assert_eq!(d3.embedding, vec![50.05, 0.0, 0.0, 0.0]);
+        assert_eq!(
+            d3.attributes.get("category"),
+            Some(&AttributeValue::String("near".into()))
+        );
+
+        // 4. Patching missing DocId returns DocumentNotFound.
+        assert!(matches!(
+            col.patch(999, DocumentPatch::new().with_attribute("rank", 1i64.into())),
+            Err(TreeError::DocumentNotFound(999))
+        ));
+
+        // 5. patch_batch atomicity: if one doc is missing or invalid, NO writes occur.
+        let err = col
+            .patch_batch(&[
+                (1, DocumentPatch::new().with_attribute("rank", 777i64.into())),
+                (999, DocumentPatch::new().with_attribute("rank", 888i64.into())),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, TreeError::DocumentNotFound(999)));
+        assert_eq!(
+            col.get(1).unwrap().unwrap().attributes.get("rank"),
+            Some(&AttributeValue::Int(1))
+        );
+
+        let err_schema = col
+            .patch_batch(&[
+                (1, DocumentPatch::new().with_attribute("rank", 777i64.into())),
+                (2, DocumentPatch::new().with_attribute("rank", "wrong_type".into())),
+            ])
+            .unwrap_err();
+        assert!(matches!(err_schema, TreeError::InvalidAttribute { .. }));
+        assert_eq!(
+            col.get(1).unwrap().unwrap().attributes.get("rank"),
+            Some(&AttributeValue::Int(1))
+        );
+
+        // 6. Valid patch_batch commits all atomically.
+        col.patch_batch(&[
+            (1, DocumentPatch::new().with_attribute("rank", 111i64.into())),
+            (2, DocumentPatch::new().with_attribute("rank", 222i64.into())),
+        ])
+        .unwrap();
+        assert_eq!(
+            col.get(1).unwrap().unwrap().attributes.get("rank"),
+            Some(&AttributeValue::Int(111))
+        );
+        assert_eq!(
+            col.get(2).unwrap().unwrap().attributes.get("rank"),
+            Some(&AttributeValue::Int(222))
+        );
+
+        col.verify_invariants().unwrap();
+    }
+
+    {
+        let (storage, _) = izzydb::storage::Storage::open(dir.path(), &cfg.tree).unwrap();
+        let loc1_after = storage.get_doc_loc(1).unwrap().unwrap();
+        let loc2_after = storage.get_doc_loc(2).unwrap().unwrap();
+        let loc3_after = storage.get_doc_loc(3).unwrap().unwrap();
+        let loc101 = storage.get_doc_loc(101).unwrap().unwrap();
+        assert_eq!(loc1_after, loc1_before);
+        assert_eq!(loc2_after, loc2_before);
+        assert_eq!(loc3_after.leaf_id, loc101.leaf_id);
+    }
+}
+
+#[test]
+fn test_delete_batch_delete_by_filter_and_update_by_filter() {
+    let dir = TempDir::new().unwrap();
+    let cfg = small_collection_config(4, DistanceMetric::L2Squared, true);
+    let mut col = Collection::open(dir.path(), cfg).unwrap();
+
+    // Insert 600 docs (> MUTATION_CHUNK_SIZE=512) to exercise multi-chunk filter ops & multi-level deletes.
+    for id in 0..600u64 {
+        let mut attrs = Attributes::new();
+        attrs.insert(
+            "category".into(),
+            match id % 3 {
+                0 => "a",
+                1 => "b",
+                _ => "c",
+            }
+            .into(),
+        );
+        attrs.insert("rank".into(), (id as i64).into());
+        attrs.insert("active".into(), (id % 2 == 0).into());
+        if id % 5 == 0 {
+            attrs.insert("tags".into(), vec!["special".to_string()].into());
+        }
+        col.upsert(id, &[((id % 20) as f32) * 0.5, (id as f32) * 0.01, 0.0, 0.0], attrs)
+            .unwrap();
+    }
+    col.verify_invariants().unwrap();
+
+    // delete returns false for missing, true for existing
+    assert!(!col.delete(999_999).unwrap());
+    assert!(col.delete(599).unwrap());
+    assert!(!col.delete(599).unwrap());
+
+    // delete_batch deduplicates and ignores missing IDs
+    let deleted = col.delete_batch(&[595, 596, 595, 999_998, 597]).unwrap();
+    assert_eq!(deleted, 3);
+    col.verify_invariants().unwrap();
+
+    // 0-match filter is a no-op
+    let zero_upd = col
+        .update_by_filter(
+            &Filter::Eq("category".into(), "does_not_exist".into()),
+            &DocumentPatch::new().with_attribute("active", false.into()),
+        )
+        .unwrap();
+    assert_eq!(zero_upd, 0);
+    let zero_del = col
+        .delete_by_filter(&Filter::Eq("category".into(), "does_not_exist".into()))
+        .unwrap();
+    assert_eq!(zero_del, 0);
+
+    // update_by_filter on range + Not
+    let upd_filter = Filter::And(vec![
+        Filter::Lt("rank".into(), 100i64.into()),
+        Filter::Not(Box::new(Filter::Eq("category".into(), "c".into()))),
+    ]);
+    let expected_upd = col.resolve_filter_doc_ids(&upd_filter).unwrap();
+    let updated = col
+        .update_by_filter(
+            &upd_filter,
+            &DocumentPatch::new().with_attribute("category", "promoted".into()),
+        )
+        .unwrap();
+    assert_eq!(updated as usize, expected_upd.len());
+    for id in expected_upd {
+        assert_eq!(
+            col.get(id).unwrap().unwrap().attributes.get("category"),
+            Some(&AttributeValue::String("promoted".into()))
+        );
+    }
+    col.verify_invariants().unwrap();
+
+    // delete_by_filter on IsNull
+    let null_tags_filter = Filter::IsNull("tags".into());
+    let expected_nulls = col.resolve_filter_doc_ids(&null_tags_filter).unwrap();
+    let del_nulls = col.delete_by_filter(&null_tags_filter).unwrap();
+    assert_eq!(del_nulls as usize, expected_nulls.len());
+    col.verify_invariants().unwrap();
+
+    // Drain everything with empty And(vec![]) and verify clean empty root leaf, then re-insert.
+    let remaining = col.len();
+    let drained = col.delete_by_filter(&Filter::And(vec![])).unwrap();
+    assert_eq!(drained, remaining);
+    let stats = col.verify_invariants().unwrap();
+    assert_eq!(stats.tree.num_vectors, 0);
+    assert_eq!(stats.tree.root_level, 0);
+    assert_eq!(stats.tree.total_nodes, 1);
+
+    let mut fresh = Attributes::new();
+    fresh.insert("category".into(), "reborn".into());
+    col.upsert(1, &[1.0, 2.0, 3.0, 4.0], fresh).unwrap();
+    assert_eq!(col.verify_invariants().unwrap().num_docs, 1);
+}
+
+#[test]
+fn test_long_horizon_mutation_churn_with_patch_and_filter_ops() {
+    let dir = TempDir::new().unwrap();
+    let cfg = small_collection_config(10, DistanceMetric::Cosine, true);
+    let mut rng = SmallRng::seed_from_u64(2026_1121);
+    let mut oracle: HashMap<DocId, (Vec<f32>, Attributes)> = HashMap::new();
+    let categories = ["alpha", "beta", "gamma", "delta"];
+
+    let mut col = Collection::open(dir.path(), cfg.clone()).unwrap();
+
+    for step in 0..400usize {
+        let op = rng.random_range(0..100);
+        if op < 35 {
+            let id = rng.random_range(0..180u64);
+            let vec = random_vec(&mut rng, 10);
+            let mut attrs = Attributes::new();
+            attrs.insert(
+                "category".into(),
+                categories[rng.random_range(0..categories.len())].into(),
+            );
+            attrs.insert("rank".into(), rng.random_range(-50i64..50).into());
+            attrs.insert("active".into(), rng.random_bool(0.5).into());
+            if rng.random_bool(0.5) {
+                attrs.insert(
+                    "tags".into(),
+                    vec![format!("t{}", rng.random_range(0..4))].into(),
+                );
+            }
+            col.upsert(id, &vec, attrs.clone()).unwrap();
+            oracle.insert(id, (vec, attrs));
+        } else if op < 55 {
+            // Single patch (attribute-only, vector-only, or both)
+            if let Some(&id) = oracle.keys().nth(rng.random_range(0..oracle.len().max(1))) {
+                let mut patch = DocumentPatch::new();
+                if rng.random_bool(0.5) {
+                    let nv = random_vec(&mut rng, 10);
+                    patch.embedding = Some(nv.clone());
+                    oracle.get_mut(&id).unwrap().0 = nv;
+                }
+                if rng.random_bool(0.7) {
+                    let cat = categories[rng.random_range(0..categories.len())];
+                    patch = patch.with_attribute("category", cat.into());
+                    oracle
+                        .get_mut(&id)
+                        .unwrap()
+                        .1
+                        .insert("category".into(), cat.into());
+                } else {
+                    patch = patch.clear_attribute("tags");
+                    oracle.get_mut(&id).unwrap().1.remove("tags");
+                }
+                col.patch(id, patch).unwrap();
+            }
+        } else if op < 70 && oracle.len() >= 3 {
+            // patch_batch
+            let ids: Vec<DocId> = oracle.keys().copied().take(3).collect();
+            let mut patches = Vec::new();
+            for id in ids {
+                let new_rank = rng.random_range(-50i64..50);
+                oracle
+                    .get_mut(&id)
+                    .unwrap()
+                    .1
+                    .insert("rank".into(), new_rank.into());
+                patches.push((id, DocumentPatch::new().with_attribute("rank", new_rank.into())));
+            }
+            col.patch_batch(&patches).unwrap();
+        } else if op < 80 {
+            // delete_batch
+            let ids: Vec<DocId> = (0..4).map(|_| rng.random_range(0..180u64)).collect();
+            let expected_del = ids
+                .iter()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .filter(|id| oracle.remove(id).is_some())
+                .count() as u64;
+            assert_eq!(col.delete_batch(&ids).unwrap(), expected_del);
+        } else if op < 87 {
+            // update_by_filter
+            let f = Filter::Eq("category".into(), "delta".into());
+            let mut count = 0u64;
+            for (_, attrs) in oracle.values_mut() {
+                if f.matches(attrs) {
+                    attrs.insert("active".into(), false.into());
+                    count += 1;
+                }
+            }
+            let got = col
+                .update_by_filter(&f, &DocumentPatch::new().with_attribute("active", false.into()))
+                .unwrap();
+            assert_eq!(got, count);
+        } else if op < 94 {
+            // delete_by_filter
+            let f = Filter::Lt("rank".into(), (-40i64).into());
+            let before = oracle.len();
+            oracle.retain(|_, (_, attrs)| !f.matches(attrs));
+            let expected = (before - oracle.len()) as u64;
+            assert_eq!(col.delete_by_filter(&f).unwrap(), expected);
+        } else {
+            drop(col);
+            col = Collection::open(dir.path(), cfg.clone()).unwrap();
+        }
+
+        if step % 40 == 39 {
+            let stats = col.verify_invariants().unwrap();
+            assert_eq!(stats.num_docs, oracle.len());
+        }
+    }
+
+    let stats = col.verify_invariants().unwrap();
+    assert_eq!(stats.num_docs, oracle.len());
+
+    let q = random_vec(&mut rng, 10);
+    let filter = Filter::And(vec![
+        Filter::Eq("active".into(), true.into()),
+        Filter::Not(Box::new(Filter::Eq("category".into(), "beta".into()))),
+    ]);
+    let got = col
+        .search(
+            &q,
+            SearchOptions::new(10, 16)
+                .with_rerank(40)
+                .with_max_expanded_leaves(128),
+            Some(&filter),
+        )
+        .unwrap();
+    let exact = brute_force_filtered(&oracle, &q, 10, DistanceMetric::Cosine, Some(&filter));
+    if !exact.is_empty() {
+        let exact_ids: HashSet<DocId> = exact.iter().map(|&(id, _)| id).collect();
+        let hits = got.iter().filter(|r| exact_ids.contains(&r.id)).count();
+        assert!(hits * 2 >= exact_ids.len());
+    }
 }

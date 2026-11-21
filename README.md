@@ -1,12 +1,11 @@
 # IzzyDB
 
-A mutable, RocksDB-backed hierarchical clustering tree (~100x fanout) for approximate nearest neighbor search, inspired by turbopuffer ANN v3 and SPFresh (LIRE).
+An embedded, RocksDB-backed hybrid search engine in Rust for vector, full-text, and filtered queries.
 
-- **Quantized posting lists:** Leaf posting lists (`cf_leaf_entries`) store 1-bit RaBitQ codes relative to each leaf centroid (~21x smaller than `f32` at 128d).
-- **Full-vector store:** Full-precision vectors are stored separately in `cf_vectors` for exact tree splits, LIRE reassignment, and optional Stage 2 reranking.
-- **Mutable & persistent:** Supports inserts, upserts, and deletes with balanced 2-means splits, underflow merges/redistributions, SPFresh LIRE boundary reassignment, and atomic `WriteBatch` commits.
-- **Cluster-aware attribute filtering:** `Collection` pairs `ClusteringTree` with a typed attribute schema, forward document storage, and cluster/leaf bitmap indexes for filtered ANN search with dynamic expansion and exhaustive-scan crossover.
-- **Full-text search & hybrid RRF:** Cluster-decoupled `FtsIndex` with `alyze` tokenization, Snowball stemming, stopword removal, ASCII folding, phrase position indexing, vectorized Block-Max MAXSCORE BM25, and Reciprocal Rank Fusion (`hybrid_search`).
+- **Vector search:** Mutable ~100x-fanout clustering tree (inspired by turbopuffer ANN v3 and SPFresh LIRE) with 1-bit RaBitQ quantization and optional exact reranking.
+- **Attribute filtering:** Typed document schemas with cluster-aware `RoaringBitmap` indexes for filtered vector and BM25 search.
+- **Full-text & hybrid:** Block-Max MAXSCORE BM25 with stemming, phrase matching, and Reciprocal Rank Fusion (`hybrid_search`).
+- **Persistent & accelerated:** Atomic RocksDB `WriteBatch` commits and runtime-dispatched SIMD (`x86_64` AVX2/AVX-512, `aarch64` NEON).
 
 ## Workspace Crates
 

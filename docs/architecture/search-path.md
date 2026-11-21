@@ -1,6 +1,6 @@
 # Search Path
 
-This document describes both the unfiltered and attribute-filtered ANN search paths in `Collection` ([`crates/izzydb/src/collection.rs`](../crates/izzydb/src/collection.rs)) and [`crates/izzydb/src/search.rs`](../crates/izzydb/src/search.rs).
+This document describes both the unfiltered and attribute-filtered ANN search paths in `Collection` ([`crates/izzydb/src/collection.rs`](../../crates/izzydb/src/collection.rs)) and [`crates/izzydb/src/search.rs`](../../crates/izzydb/src/search.rs).
 
 ## Entry Points
 

@@ -3,12 +3,12 @@
 This document specifies the persistent RocksDB key-value encodings, packed node/vector/document blob formats, order-preserving attribute encodings, and RaBitQ bit-packing layouts used by `Collection`, `ClusteringTree`, and `AttributeIndex`.
 
 Implementation sources:
-- Column families, RocksDB keys, and CF options: [`crates/izzydb-storage/src/storage.rs`](../crates/izzydb-storage/src/storage.rs)
-- Packed node/metadata serialization and zero-copy views: [`crates/izzydb-storage/src/node.rs`](../crates/izzydb-storage/src/node.rs)
-- Attribute key/forward codecs and `RoaringBitmap` serialization: [`crates/izzydb-storage/src/codec.rs`](../crates/izzydb-storage/src/codec.rs)
-- Metric tags, ID aliases, and schema/filter types: [`crates/izzydb-core/src/config.rs`](../crates/izzydb-core/src/config.rs), [`crates/izzydb-core/src/schema.rs`](../crates/izzydb-core/src/schema.rs)
-- RaBitQ code and query bit-plane packing: [`crates/izzydb-rabitq/src/quantizer.rs`](../crates/izzydb-rabitq/src/quantizer.rs)
-- Structural and index invariants: [`crates/izzydb/src/verify.rs`](../crates/izzydb/src/verify.rs)
+- Column families, RocksDB keys, and CF options: [`crates/izzydb-storage/src/storage.rs`](../../crates/izzydb-storage/src/storage.rs)
+- Packed node/metadata serialization and zero-copy views: [`crates/izzydb-storage/src/node.rs`](../../crates/izzydb-storage/src/node.rs)
+- Attribute key/forward codecs and `RoaringBitmap` serialization: [`crates/izzydb-storage/src/codec.rs`](../../crates/izzydb-storage/src/codec.rs)
+- Metric tags, ID aliases, and schema/filter types: [`crates/izzydb-core/src/config.rs`](../../crates/izzydb-core/src/config.rs), [`crates/izzydb-core/src/schema.rs`](../../crates/izzydb-core/src/schema.rs)
+- RaBitQ code and query bit-plane packing: [`crates/izzydb-rabitq/src/quantizer.rs`](../../crates/izzydb-rabitq/src/quantizer.rs)
+- Structural and index invariants: [`crates/izzydb/src/verify.rs`](../../crates/izzydb/src/verify.rs)
 
 ---
 
@@ -186,7 +186,7 @@ Array attributes (`StringArray`, `IntArray`, `UintArray`) index each distinct el
 
 ## 4. Consistency Invariants
 
-Verified exhaustively by `verify_invariants` and `verify_collection_invariants` ([`crates/izzydb/src/verify.rs`](../crates/izzydb/src/verify.rs)):
+Verified exhaustively by `verify_invariants` and `verify_collection_invariants` ([`crates/izzydb/src/verify.rs`](../../crates/izzydb/src/verify.rs)):
 
 1. **Disjoint node CFs & cache parity:** Reachable internal nodes match `internal_cache` and `cf_internal_nodes`; reachable leaves match `leaf_parent` and `cf_leaf_entries` with no orphans.
 2. **Per-leaf `LocalId` uniqueness:** Every `local_id < leaf.next_local_id` and all `local_ids` within a leaf are unique.

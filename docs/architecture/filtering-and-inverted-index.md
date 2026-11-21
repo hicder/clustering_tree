@@ -4,16 +4,16 @@ This document provides a detailed specification of `izzydb`'s typed attribute sc
 
 Primary implementation sources:
 
-- Schema & attribute types: [`crates/izzydb-core/src/schema.rs`](../crates/izzydb-core/src/schema.rs)
-- Filter AST, validation, and in-memory evaluator: [`crates/izzydb-core/src/filter.rs`](../crates/izzydb-core/src/filter.rs)
-- Attribute key & forward document codecs: [`crates/izzydb-storage/src/codec.rs`](../crates/izzydb-storage/src/codec.rs)
-- RocksDB storage, prefix extractors, and `TxContext`: [`crates/izzydb-storage/src/storage.rs`](../crates/izzydb-storage/src/storage.rs)
-- Packed leaf `local_ids` & `next_local_id`: [`crates/izzydb-storage/src/node.rs`](../crates/izzydb-storage/src/node.rs)
-- Top-level `Collection` coordinator: [`crates/izzydb/src/collection.rs`](../crates/izzydb/src/collection.rs)
-- Two-level `AttributeIndex`: [`crates/izzydb/src/attr_index.rs`](../crates/izzydb/src/attr_index.rs)
-- Filtered search & dynamic expansion: [`crates/izzydb/src/search.rs`](../crates/izzydb/src/search.rs)
-- Masked RaBitQ leaf scoring: [`crates/izzydb-rabitq/src/simd.rs`](../crates/izzydb-rabitq/src/simd.rs)
-- Invariant verification: [`crates/izzydb/src/verify.rs`](../crates/izzydb/src/verify.rs)
+- Schema & attribute types: [`crates/izzydb-core/src/schema.rs`](../../crates/izzydb-core/src/schema.rs)
+- Filter AST, validation, and in-memory evaluator: [`crates/izzydb-core/src/filter.rs`](../../crates/izzydb-core/src/filter.rs)
+- Attribute key & forward document codecs: [`crates/izzydb-storage/src/codec.rs`](../../crates/izzydb-storage/src/codec.rs)
+- RocksDB storage, prefix extractors, and `TxContext`: [`crates/izzydb-storage/src/storage.rs`](../../crates/izzydb-storage/src/storage.rs)
+- Packed leaf `local_ids` & `next_local_id`: [`crates/izzydb-storage/src/node.rs`](../../crates/izzydb-storage/src/node.rs)
+- Top-level `Collection` coordinator: [`crates/izzydb/src/collection.rs`](../../crates/izzydb/src/collection.rs)
+- Two-level `AttributeIndex`: [`crates/izzydb/src/attr_index.rs`](../../crates/izzydb/src/attr_index.rs)
+- Filtered search & dynamic expansion: [`crates/izzydb/src/search.rs`](../../crates/izzydb/src/search.rs)
+- Masked RaBitQ leaf scoring: [`crates/izzydb-rabitq/src/simd.rs`](../../crates/izzydb-rabitq/src/simd.rs)
+- Invariant verification: [`crates/izzydb/src/verify.rs`](../../crates/izzydb/src/verify.rs)
 
 ---
 
@@ -99,7 +99,7 @@ On `Collection::open`:
 
 ## 3. Filter AST & Semantics
 
-`Filter` ([`crates/izzydb-core/src/filter.rs`](../crates/izzydb-core/src/filter.rs)) defines the predicate AST evaluated both by `Filter::matches(&Attributes)` in memory and by `AttributeIndex` against RocksDB.
+`Filter` ([`crates/izzydb-core/src/filter.rs`](../../crates/izzydb-core/src/filter.rs)) defines the predicate AST evaluated both by `Filter::matches(&Attributes)` in memory and by `AttributeIndex` against RocksDB.
 
 ### 3.1 Variants & Validation Rules (`Filter::validate`)
 
@@ -224,7 +224,7 @@ For each attribute in a document:
 
 `PackedLeafNode` stores `doc_ids: [u64; n]` in strictly ascending `DocId` order so point updates/removals can locate entries via binary search. If `AttributeIndex` stored raw array slot indices (`0..n`), inserting a document whose `DocId` lands in the middle of a leaf would shift all higher slot indices and force rewriting every attribute posting bitmap in that leaf.
 
-Instead, `PackedLeafNode` ([`crates/izzydb-storage/src/node.rs`](../crates/izzydb-storage/src/node.rs)) stores:
+Instead, `PackedLeafNode` ([`crates/izzydb-storage/src/node.rs`](../../crates/izzydb-storage/src/node.rs)) stores:
 
 - `next_local_id: u32` in the 24-byte leaf header (bytes `12..16`).
 - `local_ids: [u32; n]` parallel to `doc_ids` in the leaf body.
@@ -278,7 +278,7 @@ Their lifecycle follows two regimes:
 
 ## 6. Filtered Search Execution
 
-`Collection::search(query, opts, Some(filter))` dispatches to `search::search_filtered` ([`crates/izzydb/src/search.rs`](../crates/izzydb/src/search.rs)). Unfiltered queries (`filter = None`) take `search::search` with zero filtering overhead.
+`Collection::search(query, opts, Some(filter))` dispatches to `search::search_filtered` ([`crates/izzydb/src/search.rs`](../../crates/izzydb/src/search.rs)). Unfiltered queries (`filter = None`) take `search::search` with zero filtering overhead.
 
 ### 6.1 Step 1: Cluster-Level Pruning (`AttributeIndex::prepare_filter`)
 
@@ -348,7 +348,7 @@ For broader filters (`All` or `bm.len() > exhaustive_cluster_threshold`):
 
 ## 7. Consistency Invariants (`Collection::verify_invariants`)
 
-`verify_collection_invariants` ([`crates/izzydb/src/verify.rs`](../crates/izzydb/src/verify.rs)) exhaustively verifies both tree invariants and inverted-index parity:
+`verify_collection_invariants` ([`crates/izzydb/src/verify.rs`](../../crates/izzydb/src/verify.rs)) exhaustively verifies both tree invariants and inverted-index parity:
 
 1. **Schema parity:** `cf_meta["schema"]` exists and equals the in-memory `CollectionSchema`.
 2. **Document bijection:** `cf_docs` has exactly `meta.num_vectors` entries, and its keys form a 1-to-1 bijection with `cf_doc_loc`, `cf_vectors`, and reachable leaf entries.

@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::cmp::Ordering;
 
 use crate::config::{DistanceMetric, DocId, NodeId};
 use crate::error::{Result, TreeError};
@@ -9,7 +8,6 @@ use crate::rabitq::{EncodeScratch, QuantizedEntry, RabitqQuantizer};
 const META_LEN: usize = 39;
 const INTERNAL_HEADER_LEN: usize = 24;
 const LEAF_HEADER_LEN: usize = 24;
-const LEAF_VECS_HEADER_LEN: usize = 8;
 
 /// Global tree metadata persisted in `cf_meta`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,28 +289,30 @@ impl PackedLeafNode {
         true
     }
 
-    /// Re-encode all entries from `vecs` (aligned with `doc_ids`) relative to `self.centroid`
-    /// and refresh `self.rotated_centroid`.
+    /// Re-encode all entries from `flat_vectors` (aligned with `doc_ids`) relative to
+    /// `self.centroid` and refresh `self.rotated_centroid`.
     pub fn re_encode_all(
         &mut self,
-        vecs: &PackedLeafVectors,
+        doc_ids: &[DocId],
+        flat_vectors: &[f32],
         quantizer: &RabitqQuantizer,
         dim: usize,
         scratch: &mut EncodeScratch,
     ) {
         debug_assert_eq!(self.centroid.len(), dim);
-        let n = vecs.doc_ids.len();
+        assert_eq!(flat_vectors.len(), doc_ids.len() * dim);
+        let n = doc_ids.len();
         let words = quantizer.num_words();
         quantizer.rotate_into(&self.centroid, &mut self.rotated_centroid);
 
         self.doc_ids.clear();
-        self.doc_ids.extend_from_slice(&vecs.doc_ids);
+        self.doc_ids.extend_from_slice(doc_ids);
         self.res_norm_sqs.resize(n, 0.0);
         self.scales.resize(n, 0.0);
         self.codes.resize(n * words, 0);
 
         let mut code_buf = vec![0u64; words];
-        for (i, vec) in vecs.vectors.chunks_exact(dim).enumerate() {
+        for (i, vec) in flat_vectors.chunks_exact(dim).enumerate() {
             let (res_norm_sq, scale) =
                 quantizer.encode_into(vec, &self.centroid, scratch, &mut code_buf);
             self.res_norm_sqs[i] = res_norm_sq;
@@ -455,133 +455,6 @@ impl<'a> LeafNodeView<'a> {
     }
 }
 
-/// Full-precision vectors for a leaf packed together in `cf_leaf_vectors`,
-/// sorted by `doc_ids` to match [`PackedLeafNode`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct PackedLeafVectors {
-    pub doc_ids: Vec<DocId>,
-    pub vectors: Vec<f32>,
-}
-
-impl PackedLeafVectors {
-    pub fn empty() -> Self {
-        Self {
-            doc_ids: Vec::new(),
-            vectors: Vec::new(),
-        }
-    }
-
-    pub fn upsert(&mut self, doc_id: DocId, vec: &[f32], dim: usize) {
-        debug_assert_eq!(vec.len(), dim);
-        match self.doc_ids.binary_search(&doc_id) {
-            Ok(idx) => {
-                self.vectors[idx * dim..(idx + 1) * dim].copy_from_slice(vec);
-            }
-            Err(idx) => {
-                self.doc_ids.insert(idx, doc_id);
-                self.vectors
-                    .splice(idx * dim..idx * dim, vec.iter().copied());
-            }
-        }
-    }
-
-    pub fn remove(&mut self, doc_id: DocId, dim: usize) -> bool {
-        let Ok(idx) = self.doc_ids.binary_search(&doc_id) else {
-            return false;
-        };
-        self.doc_ids.remove(idx);
-        self.vectors.drain(idx * dim..(idx + 1) * dim);
-        true
-    }
-
-    pub fn get(&self, doc_id: DocId, dim: usize) -> Option<&[f32]> {
-        let idx = self.doc_ids.binary_search(&doc_id).ok()?;
-        Some(&self.vectors[idx * dim..(idx + 1) * dim])
-    }
-
-    #[inline]
-    pub fn vec_at(&self, idx: usize, dim: usize) -> &[f32] {
-        &self.vectors[idx * dim..(idx + 1) * dim]
-    }
-
-    pub fn encode(&self, dim: usize) -> Vec<u8> {
-        let n = self.doc_ids.len();
-        debug_assert_eq!(self.vectors.len(), n * dim);
-        let total = LEAF_VECS_HEADER_LEN + n * 8 + n * dim * 4;
-        let mut buf = Vec::with_capacity(total);
-        buf.extend_from_slice(&(n as u32).to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        write_u64_le(&self.doc_ids, &mut buf);
-        write_f32_le(&self.vectors, &mut buf);
-        buf
-    }
-
-    pub fn decode(bytes: &[u8], dim: usize) -> Result<Self> {
-        let view = LeafVectorsView::parse(bytes, dim)?;
-        let n = view.entry_count;
-        Ok(Self {
-            doc_ids: read_u64_le(view.doc_ids_bytes, n)?,
-            vectors: read_f32_le(view.vectors_bytes, n * dim)?,
-        })
-    }
-}
-
-/// Zero-copy borrowed view over serialized [`PackedLeafVectors`] bytes.
-#[derive(Debug, Clone, Copy)]
-pub struct LeafVectorsView<'a> {
-    pub entry_count: usize,
-    pub doc_ids_bytes: &'a [u8],
-    pub vectors_bytes: &'a [u8],
-}
-
-impl<'a> LeafVectorsView<'a> {
-    pub fn parse(bytes: &'a [u8], dim: usize) -> Result<Self> {
-        if bytes.len() < LEAF_VECS_HEADER_LEN {
-            return Err(TreeError::CorruptedData(format!(
-                "PackedLeafVectors header too short: {}",
-                bytes.len()
-            )));
-        }
-        let n = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let expected = LEAF_VECS_HEADER_LEN + n * 8 + n * dim * 4;
-        if bytes.len() != expected {
-            return Err(TreeError::CorruptedData(format!(
-                "PackedLeafVectors expected {expected} bytes, got {}",
-                bytes.len()
-            )));
-        }
-        let off = LEAF_VECS_HEADER_LEN;
-        let doc_ids_bytes = &bytes[off..off + n * 8];
-        let vectors_bytes = &bytes[off + n * 8..];
-        Ok(Self {
-            entry_count: n,
-            doc_ids_bytes,
-            vectors_bytes,
-        })
-    }
-
-    #[inline]
-    pub fn vec_bytes_at(&self, slot: usize, dim: usize) -> &'a [u8] {
-        let stride = dim * 4;
-        &self.vectors_bytes[slot * stride..(slot + 1) * stride]
-    }
-
-    pub fn find_vec_bytes(&self, doc_id: DocId, dim: usize) -> Option<&'a [u8]> {
-        let mut lo = 0usize;
-        let mut hi = self.entry_count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let id = u64::from_le_bytes(self.doc_ids_bytes[mid * 8..(mid + 1) * 8].try_into().unwrap());
-            match id.cmp(&doc_id) {
-                Ordering::Less => lo = mid + 1,
-                Ordering::Greater => hi = mid,
-                Ordering::Equal => return Some(self.vec_bytes_at(mid, dim)),
-            }
-        }
-        None
-    }
-}
-
 #[inline]
 fn decode_parent_flag(flag: u8, pid_bytes: &[u8]) -> Result<Option<NodeId>> {
     let raw = u64::from_le_bytes(pid_bytes.try_into().unwrap());
@@ -594,9 +467,38 @@ fn decode_parent_flag(flag: u8, pid_bytes: &[u8]) -> Result<Option<NodeId>> {
     }
 }
 
+/// Encode `vals` as raw little-endian `f32` bytes (no header).
+pub fn encode_f32_slice(vals: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() * 4);
+    write_f32_le(vals, &mut out);
+    out
+}
+
 /// Decode `dim` little-endian `f32` values from `bytes`.
 pub fn decode_f32_slice(bytes: &[u8], dim: usize) -> Result<Vec<f32>> {
     read_f32_le(bytes, dim)
+}
+
+/// Decode little-endian `f32` values from `bytes` directly into `dst`.
+#[inline]
+pub fn decode_f32_into(bytes: &[u8], dst: &mut [f32]) -> Result<()> {
+    let expected = dst.len() * 4;
+    if bytes.len() != expected {
+        return Err(TreeError::CorruptedData(format!(
+            "f32 slice expected {expected} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    #[cfg(target_endian = "little")]
+    if let Ok(slice) = bytemuck::try_cast_slice::<u8, f32>(bytes) {
+        dst.copy_from_slice(slice);
+        return Ok(());
+    }
+    let (chunks, _) = bytes.as_chunks::<4>();
+    for (out, &chunk) in dst.iter_mut().zip(chunks.iter()) {
+        *out = f32::from_le_bytes(chunk);
+    }
+    Ok(())
 }
 
 /// Borrow `bytes` directly as `&[f32]` on little-endian hosts when 4-byte aligned,

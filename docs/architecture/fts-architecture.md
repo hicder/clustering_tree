@@ -25,7 +25,7 @@ Document lengths are stored once per `(attr_id, block_id)` in `cf_fts_doc_lens` 
 
 ## 3. Query Execution & Hybrid Search
 
-- **Vectorized Block-Max MAXSCORE:** Terms are sorted by ascending global upper bound and dynamically partitioned into non-essential and essential sets as the top-$k$ threshold $\theta$ rises. Blocks whose header upper bound cannot beat $\theta$ are skipped without decoding postings; surviving blocks accumulate into a stack-allocated `[f32; 256]` buffer.
+- **Vectorized Block-Max MAXSCORE:** Terms are sorted by ascending global upper bound and dynamically partitioned into non-essential and essential sets as the top-$k$ threshold $\theta$ rises. Blocks whose header upper bound cannot beat $\theta$ are skipped without decoding postings; surviving blocks accumulate into a stack-allocated `[f32; 256]` buffer. See [SIMD Block-Max MAXSCORE & Data Layout](blockmax-simd.md) for the exact binary formats and SIMD kernel pipeline.
 - **Filters:**
   - `ContainsAnyToken`, `ContainsAllTokens`, and `ContainsTokenSequence` execute directly on `cf_fts_postings` (fetching `cf_fts_positions` only for surviving candidate blocks in multi-term phrase queries).
   - Vector `Collection::search` resolves FTS subtrees to `(leaf_id, local_id)` masks inside `PreparedFilter`, supporting arbitrary `And`/`Or`/`Not` combinations with attribute filters.

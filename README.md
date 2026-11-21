@@ -209,6 +209,7 @@ let complex = Filter::Or(vec![
 - [Search Path](docs/architecture/search-path.md) — beam traversal, asymmetric 4-bit RaBitQ `popcount` scanning, cluster-aware filtering, and full-vector reranking.
 - [Filtering & Inverted Index](docs/architecture/filtering-and-inverted-index.md) — schema & filter semantics, order-preserving encodings, two-level `RoaringBitmap` index, `LocalId` lifecycle, and filtered execution.
 - [Full-Text Search Architecture](docs/architecture/fts-architecture.md) — `FtsIndex`, cluster-decoupled 256-doc posting blocks, Block-Max MAXSCORE BM25, FTS filters, and hybrid RRF.
+- [SIMD Block-Max MAXSCORE & Data Layout](docs/architecture/blockmax-simd.md) — 256-slot block geometry, out-of-line `DocLenBlock`, v2 Sparse/Dense posting layouts, `min_dl_over_tf` bounds, and runtime-dispatched SIMD kernels.
 - [ANN Latency Optimization](docs/perf/2026-11-20-latency-optimization.md) — packed node blobs, internal node cache, single-FWHT query path, and SIMD RaBitQ scoring.
 - [SIMD Block-Max MAXSCORE](docs/perf/2026-11-21-simd-maxscore.md) — out-of-line `DocLenBlock`, v2 TF-only Sparse/Dense posting blocks, `min_dl_over_tf` bounds, and runtime-dispatched FTS SIMD kernels.
 

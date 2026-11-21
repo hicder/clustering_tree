@@ -204,11 +204,13 @@ let complex = Filter::Or(vec![
 
 ## Documentation
 
-- [Key & Binary Encoding](docs/key-encoding.md) — RocksDB column families, big-endian key formats, packed SoA node/vector layouts, and RaBitQ bit-packing.
-- [Index Path](docs/index-path.md) — write path, RocksDB layout, RaBitQ quantization, splits, merges, and LIRE.
-- [Search Path](docs/search-path.md) — beam traversal, asymmetric 4-bit RaBitQ `popcount` scanning, cluster-aware filtering, and full-vector reranking.
-- [Filtering & Inverted Index](docs/filtering-and-inverted-index.md) — schema & filter semantics, order-preserving encodings, two-level `RoaringBitmap` index, `LocalId` lifecycle, and filtered execution.
-- [Full-Text Search Architecture](docs/fts-architecture.md) — `FtsIndex`, cluster-decoupled 256-doc posting blocks, Block-Max MAXSCORE BM25, FTS filters, and hybrid RRF.
+- [Key & Binary Encoding](docs/architecture/key-encoding.md) — RocksDB column families, big-endian key formats, packed SoA node/vector layouts, and RaBitQ bit-packing.
+- [Index Path](docs/architecture/index-path.md) — write path, RocksDB layout, RaBitQ quantization, splits, merges, and LIRE.
+- [Search Path](docs/architecture/search-path.md) — beam traversal, asymmetric 4-bit RaBitQ `popcount` scanning, cluster-aware filtering, and full-vector reranking.
+- [Filtering & Inverted Index](docs/architecture/filtering-and-inverted-index.md) — schema & filter semantics, order-preserving encodings, two-level `RoaringBitmap` index, `LocalId` lifecycle, and filtered execution.
+- [Full-Text Search Architecture](docs/architecture/fts-architecture.md) — `FtsIndex`, cluster-decoupled 256-doc posting blocks, Block-Max MAXSCORE BM25, FTS filters, and hybrid RRF.
+- [ANN Latency Optimization](docs/perf/2026-11-20-latency-optimization.md) — packed node blobs, internal node cache, single-FWHT query path, and SIMD RaBitQ scoring.
+- [SIMD Block-Max MAXSCORE](docs/perf/2026-11-21-simd-maxscore.md) — out-of-line `DocLenBlock`, v2 TF-only Sparse/Dense posting blocks, `min_dl_over_tf` bounds, and runtime-dispatched FTS SIMD kernels.
 
 ## Tests & Benchmarks
 

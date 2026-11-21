@@ -4,11 +4,11 @@ This document describes how `Collection` coordinates `ClusteringTree`, the forwa
 
 ## 1. Architecture & Shared RocksDB Layout
 
-`Collection` ([`crates/izzydb/src/collection.rs`](../crates/izzydb/src/collection.rs)) owns a shared `Arc<Storage>` ([`crates/izzydb-storage/src/storage.rs`](../crates/izzydb-storage/src/storage.rs)) and coordinates:
+`Collection` ([`crates/izzydb/src/collection.rs`](../../crates/izzydb/src/collection.rs)) owns a shared `Arc<Storage>` ([`crates/izzydb-storage/src/storage.rs`](../../crates/izzydb-storage/src/storage.rs)) and coordinates:
 
 1. **Document Store:** `cf_docs` (forward binary-encoded `Attributes`) and `cf_vectors` (`[f32; dim]` LE).
-2. **`ClusteringTree`** ([`crates/izzydb/src/tree.rs`](../crates/izzydb/src/tree.rs)): manages `cf_internal_nodes`, `cf_leaf_entries` (`PackedLeafNode` with RaBitQ codes and stable per-leaf `local_id`s), `cf_doc_loc` (`leaf_id || local_id`), and in-memory `internal_cache` + `leaf_parent` maps.
-3. **`AttributeIndex`** ([`crates/izzydb/src/attr_index.rs`](../crates/izzydb/src/attr_index.rs)): maintains downsampled cluster-level `RoaringBitmap<NodeId>`s in `cf_attr_clusters` and per-cluster document-level `RoaringBitmap<LocalId>`s in `cf_attr_postings`.
+2. **`ClusteringTree`** ([`crates/izzydb/src/tree.rs`](../../crates/izzydb/src/tree.rs)): manages `cf_internal_nodes`, `cf_leaf_entries` (`PackedLeafNode` with RaBitQ codes and stable per-leaf `local_id`s), `cf_doc_loc` (`leaf_id || local_id`), and in-memory `internal_cache` + `leaf_parent` maps.
+3. **`AttributeIndex`** ([`crates/izzydb/src/attr_index.rs`](../../crates/izzydb/src/attr_index.rs)): maintains downsampled cluster-level `RoaringBitmap<NodeId>`s in `cf_attr_clusters` and per-cluster document-level `RoaringBitmap<LocalId>`s in `cf_attr_postings`.
 
 All mutations in an operation execute inside a single `TxContext` overlay (`dirty_internal`, `dirty_leaf`, `dirty_vectors`, `dirty_doc_loc`, `dirty_docs`, `dirty_attr_clusters`, `dirty_attr_postings`) and commit atomically in one `rocksdb::WriteBatch`.
 

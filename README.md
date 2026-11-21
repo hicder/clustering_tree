@@ -1,4 +1,4 @@
-# izzydb
+# IzzyDB
 
 A mutable, RocksDB-backed hierarchical clustering tree (~100x fanout) for approximate nearest neighbor search, inspired by turbopuffer ANN v3 and SPFresh (LIRE).
 

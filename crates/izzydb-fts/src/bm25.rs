@@ -1,4 +1,10 @@
-use crate::block::PostingBlockView;
+use izzydb_core::config::FTS_BLOCK_SIZE;
+
+use crate::block::{PostingBlockPayload, PostingBlockView};
+use crate::simd::{
+    SimdTier, accumulate_dense_256, accumulate_dense_masked_256, accumulate_sparse,
+    accumulate_sparse_masked,
+};
 
 /// Robertson-Walker / Lucene BM25+ style IDF: `ln(1 + (N - df + 0.5) / (df + 0.5))`.
 #[inline]
@@ -86,78 +92,97 @@ impl Bm25TermScorer {
         (self.num_scale * tf_f) / (tf_f + self.k1_one_minus_b + self.k1_b_over_avgdl * dl_f)
     }
 
-    /// Sound upper bound on score for any posting with `tf <= max_tf` and `dl >= min_dl`.
+    /// Sound upper bound on score for any posting with `tf <= max_tf` and `dl / tf >= min_dl_over_tf`.
     #[inline]
-    pub fn upper_bound(&self, max_tf: u32, min_dl: u32) -> f32 {
-        self.score(max_tf, min_dl.max(1))
+    pub fn upper_bound(&self, max_tf: u32, min_dl_over_tf: f32) -> f32 {
+        if self.num_scale <= 0.0 || max_tf == 0 || !min_dl_over_tf.is_finite() {
+            return 0.0;
+        }
+        let c1 = self.k1_one_minus_b as f64;
+        let c2 = self.k1_b_over_avgdl as f64;
+        let inv_tf = if c1 > 0.0 { c1 / (max_tf as f64) } else { 0.0 };
+        let denom = 1.0 + inv_tf + c2 * (min_dl_over_tf as f64);
+        ((self.num_scale as f64) / denom) as f32
     }
 
-    /// Scatter-add BM25 scores for all postings in `view` into `scores` and mark `touched`.
+    /// Accumulate BM25 scores for all postings in `view` into `scores` using SIMD kernels.
     #[inline]
-    pub fn accumulate_block(
+    pub fn accumulate_block_simd(
         &self,
+        tier: SimdTier,
         view: &PostingBlockView<'_>,
-        scores: &mut [f32; 256],
+        dl_norm: &[f32; FTS_BLOCK_SIZE],
+        scores: &mut [f32; FTS_BLOCK_SIZE],
         touched: &mut [u64; 4],
     ) {
         if self.is_zero() {
             return;
         }
-        let n = view.header.count as usize;
-        if view.is_u16() {
-            let tfs = view.tfs_bytes;
-            let dls = view.dls_bytes;
-            for i in 0..n {
-                let slot = view.slots[i];
-                let off = i * 2;
-                let tf = u16::from_le_bytes([tfs[off], tfs[off + 1]]) as u32;
-                let dl = u16::from_le_bytes([dls[off], dls[off + 1]]) as u32;
-                let s = self.score(tf, dl);
-                scores[slot as usize] += s;
-                touched[(slot >> 6) as usize] |= 1u64 << (slot & 63);
+        match &view.payload {
+            PostingBlockPayload::Dense { bitmap, tfs_bytes } => {
+                accumulate_dense_256(
+                    tier,
+                    view.tf_width,
+                    tfs_bytes,
+                    self.num_scale,
+                    dl_norm,
+                    bitmap,
+                    scores,
+                    touched,
+                );
             }
-        } else {
-            for i in 0..n {
-                let slot = view.slots[i];
-                let s = self.score(view.tf(i), view.dl(i));
-                scores[slot as usize] += s;
-                touched[(slot >> 6) as usize] |= 1u64 << (slot & 63);
+            PostingBlockPayload::Sparse { slots, tfs_bytes } => {
+                accumulate_sparse(
+                    tier,
+                    view.tf_width,
+                    slots,
+                    tfs_bytes,
+                    self.num_scale,
+                    dl_norm,
+                    scores,
+                    touched,
+                );
             }
         }
     }
 
-    /// Scatter-add BM25 scores only for slots already set in `mask`.
+    /// Accumulate BM25 scores only for slots already set in `mask` using SIMD kernels.
     #[inline]
-    pub fn accumulate_block_masked(
+    pub fn accumulate_block_masked_simd(
         &self,
+        tier: SimdTier,
         view: &PostingBlockView<'_>,
+        dl_norm: &[f32; FTS_BLOCK_SIZE],
         mask: &[u64; 4],
-        scores: &mut [f32; 256],
+        scores: &mut [f32; FTS_BLOCK_SIZE],
     ) {
         if self.is_zero() {
             return;
         }
-        let n = view.header.count as usize;
-        if view.is_u16() {
-            let tfs = view.tfs_bytes;
-            let dls = view.dls_bytes;
-            for i in 0..n {
-                let slot = view.slots[i];
-                if ((mask[(slot >> 6) as usize] >> (slot & 63)) & 1) == 0 {
-                    continue;
-                }
-                let off = i * 2;
-                let tf = u16::from_le_bytes([tfs[off], tfs[off + 1]]) as u32;
-                let dl = u16::from_le_bytes([dls[off], dls[off + 1]]) as u32;
-                scores[slot as usize] += self.score(tf, dl);
+        match &view.payload {
+            PostingBlockPayload::Dense { bitmap, tfs_bytes } => {
+                accumulate_dense_masked_256(
+                    tier,
+                    view.tf_width,
+                    tfs_bytes,
+                    self.num_scale,
+                    dl_norm,
+                    bitmap,
+                    mask,
+                    scores,
+                );
             }
-        } else {
-            for i in 0..n {
-                let slot = view.slots[i];
-                if ((mask[(slot >> 6) as usize] >> (slot & 63)) & 1) == 0 {
-                    continue;
-                }
-                scores[slot as usize] += self.score(view.tf(i), view.dl(i));
+            PostingBlockPayload::Sparse { slots, tfs_bytes } => {
+                accumulate_sparse_masked(
+                    tier,
+                    view.tf_width,
+                    slots,
+                    tfs_bytes,
+                    self.num_scale,
+                    dl_norm,
+                    mask,
+                    scores,
+                );
             }
         }
     }

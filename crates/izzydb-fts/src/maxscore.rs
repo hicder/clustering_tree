@@ -4,14 +4,17 @@ use std::collections::{BinaryHeap, HashMap};
 use alyze::analyze::ReusableBuffer;
 use roaring::RoaringBitmap;
 
-use izzydb_core::config::{AttrId, DocId, FtsBlockId, FtsDocId, make_fts_doc_id};
-use izzydb_core::error::Result;
+use izzydb_core::config::{AttrId, DocId, FTS_BLOCK_SIZE, FtsBlockId, FtsDocId, make_fts_doc_id};
+use izzydb_core::error::{Result, TreeError};
 use izzydb_core::rank::{Bm25Overrides, RankBy};
 use izzydb_core::schema::{CollectionSchema, FullTextSearchConfig};
 
 use crate::analyzer::FtsAnalyzer;
-use crate::block::{FtsMeta, PostingBlockHeader, PostingBlockView, TermStats};
+use crate::block::{DocLenBlockView, FtsMeta, PostingBlockHeader, PostingBlockView, TermStats};
 use crate::bm25::Bm25TermScorer;
+use crate::simd::{
+    SimdTier, filter_ge_256, max_score_256, merge_add_256, merge_max_256, prepare_dl_norm_256,
+};
 
 pub const DEFAULT_MAX_PREFIX_EXPANSIONS: usize = 128;
 
@@ -48,13 +51,89 @@ pub trait FtsPostingSource {
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<(String, TermStats)>>;
-    fn open_posting_cursor<'a>(&'a self, attr_id: AttrId, token: &str)
-        -> Result<Self::Cursor<'a>>;
+    fn open_posting_cursor<'a>(
+        &'a self,
+        attr_id: AttrId,
+        token: &str,
+    ) -> Result<Self::Cursor<'a>>;
+    fn read_doc_len_block(
+        &self,
+        attr_id: AttrId,
+        block_id: FtsBlockId,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<bool>;
     fn multi_get_doc_ids(&self, fts_doc_ids: &[FtsDocId]) -> Result<Vec<Option<DocId>>>;
+}
+
+struct DlNormGroup {
+    attr_id: AttrId,
+    c1: f32,
+    c2: f32,
+    cached_block_id: Option<FtsBlockId>,
+    dl_norm: [f32; FTS_BLOCK_SIZE],
+}
+
+struct DlNormCache {
+    groups: Vec<DlNormGroup>,
+}
+
+impl DlNormCache {
+    fn new() -> Self {
+        Self { groups: Vec::new() }
+    }
+
+    fn intern(&mut self, attr_id: AttrId, scorer: &Bm25TermScorer) -> usize {
+        let c1 = scorer.k1_one_minus_b;
+        let c2 = scorer.k1_b_over_avgdl;
+        if let Some(pos) = self.groups.iter().position(|g| {
+            g.attr_id == attr_id && g.c1.to_bits() == c1.to_bits() && g.c2.to_bits() == c2.to_bits()
+        }) {
+            return pos;
+        }
+        let id = self.groups.len();
+        self.groups.push(DlNormGroup {
+            attr_id,
+            c1,
+            c2,
+            cached_block_id: None,
+            dl_norm: [f32::MIN_POSITIVE; FTS_BLOCK_SIZE],
+        });
+        id
+    }
+
+    #[inline]
+    fn get_or_load<S: FtsPostingSource>(
+        &mut self,
+        source: &S,
+        tier: SimdTier,
+        group_id: usize,
+        block_id: FtsBlockId,
+    ) -> Result<&[f32; FTS_BLOCK_SIZE]> {
+        let group = &mut self.groups[group_id];
+        if group.cached_block_id != Some(block_id) {
+            let attr_id = group.attr_id;
+            let c1 = group.c1;
+            let c2 = group.c2;
+            let out = &mut group.dl_norm;
+            let found = source.read_doc_len_block(attr_id, block_id, &mut |bytes| {
+                let view = DocLenBlockView::parse(bytes)?;
+                prepare_dl_norm_256(tier, view.width, view.dls_bytes, c1, c2, out);
+                Ok(())
+            })?;
+            if !found {
+                return Err(TreeError::CorruptedData(format!(
+                    "missing cf_fts_doc_lens block for attr {attr_id} block {block_id}"
+                )));
+            }
+            group.cached_block_id = Some(block_id);
+        }
+        Ok(&self.groups[group_id].dl_norm)
+    }
 }
 
 struct TermStream<'a, S: FtsPostingSource + 'a> {
     scorer: Bm25TermScorer,
+    dl_group: usize,
     cursor: S::Cursor<'a>,
 }
 
@@ -67,7 +146,7 @@ impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
     #[inline]
     fn block_upper_bound(&self) -> Result<f32> {
         let header = PostingBlockHeader::parse(self.cursor.current_block_bytes())?;
-        Ok(self.scorer.upper_bound(header.max_tf, header.min_dl))
+        Ok(self.scorer.upper_bound(header.max_tf, header.min_dl_over_tf))
     }
 
     #[inline]
@@ -190,74 +269,143 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
     fn accumulate_block(
         &self,
         target: FtsBlockId,
-        scores: &mut [f32; 256],
+        scores: &mut [f32; FTS_BLOCK_SIZE],
         touched: &mut [u64; 4],
+        dl_cache: &mut DlNormCache,
+        source: &S,
+        tier: SimdTier,
     ) -> Result<()> {
         match &self.kind {
             ClauseKind::Single(t) => {
-                if t.current_block_id() == Some(target) {
+                if t.current_block_id() == Some(target) && !t.scorer.is_zero() {
                     let view = PostingBlockView::parse(t.cursor.current_block_bytes())?;
-                    t.scorer.accumulate_block(&view, scores, touched);
+                    let dl_norm = dl_cache.get_or_load(source, tier, t.dl_group, target)?;
+                    t.scorer
+                        .accumulate_block_simd(tier, &view, dl_norm, scores, touched);
                 }
                 Ok(())
             }
             ClauseKind::PrefixMax(ts) => {
-                let mut local = [0.0f32; 256];
+                let matching = ts
+                    .iter()
+                    .filter(|t| t.current_block_id() == Some(target) && !t.scorer.is_zero())
+                    .count();
+                if matching == 0 {
+                    return Ok(());
+                }
+                if matching == 1 {
+                    let t = ts
+                        .iter()
+                        .find(|t| t.current_block_id() == Some(target) && !t.scorer.is_zero())
+                        .unwrap();
+                    let view = PostingBlockView::parse(t.cursor.current_block_bytes())?;
+                    let dl_norm = dl_cache.get_or_load(source, tier, t.dl_group, target)?;
+                    t.scorer
+                        .accumulate_block_simd(tier, &view, dl_norm, scores, touched);
+                    return Ok(());
+                }
+
+                let mut local = [0.0f32; FTS_BLOCK_SIZE];
+                let mut tmp = [0.0f32; FTS_BLOCK_SIZE];
                 let mut local_touched = [0u64; 4];
+                let mut first = true;
                 for t in ts {
-                    if t.current_block_id() != Some(target) {
+                    if t.current_block_id() != Some(target) || t.scorer.is_zero() {
                         continue;
                     }
                     let view = PostingBlockView::parse(t.cursor.current_block_bytes())?;
-                    if t.scorer.is_zero() {
-                        continue;
-                    }
-                    for i in 0..view.header.count as usize {
-                        let slot = view.slots[i];
-                        let s = t.scorer.score(view.tf(i), view.dl(i));
-                        let idx = slot as usize;
-                        if s > local[idx] {
-                            local[idx] = s;
-                        }
-                        local_touched[(slot >> 6) as usize] |= 1u64 << (slot & 63);
+                    let dl_norm = dl_cache.get_or_load(source, tier, t.dl_group, target)?;
+                    if first {
+                        t.scorer.accumulate_block_simd(
+                            tier,
+                            &view,
+                            dl_norm,
+                            &mut local,
+                            &mut local_touched,
+                        );
+                        first = false;
+                    } else {
+                        tmp.fill(0.0);
+                        t.scorer.accumulate_block_simd(
+                            tier,
+                            &view,
+                            dl_norm,
+                            &mut tmp,
+                            &mut local_touched,
+                        );
+                        merge_max_256(tier, &mut local, &tmp);
                     }
                 }
-                merge_add_touched(&local, &local_touched, scores, touched);
+                merge_add_256(tier, scores, &local);
+                for w in 0..4 {
+                    touched[w] |= local_touched[w];
+                }
                 Ok(())
             }
             ClauseKind::MaxBranches(branches) => {
-                let mut best = [0.0f32; 256];
-                let mut any_touched = [0u64; 4];
-                let mut branch_scores = [0.0f32; 256];
-                for branch in branches {
-                    let mut branch_touched = [0u64; 4];
-                    let mut has_any = false;
+                let matching_branches = branches
+                    .iter()
+                    .filter(|b| b.iter().any(|c| c.next_block_id() == Some(target)))
+                    .count();
+                if matching_branches == 0 {
+                    return Ok(());
+                }
+                if matching_branches == 1 {
+                    let branch = branches
+                        .iter()
+                        .find(|b| b.iter().any(|c| c.next_block_id() == Some(target)))
+                        .unwrap();
                     for c in branch {
                         if c.next_block_id() == Some(target) {
-                            if !has_any {
-                                branch_scores.fill(0.0);
-                                has_any = true;
-                            }
-                            c.accumulate_block(target, &mut branch_scores, &mut branch_touched)?;
+                            c.accumulate_block(target, scores, touched, dl_cache, source, tier)?;
                         }
                     }
-                    if !has_any {
+                    return Ok(());
+                }
+
+                let mut best = [0.0f32; FTS_BLOCK_SIZE];
+                let mut branch_scores = [0.0f32; FTS_BLOCK_SIZE];
+                let mut any_touched = [0u64; 4];
+                let mut first = true;
+                for branch in branches {
+                    if !branch.iter().any(|c| c.next_block_id() == Some(target)) {
                         continue;
                     }
-                    for (w, &bits) in branch_touched.iter().enumerate() {
-                        let mut b = bits;
-                        any_touched[w] |= b;
-                        while b != 0 {
-                            let bit = b.trailing_zeros() as usize;
-                            b &= b - 1;
-                            let idx = (w << 6) | bit;
-                            if branch_scores[idx] > best[idx] {
-                                best[idx] = branch_scores[idx];
+                    if first {
+                        for c in branch {
+                            if c.next_block_id() == Some(target) {
+                                c.accumulate_block(
+                                    target,
+                                    &mut best,
+                                    &mut any_touched,
+                                    dl_cache,
+                                    source,
+                                    tier,
+                                )?;
                             }
                         }
+                        first = false;
+                    } else {
+                        branch_scores.fill(0.0);
+                        for c in branch {
+                            if c.next_block_id() == Some(target) {
+                                c.accumulate_block(
+                                    target,
+                                    &mut branch_scores,
+                                    &mut any_touched,
+                                    dl_cache,
+                                    source,
+                                    tier,
+                                )?;
+                            }
+                        }
+                        merge_max_256(tier, &mut best, &branch_scores);
                     }
                 }
-                merge_add_touched(&best, &any_touched, scores, touched);
+                merge_add_256(tier, scores, &best);
+                for w in 0..4 {
+                    touched[w] |= any_touched[w];
+                }
                 Ok(())
             }
         }
@@ -267,118 +415,134 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
         &self,
         target: FtsBlockId,
         mask: &[u64; 4],
-        scores: &mut [f32; 256],
+        scores: &mut [f32; FTS_BLOCK_SIZE],
+        dl_cache: &mut DlNormCache,
+        source: &S,
+        tier: SimdTier,
     ) -> Result<()> {
         match &self.kind {
             ClauseKind::Single(t) => {
-                if t.current_block_id() == Some(target) {
+                if t.current_block_id() == Some(target) && !t.scorer.is_zero() {
                     let view = PostingBlockView::parse(t.cursor.current_block_bytes())?;
-                    t.scorer.accumulate_block_masked(&view, mask, scores);
+                    let dl_norm = dl_cache.get_or_load(source, tier, t.dl_group, target)?;
+                    t.scorer
+                        .accumulate_block_masked_simd(tier, &view, dl_norm, mask, scores);
                 }
                 Ok(())
             }
             ClauseKind::PrefixMax(ts) => {
-                let mut local = [0.0f32; 256];
-                let mut local_touched = [0u64; 4];
+                let matching = ts
+                    .iter()
+                    .filter(|t| t.current_block_id() == Some(target) && !t.scorer.is_zero())
+                    .count();
+                if matching == 0 {
+                    return Ok(());
+                }
+                if matching == 1 {
+                    let t = ts
+                        .iter()
+                        .find(|t| t.current_block_id() == Some(target) && !t.scorer.is_zero())
+                        .unwrap();
+                    let view = PostingBlockView::parse(t.cursor.current_block_bytes())?;
+                    let dl_norm = dl_cache.get_or_load(source, tier, t.dl_group, target)?;
+                    t.scorer
+                        .accumulate_block_masked_simd(tier, &view, dl_norm, mask, scores);
+                    return Ok(());
+                }
+
+                let mut local = [0.0f32; FTS_BLOCK_SIZE];
+                let mut tmp = [0.0f32; FTS_BLOCK_SIZE];
+                let mut first = true;
                 for t in ts {
                     if t.current_block_id() != Some(target) || t.scorer.is_zero() {
                         continue;
                     }
                     let view = PostingBlockView::parse(t.cursor.current_block_bytes())?;
-                    for i in 0..view.header.count as usize {
-                        let slot = view.slots[i];
-                        if ((mask[(slot >> 6) as usize] >> (slot & 63)) & 1) == 0 {
-                            continue;
-                        }
-                        let s = t.scorer.score(view.tf(i), view.dl(i));
-                        let idx = slot as usize;
-                        if s > local[idx] {
-                            local[idx] = s;
-                        }
-                        local_touched[(slot >> 6) as usize] |= 1u64 << (slot & 63);
+                    let dl_norm = dl_cache.get_or_load(source, tier, t.dl_group, target)?;
+                    if first {
+                        t.scorer.accumulate_block_masked_simd(
+                            tier,
+                            &view,
+                            dl_norm,
+                            mask,
+                            &mut local,
+                        );
+                        first = false;
+                    } else {
+                        tmp.fill(0.0);
+                        t.scorer
+                            .accumulate_block_masked_simd(tier, &view, dl_norm, mask, &mut tmp);
+                        merge_max_256(tier, &mut local, &tmp);
                     }
                 }
-                for (w, &bits) in local_touched.iter().enumerate() {
-                    let mut b = bits;
-                    while b != 0 {
-                        let bit = b.trailing_zeros() as usize;
-                        b &= b - 1;
-                        let idx = (w << 6) | bit;
-                        scores[idx] += local[idx];
-                    }
-                }
+                merge_add_256(tier, scores, &local);
                 Ok(())
             }
             ClauseKind::MaxBranches(branches) => {
-                let mut best = [0.0f32; 256];
-                let mut any_touched = [0u64; 4];
-                let mut branch_scores = [0.0f32; 256];
-                for branch in branches {
-                    let mut branch_touched = [0u64; 4];
-                    let mut has_any = false;
+                let matching_branches = branches
+                    .iter()
+                    .filter(|b| b.iter().any(|c| c.next_block_id() == Some(target)))
+                    .count();
+                if matching_branches == 0 {
+                    return Ok(());
+                }
+                if matching_branches == 1 {
+                    let branch = branches
+                        .iter()
+                        .find(|b| b.iter().any(|c| c.next_block_id() == Some(target)))
+                        .unwrap();
                     for c in branch {
                         if c.next_block_id() == Some(target) {
-                            if !has_any {
-                                branch_scores.fill(0.0);
-                                has_any = true;
-                            }
-                            c.accumulate_block_masked(target, mask, &mut branch_scores)?;
-                            for w in 0..4 {
-                                branch_touched[w] |= mask[w];
-                            }
+                            c.accumulate_block_masked(
+                                target, mask, scores, dl_cache, source, tier,
+                            )?;
                         }
                     }
-                    if !has_any {
+                    return Ok(());
+                }
+
+                let mut best = [0.0f32; FTS_BLOCK_SIZE];
+                let mut branch_scores = [0.0f32; FTS_BLOCK_SIZE];
+                let mut first = true;
+                for branch in branches {
+                    if !branch.iter().any(|c| c.next_block_id() == Some(target)) {
                         continue;
                     }
-                    for (w, &bits) in branch_touched.iter().enumerate() {
-                        let mut b = bits;
-                        any_touched[w] |= b;
-                        while b != 0 {
-                            let bit = b.trailing_zeros() as usize;
-                            b &= b - 1;
-                            let idx = (w << 6) | bit;
-                            if branch_scores[idx] > best[idx] {
-                                best[idx] = branch_scores[idx];
+                    if first {
+                        for c in branch {
+                            if c.next_block_id() == Some(target) {
+                                c.accumulate_block_masked(
+                                    target, mask, &mut best, dl_cache, source, tier,
+                                )?;
                             }
                         }
+                        first = false;
+                    } else {
+                        branch_scores.fill(0.0);
+                        for c in branch {
+                            if c.next_block_id() == Some(target) {
+                                c.accumulate_block_masked(
+                                    target,
+                                    mask,
+                                    &mut branch_scores,
+                                    dl_cache,
+                                    source,
+                                    tier,
+                                )?;
+                            }
+                        }
+                        merge_max_256(tier, &mut best, &branch_scores);
                     }
                 }
-                for (w, &bits) in any_touched.iter().enumerate() {
-                    let mut b = bits;
-                    while b != 0 {
-                        let bit = b.trailing_zeros() as usize;
-                        b &= b - 1;
-                        let idx = (w << 6) | bit;
-                        scores[idx] += best[idx];
-                    }
-                }
+                merge_add_256(tier, scores, &best);
                 Ok(())
             }
-        }
-    }
-}
-
-#[inline]
-fn merge_add_touched(
-    src: &[f32; 256],
-    src_touched: &[u64; 4],
-    dst: &mut [f32; 256],
-    dst_touched: &mut [u64; 4],
-) {
-    for (w, &bits) in src_touched.iter().enumerate() {
-        let mut b = bits;
-        dst_touched[w] |= b;
-        while b != 0 {
-            let bit = b.trailing_zeros() as usize;
-            b &= b - 1;
-            let idx = (w << 6) | bit;
-            dst[idx] += src[idx];
         }
     }
 }
 
 /// Compile a `RankBy` AST into flat MAXSCORE clauses (flattening `Sum` and distributing `Product`).
+#[allow(clippy::too_many_arguments)]
 fn compile_clauses<'a, S: FtsPostingSource>(
     source: &'a S,
     schema: &CollectionSchema,
@@ -386,6 +550,7 @@ fn compile_clauses<'a, S: FtsPostingSource>(
     expr: &RankBy,
     weight: f32,
     buffer: &mut ReusableBuffer,
+    dl_cache: &mut DlNormCache,
     out: &mut Vec<Clause<'a, S>>,
 ) -> Result<()> {
     if weight <= 0.0 {
@@ -393,11 +558,11 @@ fn compile_clauses<'a, S: FtsPostingSource>(
     }
     match expr {
         RankBy::Product(w, inner) => {
-            compile_clauses(source, schema, meta, inner, weight * *w, buffer, out)
+            compile_clauses(source, schema, meta, inner, weight * *w, buffer, dl_cache, out)
         }
         RankBy::Sum(children) => {
             for child in children {
-                compile_clauses(source, schema, meta, child, weight, buffer, out)?;
+                compile_clauses(source, schema, meta, child, weight, buffer, dl_cache, out)?;
             }
             Ok(())
         }
@@ -406,7 +571,16 @@ fn compile_clauses<'a, S: FtsPostingSource>(
             let mut max_branch_ub = 0.0f32;
             for child in children {
                 let mut branch_clauses = Vec::new();
-                compile_clauses(source, schema, meta, child, weight, buffer, &mut branch_clauses)?;
+                compile_clauses(
+                    source,
+                    schema,
+                    meta,
+                    child,
+                    weight,
+                    buffer,
+                    dl_cache,
+                    &mut branch_clauses,
+                )?;
                 if !branch_clauses.is_empty() {
                     let branch_ub: f32 = branch_clauses.iter().map(|c| c.term_max).sum();
                     if branch_ub > max_branch_ub {
@@ -479,15 +653,20 @@ fn compile_clauses<'a, S: FtsPostingSource>(
                         b,
                         k3,
                     );
-                    let ub = scorer.upper_bound(ts.max_tf, ts.min_dl);
+                    let ub = scorer.upper_bound(ts.max_tf, ts.min_dl_over_tf);
                     if ub <= 0.0 {
                         continue;
                     }
                     let cursor = source.open_posting_cursor(entry.id, &token)?;
                     if cursor.current_block_id().is_some() {
+                        let dl_group = dl_cache.intern(entry.id, &scorer);
                         out.push(Clause {
                             term_max: ub,
-                            kind: ClauseKind::Single(TermStream { scorer, cursor }),
+                            kind: ClauseKind::Single(TermStream {
+                                scorer,
+                                dl_group,
+                                cursor,
+                            }),
                         });
                     }
                 }
@@ -511,7 +690,7 @@ fn compile_clauses<'a, S: FtsPostingSource>(
                         b,
                         k3,
                     );
-                    let ub = scorer.upper_bound(ts.max_tf, ts.min_dl);
+                    let ub = scorer.upper_bound(ts.max_tf, ts.min_dl_over_tf);
                     if ub <= 0.0 {
                         continue;
                     }
@@ -520,7 +699,12 @@ fn compile_clauses<'a, S: FtsPostingSource>(
                         if ub > max_ub {
                             max_ub = ub;
                         }
-                        streams.push(TermStream { scorer, cursor });
+                        let dl_group = dl_cache.intern(entry.id, &scorer);
+                        streams.push(TermStream {
+                            scorer,
+                            dl_group,
+                            cursor,
+                        });
                     }
                 }
                 if !streams.is_empty() {
@@ -584,7 +768,6 @@ impl Eq for TopKEntry {}
 
 impl Ord for TopKEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse score so smallest score pops first; for ties, largest DocId pops first.
         other
             .score
             .total_cmp(&self.score)
@@ -629,7 +812,7 @@ impl BlockFilterMask {
     }
 }
 
-/// Execute a validated [`RankBy`] query using Vectorized Block-Max MAXSCORE.
+/// Execute a validated [`RankBy`] query using SIMD Vectorized Block-Max MAXSCORE.
 pub fn execute_rank_by<S: FtsPostingSource>(
     source: &S,
     schema: &CollectionSchema,
@@ -653,8 +836,19 @@ pub fn execute_rank_by<S: FtsPostingSource>(
         return Ok(Vec::new());
     }
 
+    let tier = SimdTier::detect();
+    let mut dl_cache = DlNormCache::new();
     let mut clauses = Vec::new();
-    compile_clauses(source, schema, &meta, rank_by, 1.0, buffer, &mut clauses)?;
+    compile_clauses(
+        source,
+        schema,
+        &meta,
+        rank_by,
+        1.0,
+        buffer,
+        &mut dl_cache,
+        &mut clauses,
+    )?;
     if clauses.is_empty() {
         return Ok(Vec::new());
     }
@@ -673,8 +867,10 @@ pub fn execute_rank_by<S: FtsPostingSource>(
     let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(top_k + 1);
     let mut theta: f32 = 0.0;
 
-    let mut scores = [0.0f32; 256];
+    let mut scores = [0.0f32; FTS_BLOCK_SIZE];
     let mut touched: [u64; 4];
+    let mut candidates: Vec<(f32, FtsDocId)> = Vec::with_capacity(32);
+    let mut non_ess_ubs: Vec<f32> = Vec::with_capacity(n_clauses);
 
     loop {
         // Find minimum block_id among essential clauses (`essential_start..n_clauses`).
@@ -707,7 +903,7 @@ pub fn execute_rank_by<S: FtsPostingSource>(
             0.0
         };
 
-        // Block-Max header pruning before decoding any posting lists.
+        // Block-Max header pruning before decoding any posting lists or doc_len blocks.
         if theta > 0.0 {
             let mut ess_block_ub = 0.0f64;
             for c in &clauses[essential_start..] {
@@ -723,12 +919,12 @@ pub fn execute_rank_by<S: FtsPostingSource>(
             }
         }
 
-        // Accumulate essential clauses into L1-resident [f32; 256] buffer.
+        // Accumulate essential clauses into L1-resident [f32; 256] buffer via SIMD.
         scores.fill(0.0);
         touched = [0u64; 4];
         for c in &clauses[essential_start..] {
             if c.next_block_id() == Some(block_id) {
-                c.accumulate_block(block_id, &mut scores, &mut touched)?;
+                c.accumulate_block(block_id, &mut scores, &mut touched, &mut dl_cache, source, tier)?;
             }
         }
 
@@ -738,129 +934,145 @@ pub fn execute_rank_by<S: FtsPostingSource>(
             }
         }
 
-        if touched != [0u64; 4] {
-            // Find max essential score in block to check whether non-essential clauses are needed.
-            let mut max_ess = 0.0f32;
-            for (w, &bits) in touched.iter().enumerate() {
-                let mut b = bits;
-                while b != 0 {
-                    let bit = b.trailing_zeros() as usize;
-                    b &= b - 1;
-                    let s = scores[(w << 6) | bit];
-                    if s > max_ess {
-                        max_ess = s;
-                    }
-                }
-            }
+        let mut active_mask = touched;
+        if active_mask != [0u64; 4] {
+            let max_ess = max_score_256(tier, &scores, &active_mask);
 
             if essential_start > 0 {
                 let eps = (max_ess + non_ess_ub) * 1e-6 + 1e-7;
                 if max_ess + non_ess_ub + eps >= theta {
+                    non_ess_ubs.clear();
                     let mut non_ess_block_ub = 0.0f64;
                     for c in &mut clauses[..essential_start] {
                         c.seek_to(block_id)?;
-                        non_ess_block_ub += c.block_upper_bound(block_id)? as f64;
+                        let ub = c.block_upper_bound(block_id)?;
+                        non_ess_ubs.push(ub);
+                        non_ess_block_ub += ub as f64;
                     }
                     let tight_ub = (max_ess as f64 + non_ess_block_ub) as f32;
                     let tight_eps = tight_ub * 1e-6 + 1e-7;
                     if tight_ub + tight_eps >= theta {
-                        for c in &clauses[..essential_start] {
-                            if c.next_block_id() == Some(block_id) {
-                                c.accumulate_block_masked(block_id, &touched, &mut scores)?;
+                        let mut rem_ub = non_ess_block_ub;
+                        // Iterate descending by global term_max so rem_ub shrinks fastest.
+                        for j in (0..essential_start).rev() {
+                            let ub_j = non_ess_ubs[j];
+                            if theta > 0.0 {
+                                let min_needed = (theta - rem_ub as f32) - tight_eps;
+                                if min_needed > 0.0 {
+                                    active_mask =
+                                        filter_ge_256(tier, &scores, &active_mask, min_needed);
+                                    if active_mask == [0u64; 4] {
+                                        break;
+                                    }
+                                }
                             }
+                            if ub_j > 0.0 && clauses[j].next_block_id() == Some(block_id) {
+                                clauses[j].accumulate_block_masked(
+                                    block_id,
+                                    &active_mask,
+                                    &mut scores,
+                                    &mut dl_cache,
+                                    source,
+                                    tier,
+                                )?;
+                            }
+                            rem_ub = (rem_ub - ub_j as f64).max(0.0);
                         }
                     } else {
-                        // Even with non-essential block upper bounds, no doc in this block can reach theta.
-                        touched = [0u64; 4];
+                        active_mask = [0u64; 4];
                     }
                 } else {
-                    // Essential max + global non-essential UB cannot reach theta.
-                    touched = [0u64; 4];
+                    active_mask = [0u64; 4];
                 }
             }
         }
 
-        // Collect candidates from touched slots that beat/tie theta.
-        if touched != [0u64; 4] {
-            let mut candidates: Vec<(f32, FtsDocId)> = Vec::new();
-            for (w, &bits) in touched.iter().enumerate() {
-                let mut b = bits;
-                while b != 0 {
-                    let bit = b.trailing_zeros() as usize;
-                    b &= b - 1;
-                    let slot = ((w << 6) | bit) as u8;
-                    let s = scores[slot as usize];
-                    if s <= 0.0 {
-                        continue;
-                    }
-                    if heap.len() < top_k || s >= theta {
+        // SIMD threshold filtering for top-k candidates.
+        if active_mask != [0u64; 4] {
+            let cand_thresh = if heap.len() < top_k {
+                f32::MIN_POSITIVE
+            } else {
+                theta
+            };
+            let hit_mask = filter_ge_256(tier, &scores, &active_mask, cand_thresh);
+            if hit_mask != [0u64; 4] {
+                candidates.clear();
+                for (w, &bits) in hit_mask.iter().enumerate() {
+                    let mut b = bits;
+                    while b != 0 {
+                        let bit = b.trailing_zeros() as usize;
+                        b &= b - 1;
+                        let slot = ((w << 6) | bit) as u8;
+                        let s = scores[slot as usize];
                         candidates.push((s, make_fts_doc_id(block_id, slot)));
                     }
                 }
-            }
 
-            if !candidates.is_empty() {
-                let needs_doc_ids = lazy_filter.is_some()
-                    || (heap.len() == top_k && candidates.iter().any(|&(s, _)| s == theta));
+                if !candidates.is_empty() {
+                    let needs_doc_ids = lazy_filter.is_some()
+                        || (heap.len() == top_k && candidates.iter().any(|&(s, _)| s == theta));
 
-                let resolved_ids: Vec<Option<DocId>> = if needs_doc_ids {
-                    let fts_ids: Vec<FtsDocId> = candidates.iter().map(|&(_, id)| id).collect();
-                    source.multi_get_doc_ids(&fts_ids)?
-                } else {
-                    vec![None; candidates.len()]
-                };
+                    let resolved_ids: Vec<Option<DocId>> = if needs_doc_ids {
+                        let fts_ids: Vec<FtsDocId> = candidates.iter().map(|&(_, id)| id).collect();
+                        source.multi_get_doc_ids(&fts_ids)?
+                    } else {
+                        vec![None; candidates.len()]
+                    };
 
-                for ((s, fts_doc_id), opt_doc_id) in candidates.into_iter().zip(resolved_ids) {
-                    if let Some(ref mut pred) = lazy_filter {
-                        let Some(doc_id) = opt_doc_id else {
-                            continue;
-                        };
-                        if !pred(doc_id)? {
-                            continue;
-                        }
-                    }
-
-                    if heap.len() < top_k {
-                        heap.push(TopKEntry {
-                            score: s,
-                            fts_doc_id,
-                            doc_id: opt_doc_id,
-                        });
-                        if heap.len() == top_k {
-                            theta = heap.peek().unwrap().score;
-                        }
-                    } else if s > theta {
-                        heap.pop();
-                        heap.push(TopKEntry {
-                            score: s,
-                            fts_doc_id,
-                            doc_id: opt_doc_id,
-                        });
-                        theta = heap.peek().unwrap().score;
-                    } else if s == theta {
-                        // Exact tie-breaking on ascending DocId.
-                        let Some(new_doc_id) = opt_doc_id else {
-                            continue;
-                        };
-                        let mut root = heap.pop().unwrap();
-                        let root_doc_id = match root.doc_id {
-                            Some(id) => id,
-                            None => {
-                                let fetched = source.multi_get_doc_ids(&[root.fts_doc_id])?;
-                                let id = fetched[0].unwrap_or(DocId::MAX);
-                                root.doc_id = Some(id);
-                                id
+                    for (&(s, fts_doc_id), &opt_doc_id) in
+                        candidates.iter().zip(resolved_ids.iter())
+                    {
+                        if let Some(ref mut pred) = lazy_filter {
+                            let Some(doc_id) = opt_doc_id else {
+                                continue;
+                            };
+                            if !pred(doc_id)? {
+                                continue;
                             }
-                        };
-                        if new_doc_id < root_doc_id {
+                        }
+
+                        if heap.len() < top_k {
                             heap.push(TopKEntry {
                                 score: s,
                                 fts_doc_id,
-                                doc_id: Some(new_doc_id),
+                                doc_id: opt_doc_id,
+                            });
+                            if heap.len() == top_k {
+                                theta = heap.peek().unwrap().score;
+                            }
+                        } else if s > theta {
+                            heap.pop();
+                            heap.push(TopKEntry {
+                                score: s,
+                                fts_doc_id,
+                                doc_id: opt_doc_id,
                             });
                             theta = heap.peek().unwrap().score;
-                        } else {
-                            heap.push(root);
+                        } else if s == theta {
+                            // Exact tie-breaking on ascending DocId.
+                            let Some(new_doc_id) = opt_doc_id else {
+                                continue;
+                            };
+                            let mut root = heap.pop().unwrap();
+                            let root_doc_id = match root.doc_id {
+                                Some(id) => id,
+                                None => {
+                                    let fetched = source.multi_get_doc_ids(&[root.fts_doc_id])?;
+                                    let id = fetched[0].unwrap_or(DocId::MAX);
+                                    root.doc_id = Some(id);
+                                    id
+                                }
+                            };
+                            if new_doc_id < root_doc_id {
+                                heap.push(TopKEntry {
+                                    score: s,
+                                    fts_doc_id,
+                                    doc_id: Some(new_doc_id),
+                                });
+                                theta = heap.peek().unwrap().score;
+                            } else {
+                                heap.push(root);
+                            }
                         }
                     }
                 }
@@ -929,7 +1141,7 @@ pub fn execute_rank_by<S: FtsPostingSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::PackedPostingBlock;
+    use crate::block::{DocLenBlock, PackedPostingBlock};
     use izzydb_core::config::{DistanceMetric, TreeConfig, fts_block_id, fts_slot};
     use izzydb_core::schema::{AttributeType, CollectionConfig};
     use rand::rngs::SmallRng;
@@ -940,6 +1152,7 @@ mod tests {
         docs: HashMap<FtsDocId, DocId>,
         terms: HashMap<(AttrId, String), TermStats>,
         postings: HashMap<(AttrId, String), Vec<(FtsBlockId, Vec<u8>)>>,
+        doc_lens: HashMap<(AttrId, FtsBlockId), Vec<u8>>,
     }
 
     struct MemCursor {
@@ -1024,6 +1237,21 @@ mod tests {
             Ok(MemCursor { blocks, idx: 0 })
         }
 
+        fn read_doc_len_block(
+            &self,
+            attr_id: AttrId,
+            block_id: FtsBlockId,
+            f: &mut dyn FnMut(&[u8]) -> Result<()>,
+        ) -> Result<bool> {
+            match self.doc_lens.get(&(attr_id, block_id)) {
+                Some(bytes) => {
+                    f(bytes)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        }
+
         fn multi_get_doc_ids(&self, fts_doc_ids: &[FtsDocId]) -> Result<Vec<Option<DocId>>> {
             Ok(fts_doc_ids
                 .iter()
@@ -1047,6 +1275,7 @@ mod tests {
         let mut raw_docs: Vec<(DocId, String, String)> = Vec::new();
         let mut meta = FtsMeta::default();
         let mut docs_map = HashMap::new();
+        let mut dl_acc: HashMap<(AttrId, FtsBlockId), DocLenBlock> = HashMap::new();
         let mut block_acc: HashMap<(AttrId, String, FtsBlockId), PackedPostingBlock> =
             HashMap::new();
         let mut term_stats: HashMap<(AttrId, String), TermStats> = HashMap::new();
@@ -1088,26 +1317,24 @@ mod tests {
                 let s = meta.per_attr_stats.entry(attr_id).or_default();
                 s.doc_count += 1;
                 s.total_tokens += ad.doc_len as u64;
+                let dls = dl_acc.entry((attr_id, bid)).or_default();
+                dls.set(slot, ad.doc_len);
                 for (tok, term) in &ad.terms {
                     block_acc
                         .entry((attr_id, tok.clone(), bid))
                         .or_default()
-                        .upsert(slot, term.tf, ad.doc_len);
-                    let ts = term_stats.entry((attr_id, tok.clone())).or_insert(TermStats {
-                        doc_freq: 0,
-                        max_tf: 0,
-                        min_dl: u32::MAX,
-                    });
+                        .upsert(slot, term.tf, dls);
+                    let ts = term_stats.entry((attr_id, tok.clone())).or_default();
                     ts.doc_freq += 1;
-                    ts.max_tf = ts.max_tf.max(term.tf);
-                    ts.min_dl = ts.min_dl.min(ad.doc_len);
+                    ts.observe(term.tf, ad.doc_len);
                 }
             }
             raw_docs.push((doc_id, title, body));
         }
 
         let mut postings: HashMap<(AttrId, String), Vec<(FtsBlockId, Vec<u8>)>> = HashMap::new();
-        for ((aid, tok, bid), blk) in block_acc {
+        for ((aid, tok, bid), mut blk) in block_acc {
+            blk.recompute_bounds(&dl_acc[&(aid, bid)]);
             postings
                 .entry((aid, tok))
                 .or_default()
@@ -1116,12 +1343,18 @@ mod tests {
         for blocks in postings.values_mut() {
             blocks.sort_by_key(|(bid, _)| *bid);
         }
+        let doc_lens: HashMap<(AttrId, FtsBlockId), Vec<u8>> = dl_acc
+            .into_iter()
+            .filter(|(_, d)| !d.is_empty())
+            .map(|(k, d)| (k, d.encode()))
+            .collect();
 
         let source = MemSource {
             meta: meta.clone(),
             docs: docs_map,
             terms: term_stats.clone(),
             postings,
+            doc_lens,
         };
 
         // Long 30-term LLM-style query + weighted multi-field Sum

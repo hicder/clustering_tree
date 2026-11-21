@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use roaring::RoaringBitmap;
 
 use crate::codec::{
-    decode_attribute_entries, encode_fts_posting_key, encode_fts_term_key,
+    decode_attribute_entries, encode_fts_doc_len_key, encode_fts_posting_key, encode_fts_term_key,
     extract_index_keys_from_entries, make_posting_key,
 };
 use crate::config::{AttrId, DocId, LocalId, NodeId, TreeConfig, fts_block_id, fts_slot};
@@ -12,8 +12,8 @@ use crate::node::{PackedInternalNode, TreeMeta};
 use crate::schema::{AttributeValue, CollectionSchema};
 use crate::storage::{DocLoc, Storage};
 use izzydb_fts::{
-    AttrFtsStats, FtsAnalyzer, FtsMeta, PackedPositionBlock, PackedPostingBlock, ReusableBuffer,
-    TermStats,
+    AttrFtsStats, DocLenBlock, FtsAnalyzer, FtsMeta, PackedPositionBlock, PackedPostingBlock,
+    ReusableBuffer, TermStats, dl_over_tf_lower_bound,
 };
 
 /// Summary statistics collected by [`crate::ClusteringTree::verify_invariants`].
@@ -485,6 +485,7 @@ fn verify_fts_invariants(
     let disk_terms = storage.all_fts_terms()?;
     let disk_postings = storage.all_fts_postings()?;
     let disk_positions = storage.all_fts_positions()?;
+    let disk_doc_lens = storage.all_fts_doc_lens()?;
 
     if !schema.has_fts() {
         if !disk_doc_map.is_empty()
@@ -492,6 +493,7 @@ fn verify_fts_invariants(
             || !disk_terms.is_empty()
             || !disk_postings.is_empty()
             || !disk_positions.is_empty()
+            || !disk_doc_lens.is_empty()
         {
             return Err(TreeError::InvariantViolation(
                 "schema has no FTS attributes, but FTS column families are non-empty".into(),
@@ -506,6 +508,7 @@ fn verify_fts_invariants(
         && disk_terms.is_empty()
         && disk_postings.is_empty()
         && disk_positions.is_empty()
+        && disk_doc_lens.is_empty()
     {
         return Ok((0, 0, 0, 0));
     }
@@ -551,7 +554,8 @@ fn verify_fts_invariants(
     }
 
     let mut expected_attr_stats: BTreeMap<AttrId, AttrFtsStats> = BTreeMap::new();
-    let mut expected_terms: HashMap<Vec<u8>, (u64, u32, u32)> = HashMap::new();
+    let mut expected_terms: HashMap<Vec<u8>, (u64, u32, f32)> = HashMap::new();
+    let mut expected_doc_lens: HashMap<[u8; 6], DocLenBlock> = HashMap::new();
     let mut expected_postings: HashMap<Vec<u8>, PackedPostingBlock> = HashMap::new();
     let mut expected_positions: HashMap<Vec<u8>, PackedPositionBlock> = HashMap::new();
 
@@ -581,23 +585,30 @@ fn verify_fts_invariants(
             st.doc_count += 1;
             st.total_tokens += analyzed.doc_len as u64;
 
-            for (tok, term) in analyzed.terms {
-                let tkey = encode_fts_term_key(schema_entry.id, &tok);
-                let te = expected_terms.entry(tkey).or_insert((0, 0, u32::MAX));
-                te.0 += 1;
-                te.1 = te.1.max(term.tf);
-                te.2 = te.2.min(analyzed.doc_len);
+            if analyzed.doc_len > 0 {
+                let dl_key = encode_fts_doc_len_key(schema_entry.id, block_id);
+                let dl_blk = expected_doc_lens.entry(dl_key).or_default();
+                dl_blk.set(slot, analyzed.doc_len);
+                let dl_blk_ref = &*dl_blk;
 
-                let pkey = encode_fts_posting_key(schema_entry.id, &tok, block_id);
-                expected_postings
-                    .entry(pkey.clone())
-                    .or_default()
-                    .upsert(slot, term.tf, analyzed.doc_len);
-                if fts_cfg.index_positions {
-                    expected_positions
-                        .entry(pkey)
+                for (tok, term) in analyzed.terms {
+                    let tkey = encode_fts_term_key(schema_entry.id, &tok);
+                    let te = expected_terms.entry(tkey).or_insert((0, 0, f32::INFINITY));
+                    te.0 += 1;
+                    te.1 = te.1.max(term.tf);
+                    te.2 = te.2.min(dl_over_tf_lower_bound(analyzed.doc_len, term.tf));
+
+                    let pkey = encode_fts_posting_key(schema_entry.id, &tok, block_id);
+                    expected_postings
+                        .entry(pkey.clone())
                         .or_default()
-                        .upsert(slot, term.positions);
+                        .upsert(slot, term.tf, dl_blk_ref);
+                    if fts_cfg.index_positions {
+                        expected_positions
+                            .entry(pkey)
+                            .or_default()
+                            .upsert(slot, term.positions);
+                    }
                 }
             }
         }
@@ -619,6 +630,28 @@ fn verify_fts_invariants(
         }
     }
 
+    let disk_doc_lens_map: HashMap<Vec<u8>, Vec<u8>> = disk_doc_lens.into_iter().collect();
+    if disk_doc_lens_map.len() != expected_doc_lens.len() {
+        return Err(TreeError::InvariantViolation(format!(
+            "cf_fts_doc_lens count {} != expected {}",
+            disk_doc_lens_map.len(),
+            expected_doc_lens.len()
+        )));
+    }
+    for (k, exp_dl_blk) in &expected_doc_lens {
+        let Some(raw) = disk_doc_lens_map.get(k.as_slice()) else {
+            return Err(TreeError::InvariantViolation(
+                "missing expected key in cf_fts_doc_lens".into(),
+            ));
+        };
+        let disk_dl_blk = DocLenBlock::decode(raw)?;
+        if &disk_dl_blk != exp_dl_blk {
+            return Err(TreeError::InvariantViolation(
+                "cf_fts_doc_lens block mismatch against reconstructed documents".into(),
+            ));
+        }
+    }
+
     let disk_terms_map: HashMap<Vec<u8>, Vec<u8>> = disk_terms.into_iter().collect();
     if disk_terms_map.len() != expected_terms.len() {
         return Err(TreeError::InvariantViolation(format!(
@@ -627,16 +660,19 @@ fn verify_fts_invariants(
             expected_terms.len()
         )));
     }
-    for (k, (exp_df, exp_max_tf, exp_min_dl)) in &expected_terms {
+    for (k, (exp_df, exp_max_tf, exp_min_dl_over_tf)) in &expected_terms {
         let Some(raw) = disk_terms_map.get(k) else {
             return Err(TreeError::InvariantViolation(
                 "missing expected key in cf_fts_terms".into(),
             ));
         };
         let ts = TermStats::decode(raw)?;
-        if ts.doc_freq != *exp_df || ts.max_tf < *exp_max_tf || ts.min_dl > *exp_min_dl {
+        if ts.doc_freq != *exp_df
+            || ts.max_tf < *exp_max_tf
+            || ts.min_dl_over_tf > *exp_min_dl_over_tf
+        {
             return Err(TreeError::InvariantViolation(format!(
-                "cf_fts_terms stats mismatch: disk {ts:?} vs expected (df={exp_df}, max_tf>={exp_max_tf}, min_dl<={exp_min_dl})"
+                "cf_fts_terms stats mismatch: disk {ts:?} vs expected (df={exp_df}, max_tf>={exp_max_tf}, min_dl_over_tf<={exp_min_dl_over_tf})"
             )));
         }
     }

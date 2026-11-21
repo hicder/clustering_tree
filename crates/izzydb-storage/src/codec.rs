@@ -601,6 +601,28 @@ pub fn decode_fts_posting_key(key: &[u8]) -> Result<(AttrId, String, FtsBlockId)
     Ok((attr_id, token, block_id))
 }
 
+/// Build a `cf_fts_doc_lens` key: `attr_id (u16 BE) || block_id (u32 BE)`.
+#[inline]
+pub fn encode_fts_doc_len_key(attr_id: AttrId, block_id: FtsBlockId) -> [u8; 6] {
+    let a = attr_id.to_be_bytes();
+    let b = block_id.to_be_bytes();
+    [a[0], a[1], b[0], b[1], b[2], b[3]]
+}
+
+/// Decode a `cf_fts_doc_lens` key into `(attr_id, block_id)`.
+#[inline]
+pub fn decode_fts_doc_len_key(key: &[u8]) -> Result<(AttrId, FtsBlockId)> {
+    if key.len() != 6 {
+        return Err(TreeError::CorruptedData(format!(
+            "cf_fts_doc_lens key expected 6 bytes, got {}",
+            key.len()
+        )));
+    }
+    let attr_id = u16::from_be_bytes([key[0], key[1]]);
+    let block_id = u32::from_be_bytes([key[2], key[3], key[4], key[5]]);
+    Ok((attr_id, block_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,7 +16,7 @@ pub mod tree;
 pub mod verify;
 
 pub use collection::{
-    Collection, Document, HybridSearchOptions, HybridSearchResult, SearchResult,
+    Collection, Document, DocumentPatch, HybridSearchOptions, HybridSearchResult, SearchResult,
 };
 pub use config::{AttrId, DistanceMetric, DocId, FtsBlockId, FtsDocId, LocalId, NodeId, TreeConfig};
 pub use error::{Result, TreeError};

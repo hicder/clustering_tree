@@ -586,3 +586,42 @@ fn test_lire_reassignment_preserves_vectors_and_invariants() {
         assert!(hits >= 4, "expected >= 4/5 reranked hits near {c}, got {hits}");
     }
 }
+
+#[test]
+fn test_remove_by_id_same_leaf_update_and_local_id_compaction() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = small_config(4, DistanceMetric::L2Squared, false);
+    cfg.min_leaf_size = 2;
+    cfg.max_leaf_size = 5;
+
+    let mut tree = ClusteringTree::open(dir.path(), cfg).unwrap();
+    assert!(!tree.remove(999).unwrap());
+
+    // Insert 4 docs into the root leaf, then churn > 1024 inserts+deletes without splitting.
+    for id in 0..4u64 {
+        tree.add_leaf(id, &[id as f32, 0.0, 0.0, 0.0]).unwrap();
+    }
+    // Same-leaf update preserves leaf_id & local_id
+    tree.add_leaf(1, &[1.05, 0.0, 0.0, 0.0]).unwrap();
+    assert_eq!(tree.len(), 4);
+
+    // Churn 1200 single-doc add+remove cycles in the single leaf -> triggers LocalId compaction at 1024.
+    for step in 0..1200u64 {
+        let temp_id = 10_000 + step;
+        tree.add_leaf(temp_id, &[2.0, 0.0, 0.0, 0.0]).unwrap();
+        assert!(tree.remove(temp_id).unwrap());
+    }
+    assert!(!tree.remove(10_000).unwrap());
+
+    let stats = tree.verify_invariants().unwrap();
+    assert_eq!(stats.num_vectors, 4);
+    assert_eq!(stats.leaf_nodes, 1);
+
+    let hits = tree.search_with_rerank(&[1.05, 0.0, 0.0, 0.0], 1, 2, 4).unwrap();
+    assert_eq!(hits[0].0, 1);
+
+    for id in 0..4u64 {
+        assert!(tree.remove(id).unwrap());
+    }
+    assert_eq!(tree.verify_invariants().unwrap().num_vectors, 0);
+}

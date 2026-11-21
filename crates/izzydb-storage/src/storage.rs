@@ -13,7 +13,10 @@ use izzydb_core::config::{DocId, FtsBlockId, FtsDocId, LocalId, NodeId, TreeConf
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::schema::CollectionSchema;
 
-use crate::codec::{decode_roaring_bitmap, encode_roaring_bitmap, make_posting_key};
+use crate::codec::{
+    decode_roaring_bitmap, encode_fts_posting_key_from_prefix, encode_roaring_bitmap,
+    make_posting_key,
+};
 use crate::node::{
     PackedInternalNode, PackedLeafNode, TreeMeta, decode_f32_into, decode_f32_slice,
     encode_f32_slice,
@@ -42,6 +45,7 @@ pub const CF_FTS_DOC_LENS: &str = "cf_fts_doc_lens";
 const META_KEY: &[u8] = b"tree_meta";
 const SCHEMA_KEY: &[u8] = b"schema";
 const FTS_META_KEY: &[u8] = b"fts_meta";
+const FTS_FREE_IDS_KEY: &[u8] = b"fts_free_ids";
 const BLOCK_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 /// Physical location of a document in the clustering tree.
@@ -524,6 +528,14 @@ impl Storage {
         self.db.get_cf(cf, FTS_META_KEY).map_err(map_db_err)
     }
 
+    pub fn get_fts_free_ids(&self) -> Result<RoaringBitmap> {
+        let cf = self.cf(CF_META)?;
+        match self.db.get_pinned_cf(cf, FTS_FREE_IDS_KEY).map_err(map_db_err)? {
+            Some(bytes) => decode_roaring_bitmap(&bytes),
+            None => Ok(RoaringBitmap::new()),
+        }
+    }
+
     pub fn get_fts_doc_id(&self, doc_id: DocId) -> Result<Option<FtsDocId>> {
         let cf = self.cf(CF_FTS_DOC_MAP)?;
         match self.db.get_pinned_cf(cf, doc_key(doc_id)).map_err(map_db_err)? {
@@ -881,6 +893,16 @@ impl<'a> StorageBatch<'a> {
         self.batch.put_cf(cf, FTS_META_KEY, bytes);
     }
 
+    pub fn put_fts_free_ids(&mut self, bytes: &[u8]) {
+        let cf = self.storage.db.cf_handle(CF_META).unwrap();
+        self.batch.put_cf(cf, FTS_FREE_IDS_KEY, bytes);
+    }
+
+    pub fn delete_fts_free_ids(&mut self) {
+        let cf = self.storage.db.cf_handle(CF_META).unwrap();
+        self.batch.delete_cf(cf, FTS_FREE_IDS_KEY);
+    }
+
     pub fn put_fts_doc_map(&mut self, doc_id: DocId, fts_doc_id: FtsDocId) {
         let cf = self.storage.db.cf_handle(CF_FTS_DOC_MAP).unwrap();
         self.batch
@@ -1137,6 +1159,8 @@ pub struct TxContext<'a> {
     dirty_attr_postings: HashMap<Vec<u8>, RoaringBitmap>,
     fts_meta_bytes: Option<Vec<u8>>,
     fts_meta_dirty: bool,
+    fts_free_ids: Option<RoaringBitmap>,
+    fts_free_ids_dirty: bool,
     dirty_fts_doc_map: HashMap<DocId, Option<FtsDocId>>,
     dirty_fts_rev_doc_map: HashMap<FtsDocId, Option<DocId>>,
     dirty_fts_terms: HashMap<Vec<u8>, Option<Vec<u8>>>,
@@ -1169,6 +1193,8 @@ impl<'a> TxContext<'a> {
             dirty_attr_postings: HashMap::new(),
             fts_meta_bytes: None,
             fts_meta_dirty: false,
+            fts_free_ids: None,
+            fts_free_ids_dirty: false,
             dirty_fts_doc_map: HashMap::new(),
             dirty_fts_rev_doc_map: HashMap::new(),
             dirty_fts_terms: HashMap::new(),
@@ -1237,6 +1263,17 @@ impl<'a> TxContext<'a> {
     pub fn delete_internal_node(&mut self, node_id: NodeId) {
         self.internal_nodes.insert(node_id, None);
         self.dirty_internal.insert(node_id);
+    }
+
+    pub fn try_get_leaf_node(&mut self, leaf_id: NodeId) -> Result<Option<PackedLeafNode>> {
+        if let Some(opt) = self.leaf_nodes.get(&leaf_id) {
+            return Ok(opt.clone());
+        }
+        let Some(leaf) = self.storage.get_leaf_node(leaf_id)? else {
+            return Ok(None);
+        };
+        self.leaf_nodes.insert(leaf_id, Some(leaf.clone()));
+        Ok(Some(leaf))
     }
 
     pub fn get_leaf_node(&mut self, leaf_id: NodeId) -> Result<PackedLeafNode> {
@@ -1320,6 +1357,29 @@ impl<'a> TxContext<'a> {
             return Ok(*opt);
         }
         self.storage.get_doc_loc(doc_id)
+    }
+
+    pub fn multi_get_doc_locs(&self, doc_ids: &[DocId]) -> Result<Vec<Option<DocLoc>>> {
+        if doc_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = vec![None; doc_ids.len()];
+        let mut missing: Vec<(DocId, usize)> = Vec::new();
+        for (slot, &doc_id) in doc_ids.iter().enumerate() {
+            if let Some(opt) = self.dirty_doc_loc.get(&doc_id) {
+                out[slot] = *opt;
+            } else {
+                missing.push((doc_id, slot));
+            }
+        }
+        if !missing.is_empty() {
+            let missing_ids: Vec<DocId> = missing.iter().map(|&(doc_id, _)| doc_id).collect();
+            let locs = self.storage.multi_get_doc_locs(&missing_ids)?;
+            for ((_, slot), loc) in missing.into_iter().zip(locs) {
+                out[slot] = loc;
+            }
+        }
+        Ok(out)
     }
 
     pub fn put_doc_loc(&mut self, doc_id: DocId, loc: DocLoc) {
@@ -1430,6 +1490,53 @@ impl<'a> TxContext<'a> {
     pub fn put_fts_meta_bytes(&mut self, bytes: Vec<u8>) {
         self.fts_meta_bytes = Some(bytes);
         self.fts_meta_dirty = true;
+    }
+
+    pub fn get_fts_free_ids(&mut self) -> Result<&RoaringBitmap> {
+        if self.fts_free_ids.is_none() {
+            self.fts_free_ids = Some(self.storage.get_fts_free_ids()?);
+        }
+        Ok(self.fts_free_ids.as_ref().unwrap())
+    }
+
+    pub fn get_fts_free_ids_mut(&mut self) -> Result<&mut RoaringBitmap> {
+        if self.fts_free_ids.is_none() {
+            self.fts_free_ids = Some(self.storage.get_fts_free_ids()?);
+        }
+        self.fts_free_ids_dirty = true;
+        Ok(self.fts_free_ids.as_mut().unwrap())
+    }
+
+    /// Visit all live `cf_fts_postings` blocks matching `prefix`, merging RocksDB state with
+    /// `dirty_fts_postings` overlay. Stops early if `f` returns `Ok(false)`.
+    pub fn visit_fts_posting_blocks(
+        &self,
+        prefix: &[u8],
+        mut f: impl FnMut(FtsBlockId, &[u8]) -> Result<bool>,
+    ) -> Result<()> {
+        let mut cursor = self.storage.open_fts_posting_cursor(prefix.to_vec())?;
+        while let Some(block_id) = cursor.current_block_id() {
+            let key = encode_fts_posting_key_from_prefix(prefix, block_id);
+            if !self.dirty_fts_postings.contains_key(&key)
+                && !f(block_id, cursor.current_block_bytes())?
+            {
+                return Ok(());
+            }
+            cursor.next_block()?;
+        }
+        let expected_len = prefix.len() + 4;
+        for (key, opt_bytes) in &self.dirty_fts_postings {
+            if key.len() == expected_len
+                && key.starts_with(prefix)
+                && let Some(bytes) = opt_bytes
+            {
+                let block_id = u32::from_be_bytes(key[prefix.len()..].try_into().unwrap());
+                if !f(block_id, bytes)? {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn get_fts_doc_id(&self, doc_id: DocId) -> Result<Option<FtsDocId>> {
@@ -1565,6 +1672,16 @@ impl<'a> TxContext<'a> {
         {
             batch.put_fts_meta_bytes(bytes);
         }
+        if self.fts_free_ids_dirty
+            && let Some(ref bm) = self.fts_free_ids
+        {
+            if bm.is_empty() {
+                batch.delete_fts_free_ids();
+            } else {
+                let bytes = encode_roaring_bitmap(bm)?;
+                batch.put_fts_free_ids(&bytes);
+            }
+        }
         for (doc_id, opt) in self.dirty_fts_doc_map {
             match opt {
                 Some(fid) => batch.put_fts_doc_map(doc_id, fid),
@@ -1610,9 +1727,11 @@ impl<'a> TxContext<'a> {
                 .fts_doc_lens_cache
                 .write()
                 .expect("fts_doc_lens_cache poisoned");
+            let mut touched_attrs: HashSet<u16> = HashSet::new();
             for (key, opt) in self.dirty_fts_doc_lens {
                 let attr_id = u16::from_be_bytes([key[0], key[1]]);
                 if let Some(table) = cache.get_mut(&attr_id) {
+                    touched_attrs.insert(attr_id);
                     let blocks = Arc::make_mut(table);
                     let block_id = u32::from_be_bytes([key[2], key[3], key[4], key[5]]) as usize;
                     match opt {
@@ -1627,6 +1746,19 @@ impl<'a> TxContext<'a> {
                                 blocks[block_id] = None;
                             }
                         }
+                    }
+                }
+            }
+            for attr_id in touched_attrs {
+                if let Some(table) = cache.get_mut(&attr_id)
+                    && table.last().is_some_and(Option::is_none)
+                {
+                    let blocks = Arc::make_mut(table);
+                    while blocks.last().is_some_and(Option::is_none) {
+                        blocks.pop();
+                    }
+                    if blocks.is_empty() {
+                        cache.remove(&attr_id);
                     }
                 }
             }

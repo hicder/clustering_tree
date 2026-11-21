@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -24,13 +24,39 @@ pub(crate) struct SplitPair {
     pub old_centroid: Vec<f32>,
 }
 
+/// Threshold on `PackedLeafNode::next_local_id` at which per-leaf `LocalId`s are compacted to `0..n`.
+#[inline]
+pub(crate) fn local_id_compaction_threshold(config: &TreeConfig) -> LocalId {
+    (config.max_leaf_size.saturating_mul(4))
+        .max(1024)
+        .min(LocalId::MAX as usize) as LocalId
+}
+
+/// Outcome of updating an existing document's vector inside `TxContext`.
+#[derive(Debug)]
+pub(crate) enum VectorUpdateResult {
+    SameLeaf {
+        delta: ClusterDelta,
+    },
+    Moved {
+        old_loc: DocLoc,
+        new_loc: DocLoc,
+        rem_delta: ClusterDelta,
+        ins_delta: ClusterDelta,
+        split: Option<SplitPair>,
+    },
+}
+
+/// A `(DocId, leaf_id, local_id)` entry in a [`ClusterDelta`].
+pub type ClusterEntry = (DocId, NodeId, LocalId);
+
 /// Documents whose `(leaf_id, local_id)` physical assignment changed during a tree mutation.
 #[derive(Debug, Clone, Default)]
 pub struct ClusterDelta {
     /// Docs whose `(leaf_id, local_id)` was removed (deleted, moved out, or renumbered).
-    pub removed: Vec<(DocId, NodeId, LocalId)>,
+    pub removed: Vec<ClusterEntry>,
     /// Docs whose `(leaf_id, local_id)` was added (inserted, moved in, or renumbered).
-    pub added: Vec<(DocId, NodeId, LocalId)>,
+    pub added: Vec<ClusterEntry>,
 }
 
 impl ClusterDelta {
@@ -41,6 +67,39 @@ impl ClusterDelta {
     pub fn merge(&mut self, other: Self) {
         self.removed.extend(other.removed);
         self.added.extend(other.added);
+    }
+
+    /// Cancel out identical `(doc_id, leaf_id, local_id)` pairs appearing in both `removed`
+    /// and `added` (e.g. multi-step merges or compactions within a single transaction), returning
+    /// `(net_removed, net_added)`.
+    pub fn net_changes(&self) -> (Vec<ClusterEntry>, Vec<ClusterEntry>) {
+        let mut rem = self.removed.clone();
+        let mut add = self.added.clone();
+        rem.sort_unstable();
+        add.sort_unstable();
+
+        let mut net_rem = Vec::with_capacity(rem.len());
+        let mut net_add = Vec::with_capacity(add.len());
+        let (mut i, mut j) = (0, 0);
+        while i < rem.len() && j < add.len() {
+            match rem[i].cmp(&add[j]) {
+                std::cmp::Ordering::Less => {
+                    net_rem.push(rem[i]);
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    net_add.push(add[j]);
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        net_rem.extend_from_slice(&rem[i..]);
+        net_add.extend_from_slice(&add[j..]);
+        (net_rem, net_add)
     }
 }
 
@@ -121,9 +180,16 @@ impl ClusteringTree {
             &mut self.leaf_parent,
             self.meta.clone(),
         );
-        let _ = remove_existing_in_tx(&mut tx, id, &self.config, &self.quantizer)?;
-        let (_loc, _delta, split_opt) =
-            insert_in_tx(&mut tx, id, &vec, &self.config, &self.quantizer)?;
+        let split_opt = if let Some(old_loc) = tx.get_doc_loc(id)? {
+            match update_vector_in_tx(&mut tx, id, old_loc, &vec, &self.config, &self.quantizer)? {
+                VectorUpdateResult::SameLeaf { .. } => None,
+                VectorUpdateResult::Moved { split, .. } => split,
+            }
+        } else {
+            let (_loc, _delta, split_opt) =
+                insert_in_tx(&mut tx, id, &vec, &self.config, &self.quantizer)?;
+            split_opt
+        };
         self.meta = tx.commit()?;
 
         if let Some(split_pair) = split_opt
@@ -135,19 +201,30 @@ impl ClusteringTree {
         Ok(())
     }
 
-    /// Remove a vector from the tree, triggering merges, redistributions, or root collapse as needed.
+    /// Remove a vector from the tree by `DocId`, triggering merges, redistributions, or root collapse as needed.
     ///
-    /// If `id` is not present in the tree, returns `Ok(())`.
-    pub fn remove_leaf(&mut self, id: DocId, embedding: &[f32]) -> Result<()> {
-        validate_vector(embedding, self.config.dim)?;
+    /// Returns `true` if `id` existed and was removed, or `false` if `id` was absent.
+    pub fn remove(&mut self, id: DocId) -> Result<bool> {
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
             &mut self.leaf_parent,
             self.meta.clone(),
         );
-        let _ = remove_existing_in_tx(&mut tx, id, &self.config, &self.quantizer)?;
-        self.meta = tx.commit()?;
+        let removed =
+            remove_existing_in_tx(&mut tx, id, &self.config, &self.quantizer)?.is_some();
+        if removed {
+            self.meta = tx.commit()?;
+        }
+        Ok(removed)
+    }
+
+    /// Remove a vector from the tree, triggering merges, redistributions, or root collapse as needed.
+    ///
+    /// If `id` is not present in the tree, returns `Ok(())`.
+    pub fn remove_leaf(&mut self, id: DocId, embedding: &[f32]) -> Result<()> {
+        validate_vector(embedding, self.config.dim)?;
+        let _ = self.remove(id)?;
         Ok(())
     }
 
@@ -196,6 +273,117 @@ impl ClusteringTree {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn compact_leaf_in_tx(
+    tx: &mut TxContext<'_>,
+    leaf_id: NodeId,
+    leaf: &mut PackedLeafNode,
+    flat_vecs: &[f32],
+    quantizer: &RabitqQuantizer,
+    dim: usize,
+    scratch: &mut EncodeScratch,
+    delta: &mut ClusterDelta,
+) {
+    for (&did, &lid) in leaf.doc_ids.iter().zip(leaf.local_ids.iter()) {
+        delta.removed.push((did, leaf_id, lid));
+    }
+    let doc_ids = leaf.doc_ids.clone();
+    leaf.reset_and_encode(&doc_ids, flat_vecs, quantizer, dim, scratch);
+    for (&did, &lid) in leaf.doc_ids.iter().zip(leaf.local_ids.iter()) {
+        tx.put_doc_loc(
+            did,
+            DocLoc {
+                leaf_id,
+                local_id: lid,
+            },
+        );
+        delta.added.push((did, leaf_id, lid));
+    }
+}
+
+/// Update an existing document's vector inside `tx`, using an in-place same-leaf path
+/// whenever the new vector routes back to `old_loc.leaf_id`.
+pub(crate) fn update_vector_in_tx(
+    tx: &mut TxContext<'_>,
+    id: DocId,
+    old_loc: DocLoc,
+    new_vec: &[f32],
+    config: &TreeConfig,
+    quantizer: &RabitqQuantizer,
+) -> Result<VectorUpdateResult> {
+    let target_leaf = if tx.meta().root_level == 0 {
+        tx.meta().root_id
+    } else {
+        search::route_to_leaf_in_tx(tx, new_vec, config.insert_beam_width, config)?
+    };
+
+    if target_leaf == old_loc.leaf_id {
+        tx.put_vector(id, new_vec.to_vec());
+        let mut leaf = tx.get_leaf_node(old_loc.leaf_id)?;
+        let old_centroid = leaf.centroid.clone();
+        let count = leaf.entry_count();
+        let flat_vecs = tx.get_vectors_flat(&leaf.doc_ids)?;
+        leaf.centroid = compute_mean_centroid_flat(&flat_vecs, count, config.dim, config.metric);
+        let drifted = cluster_distance(config.metric, &old_centroid, &leaf.centroid)
+            > config.centroid_drift_eps;
+
+        let mut delta = ClusterDelta::default();
+        if leaf.next_local_id >= local_id_compaction_threshold(config) {
+            let mut scratch = EncodeScratch::default();
+            compact_leaf_in_tx(
+                tx,
+                old_loc.leaf_id,
+                &mut leaf,
+                &flat_vecs,
+                quantizer,
+                config.dim,
+                &mut scratch,
+                &mut delta,
+            );
+        } else if count <= 16 || drifted {
+            let mut scratch = EncodeScratch::default();
+            leaf.re_encode_existing(&flat_vecs, quantizer, config.dim, &mut scratch);
+        } else {
+            quantizer.rotate_into(&leaf.centroid, &mut leaf.rotated_centroid);
+            let q = quantizer.encode(new_vec, &leaf.centroid);
+            let local_id =
+                leaf.upsert_entry(id, q.res_norm_sq, q.scale, &q.code, quantizer.num_words());
+            debug_assert_eq!(local_id, old_loc.local_id);
+        }
+
+        let parent_id = leaf.parent_id;
+        let new_centroid = leaf.centroid.clone();
+        tx.put_leaf_node(old_loc.leaf_id, leaf);
+
+        if drifted && let Some(pid) = parent_id {
+            propagate_centroid_upward(
+                tx,
+                old_loc.leaf_id,
+                pid,
+                count as u64,
+                &old_centroid,
+                &new_centroid,
+                config,
+            )?;
+        }
+
+        Ok(VectorUpdateResult::SameLeaf { delta })
+    } else {
+        let (rem_loc, rem_delta) =
+            remove_existing_in_tx(tx, id, config, quantizer)?.ok_or_else(|| {
+                TreeError::InvariantViolation(format!("doc {id} missing during vector update"))
+            })?;
+        let (new_loc, ins_delta, split) = insert_in_tx(tx, id, new_vec, config, quantizer)?;
+        Ok(VectorUpdateResult::Moved {
+            old_loc: rem_loc,
+            new_loc,
+            rem_delta,
+            ins_delta,
+            split,
+        })
+    }
+}
+
 /// Remove `id` inside `tx` if it exists, returning `(removed_doc_loc, other_docs_delta)`.
 pub(crate) fn remove_existing_in_tx(
     tx: &mut TxContext<'_>,
@@ -215,6 +403,7 @@ pub(crate) fn remove_existing_in_tx(
     tx.delete_doc_loc(id);
     tx.meta_mut().num_vectors = tx.meta().num_vectors.saturating_sub(1);
 
+    let mut delta = ClusterDelta::default();
     let new_count = leaf.entry_count();
     let will_underflow = loc.leaf_id != tx.meta().root_id && new_count < config.min_leaf_size;
     if new_count == 0 {
@@ -228,7 +417,19 @@ pub(crate) fn remove_existing_in_tx(
             config.dim,
             config.metric,
         );
-        if new_count <= 16
+        if leaf.next_local_id >= local_id_compaction_threshold(config) {
+            let mut scratch = EncodeScratch::default();
+            compact_leaf_in_tx(
+                tx,
+                loc.leaf_id,
+                &mut leaf,
+                &flat_vecs,
+                quantizer,
+                config.dim,
+                &mut scratch,
+                &mut delta,
+            );
+        } else if new_count <= 16
             || cluster_distance(config.metric, &old_centroid, &leaf.centroid)
                 > config.centroid_drift_eps
         {
@@ -243,7 +444,6 @@ pub(crate) fn remove_existing_in_tx(
     let new_centroid = leaf.centroid.clone();
     tx.put_leaf_node(loc.leaf_id, leaf);
 
-    let mut delta = ClusterDelta::default();
     if loc.leaf_id == tx.meta().root_id {
         return Ok(Some((loc, delta)));
     }
@@ -263,6 +463,135 @@ pub(crate) fn remove_existing_in_tx(
     }
 
     Ok(Some((loc, delta)))
+}
+
+/// Remove a batch of `DocId`s inside `tx` (deduplicating and ignoring missing IDs),
+/// updating each affected leaf once before running underflow merges/redistributions
+/// and per-leaf `LocalId` compaction.
+pub(crate) fn remove_many_in_tx(
+    tx: &mut TxContext<'_>,
+    ids: &[DocId],
+    config: &TreeConfig,
+    quantizer: &RabitqQuantizer,
+) -> Result<(Vec<(DocId, DocLoc)>, ClusterDelta)> {
+    if ids.is_empty() {
+        return Ok((Vec::new(), ClusterDelta::default()));
+    }
+    let mut unique_ids = ids.to_vec();
+    unique_ids.sort_unstable();
+    unique_ids.dedup();
+
+    let locs = tx.multi_get_doc_locs(&unique_ids)?;
+    let mut removed_docs: Vec<(DocId, DocLoc)> = Vec::with_capacity(unique_ids.len());
+    let mut by_leaf: BTreeMap<NodeId, Vec<DocId>> = BTreeMap::new();
+    for (doc_id, opt_loc) in unique_ids.into_iter().zip(locs) {
+        if let Some(loc) = opt_loc {
+            removed_docs.push((doc_id, loc));
+            by_leaf.entry(loc.leaf_id).or_default().push(doc_id);
+        }
+    }
+    if removed_docs.is_empty() {
+        return Ok((Vec::new(), ClusterDelta::default()));
+    }
+
+    let words = quantizer.num_words();
+    let threshold = local_id_compaction_threshold(config);
+    let mut underflow_leaves: Vec<NodeId> = Vec::new();
+    let mut compaction_candidates: Vec<NodeId> = Vec::new();
+    let mut scratch = EncodeScratch::default();
+
+    for (leaf_id, doc_ids) in by_leaf {
+        let mut leaf = tx.get_leaf_node(leaf_id)?;
+        let old_centroid = leaf.centroid.clone();
+
+        for doc_id in doc_ids {
+            leaf.remove_entry(doc_id, words);
+            tx.delete_vector(doc_id);
+            tx.delete_doc_loc(doc_id);
+            tx.meta_mut().num_vectors = tx.meta().num_vectors.saturating_sub(1);
+        }
+
+        let new_count = leaf.entry_count();
+        let will_underflow = leaf_id != tx.meta().root_id && new_count < config.min_leaf_size;
+        if new_count == 0 {
+            leaf.centroid = vec![0.0; config.dim];
+            leaf.rotated_centroid.fill(0.0);
+        } else if !will_underflow {
+            let flat_vecs = tx.get_vectors_flat(&leaf.doc_ids)?;
+            leaf.centroid = compute_mean_centroid_flat(
+                &flat_vecs,
+                new_count,
+                config.dim,
+                config.metric,
+            );
+            if new_count <= 16
+                || cluster_distance(config.metric, &old_centroid, &leaf.centroid)
+                    > config.centroid_drift_eps
+            {
+                leaf.re_encode_existing(&flat_vecs, quantizer, config.dim, &mut scratch);
+            } else {
+                quantizer.rotate_into(&leaf.centroid, &mut leaf.rotated_centroid);
+            }
+            if leaf.next_local_id >= threshold {
+                compaction_candidates.push(leaf_id);
+            }
+        }
+
+        let parent_id = leaf.parent_id;
+        let new_centroid = leaf.centroid.clone();
+        tx.put_leaf_node(leaf_id, leaf);
+
+        if leaf_id != tx.meta().root_id {
+            if will_underflow {
+                underflow_leaves.push(leaf_id);
+            } else if let Some(pid) = parent_id {
+                propagate_centroid_upward(
+                    tx,
+                    leaf_id,
+                    pid,
+                    new_count as u64,
+                    &old_centroid,
+                    &new_centroid,
+                    config,
+                )?;
+            }
+        }
+    }
+
+    let mut delta = ClusterDelta::default();
+    for leaf_id in underflow_leaves {
+        if leaf_id == tx.meta().root_id {
+            continue;
+        }
+        let Some(leaf) = tx.try_get_leaf_node(leaf_id)? else {
+            continue;
+        };
+        if leaf.entry_count() < config.min_leaf_size {
+            handle_underflow(tx, leaf_id, config, quantizer, &mut delta)?;
+        }
+    }
+
+    for leaf_id in compaction_candidates {
+        let Some(mut leaf) = tx.try_get_leaf_node(leaf_id)? else {
+            continue;
+        };
+        if leaf.entry_count() > 0 && leaf.next_local_id >= threshold {
+            let flat_vecs = tx.get_vectors_flat(&leaf.doc_ids)?;
+            compact_leaf_in_tx(
+                tx,
+                leaf_id,
+                &mut leaf,
+                &flat_vecs,
+                quantizer,
+                config.dim,
+                &mut scratch,
+                &mut delta,
+            );
+            tx.put_leaf_node(leaf_id, leaf);
+        }
+    }
+
+    Ok((removed_docs, delta))
 }
 
 /// Insert a prepared vector for `id` (which must not currently be present in `tx`),
@@ -289,11 +618,45 @@ pub(crate) fn insert_in_tx(
     let new_count = leaf.entry_count() + 1;
     let words = quantizer.num_words();
     if new_count <= config.max_leaf_size {
+        let mut delta = ClusterDelta::default();
+        let needs_compact =
+            leaf.next_local_id >= local_id_compaction_threshold(config).saturating_sub(1);
         let local_id = if new_count == 1 {
             leaf.centroid = vec.to_vec();
             quantizer.rotate_into(&leaf.centroid, &mut leaf.rotated_centroid);
             let q = quantizer.encode(vec, &leaf.centroid);
             leaf.upsert_entry(id, q.res_norm_sq, q.scale, &q.code, words)
+        } else if needs_compact {
+            for (&did, &lid) in leaf.doc_ids.iter().zip(leaf.local_ids.iter()) {
+                delta.removed.push((did, target_leaf, lid));
+            }
+            leaf.insert_slot_for_reencode(id, words);
+            let flat_vecs = tx.get_vectors_flat(&leaf.doc_ids)?;
+            leaf.centroid = compute_mean_centroid_flat(
+                &flat_vecs,
+                new_count,
+                config.dim,
+                config.metric,
+            );
+            let doc_ids = leaf.doc_ids.clone();
+            let mut scratch = EncodeScratch::default();
+            leaf.reset_and_encode(&doc_ids, &flat_vecs, quantizer, config.dim, &mut scratch);
+            let mut new_id_local = 0;
+            for (&did, &lid) in leaf.doc_ids.iter().zip(leaf.local_ids.iter()) {
+                if did == id {
+                    new_id_local = lid;
+                } else {
+                    tx.put_doc_loc(
+                        did,
+                        DocLoc {
+                            leaf_id: target_leaf,
+                            local_id: lid,
+                        },
+                    );
+                    delta.added.push((did, target_leaf, lid));
+                }
+            }
+            new_id_local
         } else if new_count.is_multiple_of(16) {
             let lid = leaf.insert_slot_for_reencode(id, words);
             let flat_vecs = tx.get_vectors_flat(&leaf.doc_ids)?;
@@ -344,7 +707,7 @@ pub(crate) fn insert_in_tx(
                 config,
             )?;
         }
-        Ok((doc_loc, ClusterDelta::default(), None))
+        Ok((doc_loc, delta, None))
     } else {
         leaf.insert_slot_for_reencode(id, words);
         tx.put_leaf_node(target_leaf, leaf);

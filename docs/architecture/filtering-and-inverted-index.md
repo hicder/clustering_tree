@@ -234,8 +234,10 @@ Their lifecycle follows two regimes:
 1. **Normal leaf insert / delete (no split, merge, or redistribution):**
    - **Insert:** Allocates `local_id = leaf.next_local_id; leaf.next_local_id += 1;`. All existing entries keep their `local_id`s unchanged, so `AttributeIndex` only inserts bits for the newly added document.
    - **Delete:** Removes the entry and keeps surviving entries' `local_id`s unchanged (resetting `next_local_id = 0` only when the leaf becomes empty). `AttributeIndex` only removes bits for the deleted document.
-2. **Structural mutations (leaf split, underflow merge/redistribution, or SPFresh LIRE reassignment):**
-   - Surviving entries in affected leaves are compactly renumbered to `0..n` (`next_local_id = n`) via `PackedLeafNode::reencode_from_vectors` (updating `cf_doc_loc` as well), and `tree.rs` records a `ClusterDelta { removed, added }`:
+2. **Per-leaf `LocalId` compaction:**
+   - When `leaf.next_local_id >= (config.max_leaf_size * 4).max(1024)`, surviving entries are compactly renumbered to `0..n` (`next_local_id = n`) and `ClusterDelta` updates `AttributeIndex` atomically.
+3. **Structural mutations (leaf split, underflow merge/redistribution, or SPFresh LIRE reassignment):**
+   - Surviving entries in affected leaves are compactly renumbered to `0..n` (`next_local_id = n`) via `PackedLeafNode::reset_and_encode` (updating `cf_doc_loc` as well), and `tree.rs` records a `ClusterDelta { removed, added }`:
      - `removed`: `(doc_id, old_leaf_id, old_local_id)` for every document deleted, moved out, or renumbered.
      - `added`: `(doc_id, new_leaf_id, new_local_id)` for every document inserted, moved in, or renumbered.
 
@@ -252,27 +254,11 @@ Their lifecycle follows two regimes:
      - **`!was_empty && is_empty`:** removes `cluster_id` from `dirty_attr_clusters[cluster_key]`.
    - On `TxContext::commit()`, all dirty tree nodes, `cf_vectors`, `cf_doc_loc`, `cf_docs`, `cf_attr_clusters`, and `cf_attr_postings` (deleting keys whose bitmaps became empty) are written in a single atomic `rocksdb::WriteBatch`, and in-memory `internal_cache` / `leaf_parent` are updated only after `write_batch` succeeds.
 
-### 5.3 End-to-End `Collection::upsert` and `Collection::delete`
+### 5.3 End-to-End Mutation Flows (`upsert`, `patch`, `patch_batch`, `update_by_filter`, `delete`, `delete_batch`, `delete_by_filter`)
 
-**`Collection::upsert(id, embedding, attributes)`:**
-
-1. Validates `attributes` against `schema` and prepares/normalizes `embedding`.
-2. Encodes forward `cf_docs` payload (`encode_attributes`).
-3. Opens `TxContext`. If `id` already exists (`tree::remove_existing_in_tx`):
-   - Removes `id` from its old leaf (triggering `handle_underflow` if needed), returning `(old_loc, rem_delta)`.
-   - Reads `id`'s previous `cf_docs` payload and calls `attr_index.remove_doc_entries` at `(old_loc.leaf_id, old_loc.local_id)`.
-   - Applies `rem_delta` (any neighbor docs moved/renumbered by underflow) via `attr_index.apply_cluster_delta`.
-4. Stages `tx.put_doc_bytes(id, new_doc_bytes)` and calls `tree::insert_in_tx`:
-   - Routes to the closest leaf and inserts `id` (either in-place or via `split_node`), returning `(new_loc, ins_delta, split_opt)`.
-5. Applies `ins_delta` (if a split occurred) and calls `attr_index.insert_doc` at `(new_loc.leaf_id, new_loc.local_id)`.
-6. Commits `tx` atomically.
-7. If `split_opt` is `Some(split_pair)` and `config.enable_lire && meta.root_level > 0`, runs `lire::run_lire_with_hook`, passing a callback that calls `attr_index.apply_cluster_delta(tx, &self.schema, delta)` inside each LIRE reassignment and maintenance transaction before commit.
-
-**`Collection::delete(id)`:**
-
-1. Opens `TxContext` and calls `tree::remove_existing_in_tx` (returning `Ok(())` immediately if `id` is absent).
-2. Reads `id`'s `cf_docs` payload and calls `attr_index.remove_doc_entries` at `(old_loc.leaf_id, old_loc.local_id)`.
-3. Stages `tx.delete_doc(id)`, applies any underflow `ClusterDelta`, and commits `tx` atomically.
+- **`Collection::upsert` / `patch` / `patch_batch`:** when an existing document's vector is unchanged (or `patch.embedding` is `None`), `ClusteringTree` is untouched and `AttributeIndex::diff_doc_in_place` / `diff_patched_in_place` updates only changed keys via a sorted two-pointer diff. When a vector changes and routes to the same leaf (`update_vector_in_tx` Case A), `local_id` is preserved and `AttributeIndex` diffs in place. Cross-leaf vector moves remove old keys and apply `rem_delta` before updating `cf_docs`, applying `ins_delta`, and inserting new keys at `new_loc`, followed by LIRE if splits occurred.
+- **`Collection::delete` / `delete_batch`:** `delete` returns `Result<bool>` and `delete_batch` deduplicates IDs, runs `remove_many_in_tx` (updating each affected leaf once before `handle_underflow`), batch-fetches `cf_docs` via `multi_get_doc_bytes`, and removes deleted entries from `AttributeIndex` and `FtsIndex` before applying `ClusterDelta`.
+- **`Collection::delete_by_filter` / `update_by_filter`:** resolve matching `DocId`s via `Collection::resolve_filter_doc_ids` (using a direct `FtsIndex` fast path for positive FTS-only filters or chunked leaf evaluation with `eval_leaves_masks` for general filters) and execute mutations in bounded atomic chunks (`512` docs per `TxContext` commit).
 
 ---
 

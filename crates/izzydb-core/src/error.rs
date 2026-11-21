@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::config::DocId;
+
 /// Result type alias for clustering tree operations.
 pub type Result<T> = std::result::Result<T, TreeError>;
 
@@ -53,4 +55,8 @@ pub enum TreeError {
     /// Search or ranking query failed validation.
     #[error("invalid query: {0}")]
     InvalidQuery(String),
+
+    /// Target document ID was not found in the collection.
+    #[error("document {0} not found")]
+    DocumentNotFound(DocId),
 }

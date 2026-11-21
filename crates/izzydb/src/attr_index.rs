@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use roaring::RoaringBitmap;
 
@@ -76,6 +76,24 @@ impl AttributeIndex {
         Ok(())
     }
 
+    /// Index pre-decoded `(AttrId, AttributeValue)` entries at `(leaf_id, local_id)` inside `tx`.
+    pub fn insert_doc_entries(
+        &self,
+        tx: &mut TxContext<'_>,
+        schema: &CollectionSchema,
+        entries: &[(AttrId, AttributeValue)],
+        leaf_id: NodeId,
+        local_id: LocalId,
+    ) -> Result<()> {
+        let keys = extract_index_keys_from_entries(schema, entries)?;
+        for cluster_key in keys {
+            tx.mutate_attr_posting(&cluster_key, leaf_id, |bm| {
+                bm.insert(local_id);
+            })?;
+        }
+        Ok(())
+    }
+
     /// Remove a deleted/replaced document's attributes at `(leaf_id, local_id)` inside `tx`.
     pub fn remove_doc_entries(
         &self,
@@ -94,10 +112,61 @@ impl AttributeIndex {
         Ok(())
     }
 
+    /// Update a document's attribute postings in place at `(leaf_id, local_id)` by computing
+    /// the symmetric difference between `old_entries` and `new_attrs`.
+    pub fn diff_doc_in_place(
+        &self,
+        tx: &mut TxContext<'_>,
+        schema: &CollectionSchema,
+        old_entries: &[(AttrId, AttributeValue)],
+        new_attrs: &Attributes,
+        leaf_id: NodeId,
+        local_id: LocalId,
+    ) -> Result<()> {
+        let old_keys = extract_index_keys_from_entries(schema, old_entries)?;
+        let new_keys = extract_index_keys(schema, new_attrs)?;
+        diff_sorted_keys(tx, &old_keys, &new_keys, leaf_id, local_id)
+    }
+
+    /// Update only the patched subset of attributes in place at `(leaf_id, local_id)` so
+    /// untouched filterable attributes incur zero index work.
+    pub fn diff_patched_in_place(
+        &self,
+        tx: &mut TxContext<'_>,
+        schema: &CollectionSchema,
+        old_entries: &[(AttrId, AttributeValue)],
+        patch_attrs: &Attributes,
+        leaf_id: NodeId,
+        local_id: LocalId,
+    ) -> Result<()> {
+        if patch_attrs.is_empty() {
+            return Ok(());
+        }
+        let mut patched_ids: HashSet<AttrId> = HashSet::with_capacity(patch_attrs.len());
+        for name in patch_attrs.keys() {
+            if let Some(entry) = schema.get_by_name(name)
+                && entry.filterable
+            {
+                patched_ids.insert(entry.id);
+            }
+        }
+        if patched_ids.is_empty() {
+            return Ok(());
+        }
+        let filtered_old: Vec<(AttrId, AttributeValue)> = old_entries
+            .iter()
+            .filter(|(id, _)| patched_ids.contains(id))
+            .cloned()
+            .collect();
+        let old_keys = extract_index_keys_from_entries(schema, &filtered_old)?;
+        let new_keys = extract_index_keys(schema, patch_attrs)?;
+        diff_sorted_keys(tx, &old_keys, &new_keys, leaf_id, local_id)
+    }
+
     /// Apply cluster moves / leaf renumberings (`ClusterDelta`) to `AttributeIndex` inside `tx`.
     ///
-    /// Applies all removals before additions so renumbered `local_id` collisions in the same leaf
-    /// never cancel out newly added entries.
+    /// Coalesces multi-step renumberings and applies all net removals before net additions so
+    /// renumbered `local_id` collisions in the same leaf never cancel out newly added entries.
     pub fn apply_cluster_delta(
         &self,
         tx: &mut TxContext<'_>,
@@ -108,11 +177,16 @@ impl AttributeIndex {
             return Ok(());
         }
 
-        let mut doc_ids: Vec<DocId> = Vec::with_capacity(delta.removed.len() + delta.added.len());
-        for &(doc_id, _, _) in &delta.removed {
+        let (net_removed, net_added) = delta.net_changes();
+        if net_removed.is_empty() && net_added.is_empty() {
+            return Ok(());
+        }
+
+        let mut doc_ids: Vec<DocId> = Vec::with_capacity(net_removed.len() + net_added.len());
+        for &(doc_id, _, _) in &net_removed {
             doc_ids.push(doc_id);
         }
-        for &(doc_id, _, _) in &delta.added {
+        for &(doc_id, _, _) in &net_added {
             doc_ids.push(doc_id);
         }
         doc_ids.sort_unstable();
@@ -130,7 +204,7 @@ impl AttributeIndex {
             keys_by_doc.insert(doc_id, keys);
         }
 
-        for &(doc_id, leaf_id, local_id) in &delta.removed {
+        for &(doc_id, leaf_id, local_id) in &net_removed {
             if let Some(keys) = keys_by_doc.get(&doc_id) {
                 for cluster_key in keys {
                     tx.mutate_attr_posting(cluster_key, leaf_id, |bm| {
@@ -140,7 +214,7 @@ impl AttributeIndex {
             }
         }
 
-        for &(doc_id, leaf_id, local_id) in &delta.added {
+        for &(doc_id, leaf_id, local_id) in &net_added {
             if let Some(keys) = keys_by_doc.get(&doc_id) {
                 for cluster_key in keys {
                     tx.mutate_attr_posting(cluster_key, leaf_id, |bm| {
@@ -247,6 +321,49 @@ impl AttributeIndex {
         }
         Ok(out)
     }
+}
+
+fn diff_sorted_keys(
+    tx: &mut TxContext<'_>,
+    old_keys: &[Vec<u8>],
+    new_keys: &[Vec<u8>],
+    leaf_id: NodeId,
+    local_id: LocalId,
+) -> Result<()> {
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < old_keys.len() && j < new_keys.len() {
+        match old_keys[i].cmp(&new_keys[j]) {
+            std::cmp::Ordering::Less => {
+                tx.mutate_attr_posting(&old_keys[i], leaf_id, |bm| {
+                    bm.remove(local_id);
+                })?;
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                tx.mutate_attr_posting(&new_keys[j], leaf_id, |bm| {
+                    bm.insert(local_id);
+                })?;
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    while i < old_keys.len() {
+        tx.mutate_attr_posting(&old_keys[i], leaf_id, |bm| {
+            bm.remove(local_id);
+        })?;
+        i += 1;
+    }
+    while j < new_keys.len() {
+        tx.mutate_attr_posting(&new_keys[j], leaf_id, |bm| {
+            bm.insert(local_id);
+        })?;
+        j += 1;
+    }
+    Ok(())
 }
 
 fn eval_cluster_node(

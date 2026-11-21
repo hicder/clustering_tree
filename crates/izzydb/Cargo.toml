@@ -2,10 +2,15 @@
 name = "izzydb"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "A mutable, RocksDB-backed hierarchical clustering tree for approximate nearest neighbor search"
+
+[features]
+fts-cjk = ["izzydb-core/fts-cjk", "izzydb-fts/fts-cjk"]
 
 [dependencies]
 izzydb-core.workspace = true
+izzydb-fts.workspace = true
 izzydb-rabitq.workspace = true
 izzydb-storage.workspace = true
 roaring.workspace = true

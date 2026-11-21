@@ -2,7 +2,11 @@
 name = "izzydb-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Core configuration, errors, distance metrics, SIMD kernels, and 2-means clustering for izzydb"
+
+[features]
+fts-cjk = []
 
 [dependencies]
 bytemuck.workspace = true

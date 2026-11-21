@@ -49,4 +49,8 @@ pub enum TreeError {
     /// Search filter failed validation against collection schema.
     #[error("invalid filter: {0}")]
     InvalidFilter(String),
+
+    /// Search or ranking query failed validation.
+    #[error("invalid query: {0}")]
+    InvalidQuery(String),
 }

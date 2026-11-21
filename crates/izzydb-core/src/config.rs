@@ -12,6 +12,33 @@ pub type LocalId = u32;
 /// Compact numeric identifier assigned to each attribute in a [`CollectionSchema`](crate::schema::CollectionSchema).
 pub type AttrId = u16;
 
+/// Dense monotonic document identifier used by the FTS inverted index (`block_id = fts_doc_id >> 8`).
+pub type FtsDocId = u32;
+
+/// 256-document posting block identifier (`fts_doc_id >> 8`).
+pub type FtsBlockId = u32;
+
+/// Number of documents per fixed FTS posting block.
+pub const FTS_BLOCK_SIZE: usize = 256;
+
+/// Extract the posting block ID for an [`FtsDocId`].
+#[inline]
+pub const fn fts_block_id(doc_id: FtsDocId) -> FtsBlockId {
+    doc_id >> 8
+}
+
+/// Extract the intra-block slot (`0..=255`) for an [`FtsDocId`].
+#[inline]
+pub const fn fts_slot(doc_id: FtsDocId) -> u8 {
+    (doc_id & 0xFF) as u8
+}
+
+/// Combine a block ID and intra-block slot into an [`FtsDocId`].
+#[inline]
+pub const fn make_fts_doc_id(block_id: FtsBlockId, slot: u8) -> FtsDocId {
+    (block_id << 8) | (slot as u32)
+}
+
 /// Distance metric used for clustering and nearest neighbor search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]

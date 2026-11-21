@@ -33,25 +33,31 @@ Implementation sources:
 
 ## 2. RocksDB Column Families & Key-Value Map
 
-`Storage::open` opens nine column families (including RocksDB's required `default` CF, which is unused):
+`Storage::open` opens fourteen column families (including RocksDB's required `default` CF, which is unused):
 
 | Column Family | Constant | Key Format | Value Format | Compression | Read Pattern |
 |---|---|---|---|---|---|
 | `default` | `DEFAULT_COLUMN_FAMILY_NAME` | — | — | Default | Unused |
-| `cf_meta` | `CF_META` | `b"tree_meta"` (9 B) / `b"schema"` (6 B) | `TreeMeta` (31 B) / encoded `CollectionSchema` | Default | Point `get_cf` |
+| `cf_meta` | `CF_META` | `b"tree_meta"` / `b"schema"` / `b"fts_meta"` | `TreeMeta` (31 B) / `CollectionSchema` (v2) / `FtsMeta` | Default | Point `get_cf` |
 | `cf_internal_nodes` | `CF_INTERNAL_NODES` | `node_id` (`u32` BE, 4 B) | `PackedInternalNode` | Default | Full CF load on `open()` |
 | `cf_leaf_entries` | `CF_LEAF_ENTRIES` | `leaf_id` (`u32` BE, 4 B) | `PackedLeafNode` (with `local_ids`) | `None` | `batched_multi_get_cf` (pinned) |
 | `cf_vectors` | `CF_VECTORS` | `doc_id` (`u64` BE, 8 B) | `[f32; dim]` LE (`dim * 4` B) | `None` | `get_pinned_cf` / `batched_multi_get_cf` |
-| `cf_doc_loc` | `CF_DOC_LOC` | `doc_id` (`u64` BE, 8 B) | `leaf_id` (`u32` BE) \|\| `local_id` (`u32` BE) (8 B) | Default | Point `get_pinned_cf` |
+| `cf_doc_loc` | `CF_DOC_LOC` | `doc_id` (`u64` BE, 8 B) | `leaf_id` (`u32` BE) \|\| `local_id` (`u32` BE) (8 B) | Default | Point `get_pinned_cf` / `batched_multi_get_cf` |
 | `cf_docs` | `CF_DOCS` | `doc_id` (`u64` BE, 8 B) | Forward binary-encoded `Attributes` | Default | Point / `batched_multi_get_cf` |
 | `cf_attr_clusters` | `CF_ATTR_CLUSTERS` | `attr_id` (`u16` BE) \|\| `type_tag` (`u8`) \|\| `encoded_val` | `RoaringBitmap` of `cluster_id: u32` | Default | Point `multi_get_cf` / 3-byte prefix range scan |
 | `cf_attr_postings` | `CF_ATTR_POSTINGS` | `cluster_key` \|\| `cluster_id` (`u32` BE, 4 B) | `RoaringBitmap` of `local_id: u32` | Default | `batched_multi_get_cf` |
+| `cf_fts_doc_map` | `CF_FTS_DOC_MAP` | `doc_id` (`u64` BE, 8 B) | `fts_doc_id` (`u32` BE, 4 B) | Default | Point / `batched_multi_get_cf` |
+| `cf_fts_rev_doc_map` | `CF_FTS_REV_DOC_MAP` | `fts_doc_id` (`u32` BE, 4 B) | `doc_id` (`u64` BE, 8 B) | Default | Point / `batched_multi_get_cf` |
+| `cf_fts_terms` | `CF_FTS_TERMS` | `attr_id` (`u16` BE) \|\| `token_utf8` | `TermStats` (16 B LE) | Default | `batched_multi_get_cf` / 2-byte prefix scan |
+| `cf_fts_postings` | `CF_FTS_POSTINGS` | `attr_id` (`u16` BE) \|\| `escaped_token` \|\| `block_id` (`u32` BE) | `PackedPostingBlock` | Default | Prefix iterator / point `get_cf` |
+| `cf_fts_positions` | `CF_FTS_POSITIONS` | `attr_id` (`u16` BE) \|\| `escaped_token` \|\| `block_id` (`u32` BE) | `PackedPositionBlock` | Default | Point `get_cf` (`ContainsTokenSequence` only) |
 
 ### RocksDB Tuning
 
-- Shared 128 MiB LRU block cache (`BLOCK_CACHE_BYTES = 128 * 1024 * 1024`) across all point-lookup and attribute CFs.
-- `cf_internal_nodes`, `cf_leaf_entries`, `cf_vectors`, `cf_doc_loc`, `cf_docs`, and `cf_attr_postings` use `point_lookup_cf_opts` (10.0 bits/key full-key Bloom filter, `set_memtable_whole_key_filtering(true)`, pinned L0 filter/index blocks).
+- Shared 128 MiB LRU block cache (`BLOCK_CACHE_BYTES = 128 * 1024 * 1024`) across all point-lookup, attribute, and FTS CFs.
+- `cf_internal_nodes`, `cf_leaf_entries`, `cf_vectors`, `cf_doc_loc`, `cf_docs`, `cf_attr_postings`, `cf_fts_doc_map`, `cf_fts_rev_doc_map`, `cf_fts_postings`, and `cf_fts_positions` use `point_lookup_cf_opts` (10.0 bits/key full-key Bloom filter, `set_memtable_whole_key_filtering(true)`, pinned L0 filter/index blocks).
 - `cf_attr_clusters` uses `attr_cluster_cf_opts` with a 3-byte fixed prefix extractor (`attr_id (2 B) || type_tag (1 B)`), 10.0 bits/key Bloom filter with `set_whole_key_filtering(true)`, and `set_prefix_same_as_start(true)` on range scans.
+- `cf_fts_terms` uses `fts_terms_cf_opts` with a 2-byte fixed prefix extractor (`attr_id (2 B)`), 10.0 bits/key Bloom filter with `set_whole_key_filtering(true)`, and `set_prefix_same_as_start(true)` on `last_as_prefix` term scans.
 - `DBCompressionType::None` on `cf_leaf_entries` and `cf_vectors` to keep pinned `DBPinnableSlice` reads zero-copy on hot query paths.
 
 ---
@@ -75,7 +81,11 @@ Fixed size: **31 bytes** (`META_LEN = 31`). Any other byte length fails decoding
 
 ### 3.2 `CollectionSchema` (`cf_meta`, key `b"schema"`)
 
-Persists `version: u8` (`1`), `next_attr_id: u16` LE, `count: u32` LE, followed by `count` entries of `(id: u16 LE, attr_type: u8, filterable: u8, name_len: u32 LE, name_utf8)`.
+Persists `version: u8` (`2`), `next_attr_id: u16` LE, `count: u32` LE, followed by `count` entries of `(id: u16 LE, attr_type: u8, filterable: u8, has_fts: u8, [FullTextSearchConfig (21 B)], name_len: u32 LE, name_utf8)`.
+
+### 3.2b `FtsMeta` (`cf_meta`, key `b"fts_meta"`)
+
+Persists `next_fts_doc_id: u32` LE, `count: u32` LE, followed by `count` entries of `(attr_id: u16 LE, doc_count: u64 LE, total_tokens: u64 LE)` (18 B each).
 
 ### 3.3 `cf_doc_loc` Value (`DocLoc`)
 
@@ -163,6 +173,15 @@ Total size: **`24 + (dim + padded_dim) * 4 + n * (20 + rabitq_words * 8)` bytes*
 
 Array attributes (`StringArray`, `IntArray`, `UintArray`) index each distinct element under their element's scalar `type_tag`. Values in both CFs are `RoaringBitmap` payloads serialized with `RoaringBitmap::serialize_into`.
 
+### 3.9 FTS Posting & Position Blocks (`cf_fts_terms`, `cf_fts_postings`, `cf_fts_positions`)
+
+- **`TermStats` (`cf_fts_terms`, 16 B):** `doc_freq: u64 LE`, `max_tf: u32 LE`, `min_dl: u32 LE`.
+- **`PackedPostingBlock` (`cf_fts_postings`, up to 256 docs per block):**
+  - Header (12 B): `count: u16 LE` (`1..=256`), `flags: u16 LE` (`0` = `u16` `tf`/`dl`, `1` = `u32` overflow), `max_tf: u32 LE`, `min_dl: u32 LE`.
+  - Body (sorted ascending by `slot: u8 = (fts_doc_id & 0xFF) as u8`): `slots: [u8; count]`, `tfs: [u16|u32; count] LE`, `dls: [u16|u32; count] LE`.
+- **`PackedPositionBlock` (`cf_fts_positions`, read only for `ContainsTokenSequence`):**
+  - `[count: u16 LE][slots: [u8; count]][pos_offsets: [u32; count + 1] LE][delta_varints: [u8; ...]]`.
+
 ---
 
 ## 4. Consistency Invariants
@@ -173,4 +192,5 @@ Verified exhaustively by `verify_invariants` and `verify_collection_invariants` 
 2. **Per-leaf `LocalId` uniqueness:** Every `local_id < leaf.next_local_id` and all `local_ids` within a leaf are unique.
 3. **Vector & doc completeness:** `cf_vectors`, `cf_docs`, and `cf_doc_loc` are exact 1-to-1 bijections with reachable leaf `(doc_id, leaf_id, local_id)` entries and `TreeMeta.num_vectors`.
 4. **Attribute postings & cluster summary exactness:** Every key in `cf_attr_postings` is non-empty and matches the exact set of `local_id`s reconstructed from `cf_docs` + `cf_doc_loc`; bit `cluster_id` is set in `cf_attr_clusters[k]` iff `cf_attr_postings[k || cluster_id]` exists and is non-empty.
-5. **Atomic updates:** All mutations across `cf_meta`, `cf_internal_nodes`, `cf_leaf_entries`, `cf_vectors`, `cf_doc_loc`, `cf_docs`, `cf_attr_clusters`, and `cf_attr_postings` commit in a single `rocksdb::WriteBatch` before updating in-memory caches.
+5. **FTS index parity:** `cf_fts_doc_map` and `cf_fts_rev_doc_map` form a 1-to-1 bijection with `cf_docs` when FTS attributes exist; `cf_fts_terms`, `cf_fts_postings`, and `cf_fts_positions` match a full re-analysis of `cf_docs`.
+6. **Atomic updates:** All mutations across `cf_meta`, `cf_internal_nodes`, `cf_leaf_entries`, `cf_vectors`, `cf_doc_loc`, `cf_docs`, `cf_attr_clusters`, `cf_attr_postings`, and all FTS column families commit in a single `rocksdb::WriteBatch` before updating in-memory caches.

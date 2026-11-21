@@ -4,11 +4,11 @@ use std::path::Path;
 use roaring::RoaringBitmap;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBCompressionType,
-    DBPinnableSlice, Direction, IteratorMode, Options, ReadOptions, SliceTransform, WriteBatch,
-    DB, DEFAULT_COLUMN_FAMILY_NAME,
+    DBPinnableSlice, DBRawIteratorWithThreadMode, Direction, IteratorMode, Options, ReadOptions,
+    SliceTransform, WriteBatch, DB, DEFAULT_COLUMN_FAMILY_NAME,
 };
 
-use izzydb_core::config::{DocId, LocalId, NodeId, TreeConfig};
+use izzydb_core::config::{DocId, FtsBlockId, FtsDocId, LocalId, NodeId, TreeConfig};
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::schema::CollectionSchema;
 
@@ -31,9 +31,15 @@ pub const CF_DOC_LOC: &str = "cf_doc_loc";
 pub const CF_DOCS: &str = "cf_docs";
 pub const CF_ATTR_CLUSTERS: &str = "cf_attr_clusters";
 pub const CF_ATTR_POSTINGS: &str = "cf_attr_postings";
+pub const CF_FTS_DOC_MAP: &str = "cf_fts_doc_map";
+pub const CF_FTS_REV_DOC_MAP: &str = "cf_fts_rev_doc_map";
+pub const CF_FTS_TERMS: &str = "cf_fts_terms";
+pub const CF_FTS_POSTINGS: &str = "cf_fts_postings";
+pub const CF_FTS_POSITIONS: &str = "cf_fts_positions";
 
 const META_KEY: &[u8] = b"tree_meta";
 const SCHEMA_KEY: &[u8] = b"schema";
+const FTS_META_KEY: &[u8] = b"fts_meta";
 const BLOCK_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 /// Physical location of a document in the clustering tree.
@@ -105,6 +111,17 @@ impl Storage {
             ColumnFamilyDescriptor::new(CF_DOCS, point_lookup_cf_opts(&block_cache, false)),
             ColumnFamilyDescriptor::new(CF_ATTR_CLUSTERS, attr_cluster_cf_opts(&block_cache)),
             ColumnFamilyDescriptor::new(CF_ATTR_POSTINGS, point_lookup_cf_opts(&block_cache, false)),
+            ColumnFamilyDescriptor::new(CF_FTS_DOC_MAP, point_lookup_cf_opts(&block_cache, false)),
+            ColumnFamilyDescriptor::new(
+                CF_FTS_REV_DOC_MAP,
+                point_lookup_cf_opts(&block_cache, false),
+            ),
+            ColumnFamilyDescriptor::new(CF_FTS_TERMS, fts_terms_cf_opts(&block_cache)),
+            ColumnFamilyDescriptor::new(CF_FTS_POSTINGS, point_lookup_cf_opts(&block_cache, false)),
+            ColumnFamilyDescriptor::new(
+                CF_FTS_POSITIONS,
+                point_lookup_cf_opts(&block_cache, false),
+            ),
         ];
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors).map_err(map_db_err)?;
@@ -217,6 +234,23 @@ impl Storage {
             Some(bytes) => Ok(Some(DocLoc::decode(&bytes)?)),
             None => Ok(None),
         }
+    }
+
+    pub fn multi_get_doc_locs(&self, doc_ids: &[DocId]) -> Result<Vec<Option<DocLoc>>> {
+        if doc_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cf = self.cf(CF_DOC_LOC)?;
+        let keys: Vec<[u8; 8]> = doc_ids.iter().map(|&id| doc_key(id)).collect();
+        let results = self.db.batched_multi_get_cf(cf, keys.iter(), false);
+        let mut out = Vec::with_capacity(doc_ids.len());
+        for res in results {
+            match res.map_err(map_db_err)? {
+                Some(slice) => out.push(Some(DocLoc::decode(&slice)?)),
+                None => out.push(None),
+            }
+        }
+        Ok(out)
     }
 
     pub fn get_doc_bytes(&self, doc_id: DocId) -> Result<Option<Vec<u8>>> {
@@ -478,6 +512,180 @@ impl Storage {
         Ok(out)
     }
 
+    pub fn get_fts_meta_bytes(&self) -> Result<Option<Vec<u8>>> {
+        let cf = self.cf(CF_META)?;
+        self.db.get_cf(cf, FTS_META_KEY).map_err(map_db_err)
+    }
+
+    pub fn get_fts_doc_id(&self, doc_id: DocId) -> Result<Option<FtsDocId>> {
+        let cf = self.cf(CF_FTS_DOC_MAP)?;
+        match self.db.get_pinned_cf(cf, doc_key(doc_id)).map_err(map_db_err)? {
+            Some(bytes) => Ok(Some(decode_u32_key(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn multi_get_fts_doc_ids(&self, doc_ids: &[DocId]) -> Result<Vec<Option<FtsDocId>>> {
+        if doc_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cf = self.cf(CF_FTS_DOC_MAP)?;
+        let keys: Vec<[u8; 8]> = doc_ids.iter().map(|&id| doc_key(id)).collect();
+        let results = self.db.batched_multi_get_cf(cf, keys.iter(), false);
+        let mut out = Vec::with_capacity(doc_ids.len());
+        for res in results {
+            match res.map_err(map_db_err)? {
+                Some(slice) => out.push(Some(decode_u32_key(&slice)?)),
+                None => out.push(None),
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn get_doc_id_from_fts(&self, fts_doc_id: FtsDocId) -> Result<Option<DocId>> {
+        let cf = self.cf(CF_FTS_REV_DOC_MAP)?;
+        match self
+            .db
+            .get_pinned_cf(cf, fts_doc_key(fts_doc_id))
+            .map_err(map_db_err)?
+        {
+            Some(bytes) => Ok(Some(decode_u64_key(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn multi_get_doc_ids_from_fts(&self, fts_doc_ids: &[FtsDocId]) -> Result<Vec<Option<DocId>>> {
+        if fts_doc_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cf = self.cf(CF_FTS_REV_DOC_MAP)?;
+        let keys: Vec<[u8; 4]> = fts_doc_ids.iter().map(|&id| fts_doc_key(id)).collect();
+        let results = self.db.batched_multi_get_cf(cf, keys.iter(), false);
+        let mut out = Vec::with_capacity(fts_doc_ids.len());
+        for res in results {
+            match res.map_err(map_db_err)? {
+                Some(slice) => out.push(Some(decode_u64_key(&slice)?)),
+                None => out.push(None),
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn get_fts_term_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let cf = self.cf(CF_FTS_TERMS)?;
+        self.db.get_cf(cf, key).map_err(map_db_err)
+    }
+
+    pub fn multi_get_fts_term_bytes(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cf = self.cf(CF_FTS_TERMS)?;
+        let results = self.db.batched_multi_get_cf(cf, keys.iter(), false);
+        let mut out = Vec::with_capacity(keys.len());
+        for res in results {
+            out.push(res.map_err(map_db_err)?.map(|s| s.to_vec()));
+        }
+        Ok(out)
+    }
+
+    pub fn scan_fts_term_prefix_bytes(
+        &self,
+        prefix: &[u8],
+        scan_limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cf = self.cf(CF_FTS_TERMS)?;
+        let mut ro = ReadOptions::default();
+        ro.set_prefix_same_as_start(true);
+        let iter = self
+            .db
+            .iterator_cf_opt(cf, ro, IteratorMode::From(prefix, Direction::Forward));
+        let mut out = Vec::new();
+        for item in iter {
+            let (k, v) = item.map_err(map_db_err)?;
+            if !k.starts_with(prefix) {
+                break;
+            }
+            out.push((k.to_vec(), v.to_vec()));
+            if out.len() >= scan_limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn get_fts_posting_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let cf = self.cf(CF_FTS_POSTINGS)?;
+        self.db.get_cf(cf, key).map_err(map_db_err)
+    }
+
+    pub fn get_fts_position_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let cf = self.cf(CF_FTS_POSITIONS)?;
+        self.db.get_cf(cf, key).map_err(map_db_err)
+    }
+
+    pub fn open_fts_posting_cursor(&self, prefix: Vec<u8>) -> Result<RocksPostingCursor<'_>> {
+        let cf = self.cf(CF_FTS_POSTINGS)?;
+        let mut iter = self.db.raw_iterator_cf(cf);
+        iter.seek(&prefix);
+        let valid = check_posting_iter(&iter, &prefix)?;
+        Ok(RocksPostingCursor {
+            iter,
+            prefix,
+            valid,
+        })
+    }
+
+    pub fn all_fts_doc_map(&self) -> Result<Vec<(DocId, FtsDocId)>> {
+        let cf = self.cf(CF_FTS_DOC_MAP)?;
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (k, v) = item.map_err(map_db_err)?;
+            out.push((decode_u64_key(&k)?, decode_u32_key(&v)?));
+        }
+        Ok(out)
+    }
+
+    pub fn all_fts_rev_doc_map(&self) -> Result<Vec<(FtsDocId, DocId)>> {
+        let cf = self.cf(CF_FTS_REV_DOC_MAP)?;
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (k, v) = item.map_err(map_db_err)?;
+            out.push((decode_u32_key(&k)?, decode_u64_key(&v)?));
+        }
+        Ok(out)
+    }
+
+    pub fn all_fts_terms(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cf = self.cf(CF_FTS_TERMS)?;
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (k, v) = item.map_err(map_db_err)?;
+            out.push((k.to_vec(), v.to_vec()));
+        }
+        Ok(out)
+    }
+
+    pub fn all_fts_postings(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cf = self.cf(CF_FTS_POSTINGS)?;
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (k, v) = item.map_err(map_db_err)?;
+            out.push((k.to_vec(), v.to_vec()));
+        }
+        Ok(out)
+    }
+
+    pub fn all_fts_positions(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cf = self.cf(CF_FTS_POSITIONS)?;
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (k, v) = item.map_err(map_db_err)?;
+            out.push((k.to_vec(), v.to_vec()));
+        }
+        Ok(out)
+    }
+
     fn cf(&self, name: &str) -> Result<&ColumnFamily> {
         self.db
             .cf_handle(name)
@@ -582,6 +790,133 @@ impl<'a> StorageBatch<'a> {
         let cf = self.storage.db.cf_handle(CF_ATTR_POSTINGS).unwrap();
         self.batch.delete_cf(cf, key);
     }
+
+    pub fn put_fts_meta_bytes(&mut self, bytes: &[u8]) {
+        let cf = self.storage.db.cf_handle(CF_META).unwrap();
+        self.batch.put_cf(cf, FTS_META_KEY, bytes);
+    }
+
+    pub fn put_fts_doc_map(&mut self, doc_id: DocId, fts_doc_id: FtsDocId) {
+        let cf = self.storage.db.cf_handle(CF_FTS_DOC_MAP).unwrap();
+        self.batch
+            .put_cf(cf, doc_key(doc_id), fts_doc_key(fts_doc_id));
+    }
+
+    pub fn delete_fts_doc_map(&mut self, doc_id: DocId) {
+        let cf = self.storage.db.cf_handle(CF_FTS_DOC_MAP).unwrap();
+        self.batch.delete_cf(cf, doc_key(doc_id));
+    }
+
+    pub fn put_fts_rev_doc_map(&mut self, fts_doc_id: FtsDocId, doc_id: DocId) {
+        let cf = self.storage.db.cf_handle(CF_FTS_REV_DOC_MAP).unwrap();
+        self.batch
+            .put_cf(cf, fts_doc_key(fts_doc_id), doc_key(doc_id));
+    }
+
+    pub fn delete_fts_rev_doc_map(&mut self, fts_doc_id: FtsDocId) {
+        let cf = self.storage.db.cf_handle(CF_FTS_REV_DOC_MAP).unwrap();
+        self.batch.delete_cf(cf, fts_doc_key(fts_doc_id));
+    }
+
+    pub fn put_fts_term(&mut self, key: &[u8], bytes: &[u8]) {
+        let cf = self.storage.db.cf_handle(CF_FTS_TERMS).unwrap();
+        self.batch.put_cf(cf, key, bytes);
+    }
+
+    pub fn delete_fts_term(&mut self, key: &[u8]) {
+        let cf = self.storage.db.cf_handle(CF_FTS_TERMS).unwrap();
+        self.batch.delete_cf(cf, key);
+    }
+
+    pub fn put_fts_posting(&mut self, key: &[u8], bytes: &[u8]) {
+        let cf = self.storage.db.cf_handle(CF_FTS_POSTINGS).unwrap();
+        self.batch.put_cf(cf, key, bytes);
+    }
+
+    pub fn delete_fts_posting(&mut self, key: &[u8]) {
+        let cf = self.storage.db.cf_handle(CF_FTS_POSTINGS).unwrap();
+        self.batch.delete_cf(cf, key);
+    }
+
+    pub fn put_fts_position(&mut self, key: &[u8], bytes: &[u8]) {
+        let cf = self.storage.db.cf_handle(CF_FTS_POSITIONS).unwrap();
+        self.batch.put_cf(cf, key, bytes);
+    }
+
+    pub fn delete_fts_position(&mut self, key: &[u8]) {
+        let cf = self.storage.db.cf_handle(CF_FTS_POSITIONS).unwrap();
+        self.batch.delete_cf(cf, key);
+    }
+}
+
+/// Prefix-bounded RocksDB cursor over `cf_fts_postings` for a single `(attr_id, escaped_token)`.
+pub struct RocksPostingCursor<'a> {
+    iter: DBRawIteratorWithThreadMode<'a, DB>,
+    prefix: Vec<u8>,
+    valid: bool,
+}
+
+impl<'a> RocksPostingCursor<'a> {
+    #[inline]
+    pub fn current_block_id(&self) -> Option<FtsBlockId> {
+        if !self.valid {
+            return None;
+        }
+        let k = self.iter.key()?;
+        let off = self.prefix.len();
+        if k.len() != off + 4 {
+            return None;
+        }
+        Some(u32::from_be_bytes(k[off..off + 4].try_into().unwrap()))
+    }
+
+    #[inline]
+    pub fn current_block_bytes(&self) -> &[u8] {
+        if !self.valid {
+            return &[];
+        }
+        self.iter.value().unwrap_or(&[])
+    }
+
+    #[inline]
+    pub fn next_block(&mut self) -> Result<()> {
+        if !self.valid {
+            return Ok(());
+        }
+        self.iter.next();
+        self.valid = check_posting_iter(&self.iter, &self.prefix)?;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn seek_block(&mut self, target: FtsBlockId) -> Result<()> {
+        if !self.valid {
+            return Ok(());
+        }
+        let mut seek_key = Vec::with_capacity(self.prefix.len() + 4);
+        seek_key.extend_from_slice(&self.prefix);
+        seek_key.extend_from_slice(&target.to_be_bytes());
+        self.iter.seek(&seek_key);
+        self.valid = check_posting_iter(&self.iter, &self.prefix)?;
+        Ok(())
+    }
+}
+
+#[inline]
+fn check_posting_iter(iter: &DBRawIteratorWithThreadMode<'_, DB>, prefix: &[u8]) -> Result<bool> {
+    if !iter.valid() {
+        iter.status().map_err(map_db_err)?;
+        return Ok(false);
+    }
+    let Some(k) = iter.key() else {
+        return Ok(false);
+    };
+    Ok(k.starts_with(prefix) && k.len() == prefix.len() + 4)
+}
+
+#[inline]
+pub(crate) fn fts_doc_key(id: FtsDocId) -> [u8; 4] {
+    id.to_be_bytes()
 }
 
 #[inline]
@@ -647,8 +982,23 @@ fn attr_cluster_cf_opts(block_cache: &Cache) -> Options {
     opts
 }
 
+fn fts_terms_cf_opts(block_cache: &Cache) -> Options {
+    let mut opts = Options::default();
+    opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(2));
+    opts.set_memtable_whole_key_filtering(true);
+
+    let mut bbo = BlockBasedOptions::default();
+    bbo.set_block_cache(block_cache);
+    bbo.set_bloom_filter(10.0, false);
+    bbo.set_whole_key_filtering(true);
+    bbo.set_cache_index_and_filter_blocks(true);
+    bbo.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    opts.set_block_based_table_factory(&bbo);
+    opts
+}
+
 /// Read-your-own-writes transaction overlay that commits all mutations across tree, document store,
-/// and attribute index in one atomic `WriteBatch`, updating in-memory caches only after persistence succeeds.
+/// attribute index, and FTS index in one atomic `WriteBatch`, updating in-memory caches only after persistence succeeds.
 pub struct TxContext<'a> {
     storage: &'a Storage,
     internal_cache: &'a mut HashMap<NodeId, PackedInternalNode>,
@@ -664,6 +1014,13 @@ pub struct TxContext<'a> {
     dirty_docs: HashMap<DocId, Option<Vec<u8>>>,
     dirty_attr_clusters: HashMap<Vec<u8>, RoaringBitmap>,
     dirty_attr_postings: HashMap<Vec<u8>, RoaringBitmap>,
+    fts_meta_bytes: Option<Vec<u8>>,
+    fts_meta_dirty: bool,
+    dirty_fts_doc_map: HashMap<DocId, Option<FtsDocId>>,
+    dirty_fts_rev_doc_map: HashMap<FtsDocId, Option<DocId>>,
+    dirty_fts_terms: HashMap<Vec<u8>, Option<Vec<u8>>>,
+    dirty_fts_postings: HashMap<Vec<u8>, Option<Vec<u8>>>,
+    dirty_fts_positions: HashMap<Vec<u8>, Option<Vec<u8>>>,
 }
 
 impl<'a> TxContext<'a> {
@@ -688,6 +1045,13 @@ impl<'a> TxContext<'a> {
             dirty_docs: HashMap::new(),
             dirty_attr_clusters: HashMap::new(),
             dirty_attr_postings: HashMap::new(),
+            fts_meta_bytes: None,
+            fts_meta_dirty: false,
+            dirty_fts_doc_map: HashMap::new(),
+            dirty_fts_rev_doc_map: HashMap::new(),
+            dirty_fts_terms: HashMap::new(),
+            dirty_fts_postings: HashMap::new(),
+            dirty_fts_positions: HashMap::new(),
         }
     }
 
@@ -933,6 +1297,80 @@ impl<'a> TxContext<'a> {
         Ok(())
     }
 
+    pub fn get_fts_meta_bytes(&self) -> Result<Option<Vec<u8>>> {
+        if let Some(ref bytes) = self.fts_meta_bytes {
+            return Ok(Some(bytes.clone()));
+        }
+        self.storage.get_fts_meta_bytes()
+    }
+
+    pub fn put_fts_meta_bytes(&mut self, bytes: Vec<u8>) {
+        self.fts_meta_bytes = Some(bytes);
+        self.fts_meta_dirty = true;
+    }
+
+    pub fn get_fts_doc_id(&self, doc_id: DocId) -> Result<Option<FtsDocId>> {
+        if let Some(opt) = self.dirty_fts_doc_map.get(&doc_id) {
+            return Ok(*opt);
+        }
+        self.storage.get_fts_doc_id(doc_id)
+    }
+
+    pub fn put_fts_doc_mapping(&mut self, doc_id: DocId, fts_doc_id: FtsDocId) {
+        self.dirty_fts_doc_map.insert(doc_id, Some(fts_doc_id));
+        self.dirty_fts_rev_doc_map.insert(fts_doc_id, Some(doc_id));
+    }
+
+    pub fn delete_fts_doc_mapping(&mut self, doc_id: DocId, fts_doc_id: FtsDocId) {
+        self.dirty_fts_doc_map.insert(doc_id, None);
+        self.dirty_fts_rev_doc_map.insert(fts_doc_id, None);
+    }
+
+    pub fn get_fts_term_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(opt) = self.dirty_fts_terms.get(key) {
+            return Ok(opt.clone());
+        }
+        self.storage.get_fts_term_bytes(key)
+    }
+
+    pub fn put_fts_term_bytes(&mut self, key: Vec<u8>, val: Vec<u8>) {
+        self.dirty_fts_terms.insert(key, Some(val));
+    }
+
+    pub fn delete_fts_term(&mut self, key: Vec<u8>) {
+        self.dirty_fts_terms.insert(key, None);
+    }
+
+    pub fn get_fts_posting_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(opt) = self.dirty_fts_postings.get(key) {
+            return Ok(opt.clone());
+        }
+        self.storage.get_fts_posting_bytes(key)
+    }
+
+    pub fn put_fts_posting_bytes(&mut self, key: Vec<u8>, val: Vec<u8>) {
+        self.dirty_fts_postings.insert(key, Some(val));
+    }
+
+    pub fn delete_fts_posting(&mut self, key: Vec<u8>) {
+        self.dirty_fts_postings.insert(key, None);
+    }
+
+    pub fn get_fts_position_bytes(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(opt) = self.dirty_fts_positions.get(key) {
+            return Ok(opt.clone());
+        }
+        self.storage.get_fts_position_bytes(key)
+    }
+
+    pub fn put_fts_position_bytes(&mut self, key: Vec<u8>, val: Vec<u8>) {
+        self.dirty_fts_positions.insert(key, Some(val));
+    }
+
+    pub fn delete_fts_position(&mut self, key: Vec<u8>) {
+        self.dirty_fts_positions.insert(key, None);
+    }
+
     pub fn commit(mut self) -> Result<TreeMeta> {
         let mut batch = self.storage.new_batch();
         if self.meta_dirty {
@@ -982,6 +1420,41 @@ impl<'a> TxContext<'a> {
             } else {
                 let bytes = encode_roaring_bitmap(&bm)?;
                 batch.put_attr_posting(&key, &bytes);
+            }
+        }
+        if self.fts_meta_dirty
+            && let Some(ref bytes) = self.fts_meta_bytes
+        {
+            batch.put_fts_meta_bytes(bytes);
+        }
+        for (doc_id, opt) in self.dirty_fts_doc_map {
+            match opt {
+                Some(fid) => batch.put_fts_doc_map(doc_id, fid),
+                None => batch.delete_fts_doc_map(doc_id),
+            }
+        }
+        for (fts_doc_id, opt) in self.dirty_fts_rev_doc_map {
+            match opt {
+                Some(did) => batch.put_fts_rev_doc_map(fts_doc_id, did),
+                None => batch.delete_fts_rev_doc_map(fts_doc_id),
+            }
+        }
+        for (key, opt) in self.dirty_fts_terms {
+            match opt {
+                Some(bytes) => batch.put_fts_term(&key, &bytes),
+                None => batch.delete_fts_term(&key),
+            }
+        }
+        for (key, opt) in self.dirty_fts_postings {
+            match opt {
+                Some(bytes) => batch.put_fts_posting(&key, &bytes),
+                None => batch.delete_fts_posting(&key),
+            }
+        }
+        for (key, opt) in self.dirty_fts_positions {
+            match opt {
+                Some(bytes) => batch.put_fts_position(&key, &bytes),
+                None => batch.delete_fts_position(&key),
             }
         }
 

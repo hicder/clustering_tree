@@ -5,8 +5,10 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
 
 [workspace.dependencies]
+alyze = "0.2"
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 rand = "0.9"
 roaring = "0.11"
@@ -15,5 +17,6 @@ tempfile = "3"
 thiserror = "2"
 
 izzydb-core = { path = "crates/izzydb-core" }
+izzydb-fts = { path = "crates/izzydb-fts" }
 izzydb-rabitq = { path = "crates/izzydb-rabitq" }
 izzydb-storage = { path = "crates/izzydb-storage" }

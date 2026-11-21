@@ -1,4 +1,4 @@
-use izzydb_core::config::{AttrId, NodeId};
+use izzydb_core::config::{AttrId, FtsBlockId, NodeId};
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::schema::{
     AttributeType, AttributeValue, Attributes, CollectionSchema, ScalarValue,
@@ -501,6 +501,104 @@ pub fn encode_roaring_bitmap(bm: &RoaringBitmap) -> Result<Vec<u8>> {
 pub fn decode_roaring_bitmap(bytes: &[u8]) -> Result<RoaringBitmap> {
     RoaringBitmap::deserialize_from(bytes)
         .map_err(|e| TreeError::CorruptedData(format!("roaring deserialize error: {e}")))
+}
+
+/// Build a `cf_fts_terms` key: `attr_id (u16 BE) || token_utf8`.
+#[inline]
+pub fn encode_fts_term_key(attr_id: AttrId, token: &str) -> Vec<u8> {
+    let tb = token.as_bytes();
+    let mut key = Vec::with_capacity(2 + tb.len());
+    key.extend_from_slice(&attr_id.to_be_bytes());
+    key.extend_from_slice(tb);
+    key
+}
+
+/// Decode a `cf_fts_terms` key into `(attr_id, token_utf8)`.
+pub fn decode_fts_term_key(key: &[u8]) -> Result<(AttrId, String)> {
+    if key.len() < 2 {
+        return Err(TreeError::CorruptedData(
+            "cf_fts_terms key too short".into(),
+        ));
+    }
+    let attr_id = u16::from_be_bytes([key[0], key[1]]);
+    let token = std::str::from_utf8(&key[2..])
+        .map_err(|e| TreeError::CorruptedData(format!("invalid utf8 in cf_fts_terms key: {e}")))?
+        .to_owned();
+    Ok((attr_id, token))
+}
+
+/// Build the `(attr_id BE || escaped_token)` prefix shared by `cf_fts_postings` and `cf_fts_positions`.
+#[inline]
+pub fn encode_fts_posting_prefix(attr_id: AttrId, token: &str) -> Vec<u8> {
+    let tb = token.as_bytes();
+    let mut prefix = Vec::with_capacity(4 + tb.len());
+    prefix.extend_from_slice(&attr_id.to_be_bytes());
+    encode_str_ordered(tb, &mut prefix);
+    prefix
+}
+
+/// Append a `block_id (u32 BE)` to an already-encoded FTS posting prefix.
+#[inline]
+pub fn encode_fts_posting_key_from_prefix(prefix: &[u8], block_id: FtsBlockId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(prefix.len() + 4);
+    key.extend_from_slice(prefix);
+    key.extend_from_slice(&block_id.to_be_bytes());
+    key
+}
+
+/// Build a `cf_fts_postings` / `cf_fts_positions` key: `attr_id (u16 BE) || escaped_token || block_id (u32 BE)`.
+#[inline]
+pub fn encode_fts_posting_key(attr_id: AttrId, token: &str, block_id: FtsBlockId) -> Vec<u8> {
+    let mut key = encode_fts_posting_prefix(attr_id, token);
+    key.extend_from_slice(&block_id.to_be_bytes());
+    key
+}
+
+/// Decode a `cf_fts_postings` / `cf_fts_positions` key into `(attr_id, token_utf8, block_id)`.
+pub fn decode_fts_posting_key(key: &[u8]) -> Result<(AttrId, String, FtsBlockId)> {
+    if key.len() < 8 {
+        return Err(TreeError::CorruptedData(
+            "cf_fts_postings key too short".into(),
+        ));
+    }
+    let attr_id = u16::from_be_bytes([key[0], key[1]]);
+    let mut raw = Vec::new();
+    let mut i = 2usize;
+    let mut found_term = false;
+    while i < key.len() {
+        if key[i] == 0x00 {
+            if i + 1 >= key.len() {
+                return Err(TreeError::CorruptedData(
+                    "truncated escape sequence in FTS posting key".into(),
+                ));
+            }
+            if key[i + 1] == 0x00 {
+                i += 2;
+                found_term = true;
+                break;
+            } else if key[i + 1] == 0xFF {
+                raw.push(0x00);
+                i += 2;
+            } else {
+                return Err(TreeError::CorruptedData(
+                    "invalid escape byte in FTS posting key".into(),
+                ));
+            }
+        } else {
+            raw.push(key[i]);
+            i += 1;
+        }
+    }
+    if !found_term || i + 4 != key.len() {
+        return Err(TreeError::CorruptedData(
+            "malformed FTS posting key length".into(),
+        ));
+    }
+    let token = String::from_utf8(raw).map_err(|e| {
+        TreeError::CorruptedData(format!("invalid utf8 in FTS posting key: {e}"))
+    })?;
+    let block_id = u32::from_be_bytes(key[i..i + 4].try_into().unwrap());
+    Ok((attr_id, token, block_id))
 }
 
 #[cfg(test)]

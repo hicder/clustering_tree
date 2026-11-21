@@ -1,9 +1,47 @@
 use std::cmp::Ordering;
 
 use crate::error::{Result, TreeError};
-use crate::schema::{AttributeType, AttributeValue, Attributes, CollectionSchema, ScalarValue};
+use crate::schema::{
+    AttributeType, AttributeValue, Attributes, CollectionSchema, FullTextSearchConfig, ScalarValue,
+    SchemaEntry, Tokenizer,
+};
 
-/// Boolean filter AST evaluated jointly over cluster summaries and per-leaf postings.
+/// Query input for full-text search filters and `RankBy::Bm25`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenQuery {
+    /// Raw text string to analyze using the attribute's configured FTS analyzer.
+    Text(String),
+    /// Pre-tokenized token list used verbatim (required for `Tokenizer::PreTokenizedArray`).
+    PreTokenized(Vec<String>),
+}
+
+impl From<&str> for TokenQuery {
+    fn from(s: &str) -> Self {
+        Self::Text(s.to_owned())
+    }
+}
+
+impl From<String> for TokenQuery {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+
+impl From<Vec<String>> for TokenQuery {
+    fn from(tokens: Vec<String>) -> Self {
+        Self::PreTokenized(tokens)
+    }
+}
+
+/// FTS filter matching operation kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtsPredicateKind {
+    AllTokens,
+    AnyToken,
+    TokenSequence,
+}
+
+/// Boolean filter AST evaluated jointly over cluster summaries, per-leaf postings, and FTS indexes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Filter {
     And(Vec<Filter>),
@@ -21,11 +59,50 @@ pub enum Filter {
     ContainsAny(String, Vec<ScalarValue>),
     IsNull(String),
     IsNotNull(String),
+    ContainsAllTokens {
+        attr: String,
+        query: TokenQuery,
+        last_as_prefix: bool,
+    },
+    ContainsAnyToken {
+        attr: String,
+        query: TokenQuery,
+        last_as_prefix: bool,
+    },
+    ContainsTokenSequence {
+        attr: String,
+        query: TokenQuery,
+        last_as_prefix: bool,
+    },
 }
 
 impl Filter {
+    /// Returns `true` if this filter tree contains any FTS token/sequence predicate.
+    pub fn has_fts(&self) -> bool {
+        match self {
+            Self::And(children) | Self::Or(children) => children.iter().any(Self::has_fts),
+            Self::Not(child) => child.has_fts(),
+            Self::ContainsAllTokens { .. }
+            | Self::ContainsAnyToken { .. }
+            | Self::ContainsTokenSequence { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if this filter tree contains only FTS predicates and boolean combinators.
+    pub fn is_fts_only(&self) -> bool {
+        match self {
+            Self::And(children) | Self::Or(children) => children.iter().all(Self::is_fts_only),
+            Self::Not(child) => child.is_fts_only(),
+            Self::ContainsAllTokens { .. }
+            | Self::ContainsAnyToken { .. }
+            | Self::ContainsTokenSequence { .. } => true,
+            _ => false,
+        }
+    }
+
     /// Validate this filter AST against `schema`, checking attribute existence,
-    /// `filterable` flag, and type compatibility.
+    /// `filterable` / `full_text_search` flags, and type compatibility.
     pub fn validate(&self, schema: &CollectionSchema) -> Result<()> {
         match self {
             Self::And(children) | Self::Or(children) => {
@@ -97,15 +174,45 @@ impl Filter {
                 require_filterable(schema, attr)?;
                 Ok(())
             }
+            Self::ContainsAllTokens { attr, query, .. }
+            | Self::ContainsAnyToken { attr, query, .. } => {
+                let (_, fts) = require_fts(schema, attr)?;
+                validate_token_query(attr, query, fts)
+            }
+            Self::ContainsTokenSequence { attr, query, .. } => {
+                let (_, fts) = require_fts(schema, attr)?;
+                if !fts.index_positions {
+                    return Err(TreeError::InvalidFilter(format!(
+                        "ContainsTokenSequence requires index_positions = true on attribute '{attr}'"
+                    )));
+                }
+                validate_token_query(attr, query, fts)
+            }
         }
     }
 
     /// Evaluate this filter in memory against a document's forward attributes.
+    ///
+    /// Note: FTS predicates (`ContainsAllTokens`, `ContainsAnyToken`, `ContainsTokenSequence`)
+    /// require an analyzer and schema; when evaluated via this method without an FTS callback,
+    /// they return `false`. Use [`Filter::matches_with_fts`] when FTS predicates may be present.
     pub fn matches(&self, attrs: &Attributes) -> bool {
+        self.matches_with_fts(attrs, &mut |_, _, _, _| false)
+    }
+
+    /// Evaluate this filter in memory against `attrs`, delegating FTS predicates to `eval_fts`.
+    pub fn matches_with_fts<F>(&self, attrs: &Attributes, eval_fts: &mut F) -> bool
+    where
+        F: FnMut(FtsPredicateKind, &str, &TokenQuery, bool) -> bool,
+    {
         match self {
-            Self::And(children) => children.iter().all(|c| c.matches(attrs)),
-            Self::Or(children) => children.iter().any(|c| c.matches(attrs)),
-            Self::Not(child) => !child.matches(attrs),
+            Self::And(children) => children
+                .iter()
+                .all(|c| c.matches_with_fts(attrs, eval_fts)),
+            Self::Or(children) => children
+                .iter()
+                .any(|c| c.matches_with_fts(attrs, eval_fts)),
+            Self::Not(child) => !child.matches_with_fts(attrs, eval_fts),
             Self::Eq(attr, target) => match (attrs.get(attr), target) {
                 (None | Some(AttributeValue::Null), ScalarValue::Null) => true,
                 (Some(val), target) => attr_eq_scalar(val, target),
@@ -133,14 +240,62 @@ impl Filter {
             }
             Self::IsNull(attr) => matches!(attrs.get(attr), None | Some(AttributeValue::Null)),
             Self::IsNotNull(attr) => !matches!(attrs.get(attr), None | Some(AttributeValue::Null)),
+            Self::ContainsAllTokens {
+                attr,
+                query,
+                last_as_prefix,
+            } => eval_fts(FtsPredicateKind::AllTokens, attr, query, *last_as_prefix),
+            Self::ContainsAnyToken {
+                attr,
+                query,
+                last_as_prefix,
+            } => eval_fts(FtsPredicateKind::AnyToken, attr, query, *last_as_prefix),
+            Self::ContainsTokenSequence {
+                attr,
+                query,
+                last_as_prefix,
+            } => eval_fts(
+                FtsPredicateKind::TokenSequence,
+                attr,
+                query,
+                *last_as_prefix,
+            ),
         }
     }
+}
+
+pub fn require_fts<'a>(
+    schema: &'a CollectionSchema,
+    attr: &str,
+) -> Result<(&'a SchemaEntry, &'a FullTextSearchConfig)> {
+    let entry = schema
+        .get_by_name(attr)
+        .ok_or_else(|| TreeError::InvalidFilter(format!("unknown attribute '{attr}'")))?;
+    let fts = entry.full_text_search.as_ref().ok_or_else(|| {
+        TreeError::InvalidFilter(format!(
+            "attribute '{attr}' does not have full_text_search enabled"
+        ))
+    })?;
+    Ok((entry, fts))
+}
+
+pub fn validate_token_query(
+    attr: &str,
+    query: &TokenQuery,
+    fts: &FullTextSearchConfig,
+) -> Result<()> {
+    if fts.tokenizer == Tokenizer::PreTokenizedArray && matches!(query, TokenQuery::Text(_)) {
+        return Err(TreeError::InvalidFilter(format!(
+            "attribute '{attr}' uses PreTokenizedArray tokenizer and requires TokenQuery::PreTokenized"
+        )));
+    }
+    Ok(())
 }
 
 fn require_filterable<'a>(
     schema: &'a CollectionSchema,
     attr: &str,
-) -> Result<&'a crate::schema::SchemaEntry> {
+) -> Result<&'a SchemaEntry> {
     let entry = schema
         .get_by_name(attr)
         .ok_or_else(|| TreeError::InvalidFilter(format!("unknown attribute '{attr}'")))?;

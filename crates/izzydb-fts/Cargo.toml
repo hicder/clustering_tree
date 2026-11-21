@@ -1,0 +1,17 @@
+[package]
+name = "izzydb-fts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Full-text analysis, 256-doc posting blocks, BM25 scoring, and Block-Max MAXSCORE for izzydb"
+
+[features]
+fts-cjk = ["alyze/cjk", "izzydb-core/fts-cjk"]
+
+[dependencies]
+alyze.workspace = true
+izzydb-core.workspace = true
+roaring.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

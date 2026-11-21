@@ -1,15 +1,20 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use roaring::RoaringBitmap;
 
-use crate::config::{DocId, LocalId, NodeId, TreeConfig};
+use crate::codec::{
+    decode_attribute_entries, encode_fts_posting_key, encode_fts_term_key,
+    extract_index_keys_from_entries, make_posting_key,
+};
+use crate::config::{AttrId, DocId, LocalId, NodeId, TreeConfig, fts_block_id, fts_slot};
 use crate::error::{Result, TreeError};
 use crate::node::{PackedInternalNode, TreeMeta};
-use crate::schema::CollectionSchema;
-use crate::codec::{
-    decode_attribute_entries, extract_index_keys_from_entries, make_posting_key,
-};
+use crate::schema::{AttributeValue, CollectionSchema};
 use crate::storage::{DocLoc, Storage};
+use izzydb_fts::{
+    AttrFtsStats, FtsAnalyzer, FtsMeta, PackedPositionBlock, PackedPostingBlock, ReusableBuffer,
+    TermStats,
+};
 
 /// Summary statistics collected by [`crate::ClusteringTree::verify_invariants`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +38,10 @@ pub struct CollectionStats {
     pub num_docs: usize,
     pub num_cluster_bitmaps: usize,
     pub num_posting_bitmaps: usize,
+    pub num_fts_docs: usize,
+    pub num_fts_terms: usize,
+    pub num_fts_postings: usize,
+    pub num_fts_positions: usize,
 }
 
 /// Exhaustively verify all structural invariants of the tree in RocksDB and in-memory caches.
@@ -451,10 +460,235 @@ pub fn verify_collection_invariants(
         )));
     }
 
+    let (num_fts_docs, num_fts_terms, num_fts_postings, num_fts_positions) =
+        verify_fts_invariants(storage, mem_schema, &docs_bytes)?;
+
     Ok(CollectionStats {
         tree,
         num_docs: docs_bytes.len(),
         num_cluster_bitmaps: disk_clusters.len(),
         num_posting_bitmaps: disk_postings.len(),
+        num_fts_docs,
+        num_fts_terms,
+        num_fts_postings,
+        num_fts_positions,
     })
+}
+
+fn verify_fts_invariants(
+    storage: &Storage,
+    schema: &CollectionSchema,
+    docs_bytes: &HashMap<DocId, Vec<u8>>,
+) -> Result<(usize, usize, usize, usize)> {
+    let disk_doc_map = storage.all_fts_doc_map()?;
+    let disk_rev_map = storage.all_fts_rev_doc_map()?;
+    let disk_terms = storage.all_fts_terms()?;
+    let disk_postings = storage.all_fts_postings()?;
+    let disk_positions = storage.all_fts_positions()?;
+
+    if !schema.has_fts() {
+        if !disk_doc_map.is_empty()
+            || !disk_rev_map.is_empty()
+            || !disk_terms.is_empty()
+            || !disk_postings.is_empty()
+            || !disk_positions.is_empty()
+        {
+            return Err(TreeError::InvariantViolation(
+                "schema has no FTS attributes, but FTS column families are non-empty".into(),
+            ));
+        }
+        return Ok((0, 0, 0, 0));
+    }
+
+    if docs_bytes.is_empty()
+        && disk_doc_map.is_empty()
+        && disk_rev_map.is_empty()
+        && disk_terms.is_empty()
+        && disk_postings.is_empty()
+        && disk_positions.is_empty()
+    {
+        return Ok((0, 0, 0, 0));
+    }
+
+    let fts_meta = match storage.get_fts_meta_bytes()? {
+        Some(bytes) => FtsMeta::decode(&bytes)?,
+        None => {
+            return Err(TreeError::InvariantViolation(
+                "missing fts_meta in cf_meta for non-empty FTS collection".into(),
+            ));
+        }
+    };
+
+    if disk_doc_map.len() != docs_bytes.len() || disk_rev_map.len() != docs_bytes.len() {
+        return Err(TreeError::InvariantViolation(format!(
+            "FTS doc map counts ({}, {}) != cf_docs count ({})",
+            disk_doc_map.len(),
+            disk_rev_map.len(),
+            docs_bytes.len()
+        )));
+    }
+
+    let doc_to_fts: HashMap<DocId, u32> = disk_doc_map.into_iter().collect();
+    let rev_to_doc: HashMap<u32, DocId> = disk_rev_map.into_iter().collect();
+
+    for (&doc_id, &fts_id) in &doc_to_fts {
+        if !docs_bytes.contains_key(&doc_id) {
+            return Err(TreeError::InvariantViolation(format!(
+                "orphaned cf_fts_doc_map entry for doc {doc_id}"
+            )));
+        }
+        if fts_id >= fts_meta.next_fts_doc_id {
+            return Err(TreeError::InvariantViolation(format!(
+                "fts_doc_id {fts_id} >= next_fts_doc_id {}",
+                fts_meta.next_fts_doc_id
+            )));
+        }
+        if rev_to_doc.get(&fts_id) != Some(&doc_id) {
+            return Err(TreeError::InvariantViolation(format!(
+                "FTS doc map bijection broken for doc {doc_id} <-> fts_doc_id {fts_id}"
+            )));
+        }
+    }
+
+    let mut expected_attr_stats: BTreeMap<AttrId, AttrFtsStats> = BTreeMap::new();
+    let mut expected_terms: HashMap<Vec<u8>, (u64, u32, u32)> = HashMap::new();
+    let mut expected_postings: HashMap<Vec<u8>, PackedPostingBlock> = HashMap::new();
+    let mut expected_positions: HashMap<Vec<u8>, PackedPositionBlock> = HashMap::new();
+
+    let mut buf = ReusableBuffer::new();
+    let fts_entries: Vec<_> = schema.fts_entries().collect();
+
+    for (&doc_id, raw_bytes) in docs_bytes {
+        let fts_id = *doc_to_fts.get(&doc_id).ok_or_else(|| {
+            TreeError::InvariantViolation(format!("missing doc {doc_id} in cf_fts_doc_map"))
+        })?;
+        let block_id = fts_block_id(fts_id);
+        let slot = fts_slot(fts_id);
+
+        let entries = decode_attribute_entries(raw_bytes)?;
+        let by_id: HashMap<AttrId, AttributeValue> = entries.into_iter().collect();
+
+        for schema_entry in &fts_entries {
+            let fts_cfg = schema_entry.full_text_search.as_ref().unwrap();
+            let Some(val) = by_id.get(&schema_entry.id) else {
+                continue;
+            };
+            let analyzer = FtsAnalyzer::new(fts_cfg.clone());
+            let Some(analyzed) = analyzer.analyze_attribute_value(val, &mut buf)? else {
+                continue;
+            };
+            let st = expected_attr_stats.entry(schema_entry.id).or_default();
+            st.doc_count += 1;
+            st.total_tokens += analyzed.doc_len as u64;
+
+            for (tok, term) in analyzed.terms {
+                let tkey = encode_fts_term_key(schema_entry.id, &tok);
+                let te = expected_terms.entry(tkey).or_insert((0, 0, u32::MAX));
+                te.0 += 1;
+                te.1 = te.1.max(term.tf);
+                te.2 = te.2.min(analyzed.doc_len);
+
+                let pkey = encode_fts_posting_key(schema_entry.id, &tok, block_id);
+                expected_postings
+                    .entry(pkey.clone())
+                    .or_default()
+                    .upsert(slot, term.tf, analyzed.doc_len);
+                if fts_cfg.index_positions {
+                    expected_positions
+                        .entry(pkey)
+                        .or_default()
+                        .upsert(slot, term.positions);
+                }
+            }
+        }
+    }
+
+    // Compare per_attr_stats ignoring zero-doc entries.
+    for entry in &fts_entries {
+        let disk_st = fts_meta
+            .per_attr_stats
+            .get(&entry.id)
+            .copied()
+            .unwrap_or_default();
+        let exp_st = expected_attr_stats.get(&entry.id).copied().unwrap_or_default();
+        if disk_st != exp_st {
+            return Err(TreeError::InvariantViolation(format!(
+                "FTS attr_stats mismatch for attr {}: disk {:?} != expected {:?}",
+                entry.name, disk_st, exp_st
+            )));
+        }
+    }
+
+    let disk_terms_map: HashMap<Vec<u8>, Vec<u8>> = disk_terms.into_iter().collect();
+    if disk_terms_map.len() != expected_terms.len() {
+        return Err(TreeError::InvariantViolation(format!(
+            "cf_fts_terms count {} != expected {}",
+            disk_terms_map.len(),
+            expected_terms.len()
+        )));
+    }
+    for (k, (exp_df, exp_max_tf, exp_min_dl)) in &expected_terms {
+        let Some(raw) = disk_terms_map.get(k) else {
+            return Err(TreeError::InvariantViolation(
+                "missing expected key in cf_fts_terms".into(),
+            ));
+        };
+        let ts = TermStats::decode(raw)?;
+        if ts.doc_freq != *exp_df || ts.max_tf < *exp_max_tf || ts.min_dl > *exp_min_dl {
+            return Err(TreeError::InvariantViolation(format!(
+                "cf_fts_terms stats mismatch: disk {ts:?} vs expected (df={exp_df}, max_tf>={exp_max_tf}, min_dl<={exp_min_dl})"
+            )));
+        }
+    }
+
+    let disk_postings_map: HashMap<Vec<u8>, Vec<u8>> = disk_postings.into_iter().collect();
+    if disk_postings_map.len() != expected_postings.len() {
+        return Err(TreeError::InvariantViolation(format!(
+            "cf_fts_postings count {} != expected {}",
+            disk_postings_map.len(),
+            expected_postings.len()
+        )));
+    }
+    for (k, exp_blk) in &expected_postings {
+        let Some(raw) = disk_postings_map.get(k) else {
+            return Err(TreeError::InvariantViolation(
+                "missing expected key in cf_fts_postings".into(),
+            ));
+        };
+        let disk_blk = PackedPostingBlock::decode(raw)?;
+        if &disk_blk != exp_blk {
+            return Err(TreeError::InvariantViolation(
+                "cf_fts_postings block mismatch against reconstructed documents".into(),
+            ));
+        }
+    }
+
+    let disk_positions_map: HashMap<Vec<u8>, Vec<u8>> = disk_positions.into_iter().collect();
+    if disk_positions_map.len() != expected_positions.len() {
+        return Err(TreeError::InvariantViolation(format!(
+            "cf_fts_positions count {} != expected {}",
+            disk_positions_map.len(),
+            expected_positions.len()
+        )));
+    }
+    for (k, exp_pblk) in &expected_positions {
+        let Some(raw) = disk_positions_map.get(k) else {
+            return Err(TreeError::InvariantViolation(
+                "missing expected key in cf_fts_positions".into(),
+            ));
+        };
+        let disk_pblk = PackedPositionBlock::decode(raw)?;
+        if &disk_pblk != exp_pblk {
+            return Err(TreeError::InvariantViolation(
+                "cf_fts_positions block mismatch against reconstructed documents".into(),
+            ));
+        }
+    }
+
+    Ok((
+        doc_to_fts.len(),
+        disk_terms_map.len(),
+        disk_postings_map.len(),
+        disk_positions_map.len(),
+    ))
 }

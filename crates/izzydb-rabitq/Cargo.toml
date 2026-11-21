@@ -2,6 +2,7 @@
 name = "izzydb-rabitq"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "1-bit RaBitQ quantization, FWHT rotation, and SIMD popcount leaf scoring for izzydb"
 
 [dependencies]

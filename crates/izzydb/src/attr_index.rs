@@ -4,7 +4,7 @@ use roaring::RoaringBitmap;
 
 use izzydb_core::config::{AttrId, DocId, LocalId, NodeId};
 use izzydb_core::error::Result;
-use izzydb_core::filter::Filter;
+use izzydb_core::filter::{Filter, FtsPredicateKind};
 use izzydb_core::schema::{AttributeValue, Attributes, CollectionSchema, ScalarValue};
 use izzydb_storage::codec::{
     decode_attribute_entries, encode_attr_prefix, encode_present_cluster_key,
@@ -14,6 +14,7 @@ use izzydb_storage::codec::{
 use izzydb_storage::node::LeafNodeView;
 use izzydb_storage::{Storage, TxContext};
 
+use crate::fts_index::FtsIndex;
 use crate::tree::ClusterDelta;
 
 /// Conservative cluster-level pruning result from `cf_attr_clusters`.
@@ -48,6 +49,8 @@ enum PreparedNode {
     Not(Box<PreparedNode>),
     /// Union of `(cluster_key, cluster_bitmap)` entries.
     Keys(Vec<(Vec<u8>, RoaringBitmap)>),
+    /// Pre-resolved per-leaf `local_id` bitmaps (used for FTS predicates).
+    LeafLocalMasks(HashMap<NodeId, RoaringBitmap>),
 }
 
 /// Cluster-aware inverted attribute index backed by `cf_attr_clusters` and `cf_attr_postings`.
@@ -150,15 +153,26 @@ impl AttributeIndex {
         Ok(())
     }
 
-    /// Evaluate cluster-level candidates from `cf_attr_clusters` and build a [`PreparedFilter`]
-    /// for batched exact per-leaf evaluation.
+    /// Evaluate cluster-level candidates from `cf_attr_clusters` (and `FtsIndex` if needed)
+    /// and build a [`PreparedFilter`] for batched exact per-leaf evaluation.
     pub fn prepare_filter(
         &self,
         storage: &Storage,
         schema: &CollectionSchema,
         filter: &Filter,
     ) -> Result<PreparedFilter> {
-        let (cluster_candidates, root) = eval_cluster_node(storage, schema, filter)?;
+        self.prepare_filter_with_fts(storage, schema, filter, None)
+    }
+
+    /// Evaluate cluster-level candidates with optional [`FtsIndex`] support for FTS predicates.
+    pub fn prepare_filter_with_fts(
+        &self,
+        storage: &Storage,
+        schema: &CollectionSchema,
+        filter: &Filter,
+        fts_index: Option<&FtsIndex>,
+    ) -> Result<PreparedFilter> {
+        let (cluster_candidates, root) = eval_cluster_node(storage, schema, filter, fts_index)?;
         Ok(PreparedFilter {
             cluster_candidates,
             root,
@@ -239,6 +253,7 @@ fn eval_cluster_node(
     storage: &Storage,
     schema: &CollectionSchema,
     filter: &Filter,
+    fts_index: Option<&FtsIndex>,
 ) -> Result<(ClusterCandidates, PreparedNode)> {
     match filter {
         Filter::And(children) => {
@@ -248,7 +263,7 @@ fn eval_cluster_node(
             let mut combined: Option<RoaringBitmap> = None;
             let mut prep_children = Vec::with_capacity(children.len());
             for child in children {
-                let (cands, pnode) = eval_cluster_node(storage, schema, child)?;
+                let (cands, pnode) = eval_cluster_node(storage, schema, child, fts_index)?;
                 match cands {
                     ClusterCandidates::All => {}
                     ClusterCandidates::Subset(bm) => {
@@ -292,7 +307,7 @@ fn eval_cluster_node(
             let mut union_bm = RoaringBitmap::new();
             let mut prep_children = Vec::with_capacity(children.len());
             for child in children {
-                let (cands, pnode) = eval_cluster_node(storage, schema, child)?;
+                let (cands, pnode) = eval_cluster_node(storage, schema, child, fts_index)?;
                 match cands {
                     ClusterCandidates::All => is_all = true,
                     ClusterCandidates::Subset(bm) => {
@@ -311,7 +326,7 @@ fn eval_cluster_node(
             Ok((cands, PreparedNode::Or(prep_children)))
         }
         Filter::Not(child) => {
-            let (_cands, pnode) = eval_cluster_node(storage, schema, child)?;
+            let (_cands, pnode) = eval_cluster_node(storage, schema, child, fts_index)?;
             Ok((ClusterCandidates::All, PreparedNode::Not(Box::new(pnode))))
         }
         Filter::Eq(attr, val) => {
@@ -334,7 +349,7 @@ fn eval_cluster_node(
         }
         Filter::NotEq(attr, val) => {
             let eq = Filter::Eq(attr.clone(), val.clone());
-            let (_cands, pnode) = eval_cluster_node(storage, schema, &eq)?;
+            let (_cands, pnode) = eval_cluster_node(storage, schema, &eq, fts_index)?;
             let cands = if matches!(val, ScalarValue::Null) {
                 // NotEq(attr, Null) == IsNotNull(attr), which CAN prune clusters!
                 let attr_id = schema.get_by_name(attr).unwrap().id;
@@ -396,7 +411,7 @@ fn eval_cluster_node(
         }
         Filter::NotIn(attr, vals) => {
             let inner = Filter::In(attr.clone(), vals.clone());
-            let (_cands, pnode) = eval_cluster_node(storage, schema, &inner)?;
+            let (_cands, pnode) = eval_cluster_node(storage, schema, &inner, fts_index)?;
             Ok((ClusterCandidates::All, PreparedNode::Not(Box::new(pnode))))
         }
         Filter::Contains(attr, val) => {
@@ -472,6 +487,101 @@ fn eval_cluster_node(
                 )),
             }
         }
+        Filter::ContainsAllTokens {
+            attr,
+            query,
+            last_as_prefix,
+        } => eval_fts_cluster_node(
+            storage,
+            schema,
+            fts_index,
+            FtsPredicateKind::AllTokens,
+            attr,
+            query,
+            *last_as_prefix,
+        ),
+        Filter::ContainsAnyToken {
+            attr,
+            query,
+            last_as_prefix,
+        } => eval_fts_cluster_node(
+            storage,
+            schema,
+            fts_index,
+            FtsPredicateKind::AnyToken,
+            attr,
+            query,
+            *last_as_prefix,
+        ),
+        Filter::ContainsTokenSequence {
+            attr,
+            query,
+            last_as_prefix,
+        } => eval_fts_cluster_node(
+            storage,
+            schema,
+            fts_index,
+            FtsPredicateKind::TokenSequence,
+            attr,
+            query,
+            *last_as_prefix,
+        ),
+    }
+}
+
+fn eval_fts_cluster_node(
+    storage: &Storage,
+    schema: &CollectionSchema,
+    fts_index: Option<&FtsIndex>,
+    kind: FtsPredicateKind,
+    attr: &str,
+    query: &izzydb_core::filter::TokenQuery,
+    last_as_prefix: bool,
+) -> Result<(ClusterCandidates, PreparedNode)> {
+    let default_fts;
+    let fts = match fts_index {
+        Some(idx) => idx,
+        None => {
+            default_fts = FtsIndex::new();
+            &default_fts
+        }
+    };
+    let fts_bm = fts.eval_fts_predicate(storage, schema, kind, attr, query, last_as_prefix)?;
+    if fts_bm.is_empty() {
+        return Ok((
+            ClusterCandidates::Subset(RoaringBitmap::new()),
+            PreparedNode::False,
+        ));
+    }
+    let fts_ids: Vec<u32> = fts_bm.iter().collect();
+    let opt_doc_ids = storage.multi_get_doc_ids_from_fts(&fts_ids)?;
+    let doc_ids: Vec<DocId> = opt_doc_ids.into_iter().flatten().collect();
+    if doc_ids.is_empty() {
+        return Ok((
+            ClusterCandidates::Subset(RoaringBitmap::new()),
+            PreparedNode::False,
+        ));
+    }
+    let locs = storage.multi_get_doc_locs(&doc_ids)?;
+    let mut leaf_bm = RoaringBitmap::new();
+    let mut per_leaf: HashMap<NodeId, RoaringBitmap> = HashMap::new();
+    for loc in locs.into_iter().flatten() {
+        leaf_bm.insert(loc.leaf_id);
+        per_leaf
+            .entry(loc.leaf_id)
+            .or_default()
+            .insert(loc.local_id);
+    }
+    if leaf_bm.is_empty() {
+        Ok((
+            ClusterCandidates::Subset(RoaringBitmap::new()),
+            PreparedNode::False,
+        ))
+    } else {
+        Ok((
+            ClusterCandidates::Subset(leaf_bm),
+            PreparedNode::LeafLocalMasks(per_leaf),
+        ))
     }
 }
 
@@ -487,7 +597,7 @@ fn eval_is_null_node(storage: &Storage, attr_id: AttrId) -> Result<PreparedNode>
 
 fn collect_posting_keys(node: &PreparedNode, leaf_ids: &[NodeId], out: &mut Vec<Vec<u8>>) {
     match node {
-        PreparedNode::True | PreparedNode::False => {}
+        PreparedNode::True | PreparedNode::False | PreparedNode::LeafLocalMasks(_) => {}
         PreparedNode::And(children) | PreparedNode::Or(children) => {
             for c in children {
                 collect_posting_keys(c, leaf_ids, out);
@@ -509,7 +619,7 @@ fn collect_posting_keys(node: &PreparedNode, leaf_ids: &[NodeId], out: &mut Vec<
 fn node_needs_complement(node: &PreparedNode) -> bool {
     match node {
         PreparedNode::True | PreparedNode::Not(_) => true,
-        PreparedNode::False | PreparedNode::Keys(_) => false,
+        PreparedNode::False | PreparedNode::Keys(_) | PreparedNode::LeafLocalMasks(_) => false,
         PreparedNode::And(children) | PreparedNode::Or(children) => {
             children.iter().any(node_needs_complement)
         }
@@ -525,6 +635,7 @@ fn eval_prepared_leaf(
     match node {
         PreparedNode::True => all_local.cloned().unwrap_or_default(),
         PreparedNode::False => RoaringBitmap::new(),
+        PreparedNode::LeafLocalMasks(map) => map.get(&leaf_id).cloned().unwrap_or_default(),
         PreparedNode::And(children) => {
             let mut acc: Option<RoaringBitmap> = None;
             for child in children {

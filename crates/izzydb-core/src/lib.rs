@@ -5,13 +5,18 @@ pub mod error;
 pub mod filter;
 pub mod kmeans;
 pub mod metric;
+pub mod rank;
 pub mod schema;
 pub mod simd;
 
-pub use config::{AttrId, DistanceMetric, DocId, LocalId, NodeId, TreeConfig};
+pub use config::{
+    AttrId, DistanceMetric, DocId, FTS_BLOCK_SIZE, FtsBlockId, FtsDocId, LocalId, NodeId,
+    TreeConfig, fts_block_id, fts_slot, make_fts_doc_id,
+};
 pub use error::{Result, TreeError};
-pub use filter::Filter;
+pub use filter::{Filter, FtsPredicateKind, TokenQuery};
+pub use rank::{Bm25Overrides, RankBy};
 pub use schema::{
     AttributeConfig, AttributeType, AttributeValue, Attributes, CollectionConfig, CollectionSchema,
-    ScalarValue,
+    FullTextSearchConfig, Language, ScalarValue, Tokenizer,
 };

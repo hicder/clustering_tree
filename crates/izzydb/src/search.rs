@@ -7,6 +7,7 @@ use crate::attr_index::{AttributeIndex, ClusterCandidates};
 use crate::config::{DistanceMetric, DocId, NodeId, TreeConfig};
 use crate::error::{Result, TreeError};
 use crate::filter::Filter;
+use crate::fts_index::FtsIndex;
 use crate::metric::{cluster_distance, prepare_vector_cow, search_distance, search_distance_bytes};
 use crate::node::{LeafNodeView, PackedInternalNode, TreeMeta};
 use crate::rabitq::{
@@ -273,6 +274,7 @@ pub fn search_filtered(
     quantizer: &RabitqQuantizer,
     schema: &CollectionSchema,
     attr_index: &AttributeIndex,
+    fts_index: Option<&FtsIndex>,
     query: &[f32],
     opts: SearchOptions,
     filter: &Filter,
@@ -289,8 +291,8 @@ pub fn search_filtered(
         return Ok(Vec::new());
     }
 
-    // Step 1: Cluster-level pruning via cf_attr_clusters.
-    let prepared = attr_index.prepare_filter(storage, schema, filter)?;
+    // Step 1: Cluster-level pruning via cf_attr_clusters (and FtsIndex for FTS predicates).
+    let prepared = attr_index.prepare_filter_with_fts(storage, schema, filter, fts_index)?;
     if prepared.cluster_candidates.is_empty() {
         return Ok(Vec::new());
     }

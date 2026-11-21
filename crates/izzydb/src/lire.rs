@@ -1,9 +1,11 @@
+//! SPFresh LIRE boundary-vector reassignment after leaf splits.
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
-use crate::config::{DocId, NodeId};
+use crate::config::{DistanceMetric, DocId, NodeId};
 use crate::error::{Result, TreeError};
 use crate::metric::{cluster_distance, compute_mean_centroid_flat};
-use crate::node::{LeafNodeView, decode_f32_slice};
+use crate::node::{LeafNodeView, PackedLeafNode, decode_f32_slice};
 use crate::rabitq::EncodeScratch;
 use crate::search;
 use crate::storage::TxContext;
@@ -13,6 +15,11 @@ use crate::tree::{
 };
 
 const MAX_LIRE_ROUNDS: usize = 4;
+
+struct NeighborLeaves {
+    centroids: HashMap<NodeId, Vec<f32>>,
+    doc_ids: HashMap<NodeId, Vec<DocId>>,
+}
 
 /// Run SPFresh LIRE boundary reassignment after a leaf split, invoking `on_delta`
 /// inside each atomic `TxContext` before commit so external indexes (e.g. `AttributeIndex`)
@@ -48,24 +55,14 @@ where
             };
             let count = leaf.entry_count();
             if count > tree.config.max_leaf_size {
-                let mut tx = TxContext::new(
-                    &tree.storage,
-                    &mut tree.internal_cache,
-                    &mut tree.leaf_parent,
-                    tree.meta.clone(),
-                );
-                let mut delta = ClusterDelta::default();
-                let split_pair = split_node(
-                    &mut tx,
-                    leaf_id,
-                    &tree.config,
-                    &tree.quantizer,
-                    &mut delta,
-                )?;
-                if !delta.is_empty() {
-                    on_delta(&mut tx, &delta)?;
-                }
-                tree.meta = tx.commit()?;
+                let split_pair = tree.in_tx(|tx, config, quantizer| {
+                    let mut delta = ClusterDelta::default();
+                    let split_pair = split_node(tx, leaf_id, config, quantizer, &mut delta)?;
+                    if !delta.is_empty() {
+                        on_delta(tx, &delta)?;
+                    }
+                    Ok(split_pair)
+                })?;
 
                 for child_id in [split_pair.left_id, split_pair.right_id] {
                     if let Some(ch) = tree.storage.get_leaf_node(child_id)?
@@ -80,24 +77,14 @@ where
                     break;
                 }
             } else if leaf_id != tree.meta.root_id && count < tree.config.min_leaf_size {
-                let mut tx = TxContext::new(
-                    &tree.storage,
-                    &mut tree.internal_cache,
-                    &mut tree.leaf_parent,
-                    tree.meta.clone(),
-                );
-                let mut delta = ClusterDelta::default();
-                handle_underflow(
-                    &mut tx,
-                    leaf_id,
-                    &tree.config,
-                    &tree.quantizer,
-                    &mut delta,
-                )?;
-                if !delta.is_empty() {
-                    on_delta(&mut tx, &delta)?;
-                }
-                tree.meta = tx.commit()?;
+                tree.in_tx(|tx, config, quantizer| {
+                    let mut delta = ClusterDelta::default();
+                    handle_underflow(tx, leaf_id, config, quantizer, &mut delta)?;
+                    if !delta.is_empty() {
+                        on_delta(tx, &delta)?;
+                    }
+                    Ok(())
+                })?;
             }
         }
     }
@@ -121,6 +108,19 @@ where
         return Ok(());
     };
 
+    let Some(neighbors) = load_neighbor_leaves(tree, &pair)? else {
+        return Ok(());
+    };
+
+    let plan = collect_npa_moves(tree, &pair, &u_leaf, &v_leaf, &neighbors)?;
+    if plan.moves.is_empty() {
+        return Ok(());
+    }
+
+    apply_leaf_moves(tree, &plan.moves, &plan.vecs_by_id, maintenance, on_delta)
+}
+
+fn load_neighbor_leaves(tree: &ClusteringTree, pair: &SplitPair) -> Result<Option<NeighborLeaves>> {
     let m = tree.config.lire_neighbor_count;
     let beam = (m + 2).max(tree.config.insert_beam_width);
     let candidate_leaves = search::search_leaves(
@@ -139,7 +139,7 @@ where
         .take(m)
         .collect();
     if neighbor_ids.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     neighbor_ids.sort_unstable();
 
@@ -147,41 +147,57 @@ where
     let padded_dim = tree.quantizer.padded_dim();
     let words = tree.quantizer.num_words();
 
-    let mut neighbor_centroids: HashMap<NodeId, Vec<f32>> = HashMap::new();
-    let mut neighbor_doc_ids: HashMap<NodeId, Vec<DocId>> = HashMap::new();
-    {
-        let neighbor_slices = tree.storage.multi_get_leaf_nodes_pinned(&neighbor_ids)?;
-        for (&nid, opt_slice) in neighbor_ids.iter().zip(neighbor_slices.iter()) {
-            if let Some(slice) = opt_slice {
-                let view = LeafNodeView::parse(slice, dim, padded_dim, words)?;
-                neighbor_centroids.insert(nid, view.centroid_cow(dim)?.into_owned());
-                let mut doc_ids = Vec::with_capacity(view.live_count);
-                for slot in 0..view.slot_cap {
-                    if view.is_live(slot) {
-                        doc_ids.push(view.doc_id(slot));
-                    }
+    let mut centroids: HashMap<NodeId, Vec<f32>> = HashMap::new();
+    let mut doc_ids: HashMap<NodeId, Vec<DocId>> = HashMap::new();
+    let neighbor_slices = tree.storage.multi_get_leaf_nodes_pinned(&neighbor_ids)?;
+    for (&nid, opt_slice) in neighbor_ids.iter().zip(neighbor_slices.iter()) {
+        if let Some(slice) = opt_slice {
+            let view = LeafNodeView::parse(slice, dim, padded_dim, words)?;
+            centroids.insert(nid, view.centroid_cow(dim)?.into_owned());
+            let mut live_ids = Vec::with_capacity(view.live_count);
+            for slot in 0..view.slot_cap {
+                if view.is_live(slot) {
+                    live_ids.push(view.doc_id(slot));
                 }
-                neighbor_doc_ids.insert(nid, doc_ids);
             }
+            doc_ids.insert(nid, live_ids);
         }
     }
-    if neighbor_centroids.is_empty() {
-        return Ok(());
+    if centroids.is_empty() {
+        return Ok(None);
     }
+    Ok(Some(NeighborLeaves { centroids, doc_ids }))
+}
 
+struct NpaMovePlan {
+    moves: Vec<(DocId, NodeId, NodeId)>,
+    vecs_by_id: HashMap<DocId, Vec<f32>>,
+}
+
+fn collect_npa_moves(
+    tree: &ClusteringTree,
+    pair: &SplitPair,
+    u_leaf: &PackedLeafNode,
+    v_leaf: &PackedLeafNode,
+    neighbors: &NeighborLeaves,
+) -> Result<NpaMovePlan> {
     let metric = tree.config.metric;
+    let dim = tree.config.dim;
     let c_u = &u_leaf.centroid;
     let c_v = &v_leaf.centroid;
 
     // Identify NPA-qualifying neighbors up front so we can batch-fetch all required vectors once.
-    let mut npa_neighbors: Vec<NodeId> = Vec::new();
-    for (&nid, c_n) in &neighbor_centroids {
-        let d_old = cluster_distance(metric, c_n, &pair.old_centroid);
-        let d_new_min = cluster_distance(metric, c_n, c_u).min(cluster_distance(metric, c_n, c_v));
-        if d_new_min < d_old {
-            npa_neighbors.push(nid);
-        }
-    }
+    let mut npa_neighbors: Vec<NodeId> = neighbors
+        .centroids
+        .iter()
+        .filter(|&(_, c_n)| {
+            let d_old = cluster_distance(metric, c_n, &pair.old_centroid);
+            let d_new_min =
+                cluster_distance(metric, c_n, c_u).min(cluster_distance(metric, c_n, c_v));
+            d_new_min < d_old
+        })
+        .map(|(&nid, _)| nid)
+        .collect();
     npa_neighbors.sort_unstable();
 
     let u_docs = u_leaf.live_doc_ids();
@@ -190,7 +206,7 @@ where
     required_doc_ids.extend_from_slice(&u_docs);
     required_doc_ids.extend_from_slice(&v_docs);
     for &nid in &npa_neighbors {
-        if let Some(ids) = neighbor_doc_ids.get(&nid) {
+        if let Some(ids) = neighbors.doc_ids.get(&nid) {
             required_doc_ids.extend_from_slice(ids);
         }
     }
@@ -198,38 +214,25 @@ where
     required_doc_ids.dedup();
 
     let mut vecs_by_id: HashMap<DocId, Vec<f32>> = HashMap::with_capacity(required_doc_ids.len());
-    {
-        let vec_slices = tree.storage.multi_get_vectors_pinned(&required_doc_ids)?;
-        for (&doc_id, opt_slice) in required_doc_ids.iter().zip(vec_slices.iter()) {
-            let slice = opt_slice.as_ref().ok_or_else(|| {
-                TreeError::CorruptedData(format!("missing vector {doc_id} in cf_vectors"))
-            })?;
-            vecs_by_id.insert(doc_id, decode_f32_slice(slice, dim)?);
-        }
+    let vec_slices = tree.storage.multi_get_vectors_pinned(&required_doc_ids)?;
+    for (&doc_id, opt_slice) in required_doc_ids.iter().zip(vec_slices.iter()) {
+        let slice = opt_slice.as_ref().ok_or_else(|| {
+            TreeError::CorruptedData(format!("missing vector {doc_id} in cf_vectors"))
+        })?;
+        vecs_by_id.insert(doc_id, decode_f32_slice(slice, dim)?);
     }
 
     let mut moves: Vec<(DocId, NodeId, NodeId)> = Vec::new();
 
     // 1. Outward check: vectors in U and V that are closer to a neighbor leaf's centroid.
-    let mut uv_leaves = [(pair.left_id, &u_leaf, u_docs), (pair.right_id, &v_leaf, v_docs)];
+    let mut uv_leaves = [(pair.left_id, u_leaf, u_docs), (pair.right_id, v_leaf, v_docs)];
     uv_leaves.sort_unstable_by_key(|&(id, _, _)| id);
     for (src_id, src_leaf, src_docs) in uv_leaves {
         let src_centroid = &src_leaf.centroid;
         for doc_id in src_docs {
             let vec = &vecs_by_id[&doc_id];
             let d_self = cluster_distance(metric, vec, src_centroid);
-            let mut best_neighbor: Option<(NodeId, f32)> = None;
-            for (&nid, c_n) in &neighbor_centroids {
-                let d_n = cluster_distance(metric, vec, c_n);
-                if d_n < d_self
-                    && best_neighbor.is_none_or(|(best_id, best_d)| {
-                        d_n < best_d || (d_n == best_d && nid < best_id)
-                    })
-                {
-                    best_neighbor = Some((nid, d_n));
-                }
-            }
-            if let Some((to_id, _)) = best_neighbor {
+            if let Some(to_id) = closest_closer_neighbor(vec, d_self, &neighbors.centroids, metric) {
                 moves.push((doc_id, src_id, to_id));
             }
         }
@@ -237,8 +240,8 @@ where
 
     // 2. Inward check: neighbor leaves filtered by NPA condition.
     for &nid in &npa_neighbors {
-        let c_n = &neighbor_centroids[&nid];
-        let Some(doc_ids) = neighbor_doc_ids.get(&nid) else {
+        let c_n = &neighbors.centroids[&nid];
+        let Some(doc_ids) = neighbors.doc_ids.get(&nid) else {
             continue;
         };
         for &doc_id in doc_ids {
@@ -257,116 +260,131 @@ where
         }
     }
 
-    if moves.is_empty() {
-        return Ok(());
-    }
+    Ok(NpaMovePlan { moves, vecs_by_id })
+}
 
-    let max_leaf_size = tree.config.max_leaf_size;
-    let min_leaf_size = tree.config.min_leaf_size;
-    let mut tx = TxContext::new(
-        &tree.storage,
-        &mut tree.internal_cache,
-        &mut tree.leaf_parent,
-        tree.meta.clone(),
-    );
-    let mut touched_leaves = BTreeSet::new();
-    for &(_, from_leaf_id, to_leaf_id) in &moves {
-        touched_leaves.insert(from_leaf_id);
-        touched_leaves.insert(to_leaf_id);
-    }
-
-    // Record pre-move (doc_id, leaf_id, local_id) for all touched leaves before mutating.
-    let mut leaf_doc_ids: BTreeMap<NodeId, Vec<DocId>> = BTreeMap::new();
-    let mut delta = ClusterDelta::default();
-    for &leaf_id in &touched_leaves {
-        let leaf = tx.get_leaf_node(leaf_id)?;
-        let mut docs = Vec::with_capacity(leaf.live_count);
-        for (lid, did) in leaf.live_slot_doc_pairs() {
-            delta.removed.push((did, leaf_id, lid));
-            docs.push(did);
-        }
-        docs.sort_unstable();
-        leaf_doc_ids.insert(leaf_id, docs);
-    }
-
-    for &(doc_id, from_leaf_id, to_leaf_id) in &moves {
-        let from_docs = leaf_doc_ids.get_mut(&from_leaf_id).unwrap();
-        let pos = from_docs
-            .binary_search(&doc_id)
-            .expect("moved doc must exist in source leaf");
-        from_docs.remove(pos);
-
-        let to_docs = leaf_doc_ids.get_mut(&to_leaf_id).unwrap();
-        if let Err(pos) = to_docs.binary_search(&doc_id) {
-            to_docs.insert(pos, doc_id);
+#[inline]
+fn closest_closer_neighbor(
+    vec: &[f32],
+    d_self: f32,
+    centroids: &HashMap<NodeId, Vec<f32>>,
+    metric: DistanceMetric,
+) -> Option<NodeId> {
+    let mut best: Option<(NodeId, f32)> = None;
+    for (&nid, c_n) in centroids {
+        let d_n = cluster_distance(metric, vec, c_n);
+        if d_n < d_self
+            && best.is_none_or(|(best_id, best_d)| d_n < best_d || (d_n == best_d && nid < best_id))
+        {
+            best = Some((nid, d_n));
         }
     }
+    best.map(|(id, _)| id)
+}
 
-    let mut scratch = EncodeScratch::default();
-    for leaf_id in touched_leaves {
-        let mut leaf = tx.get_leaf_node(leaf_id)?;
-        let doc_ids = leaf_doc_ids.remove(&leaf_id).unwrap();
-        let old_c = leaf.centroid.clone();
-        let count = doc_ids.len();
+fn apply_leaf_moves<F>(
+    tree: &mut ClusteringTree,
+    moves: &[(DocId, NodeId, NodeId)],
+    vecs_by_id: &HashMap<DocId, Vec<f32>>,
+    maintenance: &mut VecDeque<NodeId>,
+    on_delta: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&mut TxContext<'_>, &ClusterDelta) -> Result<()>,
+{
+    tree.in_tx(|tx, config, quantizer| {
+        let dim = config.dim;
+        let metric = config.metric;
+        let mut touched_leaves = BTreeSet::new();
+        for &(_, from_leaf_id, to_leaf_id) in moves {
+            touched_leaves.insert(from_leaf_id);
+            touched_leaves.insert(to_leaf_id);
+        }
 
-        if count == 0 {
-            leaf.centroid = vec![0.0; dim];
-            leaf.rotated_centroid.fill(0.0);
-            leaf.reset_and_encode(&[], &[], &tree.quantizer, dim, &mut scratch);
-        } else {
-            let mut flat_vecs = vec![0.0f32; count * dim];
-            let mut missing: Vec<(DocId, usize)> = Vec::new();
-            for (slot, &id) in doc_ids.iter().enumerate() {
-                if let Some(v) = vecs_by_id.get(&id) {
-                    flat_vecs[slot * dim..(slot + 1) * dim].copy_from_slice(v);
-                } else {
-                    missing.push((id, slot));
-                }
-            }
-            if !missing.is_empty() {
-                let missing_ids: Vec<DocId> = missing.iter().map(|&(id, _)| id).collect();
-                let fetched = tx.get_vectors_flat(&missing_ids)?;
-                for (i, &(_, slot)) in missing.iter().enumerate() {
-                    flat_vecs[slot * dim..(slot + 1) * dim]
-                        .copy_from_slice(&fetched[i * dim..(i + 1) * dim]);
-                }
-            }
-            leaf.centroid = compute_mean_centroid_flat(&flat_vecs, count, dim, metric);
-            leaf.reset_and_encode(&doc_ids, &flat_vecs, &tree.quantizer, dim, &mut scratch);
+        // Record pre-move (doc_id, leaf_id, local_id) for all touched leaves before mutating.
+        let mut leaf_doc_ids: BTreeMap<NodeId, Vec<DocId>> = BTreeMap::new();
+        let mut delta = ClusterDelta::default();
+        for &leaf_id in &touched_leaves {
+            let leaf = tx.get_leaf_node(leaf_id)?;
+            let mut docs = Vec::with_capacity(leaf.live_count);
             for (lid, did) in leaf.live_slot_doc_pairs() {
-                tx.put_doc_pos(did, leaf_id, lid);
-                delta.added.push((did, leaf_id, lid));
+                delta.removed.push((did, leaf_id, lid));
+                docs.push(did);
+            }
+            docs.sort_unstable();
+            leaf_doc_ids.insert(leaf_id, docs);
+        }
+
+        for &(doc_id, from_leaf_id, to_leaf_id) in moves {
+            let from_docs = leaf_doc_ids.get_mut(&from_leaf_id).unwrap();
+            let pos = from_docs
+                .binary_search(&doc_id)
+                .expect("moved doc must exist in source leaf");
+            from_docs.remove(pos);
+
+            let to_docs = leaf_doc_ids.get_mut(&to_leaf_id).unwrap();
+            if let Err(pos) = to_docs.binary_search(&doc_id) {
+                to_docs.insert(pos, doc_id);
             }
         }
 
-        let parent_id = leaf.parent_id;
-        let new_c = leaf.centroid.clone();
-        tx.put_leaf_node(leaf_id, leaf);
+        let mut scratch = EncodeScratch::default();
+        for leaf_id in touched_leaves {
+            let mut leaf = tx.get_leaf_node(leaf_id)?;
+            let doc_ids = leaf_doc_ids.remove(&leaf_id).unwrap();
+            let old_c = leaf.centroid.clone();
+            let count = doc_ids.len();
 
-        if count > 0
-            && let Some(pid) = parent_id
-        {
-            propagate_centroid_upward(
-                &mut tx,
-                leaf_id,
-                pid,
-                count as u64,
-                &old_c,
-                &new_c,
-                &tree.config,
-            )?;
+            if count == 0 {
+                leaf.centroid = vec![0.0; dim];
+                leaf.rotated_centroid.fill(0.0);
+                leaf.reset_and_encode(&[], &[], quantizer, dim, &mut scratch);
+            } else {
+                let mut flat_vecs = vec![0.0f32; count * dim];
+                let mut missing: Vec<(DocId, usize)> = Vec::new();
+                for (slot, &id) in doc_ids.iter().enumerate() {
+                    if let Some(v) = vecs_by_id.get(&id) {
+                        flat_vecs[slot * dim..(slot + 1) * dim].copy_from_slice(v);
+                    } else {
+                        missing.push((id, slot));
+                    }
+                }
+                if !missing.is_empty() {
+                    let missing_ids: Vec<DocId> = missing.iter().map(|&(id, _)| id).collect();
+                    let fetched = tx.get_vectors_flat(&missing_ids)?;
+                    for (i, &(_, slot)) in missing.iter().enumerate() {
+                        flat_vecs[slot * dim..(slot + 1) * dim]
+                            .copy_from_slice(&fetched[i * dim..(i + 1) * dim]);
+                    }
+                }
+                leaf.centroid = compute_mean_centroid_flat(&flat_vecs, count, dim, metric);
+                leaf.reset_and_encode(&doc_ids, &flat_vecs, quantizer, dim, &mut scratch);
+                for (lid, did) in leaf.live_slot_doc_pairs() {
+                    tx.put_doc_pos(did, leaf_id, lid);
+                    delta.added.push((did, leaf_id, lid));
+                }
+            }
+
+            let parent_id = leaf.parent_id;
+            let new_c = leaf.centroid.clone();
+            tx.put_leaf_node(leaf_id, leaf);
+
+            if count > 0
+                && let Some(pid) = parent_id
+            {
+                propagate_centroid_upward(tx, leaf_id, pid, count as u64, &old_c, &new_c, config)?;
+            }
+
+            if count > config.max_leaf_size
+                || (leaf_id != tx.meta().root_id && count < config.min_leaf_size)
+            {
+                maintenance.push_back(leaf_id);
+            }
         }
 
-        if count > max_leaf_size
-            || (leaf_id != tx.meta().root_id && count < min_leaf_size)
-        {
-            maintenance.push_back(leaf_id);
+        if !delta.is_empty() {
+            on_delta(tx, &delta)?;
         }
-    }
-
-    if !delta.is_empty() {
-        on_delta(&mut tx, &delta)?;
-    }
-    tree.meta = tx.commit()?;
-    Ok(())
+        Ok(())
+    })
 }

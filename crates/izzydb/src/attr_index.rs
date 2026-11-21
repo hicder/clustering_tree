@@ -1,3 +1,6 @@
+//! Cluster-aware inverted attribute index (`cf_attr_clusters`, `cf_attr_postings`, `cf_attr_zones`)
+//! and two-phase filter planner/evaluator.
+
 use std::collections::{HashMap, HashSet};
 
 use roaring::RoaringBitmap;
@@ -12,7 +15,7 @@ use izzydb_storage::codec::{
     extract_index_keys_from_entries, make_posting_key, ordered_type_tag,
 };
 use izzydb_storage::node::LeafNodeView;
-use izzydb_storage::{DBPinnableSlice, Storage, TxContext};
+use izzydb_storage::{ByteRange, DBPinnableSlice, Storage, TxContext};
 
 use crate::fts_index::FtsIndex;
 use crate::tree::ClusterDelta;
@@ -502,117 +505,8 @@ fn eval_cluster_node(
     fts_index: Option<&FtsIndex>,
 ) -> Result<(ClusterCandidates, PreparedNode)> {
     match filter {
-        Filter::And(children) => {
-            if children.is_empty() {
-                return Ok((ClusterCandidates::All, PreparedNode::True));
-            }
-            let mut combined: Option<RoaringBitmap> = None;
-            let mut non_range = Vec::with_capacity(children.len());
-            let mut ranges: Vec<PreparedNode> = Vec::new();
-            for child in children {
-                let (cands, pnode) = eval_cluster_node(storage, schema, child, fts_index)?;
-                match cands {
-                    ClusterCandidates::All => {}
-                    ClusterCandidates::Subset(bm) => {
-                        if bm.is_empty() {
-                            return Ok((
-                                ClusterCandidates::Subset(RoaringBitmap::new()),
-                                PreparedNode::False,
-                            ));
-                        }
-                        combined = Some(match combined {
-                            Some(mut cur) => {
-                                cur &= &bm;
-                                cur
-                            }
-                            None => bm,
-                        });
-                        if combined.as_ref().is_some_and(RoaringBitmap::is_empty) {
-                            return Ok((
-                                ClusterCandidates::Subset(RoaringBitmap::new()),
-                                PreparedNode::False,
-                            ));
-                        }
-                    }
-                }
-                match pnode {
-                    PreparedNode::True => {}
-                    PreparedNode::False => {
-                        return Ok((
-                            ClusterCandidates::Subset(RoaringBitmap::new()),
-                            PreparedNode::False,
-                        ));
-                    }
-                    PreparedNode::And(sub) => {
-                        for item in sub {
-                            push_and_child(item, &mut non_range, &mut ranges);
-                        }
-                    }
-                    other => push_and_child(other, &mut non_range, &mut ranges),
-                }
-            }
-            // Validate coalesced ranges (e.g., Gte(200) && Lte(400) or contradictory bounds).
-            for r in &ranges {
-                if let PreparedNode::Range {
-                    lo: Some((lo_b, lo_inc)),
-                    hi: Some((hi_b, hi_inc)),
-                    cands,
-                    ..
-                } = r
-                    && (cands.is_empty()
-                        || lo_b > hi_b
-                        || (lo_b == hi_b && (!*lo_inc || !*hi_inc)))
-                {
-                    return Ok((
-                        ClusterCandidates::Subset(RoaringBitmap::new()),
-                        PreparedNode::False,
-                    ));
-                }
-            }
-            // Evaluate non-range predicates before range scans so cheap equality/FTS masks short-circuit ranges.
-            non_range.extend(ranges);
-            let cands = match combined {
-                Some(bm) => ClusterCandidates::Subset(bm),
-                None => ClusterCandidates::All,
-            };
-            let node = if non_range.is_empty() {
-                PreparedNode::True
-            } else if non_range.len() == 1 {
-                non_range.pop().unwrap()
-            } else {
-                PreparedNode::And(non_range)
-            };
-            Ok((cands, node))
-        }
-        Filter::Or(children) => {
-            if children.is_empty() {
-                return Ok((
-                    ClusterCandidates::Subset(RoaringBitmap::new()),
-                    PreparedNode::False,
-                ));
-            }
-            let mut is_all = false;
-            let mut union_bm = RoaringBitmap::new();
-            let mut prep_children = Vec::with_capacity(children.len());
-            for child in children {
-                let (cands, pnode) = eval_cluster_node(storage, schema, child, fts_index)?;
-                match cands {
-                    ClusterCandidates::All => is_all = true,
-                    ClusterCandidates::Subset(bm) => {
-                        if !is_all {
-                            union_bm |= &bm;
-                        }
-                    }
-                }
-                prep_children.push(pnode);
-            }
-            let cands = if is_all {
-                ClusterCandidates::All
-            } else {
-                ClusterCandidates::Subset(union_bm)
-            };
-            Ok((cands, PreparedNode::Or(prep_children)))
-        }
+        Filter::And(children) => eval_and_cluster_node(storage, schema, children, fts_index),
+        Filter::Or(children) => eval_or_cluster_node(storage, schema, children, fts_index),
         Filter::Not(child) => {
             let (_cands, pnode) = eval_cluster_node(storage, schema, child, fts_index)?;
             Ok((ClusterCandidates::All, PreparedNode::Not(Box::new(pnode))))
@@ -624,78 +518,21 @@ fn eval_cluster_node(
                 return Ok((ClusterCandidates::All, pnode));
             }
             let key = encode_scalar_cluster_key(attr_id, val)?;
-            match storage.get_attr_cluster_bitmap(&key)? {
-                Some(bm) if !bm.is_empty() => Ok((
-                    ClusterCandidates::Subset(bm.clone()),
-                    PreparedNode::Keys(vec![(key, bm)]),
-                )),
-                _ => Ok((
-                    ClusterCandidates::Subset(RoaringBitmap::new()),
-                    PreparedNode::False,
-                )),
-            }
+            eval_single_key_cluster_node(storage, key)
         }
         Filter::NotEq(attr, val) => {
             let eq = Filter::Eq(attr.clone(), val.clone());
             let (_cands, pnode) = eval_cluster_node(storage, schema, &eq, fts_index)?;
-            let cands = if matches!(val, ScalarValue::Null) {
-                // NotEq(attr, Null) == IsNotNull(attr), which CAN prune clusters!
+            if matches!(val, ScalarValue::Null) {
+                // NotEq(attr, Null) == IsNotNull(attr), which CAN prune clusters.
                 let attr_id = schema.get_by_name(attr).unwrap().id;
-                let key = encode_present_cluster_key(attr_id);
-                match storage.get_attr_cluster_bitmap(&key)? {
-                    Some(bm) if !bm.is_empty() => {
-                        return Ok((
-                            ClusterCandidates::Subset(bm.clone()),
-                            PreparedNode::Keys(vec![(key, bm)]),
-                        ));
-                    }
-                    _ => ClusterCandidates::Subset(RoaringBitmap::new()),
-                }
-            } else {
-                ClusterCandidates::All
-            };
-            Ok((cands, PreparedNode::Not(Box::new(pnode))))
+                return eval_single_key_cluster_node(storage, encode_present_cluster_key(attr_id));
+            }
+            Ok((ClusterCandidates::All, PreparedNode::Not(Box::new(pnode))))
         }
         Filter::In(attr, vals) | Filter::ContainsAny(attr, vals) => {
             let attr_id = schema.get_by_name(attr).unwrap().id;
-            let mut has_null = false;
-            let mut keys: Vec<Vec<u8>> = Vec::with_capacity(vals.len());
-            for val in vals {
-                if matches!(val, ScalarValue::Null) {
-                    has_null = true;
-                } else {
-                    keys.push(encode_scalar_cluster_key(attr_id, val)?);
-                }
-            }
-            keys.sort_unstable();
-            keys.dedup();
-
-            let bitmaps = storage.multi_get_attr_cluster_bitmaps(&keys)?;
-            let mut union_bm = RoaringBitmap::new();
-            let mut items = Vec::new();
-            for (key, opt_bm) in keys.into_iter().zip(bitmaps) {
-                if let Some(bm) = opt_bm
-                    && !bm.is_empty()
-                {
-                    union_bm |= &bm;
-                    items.push((key, bm));
-                }
-            }
-            let non_null_node = if items.is_empty() {
-                PreparedNode::False
-            } else {
-                PreparedNode::Keys(items)
-            };
-
-            if has_null {
-                let null_node = eval_is_null_node(storage, attr_id)?;
-                Ok((
-                    ClusterCandidates::All,
-                    PreparedNode::Or(vec![non_null_node, null_node]),
-                ))
-            } else {
-                Ok((ClusterCandidates::Subset(union_bm), non_null_node))
-            }
+            eval_in_cluster_node(storage, attr_id, vals)
         }
         Filter::NotIn(attr, vals) => {
             let inner = Filter::In(attr.clone(), vals.clone());
@@ -704,70 +541,12 @@ fn eval_cluster_node(
         }
         Filter::Contains(attr, val) => {
             let attr_id = schema.get_by_name(attr).unwrap().id;
-            let key = encode_scalar_cluster_key(attr_id, val)?;
-            match storage.get_attr_cluster_bitmap(&key)? {
-                Some(bm) if !bm.is_empty() => Ok((
-                    ClusterCandidates::Subset(bm.clone()),
-                    PreparedNode::Keys(vec![(key, bm)]),
-                )),
-                _ => Ok((
-                    ClusterCandidates::Subset(RoaringBitmap::new()),
-                    PreparedNode::False,
-                )),
-            }
+            eval_single_key_cluster_node(storage, encode_scalar_cluster_key(attr_id, val)?)
         }
         Filter::Lt(attr, val)
         | Filter::Lte(attr, val)
         | Filter::Gt(attr, val)
-        | Filter::Gte(attr, val) => {
-            let entry = schema.get_by_name(attr).unwrap();
-            let type_tag = ordered_type_tag(entry.attr_type)?;
-            let mut bound_bytes = Vec::with_capacity(16);
-            let val_tag = encode_scalar_val_bytes(val, &mut bound_bytes)?;
-            if val_tag != type_tag {
-                return Ok((
-                    ClusterCandidates::Subset(RoaringBitmap::new()),
-                    PreparedNode::False,
-                ));
-            }
-
-            let zones = storage.get_attr_zones_cached()?;
-            let mut bm = RoaringBitmap::new();
-            if let Some(zmap) = zones.get(&(entry.id, type_tag)) {
-                for (&leaf_id, (min_b, max_b)) in zmap {
-                    let overlaps = match filter {
-                        Filter::Lt(_, _) => min_b.as_slice() < bound_bytes.as_slice(),
-                        Filter::Lte(_, _) => min_b.as_slice() <= bound_bytes.as_slice(),
-                        Filter::Gt(_, _) => max_b.as_slice() > bound_bytes.as_slice(),
-                        Filter::Gte(_, _) => max_b.as_slice() >= bound_bytes.as_slice(),
-                        _ => unreachable!(),
-                    };
-                    if overlaps {
-                        bm.insert(leaf_id);
-                    }
-                }
-            }
-            if bm.is_empty() {
-                return Ok((ClusterCandidates::Subset(bm), PreparedNode::False));
-            }
-            let (lo, hi) = match filter {
-                Filter::Lt(_, _) => (None, Some((bound_bytes, false))),
-                Filter::Lte(_, _) => (None, Some((bound_bytes, true))),
-                Filter::Gt(_, _) => (Some((bound_bytes, false)), None),
-                Filter::Gte(_, _) => (Some((bound_bytes, true)), None),
-                _ => unreachable!(),
-            };
-            Ok((
-                ClusterCandidates::Subset(bm.clone()),
-                PreparedNode::Range {
-                    attr_id: entry.id,
-                    type_tag,
-                    lo,
-                    hi,
-                    cands: bm,
-                },
-            ))
-        }
+        | Filter::Gte(attr, val) => eval_range_cluster_node(storage, schema, filter, attr, val),
         Filter::IsNull(attr) => {
             let attr_id = schema.get_by_name(attr).unwrap().id;
             let pnode = eval_is_null_node(storage, attr_id)?;
@@ -775,58 +554,233 @@ fn eval_cluster_node(
         }
         Filter::IsNotNull(attr) => {
             let attr_id = schema.get_by_name(attr).unwrap().id;
-            let key = encode_present_cluster_key(attr_id);
-            match storage.get_attr_cluster_bitmap(&key)? {
-                Some(bm) if !bm.is_empty() => Ok((
-                    ClusterCandidates::Subset(bm.clone()),
-                    PreparedNode::Keys(vec![(key, bm)]),
-                )),
-                _ => Ok((
-                    ClusterCandidates::Subset(RoaringBitmap::new()),
-                    PreparedNode::False,
-                )),
+            eval_single_key_cluster_node(storage, encode_present_cluster_key(attr_id))
+        }
+        other => {
+            let (kind, attr, query, last_as_prefix) = other
+                .as_fts_predicate()
+                .expect("all non-FTS Filter variants handled above");
+            eval_fts_cluster_node(storage, schema, fts_index, kind, attr, query, last_as_prefix)
+        }
+    }
+}
+
+fn empty_cluster_result() -> (ClusterCandidates, PreparedNode) {
+    (
+        ClusterCandidates::Subset(RoaringBitmap::new()),
+        PreparedNode::False,
+    )
+}
+
+fn eval_single_key_cluster_node(
+    storage: &Storage,
+    key: Vec<u8>,
+) -> Result<(ClusterCandidates, PreparedNode)> {
+    match storage.get_attr_cluster_bitmap(&key)? {
+        Some(bm) if !bm.is_empty() => Ok((
+            ClusterCandidates::Subset(bm.clone()),
+            PreparedNode::Keys(vec![(key, bm)]),
+        )),
+        _ => Ok(empty_cluster_result()),
+    }
+}
+
+fn eval_and_cluster_node(
+    storage: &Storage,
+    schema: &CollectionSchema,
+    children: &[Filter],
+    fts_index: Option<&FtsIndex>,
+) -> Result<(ClusterCandidates, PreparedNode)> {
+    if children.is_empty() {
+        return Ok((ClusterCandidates::All, PreparedNode::True));
+    }
+    let mut combined: Option<RoaringBitmap> = None;
+    let mut non_range = Vec::with_capacity(children.len());
+    let mut ranges: Vec<PreparedNode> = Vec::new();
+
+    for child in children {
+        let (cands, pnode) = eval_cluster_node(storage, schema, child, fts_index)?;
+        if let ClusterCandidates::Subset(bm) = cands {
+            if bm.is_empty() {
+                return Ok(empty_cluster_result());
+            }
+            combined = Some(match combined {
+                Some(mut cur) => {
+                    cur &= &bm;
+                    if cur.is_empty() {
+                        return Ok(empty_cluster_result());
+                    }
+                    cur
+                }
+                None => bm,
+            });
+        }
+        match pnode {
+            PreparedNode::True => {}
+            PreparedNode::False => return Ok(empty_cluster_result()),
+            PreparedNode::And(sub) => {
+                for item in sub {
+                    push_and_child(item, &mut non_range, &mut ranges);
+                }
+            }
+            other => push_and_child(other, &mut non_range, &mut ranges),
+        }
+    }
+
+    // Validate coalesced ranges (e.g., Gte(200) && Lte(400) or contradictory bounds).
+    for r in &ranges {
+        if let PreparedNode::Range {
+            lo: Some((lo_b, lo_inc)),
+            hi: Some((hi_b, hi_inc)),
+            cands,
+            ..
+        } = r
+            && (cands.is_empty() || lo_b > hi_b || (lo_b == hi_b && (!*lo_inc || !*hi_inc)))
+        {
+            return Ok(empty_cluster_result());
+        }
+    }
+    // Evaluate non-range predicates before range scans so cheap equality/FTS masks short-circuit ranges.
+    non_range.extend(ranges);
+    let cands = match combined {
+        Some(bm) => ClusterCandidates::Subset(bm),
+        None => ClusterCandidates::All,
+    };
+    let node = if non_range.is_empty() {
+        PreparedNode::True
+    } else if non_range.len() == 1 {
+        non_range.pop().unwrap()
+    } else {
+        PreparedNode::And(non_range)
+    };
+    Ok((cands, node))
+}
+
+fn eval_or_cluster_node(
+    storage: &Storage,
+    schema: &CollectionSchema,
+    children: &[Filter],
+    fts_index: Option<&FtsIndex>,
+) -> Result<(ClusterCandidates, PreparedNode)> {
+    if children.is_empty() {
+        return Ok(empty_cluster_result());
+    }
+    let mut is_all = false;
+    let mut union_bm = RoaringBitmap::new();
+    let mut prep_children = Vec::with_capacity(children.len());
+    for child in children {
+        let (cands, pnode) = eval_cluster_node(storage, schema, child, fts_index)?;
+        match cands {
+            ClusterCandidates::All => is_all = true,
+            ClusterCandidates::Subset(bm) if !is_all => union_bm |= &bm,
+            ClusterCandidates::Subset(_) => {}
+        }
+        prep_children.push(pnode);
+    }
+    let cands = if is_all {
+        ClusterCandidates::All
+    } else {
+        ClusterCandidates::Subset(union_bm)
+    };
+    Ok((cands, PreparedNode::Or(prep_children)))
+}
+
+fn eval_in_cluster_node(
+    storage: &Storage,
+    attr_id: AttrId,
+    vals: &[ScalarValue],
+) -> Result<(ClusterCandidates, PreparedNode)> {
+    let mut has_null = false;
+    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(vals.len());
+    for val in vals {
+        if matches!(val, ScalarValue::Null) {
+            has_null = true;
+        } else {
+            keys.push(encode_scalar_cluster_key(attr_id, val)?);
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+
+    let bitmaps = storage.multi_get_attr_cluster_bitmaps(&keys)?;
+    let mut union_bm = RoaringBitmap::new();
+    let mut items = Vec::new();
+    for (key, opt_bm) in keys.into_iter().zip(bitmaps) {
+        if let Some(bm) = opt_bm
+            && !bm.is_empty()
+        {
+            union_bm |= &bm;
+            items.push((key, bm));
+        }
+    }
+    let non_null_node = if items.is_empty() {
+        PreparedNode::False
+    } else {
+        PreparedNode::Keys(items)
+    };
+
+    if has_null {
+        let null_node = eval_is_null_node(storage, attr_id)?;
+        Ok((
+            ClusterCandidates::All,
+            PreparedNode::Or(vec![non_null_node, null_node]),
+        ))
+    } else {
+        Ok((ClusterCandidates::Subset(union_bm), non_null_node))
+    }
+}
+
+fn eval_range_cluster_node(
+    storage: &Storage,
+    schema: &CollectionSchema,
+    filter: &Filter,
+    attr: &str,
+    val: &ScalarValue,
+) -> Result<(ClusterCandidates, PreparedNode)> {
+    let entry = schema.get_by_name(attr).unwrap();
+    let type_tag = ordered_type_tag(entry.attr_type)?;
+    let mut bound_bytes = Vec::with_capacity(16);
+    let val_tag = encode_scalar_val_bytes(val, &mut bound_bytes)?;
+    if val_tag != type_tag {
+        return Ok(empty_cluster_result());
+    }
+
+    let zones = storage.get_attr_zones_cached()?;
+    let mut bm = RoaringBitmap::new();
+    if let Some(zmap) = zones.get(&(entry.id, type_tag)) {
+        for (&leaf_id, (min_b, max_b)) in zmap {
+            let overlaps = match filter {
+                Filter::Lt(_, _) => min_b.as_slice() < bound_bytes.as_slice(),
+                Filter::Lte(_, _) => min_b.as_slice() <= bound_bytes.as_slice(),
+                Filter::Gt(_, _) => max_b.as_slice() > bound_bytes.as_slice(),
+                Filter::Gte(_, _) => max_b.as_slice() >= bound_bytes.as_slice(),
+                _ => unreachable!(),
+            };
+            if overlaps {
+                bm.insert(leaf_id);
             }
         }
-        Filter::ContainsAllTokens {
-            attr,
-            query,
-            last_as_prefix,
-        } => eval_fts_cluster_node(
-            storage,
-            schema,
-            fts_index,
-            FtsPredicateKind::AllTokens,
-            attr,
-            query,
-            *last_as_prefix,
-        ),
-        Filter::ContainsAnyToken {
-            attr,
-            query,
-            last_as_prefix,
-        } => eval_fts_cluster_node(
-            storage,
-            schema,
-            fts_index,
-            FtsPredicateKind::AnyToken,
-            attr,
-            query,
-            *last_as_prefix,
-        ),
-        Filter::ContainsTokenSequence {
-            attr,
-            query,
-            last_as_prefix,
-        } => eval_fts_cluster_node(
-            storage,
-            schema,
-            fts_index,
-            FtsPredicateKind::TokenSequence,
-            attr,
-            query,
-            *last_as_prefix,
-        ),
     }
+    if bm.is_empty() {
+        return Ok((ClusterCandidates::Subset(bm), PreparedNode::False));
+    }
+    let (lo, hi) = match filter {
+        Filter::Lt(_, _) => (None, Some((bound_bytes, false))),
+        Filter::Lte(_, _) => (None, Some((bound_bytes, true))),
+        Filter::Gt(_, _) => (Some((bound_bytes, false)), None),
+        Filter::Gte(_, _) => (Some((bound_bytes, true)), None),
+        _ => unreachable!(),
+    };
+    Ok((
+        ClusterCandidates::Subset(bm.clone()),
+        PreparedNode::Range {
+            attr_id: entry.id,
+            type_tag,
+            lo,
+            hi,
+            cands: bm,
+        },
+    ))
 }
 
 fn eval_fts_cluster_node(
@@ -991,8 +945,10 @@ fn eval_prepared_leaf(
                     *attr_id,
                     *type_tag,
                     leaf_id,
-                    lo.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
-                    hi.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                    ByteRange {
+                        lo: lo.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                        hi: hi.as_ref().map(|(b, inc)| (b.as_slice(), *inc)),
+                    },
                     acc.as_mut_slice(),
                 )?;
             }

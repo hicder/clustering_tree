@@ -1,4 +1,7 @@
-use std::cmp::Ordering;
+//! High-level `Collection` API coordinating the RocksDB [`Storage`],
+//! [`ClusteringTree`] vector index, forward document store (`cf_docs`),
+//! [`AttributeIndex`], and [`FtsIndex`].
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -7,18 +10,17 @@ use roaring::RoaringBitmap;
 
 use crate::attr_index::{AttributeIndex, ClusterCandidates};
 use crate::codec::{DocView, decode_attribute_entries, decode_attributes, encode_attributes};
-use crate::config::{DocId, FtsDocId, NodeId, TreeConfig};
+use crate::config::{AttrId, DocId, FtsDocId, NodeId, TreeConfig};
 use crate::error::{Result, TreeError};
 use crate::filter::Filter;
 use crate::fts_index::{FtsIndex, has_fts_attr_changes, has_fts_patch_changes};
 use crate::lire;
 use crate::metric::prepare_vector;
-use crate::node::LeafNodeView;
 use crate::rabitq::RabitqQuantizer;
 use crate::rank::RankBy;
 use crate::schema::{AttributeValue, Attributes, CollectionConfig, CollectionSchema};
 use crate::search::{self, SearchOptions};
-use crate::storage::{Storage, TxContext};
+use crate::storage::{DocLoc, Storage, TxContext};
 use crate::tree::{
     ClusteringTree, SplitPair, VectorUpdateResult, insert_in_tx, remove_existing_in_tx,
     remove_many_in_tx, update_vector_in_tx,
@@ -27,7 +29,18 @@ use crate::verify::{self, CollectionStats};
 use izzydb_fts::Bm25Result;
 
 const MUTATION_CHUNK_SIZE: usize = 512;
-const RESOLVE_LEAF_CHUNK_SIZE: usize = 64;
+const PUSHDOWN_MAX_CANDIDATE_CLUSTERS: u64 = 64;
+
+enum FilterPushdown {
+    None,
+    Superset(RoaringBitmap),
+    Exact(RoaringBitmap),
+}
+
+enum AttrDiffMode<'a> {
+    Full(&'a Attributes),
+    Patch(&'a Attributes),
+}
 
 /// Partial document mutation applied to an existing document.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -192,19 +205,15 @@ impl Collection {
 
         if reconciled && schema.has_fts() && vector_index.meta.num_vectors > 0 {
             let docs = storage.all_docs_bytes()?;
-            let mut tx = TxContext::new(
-                &vector_index.storage,
-                &mut vector_index.internal_cache,
-                &mut vector_index.leaf_parent,
-                vector_index.meta.clone(),
-            );
-            for (doc_id, raw_bytes) in docs {
-                if tx.get_fts_doc_id(doc_id)?.is_none() {
-                    let attrs = decode_attributes(&schema, &raw_bytes)?;
-                    fts_index.upsert_doc(&mut tx, &schema, doc_id, None, &attrs)?;
+            vector_index.in_tx(|tx, _, _| {
+                for (doc_id, raw_bytes) in docs {
+                    if tx.get_fts_doc_id(doc_id)?.is_none() {
+                        let attrs = decode_attributes(&schema, &raw_bytes)?;
+                        fts_index.upsert_doc(tx, &schema, doc_id, None, &attrs)?;
+                    }
                 }
-            }
-            vector_index.meta = tx.commit()?;
+                Ok(())
+            })?;
         }
 
         Ok(Self {
@@ -247,129 +256,45 @@ impl Collection {
         )?;
         let new_doc_bytes = encode_attributes(&self.schema, &attributes)?;
 
-        let mut tx = TxContext::new(
-            &self.vector_index.storage,
-            &mut self.vector_index.internal_cache,
-            &mut self.vector_index.leaf_parent,
-            self.vector_index.meta.clone(),
-        );
+        let (tree_config, quantizer, mut tx) = self.vector_index.begin_tx_parts();
         let mut splits = Vec::new();
 
         if let Some(old_loc) = tx.get_doc_loc(id)? {
-            let old_vec = tx.get_vectors_flat(&[id])?;
-            let vec_unchanged = old_vec.len() == vec.len()
-                && old_vec
-                    .iter()
-                    .zip(vec.iter())
-                    .all(|(a, b)| a.to_bits() == b.to_bits());
+            let effective_vec = if vectors_bitwise_equal(&tx, id, &vec)? {
+                None
+            } else {
+                Some(vec.as_slice())
+            };
             let old_entries = match tx.get_doc_bytes(id)? {
                 Some(bytes) => decode_attribute_entries(&bytes)?,
                 None => Vec::new(),
             };
             let fts_changed = has_fts_attr_changes(&self.schema, &old_entries, &attributes);
-
-            if vec_unchanged {
-                if fts_changed {
-                    self.fts_index.upsert_doc(
-                        &mut tx,
-                        &self.schema,
-                        id,
-                        Some(&old_entries),
-                        &attributes,
-                    )?;
-                }
-                self.attr_index.diff_doc_in_place(
-                    &mut tx,
-                    &self.schema,
-                    &old_entries,
-                    &attributes,
-                    old_loc.leaf_id,
-                    old_loc.local_id,
-                )?;
-                tx.put_doc_bytes(id, new_doc_bytes);
-            } else {
-                match update_vector_in_tx(
-                    &mut tx,
-                    id,
-                    old_loc,
-                    &vec,
-                    &self.vector_index.config,
-                    &self.vector_index.quantizer,
-                )? {
-                    VectorUpdateResult::SameLeaf { delta, .. } => {
-                        if fts_changed {
-                            self.fts_index.upsert_doc(
-                                &mut tx,
-                                &self.schema,
-                                id,
-                                Some(&old_entries),
-                                &attributes,
-                            )?;
-                        }
-                        self.attr_index.diff_doc_in_place(
-                            &mut tx,
-                            &self.schema,
-                            &old_entries,
-                            &attributes,
-                            old_loc.leaf_id,
-                            old_loc.local_id,
-                        )?;
-                        tx.put_doc_bytes(id, new_doc_bytes);
-                        self.attr_index
-                            .apply_cluster_delta(&mut tx, &self.schema, &delta)?;
-                    }
-                    VectorUpdateResult::Moved {
-                        old_loc,
-                        new_loc,
-                        rem_delta,
-                        ins_delta,
-                        split,
-                    } => {
-                        self.attr_index.remove_doc_entries(
-                            &mut tx,
-                            &self.schema,
-                            &old_entries,
-                            old_loc.leaf_id,
-                            old_loc.local_id,
-                        )?;
-                        self.attr_index
-                            .apply_cluster_delta(&mut tx, &self.schema, &rem_delta)?;
-                        if fts_changed {
-                            self.fts_index.upsert_doc(
-                                &mut tx,
-                                &self.schema,
-                                id,
-                                Some(&old_entries),
-                                &attributes,
-                            )?;
-                        }
-                        tx.put_doc_bytes(id, new_doc_bytes);
-                        self.attr_index
-                            .apply_cluster_delta(&mut tx, &self.schema, &ins_delta)?;
-                        self.attr_index.insert_doc(
-                            &mut tx,
-                            &self.schema,
-                            &attributes,
-                            new_loc.leaf_id,
-                            new_loc.local_id,
-                        )?;
-                        if let Some(sp) = split {
-                            splits.push(sp);
-                        }
-                    }
-                }
-            }
+            update_existing_doc_in_tx(
+                &DocUpdateCtx {
+                    schema: &self.schema,
+                    attr_index: &self.attr_index,
+                    fts_index: &self.fts_index,
+                    tree_config,
+                    quantizer,
+                },
+                &mut tx,
+                id,
+                old_loc,
+                effective_vec,
+                &old_entries,
+                &attributes,
+                new_doc_bytes,
+                AttrDiffMode::Full(&attributes),
+                fts_changed,
+                &mut splits,
+            )?;
         } else {
             self.fts_index
                 .upsert_doc(&mut tx, &self.schema, id, None, &attributes)?;
             tx.put_doc_bytes(id, new_doc_bytes);
-            let (new_loc, ins_delta, split_opt) = insert_in_tx(
-                &mut tx,
-                id,
-                &vec,
-                &self.vector_index.config,
-                &self.vector_index.quantizer,
-            )?;
+            let (new_loc, ins_delta, split_opt) =
+                insert_in_tx(&mut tx, id, &vec, tree_config, quantizer)?;
             self.attr_index
                 .apply_cluster_delta(&mut tx, &self.schema, &ins_delta)?;
             self.attr_index.insert_doc(
@@ -403,19 +328,17 @@ impl Collection {
             None => None,
         };
 
-        let mut tx = TxContext::new(
-            &self.vector_index.storage,
-            &mut self.vector_index.internal_cache,
-            &mut self.vector_index.leaf_parent,
-            self.vector_index.meta.clone(),
-        );
+        let (tree_config, quantizer, mut tx) = self.vector_index.begin_tx_parts();
+        let ctx = DocUpdateCtx {
+            schema: &self.schema,
+            attr_index: &self.attr_index,
+            fts_index: &self.fts_index,
+            tree_config,
+            quantizer,
+        };
         let mut splits = Vec::new();
         apply_patch_in_tx(
-            &self.schema,
-            &self.attr_index,
-            &self.fts_index,
-            &self.vector_index.config,
-            &self.vector_index.quantizer,
+            &ctx,
             &mut tx,
             id,
             prepared_vec.as_deref(),
@@ -450,12 +373,7 @@ impl Collection {
             doc_ids.push(id);
         }
 
-        let mut tx = TxContext::new(
-            &self.vector_index.storage,
-            &mut self.vector_index.internal_cache,
-            &mut self.vector_index.leaf_parent,
-            self.vector_index.meta.clone(),
-        );
+        let (tree_config, quantizer, mut tx) = self.vector_index.begin_tx_parts();
         let locs = tx.multi_get_doc_locs(&doc_ids)?;
         for (&id, opt_loc) in doc_ids.iter().zip(locs) {
             if opt_loc.is_none() {
@@ -463,14 +381,17 @@ impl Collection {
             }
         }
 
+        let ctx = DocUpdateCtx {
+            schema: &self.schema,
+            attr_index: &self.attr_index,
+            fts_index: &self.fts_index,
+            tree_config,
+            quantizer,
+        };
         let mut splits = Vec::new();
         for (&(id, ref patch), pv) in patches.iter().zip(prepared_vecs.iter()) {
             apply_patch_in_tx(
-                &self.schema,
-                &self.attr_index,
-                &self.fts_index,
-                &self.vector_index.config,
-                &self.vector_index.quantizer,
+                &ctx,
                 &mut tx,
                 id,
                 pv.as_deref(),
@@ -505,20 +426,18 @@ impl Collection {
 
         let mut updated = 0u64;
         for chunk in doc_ids.chunks(MUTATION_CHUNK_SIZE) {
-            let mut tx = TxContext::new(
-                &self.vector_index.storage,
-                &mut self.vector_index.internal_cache,
-                &mut self.vector_index.leaf_parent,
-                self.vector_index.meta.clone(),
-            );
+            let (tree_config, quantizer, mut tx) = self.vector_index.begin_tx_parts();
+            let ctx = DocUpdateCtx {
+                schema: &self.schema,
+                attr_index: &self.attr_index,
+                fts_index: &self.fts_index,
+                tree_config,
+                quantizer,
+            };
             let mut splits = Vec::new();
             for &id in chunk {
                 apply_patch_in_tx(
-                    &self.schema,
-                    &self.attr_index,
-                    &self.fts_index,
-                    &self.vector_index.config,
-                    &self.vector_index.quantizer,
+                    &ctx,
                     &mut tx,
                     id,
                     prepared_vec.as_deref(),
@@ -537,18 +456,8 @@ impl Collection {
     ///
     /// Returns `true` if `id` existed and was deleted, or `false` if `id` was absent.
     pub fn delete(&mut self, id: DocId) -> Result<bool> {
-        let mut tx = TxContext::new(
-            &self.vector_index.storage,
-            &mut self.vector_index.internal_cache,
-            &mut self.vector_index.leaf_parent,
-            self.vector_index.meta.clone(),
-        );
-        let Some((old_loc, delta)) = remove_existing_in_tx(
-            &mut tx,
-            id,
-            &self.vector_index.config,
-            &self.vector_index.quantizer,
-        )?
+        let (tree_config, quantizer, mut tx) = self.vector_index.begin_tx_parts();
+        let Some((old_loc, delta)) = remove_existing_in_tx(&mut tx, id, tree_config, quantizer)?
         else {
             return Ok(false);
         };
@@ -577,18 +486,8 @@ impl Collection {
         if ids.is_empty() {
             return Ok(0);
         }
-        let mut tx = TxContext::new(
-            &self.vector_index.storage,
-            &mut self.vector_index.internal_cache,
-            &mut self.vector_index.leaf_parent,
-            self.vector_index.meta.clone(),
-        );
-        let (removed_docs, delta) = remove_many_in_tx(
-            &mut tx,
-            ids,
-            &self.vector_index.config,
-            &self.vector_index.quantizer,
-        )?;
+        let (tree_config, quantizer, mut tx) = self.vector_index.begin_tx_parts();
+        let (removed_docs, delta) = remove_many_in_tx(&mut tx, ids, tree_config, quantizer)?;
         if removed_docs.is_empty() {
             return Ok(0);
         }
@@ -636,12 +535,7 @@ impl Collection {
         if !self.schema.has_fts() {
             return Ok(());
         }
-        let mut tx = TxContext::new(
-            &self.vector_index.storage,
-            &mut self.vector_index.internal_cache,
-            &mut self.vector_index.leaf_parent,
-            self.vector_index.meta.clone(),
-        );
+        let (_, _, mut tx) = self.vector_index.begin_tx_parts();
         let updated = self.fts_index.compact_term_stats(&self.storage, &mut tx)?;
         if updated > 0 {
             self.vector_index.meta = tx.commit()?;
@@ -700,46 +594,16 @@ impl Collection {
             }
         };
 
-        let dim = self.vector_index.config.dim;
-        let padded_dim = self.vector_index.quantizer.padded_dim();
-        let rabitq_words = self.vector_index.quantizer.num_words();
         let mut doc_ids = Vec::new();
-
-        for chunk in leaf_ids.chunks(RESOLVE_LEAF_CHUNK_SIZE) {
-            let leaf_slices = self.storage.multi_get_leaf_nodes_pinned(chunk)?;
-            let mut views: Vec<Option<LeafNodeView<'_>>> = Vec::with_capacity(chunk.len());
-            for (&leaf_id, opt_slice) in chunk.iter().zip(leaf_slices.iter()) {
-                let slice = opt_slice.as_ref().ok_or_else(|| {
-                    TreeError::CorruptedData(format!("missing leaf blob for leaf {leaf_id}"))
-                })?;
-                views.push(Some(LeafNodeView::parse(
-                    slice,
-                    dim,
-                    padded_dim,
-                    rabitq_words,
-                )?));
-            }
-            let leaf_pairs: Vec<(NodeId, Option<&LeafNodeView<'_>>)> = chunk
-                .iter()
-                .copied()
-                .zip(views.iter().map(|v| v.as_ref()))
-                .collect();
-            let masks =
-                self.attr_index
-                    .eval_leaves_masks(&self.storage, &prepared, &leaf_pairs)?;
-            for (view_opt, mask) in views.iter().zip(masks.iter()) {
-                if mask.is_empty() {
-                    continue;
-                }
-                if let Some(view) = view_opt {
-                    mask.for_each_set_bit(view.slot_cap, |slot| {
-                        if view.is_live(slot) {
-                            doc_ids.push(view.doc_id(slot));
-                        }
-                    });
-                }
-            }
-        }
+        search::collect_matching_doc_ids_in_leaves(
+            &self.storage,
+            &self.attr_index,
+            &prepared,
+            &leaf_ids,
+            &self.vector_index.config,
+            &self.vector_index.quantizer,
+            &mut doc_ids,
+        )?;
 
         doc_ids.sort_unstable();
         doc_ids.dedup();
@@ -747,43 +611,18 @@ impl Collection {
     }
 
     fn eval_positive_fts_bitmap(&self, filter: &Filter) -> Result<Option<RoaringBitmap>> {
+        if let Some((kind, attr, query, last_as_prefix)) = filter.as_fts_predicate() {
+            return Ok(Some(self.fts_index.eval_fts_predicate(
+                &self.storage,
+                &self.schema,
+                kind,
+                attr,
+                query,
+                last_as_prefix,
+            )?));
+        }
+
         match filter {
-            Filter::ContainsAllTokens {
-                attr,
-                query,
-                last_as_prefix,
-            } => Ok(Some(self.fts_index.eval_fts_predicate(
-                &self.storage,
-                &self.schema,
-                izzydb_core::filter::FtsPredicateKind::AllTokens,
-                attr,
-                query,
-                *last_as_prefix,
-            )?)),
-            Filter::ContainsAnyToken {
-                attr,
-                query,
-                last_as_prefix,
-            } => Ok(Some(self.fts_index.eval_fts_predicate(
-                &self.storage,
-                &self.schema,
-                izzydb_core::filter::FtsPredicateKind::AnyToken,
-                attr,
-                query,
-                *last_as_prefix,
-            )?)),
-            Filter::ContainsTokenSequence {
-                attr,
-                query,
-                last_as_prefix,
-            } => Ok(Some(self.fts_index.eval_fts_predicate(
-                &self.storage,
-                &self.schema,
-                izzydb_core::filter::FtsPredicateKind::TokenSequence,
-                attr,
-                query,
-                *last_as_prefix,
-            )?)),
             Filter::And(children) => {
                 let mut acc: Option<RoaringBitmap> = None;
                 for child in children {
@@ -913,8 +752,13 @@ impl Collection {
                 .query_bm25(&self.storage, &self.schema, rank_by, top_k, None, None);
         };
 
-        let (pushdown_opt, is_exact) = self.try_pushdown_filter(f)?;
-        if let Some(ref bm) = pushdown_opt
+        let pushdown = self.try_pushdown_filter(f)?;
+        let (pushdown_bm, is_exact) = match pushdown {
+            FilterPushdown::None => (None, false),
+            FilterPushdown::Superset(bm) => (Some(bm), false),
+            FilterPushdown::Exact(bm) => (Some(bm), true),
+        };
+        if let Some(ref bm) = pushdown_bm
             && bm.is_empty()
         {
             return Ok(Vec::new());
@@ -926,7 +770,7 @@ impl Collection {
                 &self.schema,
                 rank_by,
                 top_k,
-                pushdown_opt.as_ref(),
+                pushdown_bm.as_ref(),
                 None,
             )
         } else {
@@ -947,7 +791,7 @@ impl Collection {
                 &self.schema,
                 rank_by,
                 top_k,
-                pushdown_opt.as_ref(),
+                pushdown_bm.as_ref(),
                 Some(&mut lazy),
             )
         }
@@ -1017,83 +861,52 @@ impl Collection {
         }
 
         let mut results: Vec<HybridSearchResult> = by_doc.into_values().collect();
-        results.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.id.cmp(&b.id))
-                .then(Ordering::Equal)
-        });
+        results.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
         results.truncate(opts.k);
         Ok(results)
     }
 
-    fn try_pushdown_filter(&self, filter: &Filter) -> Result<(Option<RoaringBitmap>, bool)> {
+    fn try_pushdown_filter(&self, filter: &Filter) -> Result<FilterPushdown> {
+        if let Some((kind, attr, query, last_as_prefix)) = filter.as_fts_predicate() {
+            let bm = self.fts_index.eval_fts_predicate(
+                &self.storage,
+                &self.schema,
+                kind,
+                attr,
+                query,
+                last_as_prefix,
+            )?;
+            return Ok(FilterPushdown::Exact(bm));
+        }
+
         match filter {
-            Filter::ContainsAllTokens {
-                attr,
-                query,
-                last_as_prefix,
-            } => {
-                let bm = self.fts_index.eval_fts_predicate(
-                    &self.storage,
-                    &self.schema,
-                    izzydb_core::filter::FtsPredicateKind::AllTokens,
-                    attr,
-                    query,
-                    *last_as_prefix,
-                )?;
-                Ok((Some(bm), true))
-            }
-            Filter::ContainsAnyToken {
-                attr,
-                query,
-                last_as_prefix,
-            } => {
-                let bm = self.fts_index.eval_fts_predicate(
-                    &self.storage,
-                    &self.schema,
-                    izzydb_core::filter::FtsPredicateKind::AnyToken,
-                    attr,
-                    query,
-                    *last_as_prefix,
-                )?;
-                Ok((Some(bm), true))
-            }
-            Filter::ContainsTokenSequence {
-                attr,
-                query,
-                last_as_prefix,
-            } => {
-                let bm = self.fts_index.eval_fts_predicate(
-                    &self.storage,
-                    &self.schema,
-                    izzydb_core::filter::FtsPredicateKind::TokenSequence,
-                    attr,
-                    query,
-                    *last_as_prefix,
-                )?;
-                Ok((Some(bm), true))
-            }
             Filter::And(children) => {
                 if children.is_empty() {
-                    return Ok((None, true));
+                    return Ok(FilterPushdown::None);
                 }
                 let mut combined: Option<RoaringBitmap> = None;
                 let mut all_exact = true;
                 for child in children {
-                    let (sub_bm, sub_exact) = self.try_pushdown_filter(child)?;
-                    if !sub_exact {
-                        all_exact = false;
-                    }
+                    let sub_bm = match self.try_pushdown_filter(child)? {
+                        FilterPushdown::None => {
+                            all_exact = false;
+                            None
+                        }
+                        FilterPushdown::Superset(bm) => {
+                            all_exact = false;
+                            Some(bm)
+                        }
+                        FilterPushdown::Exact(bm) => Some(bm),
+                    };
                     if let Some(bm) = sub_bm {
                         if bm.is_empty() {
-                            return Ok((Some(RoaringBitmap::new()), true));
+                            return Ok(FilterPushdown::Exact(RoaringBitmap::new()));
                         }
                         combined = Some(match combined {
                             Some(mut cur) => {
                                 cur &= &bm;
                                 if cur.is_empty() {
-                                    return Ok((Some(RoaringBitmap::new()), true));
+                                    return Ok(FilterPushdown::Exact(RoaringBitmap::new()));
                                 }
                                 cur
                             }
@@ -1101,21 +914,24 @@ impl Collection {
                         });
                     }
                 }
-                Ok((combined, all_exact))
+                match (combined, all_exact) {
+                    (None, _) => Ok(FilterPushdown::None),
+                    (Some(bm), true) => Ok(FilterPushdown::Exact(bm)),
+                    (Some(bm), false) => Ok(FilterPushdown::Superset(bm)),
+                }
             }
             Filter::Or(children) => {
                 if children.is_empty() {
-                    return Ok((Some(RoaringBitmap::new()), true));
+                    return Ok(FilterPushdown::Exact(RoaringBitmap::new()));
                 }
                 let mut union = RoaringBitmap::new();
                 for child in children {
-                    let (sub_bm, sub_exact) = self.try_pushdown_filter(child)?;
-                    match (sub_bm, sub_exact) {
-                        (Some(bm), true) => union |= &bm,
-                        _ => return Ok((None, false)),
+                    match self.try_pushdown_filter(child)? {
+                        FilterPushdown::Exact(bm) => union |= &bm,
+                        _ => return Ok(FilterPushdown::None),
                     }
                 }
-                Ok((Some(union), true))
+                Ok(FilterPushdown::Exact(union))
             }
             _ if !filter.has_fts() => {
                 let prepared = self
@@ -1123,51 +939,24 @@ impl Collection {
                     .prepare_filter(&self.storage, &self.schema, filter)?;
                 match prepared.cluster_candidates {
                     ClusterCandidates::Subset(ref bm) if bm.is_empty() => {
-                        Ok((Some(RoaringBitmap::new()), true))
+                        Ok(FilterPushdown::Exact(RoaringBitmap::new()))
                     }
-                    ClusterCandidates::Subset(ref bm) if bm.len() <= 64 => {
+                    ClusterCandidates::Subset(ref bm)
+                        if bm.len() <= PUSHDOWN_MAX_CANDIDATE_CLUSTERS =>
+                    {
                         let leaf_ids: Vec<_> = bm.iter().collect();
-                        let leaf_slices = self.storage.multi_get_leaf_nodes_pinned(&leaf_ids)?;
-                        let dim = self.vector_index.config.dim;
-                        let padded_dim = self.vector_index.quantizer.padded_dim();
-                        let rabitq_words = self.vector_index.quantizer.num_words();
-                        let mut views = Vec::with_capacity(leaf_ids.len());
-                        for (lid, opt_slice) in leaf_ids.iter().copied().zip(leaf_slices.iter()) {
-                            let slice = opt_slice.as_ref().ok_or_else(|| {
-                                TreeError::CorruptedData(format!("missing leaf blob for leaf {lid}"))
-                            })?;
-                            views.push(Some(crate::node::LeafNodeView::parse(
-                                slice,
-                                dim,
-                                padded_dim,
-                                rabitq_words,
-                            )?));
-                        }
-                        let leaf_pairs: Vec<_> = leaf_ids
-                            .iter()
-                            .copied()
-                            .zip(views.iter().map(|v| v.as_ref()))
-                            .collect();
-                        let masks = self.attr_index.eval_leaves_masks(
-                            &self.storage,
-                            &prepared,
-                            &leaf_pairs,
-                        )?;
                         let mut doc_ids = Vec::new();
-                        for (view_opt, mask) in views.iter().zip(masks.iter()) {
-                            if mask.is_empty() {
-                                continue;
-                            }
-                            if let Some(view) = view_opt {
-                                mask.for_each_set_bit(view.slot_cap, |slot| {
-                                    if view.is_live(slot) {
-                                        doc_ids.push(view.doc_id(slot));
-                                    }
-                                });
-                            }
-                        }
+                        search::collect_matching_doc_ids_in_leaves(
+                            &self.storage,
+                            &self.attr_index,
+                            &prepared,
+                            &leaf_ids,
+                            &self.vector_index.config,
+                            &self.vector_index.quantizer,
+                            &mut doc_ids,
+                        )?;
                         if doc_ids.is_empty() {
-                            return Ok((Some(RoaringBitmap::new()), true));
+                            return Ok(FilterPushdown::Exact(RoaringBitmap::new()));
                         }
                         doc_ids.sort_unstable();
                         doc_ids.dedup();
@@ -1176,12 +965,12 @@ impl Collection {
                         for fid in fts_ids.into_iter().flatten() {
                             fts_bm.insert(fid);
                         }
-                        Ok((Some(fts_bm), true))
+                        Ok(FilterPushdown::Exact(fts_bm))
                     }
-                    _ => Ok((None, false)),
+                    _ => Ok(FilterPushdown::None),
                 }
             }
-            _ => Ok((None, false)),
+            _ => Ok(FilterPushdown::None),
         }
     }
 
@@ -1198,13 +987,113 @@ impl Collection {
     }
 }
 
+struct DocUpdateCtx<'a> {
+    schema: &'a CollectionSchema,
+    attr_index: &'a AttributeIndex,
+    fts_index: &'a FtsIndex,
+    tree_config: &'a TreeConfig,
+    quantizer: &'a RabitqQuantizer,
+}
+
+#[inline]
+fn vectors_bitwise_equal(tx: &TxContext<'_>, id: DocId, vec: &[f32]) -> Result<bool> {
+    let old_vec = tx.get_vectors_flat(&[id])?;
+    Ok(old_vec.len() == vec.len()
+        && old_vec
+            .iter()
+            .zip(vec.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits()))
+}
+
 #[allow(clippy::too_many_arguments)]
+fn update_existing_doc_in_tx(
+    ctx: &DocUpdateCtx<'_>,
+    tx: &mut TxContext<'_>,
+    id: DocId,
+    old_loc: DocLoc,
+    new_vec: Option<&[f32]>,
+    old_entries: &[(AttrId, AttributeValue)],
+    new_attrs: &Attributes,
+    new_doc_bytes: Vec<u8>,
+    diff_mode: AttrDiffMode<'_>,
+    fts_changed: bool,
+    splits: &mut Vec<SplitPair>,
+) -> Result<()> {
+    let apply_in_place_attr_diff = |tx: &mut TxContext<'_>, leaf_id: NodeId, local_id: u32| {
+        match diff_mode {
+            AttrDiffMode::Full(attrs) => {
+                ctx.attr_index
+                    .diff_doc_in_place(tx, ctx.schema, old_entries, attrs, leaf_id, local_id)
+            }
+            AttrDiffMode::Patch(patch_attrs) => ctx.attr_index.diff_patched_in_place(
+                tx,
+                ctx.schema,
+                old_entries,
+                patch_attrs,
+                leaf_id,
+                local_id,
+            ),
+        }
+    };
+
+    let Some(vec) = new_vec else {
+        if fts_changed {
+            ctx.fts_index
+                .upsert_doc(tx, ctx.schema, id, Some(old_entries), new_attrs)?;
+        }
+        apply_in_place_attr_diff(tx, old_loc.leaf_id, old_loc.local_id)?;
+        tx.put_doc_bytes(id, new_doc_bytes);
+        return Ok(());
+    };
+
+    match update_vector_in_tx(tx, id, old_loc, vec, ctx.tree_config, ctx.quantizer)? {
+        VectorUpdateResult::SameLeaf { delta } => {
+            if fts_changed {
+                ctx.fts_index
+                    .upsert_doc(tx, ctx.schema, id, Some(old_entries), new_attrs)?;
+            }
+            apply_in_place_attr_diff(tx, old_loc.leaf_id, old_loc.local_id)?;
+            tx.put_doc_bytes(id, new_doc_bytes);
+            ctx.attr_index.apply_cluster_delta(tx, ctx.schema, &delta)?;
+        }
+        VectorUpdateResult::Moved {
+            old_loc,
+            new_loc,
+            rem_delta,
+            ins_delta,
+            split,
+        } => {
+            ctx.attr_index.remove_doc_entries(
+                tx,
+                ctx.schema,
+                old_entries,
+                old_loc.leaf_id,
+                old_loc.local_id,
+            )?;
+            ctx.attr_index.apply_cluster_delta(tx, ctx.schema, &rem_delta)?;
+            if fts_changed {
+                ctx.fts_index
+                    .upsert_doc(tx, ctx.schema, id, Some(old_entries), new_attrs)?;
+            }
+            tx.put_doc_bytes(id, new_doc_bytes);
+            ctx.attr_index.apply_cluster_delta(tx, ctx.schema, &ins_delta)?;
+            ctx.attr_index.insert_doc(
+                tx,
+                ctx.schema,
+                new_attrs,
+                new_loc.leaf_id,
+                new_loc.local_id,
+            )?;
+            if let Some(sp) = split {
+                splits.push(sp);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn apply_patch_in_tx(
-    schema: &CollectionSchema,
-    attr_index: &AttributeIndex,
-    fts_index: &FtsIndex,
-    tree_config: &TreeConfig,
-    quantizer: &RabitqQuantizer,
+    ctx: &DocUpdateCtx<'_>,
     tx: &mut TxContext<'_>,
     id: DocId,
     prepared_vec: Option<&[f32]>,
@@ -1216,25 +1105,17 @@ fn apply_patch_in_tx(
     };
 
     let effective_vec = match prepared_vec {
-        Some(new_vec) => {
-            let old_vec = tx.get_vectors_flat(&[id])?;
-            let unchanged = old_vec.len() == new_vec.len()
-                && old_vec
-                    .iter()
-                    .zip(new_vec.iter())
-                    .all(|(a, b)| a.to_bits() == b.to_bits());
-            if unchanged { None } else { Some(new_vec) }
-        }
-        None => None,
+        Some(new_vec) if !vectors_bitwise_equal(tx, id, new_vec)? => Some(new_vec),
+        _ => None,
     };
 
     if patch_attrs.is_empty() {
         let Some(new_vec) = effective_vec else {
             return Ok(());
         };
-        match update_vector_in_tx(tx, id, old_loc, new_vec, tree_config, quantizer)? {
-            VectorUpdateResult::SameLeaf { delta, .. } => {
-                attr_index.apply_cluster_delta(tx, schema, &delta)?;
+        match update_vector_in_tx(tx, id, old_loc, new_vec, ctx.tree_config, ctx.quantizer)? {
+            VectorUpdateResult::SameLeaf { delta } => {
+                ctx.attr_index.apply_cluster_delta(tx, ctx.schema, &delta)?;
             }
             VectorUpdateResult::Moved {
                 old_loc,
@@ -1245,25 +1126,25 @@ fn apply_patch_in_tx(
             } => {
                 if let Some(old_bytes) = tx.get_doc_bytes(id)? {
                     let entries = decode_attribute_entries(&old_bytes)?;
-                    attr_index.remove_doc_entries(
+                    ctx.attr_index.remove_doc_entries(
                         tx,
-                        schema,
+                        ctx.schema,
                         &entries,
                         old_loc.leaf_id,
                         old_loc.local_id,
                     )?;
-                    attr_index.apply_cluster_delta(tx, schema, &rem_delta)?;
-                    attr_index.apply_cluster_delta(tx, schema, &ins_delta)?;
-                    attr_index.insert_doc_entries(
+                    ctx.attr_index.apply_cluster_delta(tx, ctx.schema, &rem_delta)?;
+                    ctx.attr_index.apply_cluster_delta(tx, ctx.schema, &ins_delta)?;
+                    ctx.attr_index.insert_doc_entries(
                         tx,
-                        schema,
+                        ctx.schema,
                         &entries,
                         new_loc.leaf_id,
                         new_loc.local_id,
                     )?;
                 } else {
-                    attr_index.apply_cluster_delta(tx, schema, &rem_delta)?;
-                    attr_index.apply_cluster_delta(tx, schema, &ins_delta)?;
+                    ctx.attr_index.apply_cluster_delta(tx, ctx.schema, &rem_delta)?;
+                    ctx.attr_index.apply_cluster_delta(tx, ctx.schema, &ins_delta)?;
                 }
                 if let Some(sp) = split {
                     splits.push(sp);
@@ -1282,7 +1163,7 @@ fn apply_patch_in_tx(
 
     let mut merged_attrs = Attributes::new();
     for &(attr_id, ref val) in &old_entries {
-        if let Some(entry) = schema.get_by_id(attr_id) {
+        if let Some(entry) = ctx.schema.get_by_id(attr_id) {
             merged_attrs.insert(entry.name.clone(), val.clone());
         }
     }
@@ -1293,88 +1174,22 @@ fn apply_patch_in_tx(
             merged_attrs.insert(name.clone(), val.clone());
         }
     }
-    let new_doc_bytes = encode_attributes(schema, &merged_attrs)?;
-    let fts_changed = has_fts_patch_changes(schema, &old_entries, patch_attrs);
+    let new_doc_bytes = encode_attributes(ctx.schema, &merged_attrs)?;
+    let fts_changed = has_fts_patch_changes(ctx.schema, &old_entries, patch_attrs);
 
-    match effective_vec {
-        None => {
-            if fts_changed {
-                fts_index.upsert_doc(tx, schema, id, Some(&old_entries), &merged_attrs)?;
-            }
-            attr_index.diff_patched_in_place(
-                tx,
-                schema,
-                &old_entries,
-                patch_attrs,
-                old_loc.leaf_id,
-                old_loc.local_id,
-            )?;
-            tx.put_doc_bytes(id, new_doc_bytes);
-        }
-        Some(new_vec) => {
-            match update_vector_in_tx(tx, id, old_loc, new_vec, tree_config, quantizer)? {
-                VectorUpdateResult::SameLeaf { delta, .. } => {
-                    if fts_changed {
-                        fts_index.upsert_doc(
-                            tx,
-                            schema,
-                            id,
-                            Some(&old_entries),
-                            &merged_attrs,
-                        )?;
-                    }
-                    attr_index.diff_patched_in_place(
-                        tx,
-                        schema,
-                        &old_entries,
-                        patch_attrs,
-                        old_loc.leaf_id,
-                        old_loc.local_id,
-                    )?;
-                    tx.put_doc_bytes(id, new_doc_bytes);
-                    attr_index.apply_cluster_delta(tx, schema, &delta)?;
-                }
-                VectorUpdateResult::Moved {
-                    old_loc,
-                    new_loc,
-                    rem_delta,
-                    ins_delta,
-                    split,
-                } => {
-                    attr_index.remove_doc_entries(
-                        tx,
-                        schema,
-                        &old_entries,
-                        old_loc.leaf_id,
-                        old_loc.local_id,
-                    )?;
-                    attr_index.apply_cluster_delta(tx, schema, &rem_delta)?;
-                    if fts_changed {
-                        fts_index.upsert_doc(
-                            tx,
-                            schema,
-                            id,
-                            Some(&old_entries),
-                            &merged_attrs,
-                        )?;
-                    }
-                    tx.put_doc_bytes(id, new_doc_bytes);
-                    attr_index.apply_cluster_delta(tx, schema, &ins_delta)?;
-                    attr_index.insert_doc(
-                        tx,
-                        schema,
-                        &merged_attrs,
-                        new_loc.leaf_id,
-                        new_loc.local_id,
-                    )?;
-                    if let Some(sp) = split {
-                        splits.push(sp);
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
+    update_existing_doc_in_tx(
+        ctx,
+        tx,
+        id,
+        old_loc,
+        effective_vec,
+        &old_entries,
+        &merged_attrs,
+        new_doc_bytes,
+        AttrDiffMode::Patch(patch_attrs),
+        fts_changed,
+        splits,
+    )
 }
 
 fn filter_has_not(filter: &Filter) -> bool {

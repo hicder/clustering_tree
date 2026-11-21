@@ -403,36 +403,75 @@ pub fn encode_zone_map(map: &BTreeMap<NodeId, (Vec<u8>, Vec<u8>)>) -> Vec<u8> {
     buf
 }
 
+/// Zero-copy bounded cursor for decoding little-endian binary payloads.
+struct ByteReader<'a> {
+    bytes: &'a [u8],
+    off: usize,
+}
+
+impl<'a> ByteReader<'a> {
+    #[inline]
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, off: 0 }
+    }
+
+    #[inline]
+    fn read_bytes(&mut self, len: usize, label: &str) -> Result<&'a [u8]> {
+        let end = self.off.checked_add(len).ok_or_else(|| {
+            TreeError::CorruptedData(format!("{label}: length overflow"))
+        })?;
+        if end > self.bytes.len() {
+            return Err(TreeError::CorruptedData(format!("{label}: truncated")));
+        }
+        let slice = &self.bytes[self.off..end];
+        self.off = end;
+        Ok(slice)
+    }
+
+    #[inline]
+    fn read_u16_le(&mut self, label: &str) -> Result<u16> {
+        let s = self.read_bytes(2, label)?;
+        Ok(u16::from_le_bytes([s[0], s[1]]))
+    }
+
+    #[inline]
+    fn read_u32_le(&mut self, label: &str) -> Result<u32> {
+        let s = self.read_bytes(4, label)?;
+        Ok(u32::from_le_bytes(s.try_into().unwrap()))
+    }
+
+    #[inline]
+    fn read_len_prefixed_str(&mut self, label: &str) -> Result<String> {
+        let len = self.read_u32_le(label)? as usize;
+        let s = self.read_bytes(len, label)?;
+        std::str::from_utf8(s)
+            .map(str::to_owned)
+            .map_err(|e| TreeError::CorruptedData(format!("invalid utf8 in {label}: {e}")))
+    }
+
+    #[inline]
+    fn expect_eof(&self, label: &str) -> Result<()> {
+        if self.off != self.bytes.len() {
+            return Err(TreeError::CorruptedData(format!("{label}: trailing bytes")));
+        }
+        Ok(())
+    }
+}
+
 /// Decode per-leaf `(min_bytes, max_bytes)` zone map for an ordered attribute.
 pub fn decode_zone_map(bytes: &[u8]) -> Result<BTreeMap<NodeId, (Vec<u8>, Vec<u8>)>> {
-    if bytes.len() < 4 {
-        return Err(TreeError::CorruptedData("zone map payload too short".into()));
-    }
-    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-    let mut off = 4usize;
+    let mut r = ByteReader::new(bytes);
+    let count = r.read_u32_le("zone map count")? as usize;
     let mut map = BTreeMap::new();
     for _ in 0..count {
-        if off + 8 > bytes.len() {
-            return Err(TreeError::CorruptedData("zone map entry truncated".into()));
-        }
-        let leaf_id = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-        let min_len = u16::from_le_bytes([bytes[off + 4], bytes[off + 5]]) as usize;
-        let max_len = u16::from_le_bytes([bytes[off + 6], bytes[off + 7]]) as usize;
-        off += 8;
-        if off + min_len + max_len > bytes.len() {
-            return Err(TreeError::CorruptedData("zone map bounds truncated".into()));
-        }
-        let min_b = bytes[off..off + min_len].to_vec();
-        off += min_len;
-        let max_b = bytes[off..off + max_len].to_vec();
-        off += max_len;
+        let leaf_id = r.read_u32_le("zone map leaf_id")?;
+        let min_len = r.read_u16_le("zone map min_len")? as usize;
+        let max_len = r.read_u16_le("zone map max_len")? as usize;
+        let min_b = r.read_bytes(min_len, "zone map min_bound")?.to_vec();
+        let max_b = r.read_bytes(max_len, "zone map max_bound")?.to_vec();
         map.insert(leaf_id, (min_b, max_b));
     }
-    if off != bytes.len() {
-        return Err(TreeError::CorruptedData(
-            "trailing bytes in zone map payload".into(),
-        ));
-    }
+    r.expect_eof("zone map payload")?;
     Ok(map)
 }
 
@@ -754,56 +793,16 @@ impl<'a> DocView<'a> {
                     None | Some((DOC_VAL_NULL, _))
                 ))
             }
-            Filter::ContainsAllTokens {
-                attr,
-                query,
-                last_as_prefix,
-            } => {
-                let val = match schema.get_by_name(attr) {
-                    Some(e) => self.decode_field(e.id)?,
-                    None => None,
-                };
-                Ok(eval_fts(
-                    FtsPredicateKind::AllTokens,
-                    attr,
-                    query,
-                    *last_as_prefix,
-                    val.as_ref(),
-                ))
-            }
-            Filter::ContainsAnyToken {
-                attr,
-                query,
-                last_as_prefix,
-            } => {
-                let val = match schema.get_by_name(attr) {
-                    Some(e) => self.decode_field(e.id)?,
-                    None => None,
-                };
-                Ok(eval_fts(
-                    FtsPredicateKind::AnyToken,
-                    attr,
-                    query,
-                    *last_as_prefix,
-                    val.as_ref(),
-                ))
-            }
-            Filter::ContainsTokenSequence {
-                attr,
-                query,
-                last_as_prefix,
-            } => {
-                let val = match schema.get_by_name(attr) {
-                    Some(e) => self.decode_field(e.id)?,
-                    None => None,
-                };
-                Ok(eval_fts(
-                    FtsPredicateKind::TokenSequence,
-                    attr,
-                    query,
-                    *last_as_prefix,
-                    val.as_ref(),
-                ))
+            other => {
+                if let Some((kind, attr, query, last_as_prefix)) = other.as_fts_predicate() {
+                    let val = match schema.get_by_name(attr) {
+                        Some(e) => self.decode_field(e.id)?,
+                        None => None,
+                    };
+                    Ok(eval_fts(kind, attr, query, last_as_prefix, val.as_ref()))
+                } else {
+                    unreachable!("all non-FTS Filter variants handled above")
+                }
             }
         }
     }
@@ -1006,60 +1005,35 @@ fn decode_payload_value(kind: u8, payload: &[u8]) -> Result<AttributeValue> {
             Ok(AttributeValue::String(s))
         }
         DOC_VAL_STRING_ARRAY => {
-            if payload.len() < 4 {
-                return Err(TreeError::CorruptedData(
-                    "cf_docs string array len truncated".into(),
-                ));
-            }
-            let len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
-            let mut off = 4usize;
+            let mut r = ByteReader::new(payload);
+            let len = r.read_u32_le("cf_docs string array len")? as usize;
             let mut arr = Vec::with_capacity(len);
             for _ in 0..len {
-                let (s, next_off) = read_len_prefixed_str(payload, off)?;
-                off = next_off;
-                arr.push(s);
+                arr.push(r.read_len_prefixed_str("cf_docs string elem")?);
             }
-            if off != payload.len() {
-                return Err(TreeError::CorruptedData(
-                    "cf_docs string array trailing bytes".into(),
-                ));
-            }
+            r.expect_eof("cf_docs string array")?;
             Ok(AttributeValue::StringArray(arr))
         }
         DOC_VAL_INT_ARRAY => {
-            if payload.len() < 4 {
-                return Err(TreeError::CorruptedData(
-                    "cf_docs int array len truncated".into(),
-                ));
-            }
-            let len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
-            if payload.len() != 4 + len * 8 {
-                return Err(TreeError::CorruptedData(
-                    "cf_docs int array length mismatch".into(),
-                ));
-            }
-            let mut arr = Vec::with_capacity(len);
-            for chunk in payload[4..].chunks_exact(8) {
-                arr.push(i64::from_le_bytes(chunk.try_into().unwrap()));
-            }
+            let mut r = ByteReader::new(payload);
+            let len = r.read_u32_le("cf_docs int array len")? as usize;
+            let body = r.read_bytes(len * 8, "cf_docs int array")?;
+            r.expect_eof("cf_docs int array")?;
+            let arr = body
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
             Ok(AttributeValue::IntArray(arr))
         }
         DOC_VAL_UINT_ARRAY => {
-            if payload.len() < 4 {
-                return Err(TreeError::CorruptedData(
-                    "cf_docs uint array len truncated".into(),
-                ));
-            }
-            let len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
-            if payload.len() != 4 + len * 8 {
-                return Err(TreeError::CorruptedData(
-                    "cf_docs uint array length mismatch".into(),
-                ));
-            }
-            let mut arr = Vec::with_capacity(len);
-            for chunk in payload[4..].chunks_exact(8) {
-                arr.push(u64::from_le_bytes(chunk.try_into().unwrap()));
-            }
+            let mut r = ByteReader::new(payload);
+            let len = r.read_u32_le("cf_docs uint array len")? as usize;
+            let body = r.read_bytes(len * 8, "cf_docs uint array")?;
+            r.expect_eof("cf_docs uint array")?;
+            let arr = body
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
             Ok(AttributeValue::UintArray(arr))
         }
         other => Err(TreeError::CorruptedData(format!(
@@ -1096,24 +1070,6 @@ pub fn decode_attributes(schema: &CollectionSchema, bytes: &[u8]) -> Result<Attr
         map.insert(entry.name.clone(), val);
     }
     Ok(map)
-}
-
-fn read_len_prefixed_str(bytes: &[u8], off: usize) -> Result<(String, usize)> {
-    if off + 4 > bytes.len() {
-        return Err(TreeError::CorruptedData(
-            "cf_docs string len truncated".into(),
-        ));
-    }
-    let len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
-    let start = off + 4;
-    let end = start + len;
-    if end > bytes.len() {
-        return Err(TreeError::CorruptedData("cf_docs string truncated".into()));
-    }
-    let s = std::str::from_utf8(&bytes[start..end])
-        .map_err(|e| TreeError::CorruptedData(format!("invalid utf8 in cf_docs: {e}")))?
-        .to_owned();
-    Ok((s, end))
 }
 
 /// Extract all distinct `cf_attr_clusters` keys to index for a document's `(AttrId, AttributeValue)` list.

@@ -1,4 +1,16 @@
+//! SIMD-accelerated RaBitQ leaf scoring across AVX-512, x86 POPCNT, NEON, and scalar backends.
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+mod aarch64;
+mod scalar;
+#[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+mod x86;
+
 use izzydb_core::config::{DistanceMetric, DocId};
+
+pub(super) const METRIC_L2: u8 = DistanceMetric::L2Squared as u8;
+pub(super) const METRIC_COSINE: u8 = DistanceMetric::Cosine as u8;
+pub(super) const METRIC_DOT: u8 = DistanceMetric::DotProduct as u8;
 
 /// Candidate scored during Stage 1 RaBitQ leaf scanning.
 #[derive(Debug, Clone, Copy)]
@@ -79,13 +91,13 @@ fn dispatch_score_leaf<const MASKED: bool>(
             unsafe {
                 match params.metric {
                     DistanceMetric::L2Squared => {
-                        score_leaf_avx512::<0, MASKED>(params, allowed_slots, out)
+                        x86::score_leaf_avx512::<METRIC_L2, MASKED>(params, allowed_slots, out)
                     }
                     DistanceMetric::Cosine => {
-                        score_leaf_avx512::<1, MASKED>(params, allowed_slots, out)
+                        x86::score_leaf_avx512::<METRIC_COSINE, MASKED>(params, allowed_slots, out)
                     }
                     DistanceMetric::DotProduct => {
-                        score_leaf_avx512::<2, MASKED>(params, allowed_slots, out)
+                        x86::score_leaf_avx512::<METRIC_DOT, MASKED>(params, allowed_slots, out)
                     }
                 }
             }
@@ -96,13 +108,13 @@ fn dispatch_score_leaf<const MASKED: bool>(
             unsafe {
                 match params.metric {
                     DistanceMetric::L2Squared => {
-                        score_leaf_popcnt::<0, MASKED>(params, allowed_slots, out)
+                        x86::score_leaf_popcnt::<METRIC_L2, MASKED>(params, allowed_slots, out)
                     }
                     DistanceMetric::Cosine => {
-                        score_leaf_popcnt::<1, MASKED>(params, allowed_slots, out)
+                        x86::score_leaf_popcnt::<METRIC_COSINE, MASKED>(params, allowed_slots, out)
                     }
                     DistanceMetric::DotProduct => {
-                        score_leaf_popcnt::<2, MASKED>(params, allowed_slots, out)
+                        x86::score_leaf_popcnt::<METRIC_DOT, MASKED>(params, allowed_slots, out)
                     }
                 }
             }
@@ -116,13 +128,13 @@ fn dispatch_score_leaf<const MASKED: bool>(
             unsafe {
                 match params.metric {
                     DistanceMetric::L2Squared => {
-                        score_leaf_neon::<0, MASKED>(params, allowed_slots, out)
+                        aarch64::score_leaf_neon::<METRIC_L2, MASKED>(params, allowed_slots, out)
                     }
                     DistanceMetric::Cosine => {
-                        score_leaf_neon::<1, MASKED>(params, allowed_slots, out)
+                        aarch64::score_leaf_neon::<METRIC_COSINE, MASKED>(params, allowed_slots, out)
                     }
                     DistanceMetric::DotProduct => {
-                        score_leaf_neon::<2, MASKED>(params, allowed_slots, out)
+                        aarch64::score_leaf_neon::<METRIC_DOT, MASKED>(params, allowed_slots, out)
                     }
                 }
             }
@@ -130,419 +142,14 @@ fn dispatch_score_leaf<const MASKED: bool>(
         }
     }
     match params.metric {
-        DistanceMetric::L2Squared => score_leaf_scalar::<0, MASKED>(params, allowed_slots, out),
-        DistanceMetric::Cosine => score_leaf_scalar::<1, MASKED>(params, allowed_slots, out),
-        DistanceMetric::DotProduct => score_leaf_scalar::<2, MASKED>(params, allowed_slots, out),
-    }
-}
-
-#[inline(always)]
-fn read_popcount_scalar(params: &RabitqLeafScoreParams<'_>, slot: usize) -> u32 {
-    if params.popcount_u32 {
-        let off = slot * 4;
-        u32::from_le_bytes(
-            params.code_popcounts_bytes[off..off + 4]
-                .try_into()
-                .unwrap(),
-        )
-    } else {
-        let off = slot * 2;
-        u16::from_le_bytes([
-            params.code_popcounts_bytes[off],
-            params.code_popcounts_bytes[off + 1],
-        ]) as u32
-    }
-}
-
-#[inline(always)]
-fn score_single_entry_scalar<const METRIC: u8>(
-    params: &RabitqLeafScoreParams<'_>,
-    i: usize,
-) -> LeafCandidate {
-    let words = params.rabitq_words;
-    let doc_id =
-        u64::from_le_bytes(params.doc_ids_bytes[i * 8..(i + 1) * 8].try_into().unwrap());
-    let res_norm_sq = f32::from_le_bytes(
-        params.res_norm_sqs_bytes[i * 4..(i + 1) * 4]
-            .try_into()
-            .unwrap(),
-    );
-    let dist = if res_norm_sq == 0.0 {
-        params.zero_res_dist
-    } else {
-        let scale =
-            f32::from_le_bytes(params.scales_bytes[i * 4..(i + 1) * 4].try_into().unwrap());
-        let p_x = read_popcount_scalar(params, i);
-        let tile = i >> 3;
-        let lane = i & 7;
-        let tile_base = tile * words * 8 + lane;
-        let mut p0 = 0u32;
-        let mut p1 = 0u32;
-        let mut p2 = 0u32;
-        let mut p3 = 0u32;
-        for w in 0..words {
-            let off = (tile_base + w * 8) * 8;
-            let x = u64::from_le_bytes(params.codes_bytes[off..off + 8].try_into().unwrap());
-            p0 += (x & params.q0[w]).count_ones();
-            p1 += (x & params.q1[w]).count_ones();
-            p2 += (x & params.q2[w]).count_ones();
-            p3 += (x & params.q3[w]).count_ones();
+        DistanceMetric::L2Squared => {
+            scalar::score_leaf_scalar::<METRIC_L2, MASKED>(params, allowed_slots, out)
         }
-        let weighted_pop = (p0 + (p1 << 1) + (p2 << 2) + (p3 << 3)) as f32;
-        let sum_x_q = params.vl * (p_x as f32) + params.delta * weighted_pop;
-        let o_bar_dot_q = (2.0 * sum_x_q - params.sum_q) * params.inv_sqrt_padded_dim;
-        let est_r_dot_q = scale * o_bar_dot_q;
-        match METRIC {
-            0 => (res_norm_sq + params.q_res_norm_sq - 2.0 * est_r_dot_q).max(0.0),
-            1 => (0.5 * (res_norm_sq + params.q_res_norm_sq - 2.0 * est_r_dot_q)).max(0.0),
-            _ => params.zero_res_dist - est_r_dot_q,
+        DistanceMetric::Cosine => {
+            scalar::score_leaf_scalar::<METRIC_COSINE, MASKED>(params, allowed_slots, out)
         }
-    };
-    LeafCandidate { doc_id, dist }
-}
-
-#[inline]
-fn score_leaf_scalar<const METRIC: u8, const MASKED: bool>(
-    params: &RabitqLeafScoreParams<'_>,
-    allowed_slots: &[u64],
-    out: &mut Vec<LeafCandidate>,
-) {
-    let n = params.slot_cap;
-    if !MASKED {
-        out.reserve(n);
-    }
-    for i in 0..n {
-        if !MASKED || ((allowed_slots[i / 64] >> (i % 64)) & 1 != 0) {
-            out.push(score_single_entry_scalar::<METRIC>(params, i));
-        }
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", target_endian = "little"))]
-#[target_feature(enable = "popcnt")]
-unsafe fn score_leaf_popcnt<const METRIC: u8, const MASKED: bool>(
-    params: &RabitqLeafScoreParams<'_>,
-    allowed_slots: &[u64],
-    out: &mut Vec<LeafCandidate>,
-) {
-    score_leaf_scalar::<METRIC, MASKED>(params, allowed_slots, out);
-}
-
-#[cfg(all(target_arch = "x86_64", target_endian = "little"))]
-#[target_feature(enable = "avx512f,avx512vpopcntdq,avx2,fma")]
-unsafe fn score_leaf_avx512<const METRIC: u8, const MASKED: bool>(
-    params: &RabitqLeafScoreParams<'_>,
-    allowed_slots: &[u64],
-    out: &mut Vec<LeafCandidate>,
-) {
-    use std::arch::x86_64::*;
-
-    let n = params.slot_cap;
-    let padded_n = n.next_multiple_of(8);
-    let words = params.rabitq_words;
-    if !MASKED {
-        out.reserve(n);
-    }
-
-    let v_vl = _mm256_set1_ps(params.vl);
-    let v_delta = _mm256_set1_ps(params.delta);
-    let v_two = _mm256_set1_ps(2.0);
-    let v_sum_q = _mm256_set1_ps(params.sum_q);
-    let v_inv_sqrt = _mm256_set1_ps(params.inv_sqrt_padded_dim);
-    let v_q_res_sq = _mm256_set1_ps(params.q_res_norm_sq);
-    let v_half = _mm256_set1_ps(0.5);
-    let v_zero = _mm256_setzero_ps();
-    let v_zero_res_dist = _mm256_set1_ps(params.zero_res_dist);
-
-    let codes_ptr = params.codes_bytes.as_ptr();
-    let pop_ptr = params.code_popcounts_bytes.as_ptr();
-    let res_sq_ptr = params.res_norm_sqs_bytes.as_ptr() as *const f32;
-    let scales_ptr = params.scales_bytes.as_ptr() as *const f32;
-    let doc_ids_ptr = params.doc_ids_bytes.as_ptr();
-    let pop_u32 = params.popcount_u32;
-
-    let loop_end = if MASKED { padded_n } else { n & !7 };
-    let mut i = 0usize;
-    let mut tile = 0usize;
-    while i < loop_end {
-        let byte_mask = if MASKED {
-            let m = ((allowed_slots[i / 64] >> (i % 64)) & 0xFF) as u8;
-            if m == 0 {
-                i += 8;
-                tile += 1;
-                continue;
-            }
-            m
-        } else {
-            0xFF
-        };
-
-        let mut acc_0 = _mm512_setzero_si512();
-        let mut acc_1 = _mm512_setzero_si512();
-        let mut acc_2 = _mm512_setzero_si512();
-        let mut acc_3 = _mm512_setzero_si512();
-
-        let tile_byte_base = tile * words * 64;
-        for w in 0..words {
-            unsafe {
-                let x = _mm512_loadu_si512(codes_ptr.add(tile_byte_base + w * 64) as *const __m512i);
-                let q0w = _mm512_set1_epi64(*params.q0.get_unchecked(w) as i64);
-                let q1w = _mm512_set1_epi64(*params.q1.get_unchecked(w) as i64);
-                let q2w = _mm512_set1_epi64(*params.q2.get_unchecked(w) as i64);
-                let q3w = _mm512_set1_epi64(*params.q3.get_unchecked(w) as i64);
-
-                acc_0 = _mm512_add_epi64(acc_0, _mm512_popcnt_epi64(_mm512_and_si512(x, q0w)));
-                acc_1 = _mm512_add_epi64(acc_1, _mm512_popcnt_epi64(_mm512_and_si512(x, q1w)));
-                acc_2 = _mm512_add_epi64(acc_2, _mm512_popcnt_epi64(_mm512_and_si512(x, q2w)));
-                acc_3 = _mm512_add_epi64(acc_3, _mm512_popcnt_epi64(_mm512_and_si512(x, q3w)));
-            }
-        }
-
-        let w1 = _mm512_slli_epi64(acc_1, 1);
-        let w2 = _mm512_slli_epi64(acc_2, 2);
-        let w3 = _mm512_slli_epi64(acc_3, 3);
-        let weighted_i64 = _mm512_add_epi64(_mm512_add_epi64(acc_0, w1), _mm512_add_epi64(w2, w3));
-
-        let px_i32 = unsafe {
-            if pop_u32 {
-                _mm256_loadu_si256(pop_ptr.add(i * 4) as *const __m256i)
-            } else {
-                _mm256_cvtepu16_epi32(_mm_loadu_si128(pop_ptr.add(i * 2) as *const __m128i))
-            }
-        };
-        let px_f = _mm256_cvtepi32_ps(px_i32);
-        let wp_f = _mm256_cvtepi32_ps(_mm512_cvtepi64_epi32(weighted_i64));
-
-        let sum_x_q = _mm256_fmadd_ps(v_delta, wp_f, _mm256_mul_ps(v_vl, px_f));
-        let o_bar_dot_q = _mm256_mul_ps(_mm256_fmsub_ps(v_two, sum_x_q, v_sum_q), v_inv_sqrt);
-
-        let v_scale = unsafe { _mm256_loadu_ps(scales_ptr.add(i)) };
-        let v_res_sq = unsafe { _mm256_loadu_ps(res_sq_ptr.add(i)) };
-        let est_r_dot_q = _mm256_mul_ps(v_scale, o_bar_dot_q);
-
-        let raw_dist = match METRIC {
-            0 => {
-                let d = _mm256_fnmadd_ps(v_two, est_r_dot_q, _mm256_add_ps(v_res_sq, v_q_res_sq));
-                _mm256_max_ps(v_zero, d)
-            }
-            1 => {
-                let d = _mm256_fnmadd_ps(v_two, est_r_dot_q, _mm256_add_ps(v_res_sq, v_q_res_sq));
-                _mm256_max_ps(v_zero, _mm256_mul_ps(v_half, d))
-            }
-            _ => _mm256_sub_ps(v_zero_res_dist, est_r_dot_q),
-        };
-
-        let zero_mask = _mm256_cmp_ps(v_res_sq, v_zero, _CMP_EQ_OQ);
-        let final_dist = _mm256_blendv_ps(raw_dist, v_zero_res_dist, zero_mask);
-
-        let mut dists = [0.0f32; 8];
-        let mut doc_ids = [0u64; 8];
-        unsafe {
-            _mm256_storeu_ps(dists.as_mut_ptr(), final_dist);
-            std::ptr::copy_nonoverlapping(doc_ids_ptr.add(i * 8), doc_ids.as_mut_ptr() as *mut u8, 64);
-        }
-
-        if !MASKED || byte_mask == 0xFF {
-            for lane in 0..8 {
-                out.push(LeafCandidate {
-                    doc_id: doc_ids[lane],
-                    dist: dists[lane],
-                });
-            }
-        } else {
-            let mut m = byte_mask;
-            while m != 0 {
-                let lane = m.trailing_zeros() as usize;
-                m &= m - 1;
-                if i + lane < n {
-                    out.push(LeafCandidate {
-                        doc_id: doc_ids[lane],
-                        dist: dists[lane],
-                    });
-                }
-            }
-        }
-
-        i += 8;
-        tile += 1;
-    }
-
-    if !MASKED {
-        while i < n {
-            out.push(score_single_entry_scalar::<METRIC>(params, i));
-            i += 1;
-        }
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-#[target_feature(enable = "neon")]
-unsafe fn score_leaf_neon<const METRIC: u8, const MASKED: bool>(
-    params: &RabitqLeafScoreParams<'_>,
-    allowed_slots: &[u64],
-    out: &mut Vec<LeafCandidate>,
-) {
-    use std::arch::aarch64::*;
-
-    let n = params.slot_cap;
-    let padded_n = n.next_multiple_of(8);
-    let words = params.rabitq_words;
-    if !MASKED {
-        out.reserve(n);
-    }
-
-    let v_vl = vdupq_n_f32(params.vl);
-    let v_delta = vdupq_n_f32(params.delta);
-    let v_two = vdupq_n_f32(2.0);
-    let v_neg_sum_q = vdupq_n_f32(-params.sum_q);
-    let v_inv_sqrt = vdupq_n_f32(params.inv_sqrt_padded_dim);
-    let v_q_res_sq = vdupq_n_f32(params.q_res_norm_sq);
-    let v_half = vdupq_n_f32(0.5);
-    let v_zero = vdupq_n_f32(0.0);
-    let v_zero_res_dist = vdupq_n_f32(params.zero_res_dist);
-
-    let codes_ptr = params.codes_bytes.as_ptr();
-    let pop_ptr = params.code_popcounts_bytes.as_ptr();
-    let res_sq_ptr = params.res_norm_sqs_bytes.as_ptr();
-    let scales_ptr = params.scales_bytes.as_ptr();
-    let doc_ids_ptr = params.doc_ids_bytes.as_ptr();
-    let pop_u32 = params.popcount_u32;
-
-    let loop_end = if MASKED { padded_n } else { n & !3 };
-    let mut i = 0usize;
-    while i < loop_end {
-        let nibble_mask = if MASKED {
-            let m = ((allowed_slots[i / 64] >> (i % 64)) & 0xF) as u8;
-            if m == 0 {
-                i += 4;
-                continue;
-            }
-            m
-        } else {
-            0xF
-        };
-
-        let mut total_0 = vdupq_n_u32(0);
-        let mut total_1 = vdupq_n_u32(0);
-        let mut total_2 = vdupq_n_u32(0);
-        let mut total_3 = vdupq_n_u32(0);
-
-        let tile = i >> 3;
-        let half_off = (i & 4) * 8; // 0 for lanes 0..4, 32 for lanes 4..8
-        let tile_byte_base = tile * words * 64 + half_off;
-
-        let mut w_start = 0usize;
-        while w_start < words {
-            let w_end = (w_start + 1024).min(words);
-            let mut acc_0_lo = vdupq_n_u16(0);
-            let mut acc_1_lo = vdupq_n_u16(0);
-            let mut acc_2_lo = vdupq_n_u16(0);
-            let mut acc_3_lo = vdupq_n_u16(0);
-
-            let mut acc_0_hi = vdupq_n_u16(0);
-            let mut acc_1_hi = vdupq_n_u16(0);
-            let mut acc_2_hi = vdupq_n_u16(0);
-            let mut acc_3_hi = vdupq_n_u16(0);
-
-            for w in w_start..w_end {
-                unsafe {
-                    let base = tile_byte_base + w * 64;
-                    let x_lo = vld1q_u8(codes_ptr.add(base));
-                    let x_hi = vld1q_u8(codes_ptr.add(base + 16));
-
-                    let q0w = vreinterpretq_u8_u64(vdupq_n_u64(*params.q0.get_unchecked(w)));
-                    let q1w = vreinterpretq_u8_u64(vdupq_n_u64(*params.q1.get_unchecked(w)));
-                    let q2w = vreinterpretq_u8_u64(vdupq_n_u64(*params.q2.get_unchecked(w)));
-                    let q3w = vreinterpretq_u8_u64(vdupq_n_u64(*params.q3.get_unchecked(w)));
-
-                    acc_0_lo = vpadalq_u8(acc_0_lo, vcntq_u8(vandq_u8(x_lo, q0w)));
-                    acc_1_lo = vpadalq_u8(acc_1_lo, vcntq_u8(vandq_u8(x_lo, q1w)));
-                    acc_2_lo = vpadalq_u8(acc_2_lo, vcntq_u8(vandq_u8(x_lo, q2w)));
-                    acc_3_lo = vpadalq_u8(acc_3_lo, vcntq_u8(vandq_u8(x_lo, q3w)));
-
-                    acc_0_hi = vpadalq_u8(acc_0_hi, vcntq_u8(vandq_u8(x_hi, q0w)));
-                    acc_1_hi = vpadalq_u8(acc_1_hi, vcntq_u8(vandq_u8(x_hi, q1w)));
-                    acc_2_hi = vpadalq_u8(acc_2_hi, vcntq_u8(vandq_u8(x_hi, q2w)));
-                    acc_3_hi = vpadalq_u8(acc_3_hi, vcntq_u8(vandq_u8(x_hi, q3w)));
-                }
-            }
-
-            total_0 = vaddq_u32(total_0, vpaddlq_u16(vpaddq_u16(acc_0_lo, acc_0_hi)));
-            total_1 = vaddq_u32(total_1, vpaddlq_u16(vpaddq_u16(acc_1_lo, acc_1_hi)));
-            total_2 = vaddq_u32(total_2, vpaddlq_u16(vpaddq_u16(acc_2_lo, acc_2_hi)));
-            total_3 = vaddq_u32(total_3, vpaddlq_u16(vpaddq_u16(acc_3_lo, acc_3_hi)));
-            w_start = w_end;
-        }
-
-        let w1 = vshlq_n_u32::<1>(total_1);
-        let w2 = vshlq_n_u32::<2>(total_2);
-        let w3 = vshlq_n_u32::<3>(total_3);
-        let weighted_u32 = vaddq_u32(vaddq_u32(total_0, w1), vaddq_u32(w2, w3));
-
-        let total_x = unsafe {
-            if pop_u32 {
-                vreinterpretq_u32_u8(vld1q_u8(pop_ptr.add(i * 4)))
-            } else {
-                vmovl_u16(vreinterpret_u16_u8(vld1_u8(pop_ptr.add(i * 2))))
-            }
-        };
-        let px_f = vcvtq_f32_u32(total_x);
-        let wp_f = vcvtq_f32_u32(weighted_u32);
-
-        let sum_x_q = vfmaq_f32(vmulq_f32(v_vl, px_f), v_delta, wp_f);
-        let o_bar_dot_q = vmulq_f32(vfmaq_f32(v_neg_sum_q, v_two, sum_x_q), v_inv_sqrt);
-
-        let v_scale = unsafe { vreinterpretq_f32_u8(vld1q_u8(scales_ptr.add(i * 4))) };
-        let v_res_sq = unsafe { vreinterpretq_f32_u8(vld1q_u8(res_sq_ptr.add(i * 4))) };
-        let est_r_dot_q = vmulq_f32(v_scale, o_bar_dot_q);
-
-        let raw_dist = match METRIC {
-            0 => {
-                let d = vfmsq_f32(vaddq_f32(v_res_sq, v_q_res_sq), v_two, est_r_dot_q);
-                vmaxq_f32(v_zero, d)
-            }
-            1 => {
-                let d = vfmsq_f32(vaddq_f32(v_res_sq, v_q_res_sq), v_two, est_r_dot_q);
-                vmaxq_f32(v_zero, vmulq_f32(v_half, d))
-            }
-            _ => vsubq_f32(v_zero_res_dist, est_r_dot_q),
-        };
-
-        let zero_mask = vceqq_f32(v_res_sq, v_zero);
-        let final_dist = vbslq_f32(zero_mask, v_zero_res_dist, raw_dist);
-
-        let mut dists = [0.0f32; 4];
-        let mut doc_ids = [0u64; 4];
-        unsafe {
-            vst1q_f32(dists.as_mut_ptr(), final_dist);
-            std::ptr::copy_nonoverlapping(doc_ids_ptr.add(i * 8), doc_ids.as_mut_ptr() as *mut u8, 32);
-        }
-
-        if !MASKED || nibble_mask == 0xF {
-            for lane in 0..4 {
-                out.push(LeafCandidate {
-                    doc_id: doc_ids[lane],
-                    dist: dists[lane],
-                });
-            }
-        } else {
-            for lane in 0..4 {
-                if (nibble_mask >> lane) & 1 != 0 && i + lane < n {
-                    out.push(LeafCandidate {
-                        doc_id: doc_ids[lane],
-                        dist: dists[lane],
-                    });
-                }
-            }
-        }
-
-        i += 4;
-    }
-
-    if !MASKED {
-        while i < n {
-            out.push(score_single_entry_scalar::<METRIC>(params, i));
-            i += 1;
+        DistanceMetric::DotProduct => {
+            scalar::score_leaf_scalar::<METRIC_DOT, MASKED>(params, allowed_slots, out)
         }
     }
 }

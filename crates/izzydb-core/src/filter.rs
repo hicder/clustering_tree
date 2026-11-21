@@ -77,15 +77,35 @@ pub enum Filter {
 }
 
 impl Filter {
+    /// If this node is an FTS predicate leaf, return `(kind, attr, query, last_as_prefix)`.
+    #[inline]
+    pub fn as_fts_predicate(&self) -> Option<(FtsPredicateKind, &str, &TokenQuery, bool)> {
+        match self {
+            Self::ContainsAllTokens {
+                attr,
+                query,
+                last_as_prefix,
+            } => Some((FtsPredicateKind::AllTokens, attr, query, *last_as_prefix)),
+            Self::ContainsAnyToken {
+                attr,
+                query,
+                last_as_prefix,
+            } => Some((FtsPredicateKind::AnyToken, attr, query, *last_as_prefix)),
+            Self::ContainsTokenSequence {
+                attr,
+                query,
+                last_as_prefix,
+            } => Some((FtsPredicateKind::TokenSequence, attr, query, *last_as_prefix)),
+            _ => None,
+        }
+    }
+
     /// Returns `true` if this filter tree contains any FTS token/sequence predicate.
     pub fn has_fts(&self) -> bool {
         match self {
             Self::And(children) | Self::Or(children) => children.iter().any(Self::has_fts),
             Self::Not(child) => child.has_fts(),
-            Self::ContainsAllTokens { .. }
-            | Self::ContainsAnyToken { .. }
-            | Self::ContainsTokenSequence { .. } => true,
-            _ => false,
+            _ => self.as_fts_predicate().is_some(),
         }
     }
 
@@ -94,10 +114,7 @@ impl Filter {
         match self {
             Self::And(children) | Self::Or(children) => children.iter().all(Self::is_fts_only),
             Self::Not(child) => child.is_fts_only(),
-            Self::ContainsAllTokens { .. }
-            | Self::ContainsAnyToken { .. }
-            | Self::ContainsTokenSequence { .. } => true,
-            _ => false,
+            _ => self.as_fts_predicate().is_some(),
         }
     }
 
@@ -240,26 +257,13 @@ impl Filter {
             }
             Self::IsNull(attr) => matches!(attrs.get(attr), None | Some(AttributeValue::Null)),
             Self::IsNotNull(attr) => !matches!(attrs.get(attr), None | Some(AttributeValue::Null)),
-            Self::ContainsAllTokens {
-                attr,
-                query,
-                last_as_prefix,
-            } => eval_fts(FtsPredicateKind::AllTokens, attr, query, *last_as_prefix),
-            Self::ContainsAnyToken {
-                attr,
-                query,
-                last_as_prefix,
-            } => eval_fts(FtsPredicateKind::AnyToken, attr, query, *last_as_prefix),
-            Self::ContainsTokenSequence {
-                attr,
-                query,
-                last_as_prefix,
-            } => eval_fts(
-                FtsPredicateKind::TokenSequence,
-                attr,
-                query,
-                *last_as_prefix,
-            ),
+            other => {
+                if let Some((kind, attr, query, last_as_prefix)) = other.as_fts_predicate() {
+                    eval_fts(kind, attr, query, last_as_prefix)
+                } else {
+                    unreachable!("all non-FTS Filter variants handled above")
+                }
+            }
         }
     }
 }

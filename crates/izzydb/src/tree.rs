@@ -1,3 +1,6 @@
+//! Mutable, RocksDB-backed hierarchical clustering tree (~100x fanout) with
+//! RaBitQ-quantized leaf posting lists and full-precision vector storage.
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
@@ -16,6 +19,17 @@ use crate::search::{self, SearchOptions};
 use crate::storage::{DocLoc, Storage, TxContext};
 use crate::verify::{self, TreeStats};
 
+const SMALL_LEAF_REENCODE_THRESHOLD: usize = 16;
+const MIN_COMPACT_SLOT_CAP: usize = 32;
+
+/// Summary of a child node passed during root creation, parent attachment, and redistribution.
+#[derive(Clone, Copy)]
+struct ChildSummary<'a> {
+    id: NodeId,
+    subtree_count: u64,
+    centroid: &'a [f32],
+}
+
 /// Metadata about a completed leaf split passed to SPFresh LIRE.
 #[derive(Debug, Clone)]
 pub(crate) struct SplitPair {
@@ -28,7 +42,8 @@ pub(crate) struct SplitPair {
 #[inline]
 pub(crate) fn needs_leaf_compaction(leaf: &PackedLeafNode, config: &TreeConfig) -> bool {
     leaf.slot_cap > config.max_leaf_size
-        || (leaf.slot_cap > 32 && leaf.live_count.saturating_mul(2) <= leaf.slot_cap)
+        || (leaf.slot_cap > MIN_COMPACT_SLOT_CAP
+            && leaf.live_count.saturating_mul(2) <= leaf.slot_cap)
 }
 
 /// Outcome of updating an existing document's vector inside `TxContext`.
@@ -169,27 +184,53 @@ impl ClusteringTree {
         self.storage.get_vector(id)
     }
 
-    /// Insert or update a vector in the tree, quantizing it for the leaf posting list
-    /// while persisting the full-precision vector in `cf_vectors`.
-    pub fn add_leaf(&mut self, id: DocId, embedding: &[f32]) -> Result<()> {
-        let vec = prepare_vector(embedding, self.config.dim, self.config.metric)?;
+    /// Open a read-your-own-writes transaction alongside immutable config and quantizer refs.
+    pub(crate) fn begin_tx_parts(
+        &mut self,
+    ) -> (&TreeConfig, &RabitqQuantizer, TxContext<'_>) {
+        (
+            &self.config,
+            &self.quantizer,
+            TxContext::new(
+                &self.storage,
+                &mut self.internal_cache,
+                &mut self.leaf_parent,
+                self.meta.clone(),
+            ),
+        )
+    }
+
+    /// Execute `f` inside an atomic [`TxContext`], committing `self.meta` on success.
+    pub(crate) fn in_tx<T>(
+        &mut self,
+        f: impl FnOnce(&mut TxContext<'_>, &TreeConfig, &RabitqQuantizer) -> Result<T>,
+    ) -> Result<T> {
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
             &mut self.leaf_parent,
             self.meta.clone(),
         );
-        let split_opt = if let Some(old_loc) = tx.get_doc_loc(id)? {
-            match update_vector_in_tx(&mut tx, id, old_loc, &vec, &self.config, &self.quantizer)? {
-                VectorUpdateResult::SameLeaf { .. } => None,
-                VectorUpdateResult::Moved { split, .. } => split,
-            }
-        } else {
-            let (_loc, _delta, split_opt) =
-                insert_in_tx(&mut tx, id, &vec, &self.config, &self.quantizer)?;
-            split_opt
-        };
+        let result = f(&mut tx, &self.config, &self.quantizer)?;
         self.meta = tx.commit()?;
+        Ok(result)
+    }
+
+    /// Insert or update a vector in the tree, quantizing it for the leaf posting list
+    /// while persisting the full-precision vector in `cf_vectors`.
+    pub fn add_leaf(&mut self, id: DocId, embedding: &[f32]) -> Result<()> {
+        let vec = prepare_vector(embedding, self.config.dim, self.config.metric)?;
+        let split_opt = self.in_tx(|tx, config, quantizer| {
+            if let Some(old_loc) = tx.get_doc_loc(id)? {
+                match update_vector_in_tx(tx, id, old_loc, &vec, config, quantizer)? {
+                    VectorUpdateResult::SameLeaf { .. } => Ok(None),
+                    VectorUpdateResult::Moved { split, .. } => Ok(split),
+                }
+            } else {
+                let (_loc, _delta, split_opt) = insert_in_tx(tx, id, &vec, config, quantizer)?;
+                Ok(split_opt)
+            }
+        })?;
 
         if let Some(split_pair) = split_opt
             && self.config.enable_lire
@@ -204,14 +245,8 @@ impl ClusteringTree {
     ///
     /// Returns `true` if `id` existed and was removed, or `false` if `id` was absent.
     pub fn remove(&mut self, id: DocId) -> Result<bool> {
-        let mut tx = TxContext::new(
-            &self.storage,
-            &mut self.internal_cache,
-            &mut self.leaf_parent,
-            self.meta.clone(),
-        );
-        let removed =
-            remove_existing_in_tx(&mut tx, id, &self.config, &self.quantizer)?.is_some();
+        let (config, quantizer, mut tx) = self.begin_tx_parts();
+        let removed = remove_existing_in_tx(&mut tx, id, config, quantizer)?.is_some();
         if removed {
             self.meta = tx.commit()?;
         }
@@ -272,28 +307,53 @@ impl ClusteringTree {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn compact_leaf_in_tx(
-    tx: &mut TxContext<'_>,
+struct CompactArgs<'a, 'b> {
+    tx: &'a mut TxContext<'b>,
     leaf_id: NodeId,
-    leaf: &mut PackedLeafNode,
-    flat_vecs: &[f32],
-    quantizer: &RabitqQuantizer,
+    leaf: &'a mut PackedLeafNode,
+    flat_vecs: &'a [f32],
+    quantizer: &'a RabitqQuantizer,
     dim: usize,
-    scratch: &mut EncodeScratch,
-    delta: &mut ClusterDelta,
-) {
-    let pairs = leaf.live_slot_doc_pairs();
+    scratch: &'a mut EncodeScratch,
+    delta: &'a mut ClusterDelta,
+}
+
+fn compact_leaf_in_tx(args: CompactArgs<'_, '_>) {
+    let pairs = args.leaf.live_slot_doc_pairs();
     let mut doc_ids = Vec::with_capacity(pairs.len());
     for &(lid, did) in &pairs {
-        delta.removed.push((did, leaf_id, lid));
+        args.delta.removed.push((did, args.leaf_id, lid));
         doc_ids.push(did);
     }
-    leaf.reset_and_encode(&doc_ids, flat_vecs, quantizer, dim, scratch);
-    for (lid, did) in leaf.live_slot_doc_pairs() {
-        tx.put_doc_pos(did, leaf_id, lid);
-        delta.added.push((did, leaf_id, lid));
+    args.leaf
+        .reset_and_encode(&doc_ids, args.flat_vecs, args.quantizer, args.dim, args.scratch);
+    for (lid, did) in args.leaf.live_slot_doc_pairs() {
+        args.tx.put_doc_pos(did, args.leaf_id, lid);
+        args.delta.added.push((did, args.leaf_id, lid));
     }
+}
+
+/// Recompute a leaf's centroid and either re-encode all live slots or rotate the centroid.
+fn refresh_leaf_after_shrink(
+    tx: &TxContext<'_>,
+    leaf: &mut PackedLeafNode,
+    old_centroid: &[f32],
+    config: &TreeConfig,
+    quantizer: &RabitqQuantizer,
+    scratch: &mut EncodeScratch,
+) -> Result<(Vec<f32>, bool)> {
+    let count = leaf.entry_count();
+    let live_docs = leaf.live_doc_ids();
+    let flat_vecs = tx.get_vectors_flat(&live_docs)?;
+    leaf.centroid = compute_mean_centroid_flat(&flat_vecs, count, config.dim, config.metric);
+    let drifted =
+        cluster_distance(config.metric, old_centroid, &leaf.centroid) > config.centroid_drift_eps;
+    if count <= SMALL_LEAF_REENCODE_THRESHOLD || drifted {
+        leaf.re_encode_existing(&flat_vecs, quantizer, config.dim, scratch);
+    } else {
+        quantizer.rotate_into(&leaf.centroid, &mut leaf.rotated_centroid);
+    }
+    Ok((flat_vecs, drifted))
 }
 
 /// Update an existing document's vector inside `tx`, using an in-place same-leaf path
@@ -324,25 +384,23 @@ pub(crate) fn update_vector_in_tx(
             > config.centroid_drift_eps;
 
         let mut delta = ClusterDelta::default();
+        let mut scratch = EncodeScratch::default();
         if needs_leaf_compaction(&leaf, config) {
-            let mut scratch = EncodeScratch::default();
-            compact_leaf_in_tx(
+            compact_leaf_in_tx(CompactArgs {
                 tx,
-                old_loc.leaf_id,
-                &mut leaf,
-                &flat_vecs,
+                leaf_id: old_loc.leaf_id,
+                leaf: &mut leaf,
+                flat_vecs: &flat_vecs,
                 quantizer,
-                config.dim,
-                &mut scratch,
-                &mut delta,
-            );
-        } else if count <= 16 || drifted {
-            let mut scratch = EncodeScratch::default();
+                dim: config.dim,
+                scratch: &mut scratch,
+                delta: &mut delta,
+            });
+        } else if count <= SMALL_LEAF_REENCODE_THRESHOLD || drifted {
             leaf.re_encode_existing(&flat_vecs, quantizer, config.dim, &mut scratch);
         } else {
             quantizer.rotate_into(&leaf.centroid, &mut leaf.rotated_centroid);
             let words = quantizer.num_words();
-            let mut scratch = EncodeScratch::default();
             let mut code = vec![0u64; words];
             let (res_norm_sq, scale, popcnt) =
                 quantizer.encode_into_with_popcnt(new_vec, &leaf.centroid, &mut scratch, &mut code);
@@ -417,34 +475,28 @@ pub(crate) fn remove_existing_in_tx(
         leaf.centroid = vec![0.0; config.dim];
         leaf.rotated_centroid.fill(0.0);
     } else if !will_underflow {
-        let live_docs = leaf.live_doc_ids();
-        let flat_vecs = tx.get_vectors_flat(&live_docs)?;
-        leaf.centroid = compute_mean_centroid_flat(
-            &flat_vecs,
-            new_count,
-            config.dim,
-            config.metric,
-        );
+        let mut scratch = EncodeScratch::default();
         if needs_leaf_compaction(&leaf, config) {
-            let mut scratch = EncodeScratch::default();
-            compact_leaf_in_tx(
-                tx,
-                loc.leaf_id,
-                &mut leaf,
+            let live_docs = leaf.live_doc_ids();
+            let flat_vecs = tx.get_vectors_flat(&live_docs)?;
+            leaf.centroid = compute_mean_centroid_flat(
                 &flat_vecs,
-                quantizer,
+                new_count,
                 config.dim,
-                &mut scratch,
-                &mut delta,
+                config.metric,
             );
-        } else if new_count <= 16
-            || cluster_distance(config.metric, &old_centroid, &leaf.centroid)
-                > config.centroid_drift_eps
-        {
-            let mut scratch = EncodeScratch::default();
-            leaf.re_encode_existing(&flat_vecs, quantizer, config.dim, &mut scratch);
+            compact_leaf_in_tx(CompactArgs {
+                tx,
+                leaf_id: loc.leaf_id,
+                leaf: &mut leaf,
+                flat_vecs: &flat_vecs,
+                quantizer,
+                dim: config.dim,
+                scratch: &mut scratch,
+                delta: &mut delta,
+            });
         } else {
-            quantizer.rotate_into(&leaf.centroid, &mut leaf.rotated_centroid);
+            refresh_leaf_after_shrink(tx, &mut leaf, &old_centroid, config, quantizer, &mut scratch)?;
         }
     }
 
@@ -524,22 +576,7 @@ pub(crate) fn remove_many_in_tx(
             leaf.centroid = vec![0.0; config.dim];
             leaf.rotated_centroid.fill(0.0);
         } else if !will_underflow {
-            let live_docs = leaf.live_doc_ids();
-            let flat_vecs = tx.get_vectors_flat(&live_docs)?;
-            leaf.centroid = compute_mean_centroid_flat(
-                &flat_vecs,
-                new_count,
-                config.dim,
-                config.metric,
-            );
-            if new_count <= 16
-                || cluster_distance(config.metric, &old_centroid, &leaf.centroid)
-                    > config.centroid_drift_eps
-            {
-                leaf.re_encode_existing(&flat_vecs, quantizer, config.dim, &mut scratch);
-            } else {
-                quantizer.rotate_into(&leaf.centroid, &mut leaf.rotated_centroid);
-            }
+            refresh_leaf_after_shrink(tx, &mut leaf, &old_centroid, config, quantizer, &mut scratch)?;
             if needs_leaf_compaction(&leaf, config) {
                 compaction_candidates.push(leaf_id);
             }
@@ -586,16 +623,16 @@ pub(crate) fn remove_many_in_tx(
         if leaf.entry_count() > 0 && needs_leaf_compaction(&leaf, config) {
             let live_docs = leaf.live_doc_ids();
             let flat_vecs = tx.get_vectors_flat(&live_docs)?;
-            compact_leaf_in_tx(
+            compact_leaf_in_tx(CompactArgs {
                 tx,
                 leaf_id,
-                &mut leaf,
-                &flat_vecs,
+                leaf: &mut leaf,
+                flat_vecs: &flat_vecs,
                 quantizer,
-                config.dim,
-                &mut scratch,
-                &mut delta,
-            );
+                dim: config.dim,
+                scratch: &mut scratch,
+                delta: &mut delta,
+            });
             tx.put_leaf_node(leaf_id, leaf);
         }
     }
@@ -662,7 +699,7 @@ pub(crate) fn insert_in_tx(
                 }
             }
             new_id_local
-        } else if new_count.is_multiple_of(16) {
+        } else if new_count.is_multiple_of(SMALL_LEAF_REENCODE_THRESHOLD) {
             let lid = leaf.insert_slot_for_reencode(id, words);
             let live_docs = leaf.live_doc_ids();
             let flat_vecs = tx.get_vectors_flat(&live_docs)?;
@@ -679,7 +716,7 @@ pub(crate) fn insert_in_tx(
             leaf.centroid = incremental_mean(&leaf.centroid, vec, new_count, config.metric);
             let drifted = cluster_distance(config.metric, &old_centroid, &leaf.centroid)
                 > config.centroid_drift_eps;
-            if new_count <= 16 || drifted {
+            if new_count <= SMALL_LEAF_REENCODE_THRESHOLD || drifted {
                 let lid = leaf.insert_slot_for_reencode(id, words);
                 let live_docs = leaf.live_doc_ids();
                 let flat_vecs = tx.get_vectors_flat(&live_docs)?;
@@ -801,286 +838,272 @@ pub(crate) fn split_node(
     quantizer: &RabitqQuantizer,
     delta: &mut ClusterDelta,
 ) -> Result<SplitPair> {
-    let is_internal = tx.is_internal_node(node_id);
     let right_id = tx.alloc_node_id();
-
-    if !is_internal {
-        let leaf = tx.get_leaf_node(node_id)?;
-        let live_pairs = leaf.live_slot_doc_pairs();
-        let mut live_doc_ids = Vec::with_capacity(live_pairs.len());
-        for &(lid, did) in &live_pairs {
-            delta.removed.push((did, node_id, lid));
-            live_doc_ids.push(did);
-        }
-
-        let flat_vecs = tx.get_vectors_flat(&live_doc_ids)?;
-        let parent_id = leaf.parent_id;
-        let old_centroid = leaf.centroid;
-        let dim = config.dim;
-        let padded_dim = quantizer.padded_dim();
-
-        let weighted: Vec<(&[f32], u64)> = flat_vecs
-            .chunks_exact(dim)
-            .map(|v| (v, 1u64))
-            .collect();
-        let mut split = balanced_two_means(
-            &weighted,
-            config.min_leaf_size,
-            config.max_leaf_size,
-            dim,
-            config.metric,
-        );
-        split.part1.sort_unstable();
-        split.part2.sort_unstable();
-
-        let mut left_doc_ids = Vec::with_capacity(split.part1.len());
-        let mut left_vecs = Vec::with_capacity(split.part1.len() * dim);
-        for &idx in &split.part1 {
-            left_doc_ids.push(live_doc_ids[idx]);
-            left_vecs.extend_from_slice(&flat_vecs[idx * dim..(idx + 1) * dim]);
-        }
-
-        let mut right_doc_ids = Vec::with_capacity(split.part2.len());
-        let mut right_vecs = Vec::with_capacity(split.part2.len() * dim);
-        for &idx in &split.part2 {
-            right_doc_ids.push(live_doc_ids[idx]);
-            right_vecs.extend_from_slice(&flat_vecs[idx * dim..(idx + 1) * dim]);
-        }
-
-        let mut scratch = EncodeScratch::default();
-        let mut left_leaf = PackedLeafNode::empty(parent_id, dim, padded_dim);
-        left_leaf.centroid = split.centroid1;
-        left_leaf.reset_and_encode(&left_doc_ids, &left_vecs, quantizer, dim, &mut scratch);
-        for (lid, did) in left_leaf.live_slot_doc_pairs() {
-            tx.put_doc_pos(did, node_id, lid);
-            delta.added.push((did, node_id, lid));
-        }
-
-        let mut right_leaf = PackedLeafNode::empty(parent_id, dim, padded_dim);
-        right_leaf.centroid = split.centroid2;
-        right_leaf.reset_and_encode(&right_doc_ids, &right_vecs, quantizer, dim, &mut scratch);
-        for (lid, did) in right_leaf.live_slot_doc_pairs() {
-            tx.put_doc_pos(did, right_id, lid);
-            delta.added.push((did, right_id, lid));
-        }
-
-        let left_sub = left_leaf.entry_count() as u64;
-        let right_sub = right_leaf.entry_count() as u64;
-        let left_c = left_leaf.centroid.clone();
-        let right_c = right_leaf.centroid.clone();
-
-        match parent_id {
-            None => {
-                let new_root_id = tx.alloc_node_id();
-                left_leaf.parent_id = Some(new_root_id);
-                right_leaf.parent_id = Some(new_root_id);
-                tx.put_leaf_node(node_id, left_leaf);
-                tx.put_leaf_node(right_id, right_leaf);
-
-                create_new_root(
-                    tx,
-                    new_root_id,
-                    1,
-                    node_id,
-                    left_sub,
-                    &left_c,
-                    right_id,
-                    right_sub,
-                    &right_c,
-                    config,
-                );
-            }
-            Some(pid) => {
-                tx.put_leaf_node(node_id, left_leaf);
-                tx.put_leaf_node(right_id, right_leaf);
-                attach_to_parent(
-                    tx,
-                    pid,
-                    node_id,
-                    left_sub,
-                    &left_c,
-                    right_id,
-                    right_sub,
-                    &right_c,
-                    config,
-                    quantizer,
-                    delta,
-                )?;
-            }
-        }
-
-        Ok(SplitPair {
-            left_id: node_id,
-            right_id,
-            old_centroid,
-        })
+    if !tx.is_internal_node(node_id) {
+        split_leaf(tx, node_id, right_id, config, quantizer, delta)
     } else {
-        let node = tx.get_internal_node(node_id)?;
-        let level = node.level;
-        let parent_id = node.parent_id;
-        let old_centroid = node.centroid.clone();
-        let dim = config.dim;
-
-        let weighted: Vec<(&[f32], u64)> = node
-            .child_centroids
-            .chunks_exact(dim)
-            .zip(node.child_subtree_counts.iter().copied())
-            .collect();
-        let mut split = balanced_two_means(
-            &weighted,
-            config.min_internal_fanout,
-            config.max_internal_fanout,
-            dim,
-            config.metric,
-        );
-        split.part1.sort_unstable();
-        split.part2.sort_unstable();
-
-        let mut left_node = PackedInternalNode {
-            level,
-            parent_id,
-            subtree_count: 0,
-            centroid: split.centroid1,
-            child_ids: Vec::with_capacity(split.part1.len()),
-            child_subtree_counts: Vec::with_capacity(split.part1.len()),
-            child_centroids: Vec::with_capacity(split.part1.len() * dim),
-        };
-        for &idx in &split.part1 {
-            let sub = node.child_subtree_counts[idx];
-            left_node.subtree_count += sub;
-            left_node.child_ids.push(node.child_ids[idx]);
-            left_node.child_subtree_counts.push(sub);
-            left_node
-                .child_centroids
-                .extend_from_slice(node.child_centroid(idx, dim));
-        }
-
-        let mut right_node = PackedInternalNode {
-            level,
-            parent_id,
-            subtree_count: 0,
-            centroid: split.centroid2,
-            child_ids: Vec::with_capacity(split.part2.len()),
-            child_subtree_counts: Vec::with_capacity(split.part2.len()),
-            child_centroids: Vec::with_capacity(split.part2.len() * dim),
-        };
-        for &idx in &split.part2 {
-            let child_id = node.child_ids[idx];
-            let sub = node.child_subtree_counts[idx];
-            right_node.subtree_count += sub;
-            right_node.child_ids.push(child_id);
-            right_node.child_subtree_counts.push(sub);
-            right_node
-                .child_centroids
-                .extend_from_slice(node.child_centroid(idx, dim));
-            set_child_parent(tx, child_id, Some(right_id))?;
-        }
-
-        let left_sub = left_node.subtree_count;
-        let right_sub = right_node.subtree_count;
-        let left_c = left_node.centroid.clone();
-        let right_c = right_node.centroid.clone();
-
-        match parent_id {
-            None => {
-                let new_root_id = tx.alloc_node_id();
-                left_node.parent_id = Some(new_root_id);
-                right_node.parent_id = Some(new_root_id);
-                tx.put_internal_node(node_id, left_node);
-                tx.put_internal_node(right_id, right_node);
-
-                create_new_root(
-                    tx,
-                    new_root_id,
-                    level + 1,
-                    node_id,
-                    left_sub,
-                    &left_c,
-                    right_id,
-                    right_sub,
-                    &right_c,
-                    config,
-                );
-            }
-            Some(pid) => {
-                tx.put_internal_node(node_id, left_node);
-                tx.put_internal_node(right_id, right_node);
-                attach_to_parent(
-                    tx,
-                    pid,
-                    node_id,
-                    left_sub,
-                    &left_c,
-                    right_id,
-                    right_sub,
-                    &right_c,
-                    config,
-                    quantizer,
-                    delta,
-                )?;
-            }
-        }
-
-        Ok(SplitPair {
-            left_id: node_id,
-            right_id,
-            old_centroid,
-        })
+        split_internal(tx, node_id, right_id, config, quantizer, delta)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn split_leaf(
+    tx: &mut TxContext<'_>,
+    left_id: NodeId,
+    right_id: NodeId,
+    config: &TreeConfig,
+    quantizer: &RabitqQuantizer,
+    delta: &mut ClusterDelta,
+) -> Result<SplitPair> {
+    let leaf = tx.get_leaf_node(left_id)?;
+    let live_pairs = leaf.live_slot_doc_pairs();
+    let mut live_doc_ids = Vec::with_capacity(live_pairs.len());
+    for &(lid, did) in &live_pairs {
+        delta.removed.push((did, left_id, lid));
+        live_doc_ids.push(did);
+    }
+
+    let flat_vecs = tx.get_vectors_flat(&live_doc_ids)?;
+    let parent_id = leaf.parent_id;
+    let old_centroid = leaf.centroid;
+    let dim = config.dim;
+    let padded_dim = quantizer.padded_dim();
+
+    let weighted: Vec<(&[f32], u64)> = flat_vecs
+        .chunks_exact(dim)
+        .map(|v| (v, 1u64))
+        .collect();
+    let mut split = balanced_two_means(
+        &weighted,
+        config.min_leaf_size,
+        config.max_leaf_size,
+        dim,
+        config.metric,
+    );
+    split.part1.sort_unstable();
+    split.part2.sort_unstable();
+
+    let build_half = |indices: &[usize]| -> (Vec<DocId>, Vec<f32>) {
+        let mut ids = Vec::with_capacity(indices.len());
+        let mut vecs = Vec::with_capacity(indices.len() * dim);
+        for &idx in indices {
+            ids.push(live_doc_ids[idx]);
+            vecs.extend_from_slice(&flat_vecs[idx * dim..(idx + 1) * dim]);
+        }
+        (ids, vecs)
+    };
+    let (left_doc_ids, left_vecs) = build_half(&split.part1);
+    let (right_doc_ids, right_vecs) = build_half(&split.part2);
+
+    let mut scratch = EncodeScratch::default();
+    let mut encode_leaf = |nid: NodeId, centroid: Vec<f32>, ids: &[DocId], vecs: &[f32]| {
+        let mut half = PackedLeafNode::empty(parent_id, dim, padded_dim);
+        half.centroid = centroid;
+        half.reset_and_encode(ids, vecs, quantizer, dim, &mut scratch);
+        for (lid, did) in half.live_slot_doc_pairs() {
+            tx.put_doc_pos(did, nid, lid);
+            delta.added.push((did, nid, lid));
+        }
+        half
+    };
+    let mut left_leaf = encode_leaf(left_id, split.centroid1, &left_doc_ids, &left_vecs);
+    let mut right_leaf = encode_leaf(right_id, split.centroid2, &right_doc_ids, &right_vecs);
+
+    let left_c = left_leaf.centroid.clone();
+    let right_c = right_leaf.centroid.clone();
+    let left_summary = ChildSummary {
+        id: left_id,
+        subtree_count: left_leaf.entry_count() as u64,
+        centroid: &left_c,
+    };
+    let right_summary = ChildSummary {
+        id: right_id,
+        subtree_count: right_leaf.entry_count() as u64,
+        centroid: &right_c,
+    };
+
+    match parent_id {
+        None => {
+            let new_root_id = tx.alloc_node_id();
+            left_leaf.parent_id = Some(new_root_id);
+            right_leaf.parent_id = Some(new_root_id);
+            tx.put_leaf_node(left_id, left_leaf);
+            tx.put_leaf_node(right_id, right_leaf);
+            create_new_root(tx, new_root_id, 1, left_summary, right_summary, config);
+        }
+        Some(pid) => {
+            tx.put_leaf_node(left_id, left_leaf);
+            tx.put_leaf_node(right_id, right_leaf);
+            attach_to_parent(
+                tx,
+                pid,
+                left_summary,
+                right_summary,
+                config,
+                quantizer,
+                delta,
+            )?;
+        }
+    }
+
+    Ok(SplitPair {
+        left_id,
+        right_id,
+        old_centroid,
+    })
+}
+
+fn split_internal(
+    tx: &mut TxContext<'_>,
+    left_id: NodeId,
+    right_id: NodeId,
+    config: &TreeConfig,
+    quantizer: &RabitqQuantizer,
+    delta: &mut ClusterDelta,
+) -> Result<SplitPair> {
+    let node = tx.get_internal_node(left_id)?;
+    let level = node.level;
+    let parent_id = node.parent_id;
+    let old_centroid = node.centroid.clone();
+    let dim = config.dim;
+
+    let weighted: Vec<(&[f32], u64)> = node
+        .child_centroids
+        .chunks_exact(dim)
+        .zip(node.child_subtree_counts.iter().copied())
+        .collect();
+    let mut split = balanced_two_means(
+        &weighted,
+        config.min_internal_fanout,
+        config.max_internal_fanout,
+        dim,
+        config.metric,
+    );
+    split.part1.sort_unstable();
+    split.part2.sort_unstable();
+
+    let build_half = |indices: &[usize], centroid: Vec<f32>| -> PackedInternalNode {
+        let mut half = PackedInternalNode {
+            level,
+            parent_id,
+            subtree_count: 0,
+            centroid,
+            child_ids: Vec::with_capacity(indices.len()),
+            child_subtree_counts: Vec::with_capacity(indices.len()),
+            child_centroids: Vec::with_capacity(indices.len() * dim),
+        };
+        for &idx in indices {
+            let sub = node.child_subtree_counts[idx];
+            half.subtree_count += sub;
+            half.child_ids.push(node.child_ids[idx]);
+            half.child_subtree_counts.push(sub);
+            half.child_centroids
+                .extend_from_slice(node.child_centroid(idx, dim));
+        }
+        half
+    };
+
+    let mut left_node = build_half(&split.part1, split.centroid1);
+    let mut right_node = build_half(&split.part2, split.centroid2);
+    for &child_id in &right_node.child_ids {
+        set_child_parent(tx, child_id, Some(right_id))?;
+    }
+
+    let left_c = left_node.centroid.clone();
+    let right_c = right_node.centroid.clone();
+    let left_summary = ChildSummary {
+        id: left_id,
+        subtree_count: left_node.subtree_count,
+        centroid: &left_c,
+    };
+    let right_summary = ChildSummary {
+        id: right_id,
+        subtree_count: right_node.subtree_count,
+        centroid: &right_c,
+    };
+
+    match parent_id {
+        None => {
+            let new_root_id = tx.alloc_node_id();
+            left_node.parent_id = Some(new_root_id);
+            right_node.parent_id = Some(new_root_id);
+            tx.put_internal_node(left_id, left_node);
+            tx.put_internal_node(right_id, right_node);
+            create_new_root(
+                tx,
+                new_root_id,
+                level + 1,
+                left_summary,
+                right_summary,
+                config,
+            );
+        }
+        Some(pid) => {
+            tx.put_internal_node(left_id, left_node);
+            tx.put_internal_node(right_id, right_node);
+            attach_to_parent(
+                tx,
+                pid,
+                left_summary,
+                right_summary,
+                config,
+                quantizer,
+                delta,
+            )?;
+        }
+    }
+
+    Ok(SplitPair {
+        left_id,
+        right_id,
+        old_centroid,
+    })
+}
+
 fn create_new_root(
     tx: &mut TxContext<'_>,
     new_root_id: NodeId,
     new_root_level: u8,
-    left_id: NodeId,
-    left_sub: u64,
-    left_centroid: &[f32],
-    right_id: NodeId,
-    right_sub: u64,
-    right_centroid: &[f32],
+    left: ChildSummary<'_>,
+    right: ChildSummary<'_>,
     config: &TreeConfig,
 ) {
     let root_centroid = compute_weighted_centroid(
-        &[(left_centroid, left_sub), (right_centroid, right_sub)],
+        &[
+            (left.centroid, left.subtree_count),
+            (right.centroid, right.subtree_count),
+        ],
         config.dim,
         config.metric,
     );
     let mut root_node = PackedInternalNode {
         level: new_root_level,
         parent_id: None,
-        subtree_count: left_sub + right_sub,
+        subtree_count: left.subtree_count + right.subtree_count,
         centroid: root_centroid,
         child_ids: Vec::with_capacity(2),
         child_subtree_counts: Vec::with_capacity(2),
         child_centroids: Vec::with_capacity(2 * config.dim),
     };
-    root_node.upsert_child(left_id, left_sub, left_centroid, config.dim);
-    root_node.upsert_child(right_id, right_sub, right_centroid, config.dim);
+    root_node.upsert_child(left.id, left.subtree_count, left.centroid, config.dim);
+    root_node.upsert_child(right.id, right.subtree_count, right.centroid, config.dim);
     tx.put_internal_node(new_root_id, root_node);
     tx.meta_mut().root_id = new_root_id;
     tx.meta_mut().root_level = new_root_level;
 }
 
-#[allow(clippy::too_many_arguments)]
 fn attach_to_parent(
     tx: &mut TxContext<'_>,
     parent_id: NodeId,
-    left_id: NodeId,
-    left_sub: u64,
-    left_centroid: &[f32],
-    right_id: NodeId,
-    right_sub: u64,
-    right_centroid: &[f32],
+    left: ChildSummary<'_>,
+    right: ChildSummary<'_>,
     config: &TreeConfig,
     quantizer: &RabitqQuantizer,
     delta: &mut ClusterDelta,
 ) -> Result<()> {
     let mut parent = tx.get_internal_node(parent_id)?;
     let old_parent_centroid = parent.centroid.clone();
-    parent.upsert_child(left_id, left_sub, left_centroid, config.dim);
-    parent.upsert_child(right_id, right_sub, right_centroid, config.dim);
+    parent.upsert_child(left.id, left.subtree_count, left.centroid, config.dim);
+    parent.upsert_child(right.id, right.subtree_count, right.centroid, config.dim);
     parent.recompute_stats(config.dim, config.metric);
     let fanout = parent.entry_count();
     let parent_pid = parent.parent_id;
@@ -1143,12 +1166,11 @@ pub(crate) fn handle_underflow(
         (l.entry_count(), l.parent_id, l.centroid)
     };
 
-    let (min_size, max_size) = if is_internal {
-        (config.min_internal_fanout, config.max_internal_fanout)
+    let min_size = if is_internal {
+        config.min_internal_fanout
     } else {
-        (config.min_leaf_size, config.max_leaf_size)
+        config.min_leaf_size
     };
-
     if entry_count >= min_size {
         return Ok(());
     }
@@ -1158,33 +1180,10 @@ pub(crate) fn handle_underflow(
     })?;
 
     if entry_count == 0 {
-        if is_internal {
-            tx.delete_internal_node(node_id);
-        } else {
-            tx.delete_leaf_node(node_id);
-        }
-        let mut parent = tx.get_internal_node(parent_id)?;
-        parent.remove_child(node_id, config.dim);
-        tx.put_internal_node(parent_id, parent);
-        refresh_parent_after_removal(tx, parent_id, config, quantizer, delta)?;
-        return Ok(());
+        return delete_empty_node(tx, node_id, parent_id, is_internal, config, quantizer, delta);
     }
 
-    let parent = tx.get_internal_node(parent_id)?;
-    let dim = config.dim;
-    let sib_id = parent
-        .child_ids
-        .iter()
-        .enumerate()
-        .filter(|&(_, &cid)| cid != node_id)
-        .min_by(|&(ia, &id_a), &(ib, &id_b)| {
-            let da = cluster_distance(config.metric, &node_centroid, parent.child_centroid(ia, dim));
-            let db = cluster_distance(config.metric, &node_centroid, parent.child_centroid(ib, dim));
-            da.total_cmp(&db).then_with(|| id_a.cmp(&id_b))
-        })
-        .map(|(_, &cid)| cid);
-
-    let Some(sib_id) = sib_id else {
+    let Some(sib_id) = find_closest_sibling(tx, parent_id, node_id, &node_centroid, config)? else {
         if parent_id == tx.meta().root_id {
             collapse_root(tx)?;
             return Ok(());
@@ -1195,241 +1194,296 @@ pub(crate) fn handle_underflow(
     };
 
     if !is_internal {
-        let mut left_leaf = tx.get_leaf_node(node_id)?;
-        let mut sib_leaf = tx.get_leaf_node(sib_id)?;
-
-        let left_pairs = left_leaf.live_slot_doc_pairs();
-        let sib_pairs = sib_leaf.live_slot_doc_pairs();
-        for &(lid, did) in &left_pairs {
-            delta.removed.push((did, node_id, lid));
-        }
-        for &(lid, did) in &sib_pairs {
-            delta.removed.push((did, sib_id, lid));
-        }
-
-        let left_ids: Vec<DocId> = left_pairs.iter().map(|&(_, d)| d).collect();
-        let sib_ids: Vec<DocId> = sib_pairs.iter().map(|&(_, d)| d).collect();
-        let left_vecs = tx.get_vectors_flat(&left_ids)?;
-        let sib_vecs = tx.get_vectors_flat(&sib_ids)?;
-        let total = left_ids.len() + sib_ids.len();
-
-        let mut combined: Vec<(DocId, &[f32])> = Vec::with_capacity(total);
-        for (i, &did) in left_ids.iter().enumerate() {
-            combined.push((did, &left_vecs[i * dim..(i + 1) * dim]));
-        }
-        for (i, &did) in sib_ids.iter().enumerate() {
-            combined.push((did, &sib_vecs[i * dim..(i + 1) * dim]));
-        }
-        combined.sort_unstable_by_key(|&(did, _)| did);
-
-        if total <= max_size {
-            let mut merged_doc_ids = Vec::with_capacity(total);
-            let mut merged_vecs = Vec::with_capacity(total * dim);
-            for (did, v) in combined {
-                merged_doc_ids.push(did);
-                merged_vecs.extend_from_slice(v);
-            }
-
-            sib_leaf.centroid = compute_mean_centroid_flat(
-                &merged_vecs,
-                total,
-                dim,
-                config.metric,
-            );
-            let mut scratch = EncodeScratch::default();
-            sib_leaf.reset_and_encode(&merged_doc_ids, &merged_vecs, quantizer, dim, &mut scratch);
-            for (lid, did) in sib_leaf.live_slot_doc_pairs() {
-                tx.put_doc_pos(did, sib_id, lid);
-                delta.added.push((did, sib_id, lid));
-            }
-
-            let sib_sub = sib_leaf.entry_count() as u64;
-            let sib_c = sib_leaf.centroid.clone();
-            tx.put_leaf_node(sib_id, sib_leaf);
-            tx.delete_leaf_node(node_id);
-
-            let mut parent = tx.get_internal_node(parent_id)?;
-            parent.remove_child(node_id, dim);
-            parent.upsert_child(sib_id, sib_sub, &sib_c, dim);
-            tx.put_internal_node(parent_id, parent);
-
-            refresh_parent_after_removal(tx, parent_id, config, quantizer, delta)?;
-        } else {
-            let weighted: Vec<(&[f32], u64)> = combined.iter().map(|&(_, v)| (v, 1u64)).collect();
-            let mut split = balanced_two_means(&weighted, min_size, max_size, dim, config.metric);
-            split.part1.sort_unstable();
-            split.part2.sort_unstable();
-
-            let mut new_left_ids = Vec::with_capacity(split.part1.len());
-            let mut new_left_vecs = Vec::with_capacity(split.part1.len() * dim);
-            for &idx in &split.part1 {
-                let (did, v) = combined[idx];
-                new_left_ids.push(did);
-                new_left_vecs.extend_from_slice(v);
-            }
-
-            let mut new_right_ids = Vec::with_capacity(split.part2.len());
-            let mut new_right_vecs = Vec::with_capacity(split.part2.len() * dim);
-            for &idx in &split.part2 {
-                let (did, v) = combined[idx];
-                new_right_ids.push(did);
-                new_right_vecs.extend_from_slice(v);
-            }
-
-            let mut scratch = EncodeScratch::default();
-            left_leaf.centroid = split.centroid1;
-            left_leaf.reset_and_encode(&new_left_ids, &new_left_vecs, quantizer, dim, &mut scratch);
-            for (lid, did) in left_leaf.live_slot_doc_pairs() {
-                tx.put_doc_pos(did, node_id, lid);
-                delta.added.push((did, node_id, lid));
-            }
-
-            sib_leaf.centroid = split.centroid2;
-            sib_leaf.reset_and_encode(&new_right_ids, &new_right_vecs, quantizer, dim, &mut scratch);
-            for (lid, did) in sib_leaf.live_slot_doc_pairs() {
-                tx.put_doc_pos(did, sib_id, lid);
-                delta.added.push((did, sib_id, lid));
-            }
-
-            let left_sub = left_leaf.entry_count() as u64;
-            let sib_sub = sib_leaf.entry_count() as u64;
-            let left_c = left_leaf.centroid.clone();
-            let sib_c = sib_leaf.centroid.clone();
-
-            tx.put_leaf_node(node_id, left_leaf);
-            tx.put_leaf_node(sib_id, sib_leaf);
-
-            update_parent_pair(
-                tx, parent_id, node_id, left_sub, &left_c, sib_id, sib_sub, &sib_c, config,
-            )?;
-        }
+        rebalance_underflowing_leaf(tx, node_id, sib_id, parent_id, config, quantizer, delta)
     } else {
-        let mut left_node = tx.get_internal_node(node_id)?;
-        let mut sib_node = tx.get_internal_node(sib_id)?;
-        let total = left_node.entry_count() + sib_node.entry_count();
-
-        if total <= max_size {
-            for (i, &child_id) in left_node.child_ids.iter().enumerate() {
-                sib_node.upsert_child(
-                    child_id,
-                    left_node.child_subtree_counts[i],
-                    left_node.child_centroid(i, dim),
-                    dim,
-                );
-                set_child_parent(tx, child_id, Some(sib_id))?;
-            }
-            sib_node.recompute_stats(dim, config.metric);
-
-            let sib_sub = sib_node.subtree_count;
-            let sib_c = sib_node.centroid.clone();
-            tx.put_internal_node(sib_id, sib_node);
-            tx.delete_internal_node(node_id);
-
-            let mut parent = tx.get_internal_node(parent_id)?;
-            parent.remove_child(node_id, dim);
-            parent.upsert_child(sib_id, sib_sub, &sib_c, dim);
-            tx.put_internal_node(parent_id, parent);
-
-            refresh_parent_after_removal(tx, parent_id, config, quantizer, delta)?;
-        } else {
-            struct ChildItem {
-                id: NodeId,
-                sub: u64,
-                centroid: Vec<f32>,
-                was_left: bool,
-            }
-            let mut combined: Vec<ChildItem> = Vec::with_capacity(total);
-            for (i, &cid) in left_node.child_ids.iter().enumerate() {
-                combined.push(ChildItem {
-                    id: cid,
-                    sub: left_node.child_subtree_counts[i],
-                    centroid: left_node.child_centroid(i, dim).to_vec(),
-                    was_left: true,
-                });
-            }
-            for (i, &cid) in sib_node.child_ids.iter().enumerate() {
-                combined.push(ChildItem {
-                    id: cid,
-                    sub: sib_node.child_subtree_counts[i],
-                    centroid: sib_node.child_centroid(i, dim).to_vec(),
-                    was_left: false,
-                });
-            }
-            combined.sort_unstable_by_key(|item| item.id);
-
-            let weighted: Vec<(&[f32], u64)> = combined
-                .iter()
-                .map(|c| (c.centroid.as_slice(), c.sub))
-                .collect();
-            let mut split = balanced_two_means(&weighted, min_size, max_size, dim, config.metric);
-            split.part1.sort_unstable();
-            split.part2.sort_unstable();
-
-            left_node.child_ids.clear();
-            left_node.child_subtree_counts.clear();
-            left_node.child_centroids.clear();
-            left_node.subtree_count = 0;
-            left_node.centroid = split.centroid1;
-            for &idx in &split.part1 {
-                let item = &combined[idx];
-                left_node.subtree_count += item.sub;
-                left_node.child_ids.push(item.id);
-                left_node.child_subtree_counts.push(item.sub);
-                left_node.child_centroids.extend_from_slice(&item.centroid);
-                if !item.was_left {
-                    set_child_parent(tx, item.id, Some(node_id))?;
-                }
-            }
-
-            sib_node.child_ids.clear();
-            sib_node.child_subtree_counts.clear();
-            sib_node.child_centroids.clear();
-            sib_node.subtree_count = 0;
-            sib_node.centroid = split.centroid2;
-            for &idx in &split.part2 {
-                let item = &combined[idx];
-                sib_node.subtree_count += item.sub;
-                sib_node.child_ids.push(item.id);
-                sib_node.child_subtree_counts.push(item.sub);
-                sib_node.child_centroids.extend_from_slice(&item.centroid);
-                if item.was_left {
-                    set_child_parent(tx, item.id, Some(sib_id))?;
-                }
-            }
-
-            let left_sub = left_node.subtree_count;
-            let sib_sub = sib_node.subtree_count;
-            let left_c = left_node.centroid.clone();
-            let sib_c = sib_node.centroid.clone();
-
-            tx.put_internal_node(node_id, left_node);
-            tx.put_internal_node(sib_id, sib_node);
-
-            update_parent_pair(
-                tx, parent_id, node_id, left_sub, &left_c, sib_id, sib_sub, &sib_c, config,
-            )?;
-        }
+        rebalance_underflowing_internal(tx, node_id, sib_id, parent_id, config, quantizer, delta)
     }
-
-    Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+fn delete_empty_node(
+    tx: &mut TxContext<'_>,
+    node_id: NodeId,
+    parent_id: NodeId,
+    is_internal: bool,
+    config: &TreeConfig,
+    quantizer: &RabitqQuantizer,
+    delta: &mut ClusterDelta,
+) -> Result<()> {
+    if is_internal {
+        tx.delete_internal_node(node_id);
+    } else {
+        tx.delete_leaf_node(node_id);
+    }
+    let mut parent = tx.get_internal_node(parent_id)?;
+    parent.remove_child(node_id, config.dim);
+    tx.put_internal_node(parent_id, parent);
+    refresh_parent_after_removal(tx, parent_id, config, quantizer, delta)
+}
+
+fn find_closest_sibling(
+    tx: &TxContext<'_>,
+    parent_id: NodeId,
+    node_id: NodeId,
+    node_centroid: &[f32],
+    config: &TreeConfig,
+) -> Result<Option<NodeId>> {
+    let parent = tx.get_internal_node_ref(parent_id)?;
+    let dim = config.dim;
+    Ok(parent
+        .child_ids
+        .iter()
+        .enumerate()
+        .filter(|&(_, &cid)| cid != node_id)
+        .min_by(|&(ia, &id_a), &(ib, &id_b)| {
+            let da = cluster_distance(config.metric, node_centroid, parent.child_centroid(ia, dim));
+            let db = cluster_distance(config.metric, node_centroid, parent.child_centroid(ib, dim));
+            da.total_cmp(&db).then_with(|| id_a.cmp(&id_b))
+        })
+        .map(|(_, &cid)| cid))
+}
+
+fn rebalance_underflowing_leaf(
+    tx: &mut TxContext<'_>,
+    node_id: NodeId,
+    sib_id: NodeId,
+    parent_id: NodeId,
+    config: &TreeConfig,
+    quantizer: &RabitqQuantizer,
+    delta: &mut ClusterDelta,
+) -> Result<()> {
+    let dim = config.dim;
+    let mut left_leaf = tx.get_leaf_node(node_id)?;
+    let mut sib_leaf = tx.get_leaf_node(sib_id)?;
+
+    let left_pairs = left_leaf.live_slot_doc_pairs();
+    let sib_pairs = sib_leaf.live_slot_doc_pairs();
+    for &(lid, did) in &left_pairs {
+        delta.removed.push((did, node_id, lid));
+    }
+    for &(lid, did) in &sib_pairs {
+        delta.removed.push((did, sib_id, lid));
+    }
+
+    let left_ids: Vec<DocId> = left_pairs.iter().map(|&(_, d)| d).collect();
+    let sib_ids: Vec<DocId> = sib_pairs.iter().map(|&(_, d)| d).collect();
+    let left_vecs = tx.get_vectors_flat(&left_ids)?;
+    let sib_vecs = tx.get_vectors_flat(&sib_ids)?;
+    let total = left_ids.len() + sib_ids.len();
+
+    let mut combined: Vec<(DocId, &[f32])> = Vec::with_capacity(total);
+    for (i, &did) in left_ids.iter().enumerate() {
+        combined.push((did, &left_vecs[i * dim..(i + 1) * dim]));
+    }
+    for (i, &did) in sib_ids.iter().enumerate() {
+        combined.push((did, &sib_vecs[i * dim..(i + 1) * dim]));
+    }
+    combined.sort_unstable_by_key(|&(did, _)| did);
+
+    let mut scratch = EncodeScratch::default();
+    if total <= config.max_leaf_size {
+        let mut merged_doc_ids = Vec::with_capacity(total);
+        let mut merged_vecs = Vec::with_capacity(total * dim);
+        for (did, v) in combined {
+            merged_doc_ids.push(did);
+            merged_vecs.extend_from_slice(v);
+        }
+
+        sib_leaf.centroid = compute_mean_centroid_flat(&merged_vecs, total, dim, config.metric);
+        sib_leaf.reset_and_encode(&merged_doc_ids, &merged_vecs, quantizer, dim, &mut scratch);
+        for (lid, did) in sib_leaf.live_slot_doc_pairs() {
+            tx.put_doc_pos(did, sib_id, lid);
+            delta.added.push((did, sib_id, lid));
+        }
+
+        let sib_sub = sib_leaf.entry_count() as u64;
+        let sib_c = sib_leaf.centroid.clone();
+        tx.put_leaf_node(sib_id, sib_leaf);
+        tx.delete_leaf_node(node_id);
+
+        let mut parent = tx.get_internal_node(parent_id)?;
+        parent.remove_child(node_id, dim);
+        parent.upsert_child(sib_id, sib_sub, &sib_c, dim);
+        tx.put_internal_node(parent_id, parent);
+
+        refresh_parent_after_removal(tx, parent_id, config, quantizer, delta)
+    } else {
+        let weighted: Vec<(&[f32], u64)> = combined.iter().map(|&(_, v)| (v, 1u64)).collect();
+        let mut split = balanced_two_means(
+            &weighted,
+            config.min_leaf_size,
+            config.max_leaf_size,
+            dim,
+            config.metric,
+        );
+        split.part1.sort_unstable();
+        split.part2.sort_unstable();
+
+        let mut reencode_half = |nid: NodeId, leaf: &mut PackedLeafNode, indices: &[usize], centroid: Vec<f32>| {
+            let mut ids = Vec::with_capacity(indices.len());
+            let mut vecs = Vec::with_capacity(indices.len() * dim);
+            for &idx in indices {
+                let (did, v) = combined[idx];
+                ids.push(did);
+                vecs.extend_from_slice(v);
+            }
+            leaf.centroid = centroid;
+            leaf.reset_and_encode(&ids, &vecs, quantizer, dim, &mut scratch);
+            for (lid, did) in leaf.live_slot_doc_pairs() {
+                tx.put_doc_pos(did, nid, lid);
+                delta.added.push((did, nid, lid));
+            }
+        };
+        reencode_half(node_id, &mut left_leaf, &split.part1, split.centroid1);
+        reencode_half(sib_id, &mut sib_leaf, &split.part2, split.centroid2);
+
+        let left_c = left_leaf.centroid.clone();
+        let sib_c = sib_leaf.centroid.clone();
+        let left_summary = ChildSummary {
+            id: node_id,
+            subtree_count: left_leaf.entry_count() as u64,
+            centroid: &left_c,
+        };
+        let sib_summary = ChildSummary {
+            id: sib_id,
+            subtree_count: sib_leaf.entry_count() as u64,
+            centroid: &sib_c,
+        };
+        tx.put_leaf_node(node_id, left_leaf);
+        tx.put_leaf_node(sib_id, sib_leaf);
+
+        update_parent_pair(tx, parent_id, left_summary, sib_summary, config)
+    }
+}
+
+fn rebalance_underflowing_internal(
+    tx: &mut TxContext<'_>,
+    node_id: NodeId,
+    sib_id: NodeId,
+    parent_id: NodeId,
+    config: &TreeConfig,
+    quantizer: &RabitqQuantizer,
+    delta: &mut ClusterDelta,
+) -> Result<()> {
+    let dim = config.dim;
+    let mut left_node = tx.get_internal_node(node_id)?;
+    let mut sib_node = tx.get_internal_node(sib_id)?;
+    let total = left_node.entry_count() + sib_node.entry_count();
+
+    if total <= config.max_internal_fanout {
+        for (i, &child_id) in left_node.child_ids.iter().enumerate() {
+            sib_node.upsert_child(
+                child_id,
+                left_node.child_subtree_counts[i],
+                left_node.child_centroid(i, dim),
+                dim,
+            );
+            set_child_parent(tx, child_id, Some(sib_id))?;
+        }
+        sib_node.recompute_stats(dim, config.metric);
+
+        let sib_sub = sib_node.subtree_count;
+        let sib_c = sib_node.centroid.clone();
+        tx.put_internal_node(sib_id, sib_node);
+        tx.delete_internal_node(node_id);
+
+        let mut parent = tx.get_internal_node(parent_id)?;
+        parent.remove_child(node_id, dim);
+        parent.upsert_child(sib_id, sib_sub, &sib_c, dim);
+        tx.put_internal_node(parent_id, parent);
+
+        refresh_parent_after_removal(tx, parent_id, config, quantizer, delta)
+    } else {
+        struct ChildItem {
+            id: NodeId,
+            sub: u64,
+            centroid: Vec<f32>,
+            was_left: bool,
+        }
+        let mut combined: Vec<ChildItem> = Vec::with_capacity(total);
+        for (i, &cid) in left_node.child_ids.iter().enumerate() {
+            combined.push(ChildItem {
+                id: cid,
+                sub: left_node.child_subtree_counts[i],
+                centroid: left_node.child_centroid(i, dim).to_vec(),
+                was_left: true,
+            });
+        }
+        for (i, &cid) in sib_node.child_ids.iter().enumerate() {
+            combined.push(ChildItem {
+                id: cid,
+                sub: sib_node.child_subtree_counts[i],
+                centroid: sib_node.child_centroid(i, dim).to_vec(),
+                was_left: false,
+            });
+        }
+        combined.sort_unstable_by_key(|item| item.id);
+
+        let weighted: Vec<(&[f32], u64)> = combined
+            .iter()
+            .map(|c| (c.centroid.as_slice(), c.sub))
+            .collect();
+        let mut split = balanced_two_means(
+            &weighted,
+            config.min_internal_fanout,
+            config.max_internal_fanout,
+            dim,
+            config.metric,
+        );
+        split.part1.sort_unstable();
+        split.part2.sort_unstable();
+
+        let mut refill =
+            |target_id: NodeId, node: &mut PackedInternalNode, indices: &[usize], centroid: Vec<f32>, expect_left: bool| -> Result<()> {
+                node.child_ids.clear();
+                node.child_subtree_counts.clear();
+                node.child_centroids.clear();
+                node.subtree_count = 0;
+                node.centroid = centroid;
+                for &idx in indices {
+                    let item = &combined[idx];
+                    node.subtree_count += item.sub;
+                    node.child_ids.push(item.id);
+                    node.child_subtree_counts.push(item.sub);
+                    node.child_centroids.extend_from_slice(&item.centroid);
+                    if item.was_left != expect_left {
+                        set_child_parent(tx, item.id, Some(target_id))?;
+                    }
+                }
+                Ok(())
+            };
+        refill(node_id, &mut left_node, &split.part1, split.centroid1, true)?;
+        refill(sib_id, &mut sib_node, &split.part2, split.centroid2, false)?;
+
+        let left_c = left_node.centroid.clone();
+        let sib_c = sib_node.centroid.clone();
+        let left_summary = ChildSummary {
+            id: node_id,
+            subtree_count: left_node.subtree_count,
+            centroid: &left_c,
+        };
+        let sib_summary = ChildSummary {
+            id: sib_id,
+            subtree_count: sib_node.subtree_count,
+            centroid: &sib_c,
+        };
+        tx.put_internal_node(node_id, left_node);
+        tx.put_internal_node(sib_id, sib_node);
+
+        update_parent_pair(tx, parent_id, left_summary, sib_summary, config)
+    }
+}
+
 fn update_parent_pair(
     tx: &mut TxContext<'_>,
     parent_id: NodeId,
-    left_id: NodeId,
-    left_sub: u64,
-    left_c: &[f32],
-    right_id: NodeId,
-    right_sub: u64,
-    right_c: &[f32],
+    left: ChildSummary<'_>,
+    right: ChildSummary<'_>,
     config: &TreeConfig,
 ) -> Result<()> {
     let mut parent = tx.get_internal_node(parent_id)?;
     let old_parent_centroid = parent.centroid.clone();
-    parent.upsert_child(left_id, left_sub, left_c, config.dim);
-    parent.upsert_child(right_id, right_sub, right_c, config.dim);
+    parent.upsert_child(left.id, left.subtree_count, left.centroid, config.dim);
+    parent.upsert_child(right.id, right.subtree_count, right.centroid, config.dim);
     parent.recompute_stats(config.dim, config.metric);
 
     let gp_id_opt = parent.parent_id;

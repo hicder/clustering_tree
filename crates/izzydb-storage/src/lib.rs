@@ -10,7 +10,7 @@ pub use node::{
 };
 pub use rocksdb::DBPinnableSlice;
 pub use storage::{
-    AttrZoneMap, CF_ATTR_CLUSTERS, CF_ATTR_POSTINGS, CF_ATTR_ZONES, CF_DOC_LOC, CF_DOCS,
+    AttrZoneMap, ByteRange, CF_ATTR_CLUSTERS, CF_ATTR_POSTINGS, CF_ATTR_ZONES, CF_DOC_LOC, CF_DOCS,
     CF_FTS_DOC_LENS, CF_FTS_POSITIONS, CF_FTS_POSTINGS, CF_FTS_REV_DOC_MAP, CF_FTS_SKIPS,
     CF_FTS_TERMS, CF_INTERNAL_NODES, CF_LEAF_ENTRIES, CF_META, CF_VECTORS, DocLoc, FtsRevBlock,
     RocksDocLenCursor, RocksSkipCursor, Storage, StorageBatch, TxContext,

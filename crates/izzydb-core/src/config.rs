@@ -66,6 +66,19 @@ pub const fn make_fts_doc_id(block_id: FtsBlockId, slot: u8) -> FtsDocId {
     (block_id << 8) | (slot as u32)
 }
 
+/// Iterate over each set bit index (`0..=255`) in a 256-bit `[u64; 4]` block mask in ascending order.
+#[inline]
+pub fn for_each_set_bit_256(mask: &[u64; 4], mut f: impl FnMut(u8)) {
+    for (w, &bits) in mask.iter().enumerate() {
+        let mut b = bits;
+        while b != 0 {
+            let bit = b.trailing_zeros() as usize;
+            b &= b - 1;
+            f(((w << 6) | bit) as u8);
+        }
+    }
+}
+
 /// Distance metric used for clustering and nearest neighbor search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]

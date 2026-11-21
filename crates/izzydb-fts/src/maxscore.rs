@@ -1,10 +1,15 @@
+//! Vectorized Block-Max MAXSCORE BM25 query compiler and execution engine.
+
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
 use alyze::analyze::ReusableBuffer;
 use roaring::RoaringBitmap;
 
-use izzydb_core::config::{AttrId, DocId, FTS_BLOCK_SIZE, FtsBlockId, FtsDocId, TermId, make_fts_doc_id};
+use izzydb_core::config::{
+    AttrId, DocId, FTS_BLOCK_SIZE, FtsBlockId, FtsDocId, TermId, for_each_set_bit_256,
+    fts_block_id, fts_slot, make_fts_doc_id,
+};
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::rank::{Bm25Overrides, RankBy};
 use izzydb_core::schema::{CollectionSchema, FullTextSearchConfig};
@@ -199,11 +204,11 @@ impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
     }
 
     #[inline]
-    fn accumulate(
+    fn accumulate_into(
         &mut self,
         target: FtsBlockId,
+        mode: AccumMode<'_, '_>,
         scores: &mut [f32; FTS_BLOCK_SIZE],
-        touched: &mut [u64; 4],
         dl_cache: &mut DlNormCache<'a, S>,
         source: &'a S,
         tier: SimdTier,
@@ -211,8 +216,7 @@ impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
         let dl_norm = dl_cache.get_or_load(source, tier, self.dl_group, target)?;
         if let Some(bytes) = self.cursor.current_posting_bytes()? {
             let view = PostingBlockView::parse(bytes)?;
-            self.scorer
-                .accumulate_block_simd(tier, &view, dl_norm, scores, touched);
+            mode.apply(&self.scorer, tier, &view, dl_norm, scores);
             return Ok(());
         }
         let Some(guard) = source.get_posting_block(self.term_id, target)? else {
@@ -222,38 +226,34 @@ impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
             )));
         };
         let view = PostingBlockView::parse(guard.as_ref())?;
-        self.scorer
-            .accumulate_block_simd(tier, &view, dl_norm, scores, touched);
+        mode.apply(&self.scorer, tier, &view, dl_norm, scores);
         Ok(())
     }
+}
 
+enum AccumMode<'m, 't> {
+    Unmasked { touched: &'t mut [u64; 4] },
+    Masked { mask: &'m [u64; 4] },
+}
+
+impl AccumMode<'_, '_> {
     #[inline]
-    fn accumulate_masked(
-        &mut self,
-        target: FtsBlockId,
-        mask: &[u64; 4],
-        scores: &mut [f32; FTS_BLOCK_SIZE],
-        dl_cache: &mut DlNormCache<'a, S>,
-        source: &'a S,
+    fn apply(
+        self,
+        scorer: &Bm25TermScorer,
         tier: SimdTier,
-    ) -> Result<()> {
-        let dl_norm = dl_cache.get_or_load(source, tier, self.dl_group, target)?;
-        if let Some(bytes) = self.cursor.current_posting_bytes()? {
-            let view = PostingBlockView::parse(bytes)?;
-            self.scorer
-                .accumulate_block_masked_simd(tier, &view, dl_norm, mask, scores);
-            return Ok(());
+        view: &PostingBlockView<'_>,
+        dl_norm: &[f32; FTS_BLOCK_SIZE],
+        scores: &mut [f32; FTS_BLOCK_SIZE],
+    ) {
+        match self {
+            Self::Unmasked { touched } => {
+                scorer.accumulate_block_simd(tier, view, dl_norm, scores, touched);
+            }
+            Self::Masked { mask } => {
+                scorer.accumulate_block_masked_simd(tier, view, dl_norm, mask, scores);
+            }
         }
-        let Some(guard) = source.get_posting_block(self.term_id, target)? else {
-            return Err(TreeError::CorruptedData(format!(
-                "missing posting block for term_id {} block {target}",
-                self.term_id
-            )));
-        };
-        let view = PostingBlockView::parse(guard.as_ref())?;
-        self.scorer
-            .accumulate_block_masked_simd(tier, &view, dl_norm, mask, scores);
-        Ok(())
     }
 }
 
@@ -290,28 +290,20 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
                     0.0
                 }
             }
-            ClauseKind::PrefixMax(ts) => {
-                let mut best = 0.0f32;
-                for t in ts {
-                    if t.current_block_id() == Some(target) {
-                        best = best.max(t.block_upper_bound());
-                    }
-                }
-                best
-            }
-            ClauseKind::MaxBranches(branches) => {
-                let mut best = 0.0f32;
-                for branch in branches {
-                    let mut sum = 0.0f32;
-                    for c in branch {
-                        sum += c.block_upper_bound(target);
-                    }
-                    if sum > best {
-                        best = sum;
-                    }
-                }
-                best
-            }
+            ClauseKind::PrefixMax(ts) => ts
+                .iter()
+                .filter(|t| t.current_block_id() == Some(target))
+                .map(TermStream::block_upper_bound)
+                .fold(0.0f32, f32::max),
+            ClauseKind::MaxBranches(branches) => branches
+                .iter()
+                .map(|branch| {
+                    branch
+                        .iter()
+                        .map(|c| c.block_upper_bound(target))
+                        .sum::<f32>()
+                })
+                .fold(0.0f32, f32::max),
         }
     }
 
@@ -364,10 +356,48 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
         source: &'a S,
         tier: SimdTier,
     ) -> Result<()> {
+        self.accumulate_impl(target, None, scores, Some(touched), dl_cache, source, tier)
+    }
+
+    fn accumulate_block_masked(
+        &mut self,
+        target: FtsBlockId,
+        mask: &[u64; 4],
+        scores: &mut [f32; FTS_BLOCK_SIZE],
+        dl_cache: &mut DlNormCache<'a, S>,
+        source: &'a S,
+        tier: SimdTier,
+    ) -> Result<()> {
+        self.accumulate_impl(target, Some(mask), scores, None, dl_cache, source, tier)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_impl(
+        &mut self,
+        target: FtsBlockId,
+        mask: Option<&[u64; 4]>,
+        scores: &mut [f32; FTS_BLOCK_SIZE],
+        touched: Option<&mut [u64; 4]>,
+        dl_cache: &mut DlNormCache<'a, S>,
+        source: &'a S,
+        tier: SimdTier,
+    ) -> Result<()> {
+        let mut mode_for = |t: &mut TermStream<'a, S>,
+                            local_touched: Option<&mut [u64; 4]>,
+                            dst_scores: &mut [f32; FTS_BLOCK_SIZE]|
+         -> Result<()> {
+            let mode = match (mask, local_touched) {
+                (Some(m), _) => AccumMode::Masked { mask: m },
+                (None, Some(tr)) => AccumMode::Unmasked { touched: tr },
+                (None, None) => unreachable!("unmasked mode requires touched mask"),
+            };
+            t.accumulate_into(target, mode, dst_scores, dl_cache, source, tier)
+        };
+
         match &mut self.kind {
             ClauseKind::Single(t) => {
                 if t.current_block_id() == Some(target) && !t.scorer.is_zero() {
-                    t.accumulate(target, scores, touched, dl_cache, source, tier)?;
+                    mode_for(t, touched, scores)?;
                 }
                 Ok(())
             }
@@ -384,7 +414,7 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
                         .iter_mut()
                         .find(|t| t.current_block_id() == Some(target) && !t.scorer.is_zero())
                         .unwrap();
-                    return t.accumulate(target, scores, touched, dl_cache, source, tier);
+                    return mode_for(t, touched, scores);
                 }
 
                 let mut local = [0.0f32; FTS_BLOCK_SIZE];
@@ -395,18 +425,23 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
                     if t.current_block_id() != Some(target) || t.scorer.is_zero() {
                         continue;
                     }
-                    if first {
-                        t.accumulate(target, &mut local, &mut local_touched, dl_cache, source, tier)?;
+                    let dst = if first {
                         first = false;
+                        &mut local
                     } else {
                         tmp.fill(0.0);
-                        t.accumulate(target, &mut tmp, &mut local_touched, dl_cache, source, tier)?;
+                        &mut tmp
+                    };
+                    mode_for(t, touched.as_ref().map(|_| &mut local_touched), dst)?;
+                    if std::ptr::eq(dst, &tmp) {
                         merge_max_256(tier, &mut local, &tmp);
                     }
                 }
                 merge_add_256(tier, scores, &local);
-                for w in 0..4 {
-                    touched[w] |= local_touched[w];
+                if let Some(tr) = touched {
+                    for w in 0..4 {
+                        tr[w] |= local_touched[w];
+                    }
                 }
                 Ok(())
             }
@@ -423,9 +458,18 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
                         .iter_mut()
                         .find(|b| b.iter().any(|c| c.next_block_id() == Some(target)))
                         .unwrap();
+                    let mut tr = touched;
                     for c in branch.iter_mut() {
                         if c.next_block_id() == Some(target) {
-                            c.accumulate_block(target, scores, touched, dl_cache, source, tier)?;
+                            c.accumulate_impl(
+                                target,
+                                mask,
+                                scores,
+                                tr.as_deref_mut(),
+                                dl_cache,
+                                source,
+                                tier,
+                            )?;
                         }
                     }
                     return Ok(());
@@ -439,182 +483,66 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
                     if !branch.iter().any(|c| c.next_block_id() == Some(target)) {
                         continue;
                     }
-                    if first {
-                        for c in branch.iter_mut() {
-                            if c.next_block_id() == Some(target) {
-                                c.accumulate_block(
-                                    target,
-                                    &mut best,
-                                    &mut any_touched,
-                                    dl_cache,
-                                    source,
-                                    tier,
-                                )?;
-                            }
-                        }
-                        first = false;
+                    let is_first = first;
+                    first = false;
+                    let dst = if is_first {
+                        &mut best
                     } else {
                         branch_scores.fill(0.0);
-                        for c in branch.iter_mut() {
-                            if c.next_block_id() == Some(target) {
-                                c.accumulate_block(
-                                    target,
-                                    &mut branch_scores,
-                                    &mut any_touched,
-                                    dl_cache,
-                                    source,
-                                    tier,
-                                )?;
-                            }
-                        }
-                        merge_max_256(tier, &mut best, &branch_scores);
-                    }
-                }
-                merge_add_256(tier, scores, &best);
-                for w in 0..4 {
-                    touched[w] |= any_touched[w];
-                }
-                Ok(())
-            }
-        }
-    }
-
-    fn accumulate_block_masked(
-        &mut self,
-        target: FtsBlockId,
-        mask: &[u64; 4],
-        scores: &mut [f32; FTS_BLOCK_SIZE],
-        dl_cache: &mut DlNormCache<'a, S>,
-        source: &'a S,
-        tier: SimdTier,
-    ) -> Result<()> {
-        match &mut self.kind {
-            ClauseKind::Single(t) => {
-                if t.current_block_id() == Some(target) && !t.scorer.is_zero() {
-                    t.accumulate_masked(target, mask, scores, dl_cache, source, tier)?;
-                }
-                Ok(())
-            }
-            ClauseKind::PrefixMax(ts) => {
-                let matching = ts
-                    .iter()
-                    .filter(|t| t.current_block_id() == Some(target) && !t.scorer.is_zero())
-                    .count();
-                if matching == 0 {
-                    return Ok(());
-                }
-                if matching == 1 {
-                    let t = ts
-                        .iter_mut()
-                        .find(|t| t.current_block_id() == Some(target) && !t.scorer.is_zero())
-                        .unwrap();
-                    return t.accumulate_masked(target, mask, scores, dl_cache, source, tier);
-                }
-
-                let mut local = [0.0f32; FTS_BLOCK_SIZE];
-                let mut tmp = [0.0f32; FTS_BLOCK_SIZE];
-                let mut first = true;
-                for t in ts.iter_mut() {
-                    if t.current_block_id() != Some(target) || t.scorer.is_zero() {
-                        continue;
-                    }
-                    if first {
-                        t.accumulate_masked(target, mask, &mut local, dl_cache, source, tier)?;
-                        first = false;
-                    } else {
-                        tmp.fill(0.0);
-                        t.accumulate_masked(target, mask, &mut tmp, dl_cache, source, tier)?;
-                        merge_max_256(tier, &mut local, &tmp);
-                    }
-                }
-                merge_add_256(tier, scores, &local);
-                Ok(())
-            }
-            ClauseKind::MaxBranches(branches) => {
-                let matching_branches = branches
-                    .iter()
-                    .filter(|b| b.iter().any(|c| c.next_block_id() == Some(target)))
-                    .count();
-                if matching_branches == 0 {
-                    return Ok(());
-                }
-                if matching_branches == 1 {
-                    let branch = branches
-                        .iter_mut()
-                        .find(|b| b.iter().any(|c| c.next_block_id() == Some(target)))
-                        .unwrap();
+                        &mut branch_scores
+                    };
                     for c in branch.iter_mut() {
                         if c.next_block_id() == Some(target) {
-                            c.accumulate_block_masked(
-                                target, mask, scores, dl_cache, source, tier,
+                            c.accumulate_impl(
+                                target,
+                                mask,
+                                dst,
+                                touched.as_ref().map(|_| &mut any_touched),
+                                dl_cache,
+                                source,
+                                tier,
                             )?;
                         }
                     }
-                    return Ok(());
-                }
-
-                let mut best = [0.0f32; FTS_BLOCK_SIZE];
-                let mut branch_scores = [0.0f32; FTS_BLOCK_SIZE];
-                let mut first = true;
-                for branch in branches.iter_mut() {
-                    if !branch.iter().any(|c| c.next_block_id() == Some(target)) {
-                        continue;
-                    }
-                    if first {
-                        for c in branch.iter_mut() {
-                            if c.next_block_id() == Some(target) {
-                                c.accumulate_block_masked(
-                                    target, mask, &mut best, dl_cache, source, tier,
-                                )?;
-                            }
-                        }
-                        first = false;
-                    } else {
-                        branch_scores.fill(0.0);
-                        for c in branch.iter_mut() {
-                            if c.next_block_id() == Some(target) {
-                                c.accumulate_block_masked(
-                                    target,
-                                    mask,
-                                    &mut branch_scores,
-                                    dl_cache,
-                                    source,
-                                    tier,
-                                )?;
-                            }
-                        }
+                    if !is_first {
                         merge_max_256(tier, &mut best, &branch_scores);
                     }
                 }
                 merge_add_256(tier, scores, &best);
+                if let Some(tr) = touched {
+                    for w in 0..4 {
+                        tr[w] |= any_touched[w];
+                    }
+                }
                 Ok(())
             }
         }
     }
 }
 
-/// Compile a `RankBy` AST into flat MAXSCORE clauses (flattening `Sum` and distributing `Product`).
-#[allow(clippy::too_many_arguments)]
-fn compile_clauses<'a, S: FtsPostingSource>(
+struct CompileContext<'a, 'b, S: FtsPostingSource + 'a> {
     source: &'a S,
-    schema: &CollectionSchema,
-    meta: &FtsMeta,
+    schema: &'a CollectionSchema,
+    meta: &'a FtsMeta,
+    buffer: &'b mut ReusableBuffer,
+    dl_cache: &'b mut DlNormCache<'a, S>,
+}
+
+/// Compile a `RankBy` AST into flat MAXSCORE clauses (flattening `Sum` and distributing `Product`).
+fn compile_clauses<'a, S: FtsPostingSource>(
+    ctx: &mut CompileContext<'a, '_, S>,
     expr: &RankBy,
     weight: f32,
-    buffer: &mut ReusableBuffer,
-    dl_cache: &mut DlNormCache<'a, S>,
     out: &mut Vec<Clause<'a, S>>,
 ) -> Result<()> {
     if weight <= 0.0 {
         return Ok(());
     }
     match expr {
-        RankBy::Product(w, inner) => {
-            compile_clauses(source, schema, meta, inner, weight * *w, buffer, dl_cache, out)
-        }
+        RankBy::Product(w, inner) => compile_clauses(ctx, inner, weight * *w, out),
         RankBy::Sum(children) => {
             for child in children {
-                compile_clauses(source, schema, meta, child, weight, buffer, dl_cache, out)?;
+                compile_clauses(ctx, child, weight, out)?;
             }
             Ok(())
         }
@@ -623,21 +551,10 @@ fn compile_clauses<'a, S: FtsPostingSource>(
             let mut max_branch_ub = 0.0f32;
             for child in children {
                 let mut branch_clauses = Vec::new();
-                compile_clauses(
-                    source,
-                    schema,
-                    meta,
-                    child,
-                    weight,
-                    buffer,
-                    dl_cache,
-                    &mut branch_clauses,
-                )?;
+                compile_clauses(ctx, child, weight, &mut branch_clauses)?;
                 if !branch_clauses.is_empty() {
                     let branch_ub: f32 = branch_clauses.iter().map(|c| c.term_max).sum();
-                    if branch_ub > max_branch_ub {
-                        max_branch_ub = branch_ub;
-                    }
+                    max_branch_ub = max_branch_ub.max(branch_ub);
                     branches.push(branch_clauses);
                 }
             }
@@ -658,21 +575,23 @@ fn compile_clauses<'a, S: FtsPostingSource>(
             query,
             params,
         } => {
-            let entry = schema.get_by_name(attr).unwrap();
+            let entry = ctx.schema.get_by_name(attr).unwrap();
             let fts = entry.full_text_search.as_ref().unwrap();
-            let attr_stats = match meta.per_attr_stats.get(&entry.id) {
-                Some(s) if s.doc_count > 0 && s.total_tokens > 0 => *s,
-                _ => return Ok(()),
+            let Some(&attr_stats) = ctx
+                .meta
+                .per_attr_stats
+                .get(&entry.id)
+                .filter(|s| s.doc_count > 0 && s.total_tokens > 0)
+            else {
+                return Ok(());
             };
-            let analyzer = FtsAnalyzer::new(fts.clone());
-            let qtokens = analyzer.analyze_query(query, buffer)?;
+            let qtokens = FtsAnalyzer::new(fts.clone()).analyze_query(query, ctx.buffer)?;
             if qtokens.is_empty() {
                 return Ok(());
             }
 
-            let (k1, b, k3, last_as_prefix, max_exp) = resolve_params(fts, params.as_ref());
-
-            let (exact_tokens, prefix_token) = if last_as_prefix {
+            let resolved = resolve_params(fts, params.as_ref());
+            let (exact_tokens, prefix_token) = if resolved.last_as_prefix {
                 let last_idx = qtokens.len() - 1;
                 (&qtokens[..last_idx], Some(qtokens[last_idx].text.clone()))
             } else {
@@ -693,113 +612,55 @@ fn compile_clauses<'a, S: FtsPostingSource>(
                         qtfs.push(1);
                     }
                 }
-                let records = source.multi_get_term_records(entry.id, &keys)?;
-                let mut active_meta: Vec<(TermId, Bm25TermScorer, f32, usize)> =
-                    Vec::with_capacity(keys.len());
-                let mut active_recs: Vec<TermRecord> = Vec::with_capacity(keys.len());
-                for (qtf, opt_rec) in qtfs.into_iter().zip(records) {
-                    let Some(rec) = opt_rec else {
-                        continue;
-                    };
-                    if rec.stats.doc_freq == 0 {
-                        continue;
-                    }
-                    let scorer = Bm25TermScorer::new(
-                        weight,
-                        attr_stats.doc_count,
-                        attr_stats.total_tokens,
-                        rec.stats.doc_freq,
-                        qtf,
-                        k1,
-                        b,
-                        k3,
-                    );
-                    let ub = scorer.upper_bound(rec.stats.max_tf, rec.stats.min_dl_over_tf);
-                    if ub <= 0.0 {
-                        continue;
-                    }
-                    let dl_group = dl_cache.intern(entry.id, &scorer);
-                    active_meta.push((rec.term_id, scorer, ub, dl_group));
-                    active_recs.push(rec);
-                }
-                if !active_recs.is_empty() {
-                    let cursors = source.open_skip_cursors(active_recs)?;
-                    for ((term_id, scorer, ub, dl_group), cursor) in
-                        active_meta.into_iter().zip(cursors)
-                    {
-                        if cursor.current_block_id().is_some() {
-                            out.push(Clause {
-                                term_max: ub,
-                                kind: ClauseKind::Single(TermStream {
-                                    term_id,
-                                    scorer,
-                                    dl_group,
-                                    cursor,
-                                }),
-                            });
-                        }
-                    }
+                let records = ctx.source.multi_get_term_records(entry.id, &keys)?;
+                let pairs = records.into_iter().zip(qtfs).filter_map(|(r, q)| r.map(|rec| (rec, q)));
+                let streams = build_term_streams(
+                    ctx.source,
+                    ctx.dl_cache,
+                    entry.id,
+                    attr_stats,
+                    weight,
+                    &resolved,
+                    pairs,
+                )?;
+                for (ub, stream) in streams {
+                    out.push(Clause {
+                        term_max: ub,
+                        kind: ClauseKind::Single(stream),
+                    });
                 }
             }
 
             if let Some(prefix) = prefix_token {
-                let expanded = source.scan_prefix_terms(entry.id, &prefix, max_exp)?;
-                let mut p_meta: Vec<(TermId, Bm25TermScorer, f32, usize)> =
-                    Vec::with_capacity(expanded.len());
-                let mut p_recs: Vec<TermRecord> = Vec::with_capacity(expanded.len());
-                for (_token, rec) in expanded {
-                    if rec.stats.doc_freq == 0 {
-                        continue;
-                    }
-                    let scorer = Bm25TermScorer::new(
-                        weight,
-                        attr_stats.doc_count,
-                        attr_stats.total_tokens,
-                        rec.stats.doc_freq,
-                        1,
-                        k1,
-                        b,
-                        k3,
-                    );
-                    let ub = scorer.upper_bound(rec.stats.max_tf, rec.stats.min_dl_over_tf);
-                    if ub <= 0.0 {
-                        continue;
-                    }
-                    let dl_group = dl_cache.intern(entry.id, &scorer);
-                    p_meta.push((rec.term_id, scorer, ub, dl_group));
-                    p_recs.push(rec);
-                }
-                let mut streams = Vec::with_capacity(p_recs.len());
-                let mut max_ub = 0.0f32;
-                if !p_recs.is_empty() {
-                    let cursors = source.open_skip_cursors(p_recs)?;
-                    for ((term_id, scorer, ub, dl_group), cursor) in p_meta.into_iter().zip(cursors)
-                    {
-                        if cursor.current_block_id().is_some() {
-                            if ub > max_ub {
-                                max_ub = ub;
-                            }
-                            streams.push(TermStream {
-                                term_id,
-                                scorer,
-                                dl_group,
-                                cursor,
-                            });
-                        }
-                    }
-                }
-                if !streams.is_empty() {
-                    if streams.len() == 1 {
-                        out.push(Clause {
-                            term_max: max_ub,
-                            kind: ClauseKind::Single(streams.into_iter().next().unwrap()),
-                        });
-                    } else {
-                        out.push(Clause {
-                            term_max: max_ub,
-                            kind: ClauseKind::PrefixMax(streams),
-                        });
-                    }
+                let expanded =
+                    ctx.source
+                        .scan_prefix_terms(entry.id, &prefix, resolved.max_prefix_expansions)?;
+                let pairs = expanded.into_iter().map(|(_, rec)| (rec, 1));
+                let streams_with_ub = build_term_streams(
+                    ctx.source,
+                    ctx.dl_cache,
+                    entry.id,
+                    attr_stats,
+                    weight,
+                    &resolved,
+                    pairs,
+                )?;
+                let max_ub = streams_with_ub
+                    .iter()
+                    .map(|(ub, _)| *ub)
+                    .fold(0.0f32, f32::max);
+                let mut streams: Vec<TermStream<'a, S>> =
+                    streams_with_ub.into_iter().map(|(_, s)| s).collect();
+                if streams.len() == 1 {
+                    out.push(Clause {
+                        term_max: max_ub,
+                        kind: ClauseKind::Single(streams.pop().unwrap()),
+                    });
+                } else if !streams.is_empty() {
+                    out.push(Clause {
+                        term_max: max_ub,
+                        kind: ClauseKind::PrefixMax(streams),
+                    });
                 }
             }
 
@@ -808,27 +669,100 @@ fn compile_clauses<'a, S: FtsPostingSource>(
     }
 }
 
+fn build_term_streams<'a, S: FtsPostingSource>(
+    source: &'a S,
+    dl_cache: &mut DlNormCache<'a, S>,
+    attr_id: AttrId,
+    attr_stats: crate::block::AttrFtsStats,
+    weight: f32,
+    params: &ResolvedBm25Params,
+    records: impl Iterator<Item = (TermRecord, u32)>,
+) -> Result<Vec<(f32, TermStream<'a, S>)>> {
+    let mut active_meta: Vec<(TermId, Bm25TermScorer, f32, usize)> = Vec::new();
+    let mut active_recs: Vec<TermRecord> = Vec::new();
+    for (rec, qtf) in records {
+        if rec.stats.doc_freq == 0 {
+            continue;
+        }
+        let scorer = Bm25TermScorer::new(
+            weight,
+            attr_stats.doc_count,
+            attr_stats.total_tokens,
+            rec.stats.doc_freq,
+            qtf,
+            params.k1,
+            params.b,
+            params.k3,
+        );
+        let ub = scorer.upper_bound(rec.stats.max_tf, rec.stats.min_dl_over_tf);
+        if ub <= 0.0 {
+            continue;
+        }
+        let dl_group = dl_cache.intern(attr_id, &scorer);
+        active_meta.push((rec.term_id, scorer, ub, dl_group));
+        active_recs.push(rec);
+    }
+    if active_recs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cursors = source.open_skip_cursors(active_recs)?;
+    let mut out = Vec::with_capacity(cursors.len());
+    for ((term_id, scorer, ub, dl_group), cursor) in active_meta.into_iter().zip(cursors) {
+        if cursor.current_block_id().is_some() {
+            out.push((
+                ub,
+                TermStream {
+                    term_id,
+                    scorer,
+                    dl_group,
+                    cursor,
+                },
+            ));
+        }
+    }
+    Ok(out)
+}
+
+struct ResolvedBm25Params {
+    k1: f32,
+    b: f32,
+    k3: f32,
+    last_as_prefix: bool,
+    max_prefix_expansions: usize,
+}
+
 fn resolve_params(
     fts: &FullTextSearchConfig,
     overrides: Option<&Bm25Overrides>,
-) -> (f32, f32, f32, bool, usize) {
+) -> ResolvedBm25Params {
     match overrides {
-        Some(o) => (
-            o.k1.unwrap_or(fts.k1),
-            o.b.unwrap_or(fts.b),
-            o.k3.unwrap_or(fts.k3),
-            o.last_as_prefix.unwrap_or(false),
-            o.max_prefix_expansions
+        Some(o) => ResolvedBm25Params {
+            k1: o.k1.unwrap_or(fts.k1),
+            b: o.b.unwrap_or(fts.b),
+            k3: o.k3.unwrap_or(fts.k3),
+            last_as_prefix: o.last_as_prefix.unwrap_or(false),
+            max_prefix_expansions: o
+                .max_prefix_expansions
                 .unwrap_or(DEFAULT_MAX_PREFIX_EXPANSIONS),
-        ),
-        None => (
-            fts.k1,
-            fts.b,
-            fts.k3,
-            false,
-            DEFAULT_MAX_PREFIX_EXPANSIONS,
-        ),
+        },
+        None => ResolvedBm25Params {
+            k1: fts.k1,
+            b: fts.b,
+            k3: fts.k3,
+            last_as_prefix: false,
+            max_prefix_expansions: DEFAULT_MAX_PREFIX_EXPANSIONS,
+        },
     }
+}
+
+#[inline]
+fn ub_slack(ub: f32) -> f32 {
+    ub * 1e-6 + 1e-7
+}
+
+#[inline]
+fn ub_below_threshold(ub: f32, theta: f32) -> bool {
+    ub + ub_slack(ub) < theta
 }
 
 /// Min-heap entry for top-$k$ BM25 (smallest score / largest DocId at the top so it is evicted first).
@@ -874,8 +808,8 @@ impl BlockFilterMask {
     pub fn from_bitmap(bm: &RoaringBitmap) -> Self {
         let mut blocks: HashMap<FtsBlockId, [u64; 4]> = HashMap::new();
         for fts_doc_id in bm.iter() {
-            let block_id = fts_doc_id >> 8;
-            let slot = (fts_doc_id & 0xFF) as u8;
+            let block_id = fts_block_id(fts_doc_id);
+            let slot = fts_slot(fts_doc_id);
             let entry = blocks.entry(block_id).or_insert([0u64; 4]);
             entry[(slot >> 6) as usize] |= 1u64 << (slot & 63);
         }
@@ -920,16 +854,16 @@ pub fn execute_rank_by<S: FtsPostingSource>(
     let tier = SimdTier::detect();
     let mut dl_cache = DlNormCache::new();
     let mut clauses = Vec::new();
-    compile_clauses(
-        source,
-        schema,
-        &meta,
-        rank_by,
-        1.0,
-        buffer,
-        &mut dl_cache,
-        &mut clauses,
-    )?;
+    {
+        let mut ctx = CompileContext {
+            source,
+            schema,
+            meta: &meta,
+            buffer,
+            dl_cache: &mut dl_cache,
+        };
+        compile_clauses(&mut ctx, rank_by, 1.0, &mut clauses)?;
+    }
     if clauses.is_empty() {
         return Ok(Vec::new());
     }
@@ -953,29 +887,16 @@ pub fn execute_rank_by<S: FtsPostingSource>(
     let mut candidates: Vec<(f32, FtsDocId)> = Vec::with_capacity(32);
     let mut non_ess_ubs: Vec<f32> = Vec::with_capacity(n_clauses);
 
-    loop {
-        // Find minimum block_id among essential clauses (`essential_start..n_clauses`).
-        let mut target_block: Option<FtsBlockId> = None;
-        for c in &clauses[essential_start..] {
-            if let Some(bid) = c.next_block_id() {
-                target_block = Some(target_block.map_or(bid, |m| m.min(bid)));
-            }
-        }
-        let Some(block_id) = target_block else {
-            break;
-        };
-
-        // Check pushdown block filter mask first.
-        let allowed_mask = if let Some(ref fm) = filter_mask {
-            let Some(mask) = fm.get(block_id) else {
-                for c in &mut clauses[essential_start..] {
-                    c.advance_past(block_id)?;
+    while let Some(block_id) = next_essential_block(&clauses[essential_start..]) {
+        let allowed_mask = match filter_mask {
+            Some(ref fm) => match fm.get(block_id) {
+                Some(mask) => Some(*mask),
+                None => {
+                    advance_clauses_past(&mut clauses[essential_start..], block_id)?;
+                    continue;
                 }
-                continue;
-            };
-            Some(*mask)
-        } else {
-            None
+            },
+            None => None,
         };
 
         let non_ess_ub = if essential_start > 0 {
@@ -985,19 +906,10 @@ pub fn execute_rank_by<S: FtsPostingSource>(
         };
 
         // Block-Max skip pruning BEFORE reading any posting blocks or doc_len blocks.
-        if theta > 0.0 {
-            let mut ess_block_ub = 0.0f64;
-            for c in &clauses[essential_start..] {
-                ess_block_ub += c.block_upper_bound(block_id) as f64;
-            }
-            let block_ub = (ess_block_ub + non_ess_ub as f64) as f32;
-            let eps = block_ub * 1e-6 + 1e-7;
-            if block_ub + eps < theta {
-                for c in &mut clauses[essential_start..] {
-                    c.advance_past(block_id)?;
-                }
-                continue;
-            }
+        if theta > 0.0 && essential_block_pruned(&clauses[essential_start..], block_id, non_ess_ub, theta)
+        {
+            advance_clauses_past(&mut clauses[essential_start..], block_id)?;
+            continue;
         }
 
         // Accumulate essential clauses into L1-resident [f32; 256] buffer via SIMD,
@@ -1017,70 +929,23 @@ pub fn execute_rank_by<S: FtsPostingSource>(
             }
         }
 
-        let mut active_mask = touched;
-        if active_mask != [0u64; 4] {
-            let max_ess = max_score_256(tier, &scores, &active_mask);
-
-            if essential_start > 0 {
-                let eps = (max_ess + non_ess_ub) * 1e-6 + 1e-7;
-                if max_ess + non_ess_ub + eps >= theta {
-                    non_ess_ubs.clear();
-                    let mut non_ess_block_ub = 0.0f64;
-                    let mut pruned_early = false;
-                    // Seek descending by global term_max using out-of-line skip cursors only.
-                    for j in (0..essential_start).rev() {
-                        clauses[j].seek_to(block_id)?;
-                        let ub = clauses[j].block_upper_bound(block_id);
-                        non_ess_ubs.push(ub);
-                        non_ess_block_ub += ub as f64;
-                        if theta > 0.0 {
-                            let rem_global = if j > 0 { prefix_max_sum[j - 1] } else { 0.0 };
-                            let upper =
-                                (max_ess as f64 + non_ess_block_ub + rem_global as f64) as f32;
-                            let upper_eps = upper * 1e-6 + 1e-7;
-                            if upper + upper_eps < theta {
-                                pruned_early = true;
-                                break;
-                            }
-                        }
-                    }
-                    if !pruned_early {
-                        let tight_ub = (max_ess as f64 + non_ess_block_ub) as f32;
-                        let tight_eps = tight_ub * 1e-6 + 1e-7;
-                        let mut rem_ub = non_ess_block_ub;
-                        for (idx, j) in (0..essential_start).rev().enumerate() {
-                            let ub_j = non_ess_ubs[idx];
-                            if ub_j <= 0.0 {
-                                continue;
-                            }
-                            if theta > 0.0 {
-                                let min_needed = (theta - rem_ub as f32) - tight_eps;
-                                if min_needed > 0.0 {
-                                    active_mask =
-                                        filter_ge_256(tier, &scores, &active_mask, min_needed);
-                                    if active_mask == [0u64; 4] {
-                                        break;
-                                    }
-                                }
-                            }
-                            clauses[j].accumulate_block_masked(
-                                block_id,
-                                &active_mask,
-                                &mut scores,
-                                &mut dl_cache,
-                                source,
-                                tier,
-                            )?;
-                            rem_ub = (rem_ub - ub_j as f64).max(0.0);
-                        }
-                    } else {
-                        active_mask = [0u64; 4];
-                    }
-                } else {
-                    active_mask = [0u64; 4];
-                }
-            }
-        }
+        let active_mask = if touched == [0u64; 4] || essential_start == 0 {
+            touched
+        } else {
+            eval_non_essential_clauses(
+                &mut clauses[..essential_start],
+                &prefix_max_sum[..essential_start],
+                block_id,
+                touched,
+                non_ess_ub,
+                theta,
+                &mut scores,
+                &mut non_ess_ubs,
+                &mut dl_cache,
+                source,
+                tier,
+            )?
+        };
 
         // SIMD threshold filtering for top-k candidates.
         if active_mask != [0u64; 4] {
@@ -1091,98 +956,25 @@ pub fn execute_rank_by<S: FtsPostingSource>(
             };
             let hit_mask = filter_ge_256(tier, &scores, &active_mask, cand_thresh);
             if hit_mask != [0u64; 4] {
-                candidates.clear();
-                for (w, &bits) in hit_mask.iter().enumerate() {
-                    let mut b = bits;
-                    while b != 0 {
-                        let bit = b.trailing_zeros() as usize;
-                        b &= b - 1;
-                        let slot = ((w << 6) | bit) as u8;
-                        let s = scores[slot as usize];
-                        candidates.push((s, make_fts_doc_id(block_id, slot)));
-                    }
-                }
-
+                collect_block_candidates(block_id, &hit_mask, &scores, &mut candidates);
                 if !candidates.is_empty() {
-                    let needs_doc_ids = lazy_filter.is_some()
-                        || (heap.len() == top_k && candidates.iter().any(|&(s, _)| s == theta));
-
-                    let resolved_ids: Vec<Option<DocId>> = if needs_doc_ids {
-                        let fts_ids: Vec<FtsDocId> = candidates.iter().map(|&(_, id)| id).collect();
-                        source.multi_get_doc_ids(&fts_ids)?
-                    } else {
-                        vec![None; candidates.len()]
-                    };
-
-                    for (&(s, fts_doc_id), &opt_doc_id) in
-                        candidates.iter().zip(resolved_ids.iter())
-                    {
-                        if let Some(ref mut pred) = lazy_filter {
-                            let Some(doc_id) = opt_doc_id else {
-                                continue;
-                            };
-                            if !pred(doc_id)? {
-                                continue;
-                            }
-                        }
-
-                        if heap.len() < top_k {
-                            heap.push(TopKEntry {
-                                score: s,
-                                fts_doc_id,
-                                doc_id: opt_doc_id,
-                            });
-                            if heap.len() == top_k {
-                                theta = heap.peek().unwrap().score;
-                            }
-                        } else if s > theta {
-                            heap.pop();
-                            heap.push(TopKEntry {
-                                score: s,
-                                fts_doc_id,
-                                doc_id: opt_doc_id,
-                            });
-                            theta = heap.peek().unwrap().score;
-                        } else if s == theta {
-                            let Some(new_doc_id) = opt_doc_id else {
-                                continue;
-                            };
-                            let mut root = heap.pop().unwrap();
-                            let root_doc_id = match root.doc_id {
-                                Some(id) => id,
-                                None => {
-                                    let fetched = source.multi_get_doc_ids(&[root.fts_doc_id])?;
-                                    let id = fetched[0].unwrap_or(DocId::MAX);
-                                    root.doc_id = Some(id);
-                                    id
-                                }
-                            };
-                            if new_doc_id < root_doc_id {
-                                heap.push(TopKEntry {
-                                    score: s,
-                                    fts_doc_id,
-                                    doc_id: Some(new_doc_id),
-                                });
-                                theta = heap.peek().unwrap().score;
-                            } else {
-                                heap.push(root);
-                            }
-                        }
-                    }
+                    theta = insert_candidates_into_heap(
+                        source,
+                        &candidates,
+                        top_k,
+                        theta,
+                        &mut heap,
+                        &mut lazy_filter,
+                    )?;
                 }
             }
         }
 
         // Dynamically shrink essential set as theta rises.
         if heap.len() == top_k && theta > 0.0 {
-            while essential_start < n_clauses {
-                let ub = prefix_max_sum[essential_start];
-                let eps = ub * 1e-6 + 1e-7;
-                if ub + eps < theta {
-                    essential_start += 1;
-                } else {
-                    break;
-                }
+            while essential_start < n_clauses && ub_below_threshold(prefix_max_sum[essential_start], theta)
+            {
+                essential_start += 1;
             }
             if essential_start >= n_clauses {
                 break;
@@ -1190,6 +982,202 @@ pub fn execute_rank_by<S: FtsPostingSource>(
         }
     }
 
+    resolve_and_sort_results(source, heap)
+}
+
+#[inline]
+fn next_essential_block<'a, S: FtsPostingSource + 'a>(
+    essential: &[Clause<'a, S>],
+) -> Option<FtsBlockId> {
+    essential
+        .iter()
+        .filter_map(Clause::next_block_id)
+        .min()
+}
+
+#[inline]
+fn advance_clauses_past<'a, S: FtsPostingSource + 'a>(
+    clauses: &mut [Clause<'a, S>],
+    block_id: FtsBlockId,
+) -> Result<()> {
+    for c in clauses {
+        c.advance_past(block_id)?;
+    }
+    Ok(())
+}
+
+#[inline]
+fn essential_block_pruned<'a, S: FtsPostingSource + 'a>(
+    essential: &[Clause<'a, S>],
+    block_id: FtsBlockId,
+    non_ess_ub: f32,
+    theta: f32,
+) -> bool {
+    let ess_block_ub: f64 = essential
+        .iter()
+        .map(|c| c.block_upper_bound(block_id) as f64)
+        .sum();
+    let block_ub = (ess_block_ub + non_ess_ub as f64) as f32;
+    ub_below_threshold(block_ub, theta)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_non_essential_clauses<'a, S: FtsPostingSource + 'a>(
+    non_essential: &mut [Clause<'a, S>],
+    prefix_max_sum: &[f32],
+    block_id: FtsBlockId,
+    mut active_mask: [u64; 4],
+    non_ess_ub: f32,
+    theta: f32,
+    scores: &mut [f32; FTS_BLOCK_SIZE],
+    non_ess_ubs: &mut Vec<f32>,
+    dl_cache: &mut DlNormCache<'a, S>,
+    source: &'a S,
+    tier: SimdTier,
+) -> Result<[u64; 4]> {
+    let max_ess = max_score_256(tier, scores, &active_mask);
+    if ub_below_threshold(max_ess + non_ess_ub, theta) {
+        return Ok([0u64; 4]);
+    }
+
+    non_ess_ubs.clear();
+    let mut non_ess_block_ub = 0.0f64;
+    // Seek descending by global term_max using out-of-line skip cursors only.
+    for j in (0..non_essential.len()).rev() {
+        non_essential[j].seek_to(block_id)?;
+        let ub = non_essential[j].block_upper_bound(block_id);
+        non_ess_ubs.push(ub);
+        non_ess_block_ub += ub as f64;
+        if theta > 0.0 {
+            let rem_global = if j > 0 { prefix_max_sum[j - 1] } else { 0.0 };
+            let upper = (max_ess as f64 + non_ess_block_ub + rem_global as f64) as f32;
+            if ub_below_threshold(upper, theta) {
+                return Ok([0u64; 4]);
+            }
+        }
+    }
+
+    let tight_ub = (max_ess as f64 + non_ess_block_ub) as f32;
+    let tight_eps = ub_slack(tight_ub);
+    let mut rem_ub = non_ess_block_ub;
+    for (idx, j) in (0..non_essential.len()).rev().enumerate() {
+        let ub_j = non_ess_ubs[idx];
+        if ub_j <= 0.0 {
+            continue;
+        }
+        if theta > 0.0 {
+            let min_needed = (theta - rem_ub as f32) - tight_eps;
+            if min_needed > 0.0 {
+                active_mask = filter_ge_256(tier, scores, &active_mask, min_needed);
+                if active_mask == [0u64; 4] {
+                    break;
+                }
+            }
+        }
+        non_essential[j].accumulate_block_masked(
+            block_id,
+            &active_mask,
+            scores,
+            dl_cache,
+            source,
+            tier,
+        )?;
+        rem_ub = (rem_ub - ub_j as f64).max(0.0);
+    }
+    Ok(active_mask)
+}
+
+#[inline]
+fn collect_block_candidates(
+    block_id: FtsBlockId,
+    hit_mask: &[u64; 4],
+    scores: &[f32; FTS_BLOCK_SIZE],
+    candidates: &mut Vec<(f32, FtsDocId)>,
+) {
+    candidates.clear();
+    for_each_set_bit_256(hit_mask, |slot| {
+        candidates.push((scores[slot as usize], make_fts_doc_id(block_id, slot)));
+    });
+}
+
+fn insert_candidates_into_heap<S: FtsPostingSource>(
+    source: &S,
+    candidates: &[(f32, FtsDocId)],
+    top_k: usize,
+    mut theta: f32,
+    heap: &mut BinaryHeap<TopKEntry>,
+    lazy_filter: &mut Option<&mut dyn FnMut(DocId) -> Result<bool>>,
+) -> Result<f32> {
+    let needs_doc_ids = lazy_filter.is_some()
+        || (heap.len() == top_k && candidates.iter().any(|&(s, _)| s == theta));
+
+    let resolved_ids: Vec<Option<DocId>> = if needs_doc_ids {
+        let fts_ids: Vec<FtsDocId> = candidates.iter().map(|&(_, id)| id).collect();
+        source.multi_get_doc_ids(&fts_ids)?
+    } else {
+        vec![None; candidates.len()]
+    };
+
+    for (&(s, fts_doc_id), &opt_doc_id) in candidates.iter().zip(resolved_ids.iter()) {
+        if let Some(pred) = lazy_filter {
+            let Some(doc_id) = opt_doc_id else {
+                continue;
+            };
+            if !pred(doc_id)? {
+                continue;
+            }
+        }
+
+        if heap.len() < top_k {
+            heap.push(TopKEntry {
+                score: s,
+                fts_doc_id,
+                doc_id: opt_doc_id,
+            });
+            if heap.len() == top_k {
+                theta = heap.peek().unwrap().score;
+            }
+        } else if s > theta {
+            heap.pop();
+            heap.push(TopKEntry {
+                score: s,
+                fts_doc_id,
+                doc_id: opt_doc_id,
+            });
+            theta = heap.peek().unwrap().score;
+        } else if s == theta {
+            let Some(new_doc_id) = opt_doc_id else {
+                continue;
+            };
+            let mut root = heap.pop().unwrap();
+            let root_doc_id = match root.doc_id {
+                Some(id) => id,
+                None => {
+                    let fetched = source.multi_get_doc_ids(&[root.fts_doc_id])?;
+                    let id = fetched[0].unwrap_or(DocId::MAX);
+                    root.doc_id = Some(id);
+                    id
+                }
+            };
+            if new_doc_id < root_doc_id {
+                heap.push(TopKEntry {
+                    score: s,
+                    fts_doc_id,
+                    doc_id: Some(new_doc_id),
+                });
+                theta = heap.peek().unwrap().score;
+            } else {
+                heap.push(root);
+            }
+        }
+    }
+    Ok(theta)
+}
+
+fn resolve_and_sort_results<S: FtsPostingSource>(
+    source: &S,
+    heap: BinaryHeap<TopKEntry>,
+) -> Result<Vec<Bm25Result>> {
     if heap.is_empty() {
         return Ok(Vec::new());
     }

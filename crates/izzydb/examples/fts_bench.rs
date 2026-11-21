@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use izzydb::fts::{Bm25TermScorer, FtsAnalyzer, ReusableBuffer};
+use izzydb::fts::{Bm25TermScorer, FtsAnalyzer, ReusableBuffer, SimdTier};
 use izzydb::{
     AttributeType, Attributes, Bm25Result, Collection, CollectionConfig, DistanceMetric, DocId,
     FullTextSearchConfig, RankBy, TreeConfig,
@@ -10,11 +10,10 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use tempfile::TempDir;
 
-fn main() {
-    let n = 10_000usize;
+fn run_suite(n: usize, vocab_size: usize) {
     let dim = 32usize;
     let mut rng = SmallRng::seed_from_u64(42);
-    let vocab: Vec<String> = (0..1_000).map(|i| format!("term{i:04}")).collect();
+    let vocab: Vec<String> = (0..vocab_size).map(|i| format!("term{i:04}")).collect();
 
     let dir = TempDir::new().unwrap();
     let cfg = CollectionConfig::new(TreeConfig::new(dim, DistanceMetric::L2Squared))
@@ -33,9 +32,9 @@ fn main() {
         let doc_len = rng.random_range(15..=40);
         let text: String = (0..doc_len)
             .map(|_| {
-                // Zipf-like skew: favor lower-index terms slightly, mix rare terms
+                // Zipf-like skew: favor lower-index terms to generate dense blocks, mix rare terms
                 let idx = if rng.random_bool(0.5) {
-                    rng.random_range(0..50)
+                    rng.random_range(0..50.min(vocab.len()))
                 } else {
                     rng.random_range(0..vocab.len())
                 };
@@ -49,11 +48,11 @@ fn main() {
         raw_texts.push((id, text));
     }
     println!(
-        "Indexed {n} FTS docs in {:.1}ms",
+        "\n[n={n}, tier={:?}] Indexed in {:.1}ms",
+        SimdTier::detect(),
         t0.elapsed().as_secs_f64() * 1000.0
     );
 
-    // Precompute in-memory exhaustive BM25 baseline structures
     let analyzer = FtsAnalyzer::new(FullTextSearchConfig::default());
     let mut buf = ReusableBuffer::new();
     let mut analyzed_docs = Vec::with_capacity(n);
@@ -68,14 +67,21 @@ fn main() {
         analyzed_docs.push((*id, ad));
     }
 
-    for (label, num_terms) in [("Short 3-term query", 3usize), ("Long 50-term LLM query", 50)] {
+    for (label, num_terms) in [
+        ("Short 3-term query", 3usize),
+        ("Medium 8-term query", 8),
+        ("Long 50-term LLM query", 50),
+    ] {
         let q_terms: Vec<String> = (0..num_terms)
             .map(|i| vocab[(i * 19 + 5) % vocab.len()].clone())
             .collect();
         let q_str = q_terms.join(" ");
         let rank_by = RankBy::bm25("body", q_str.as_str());
 
-        let runs = 20usize;
+        // Warmup
+        let _ = col.query_bm25(&rank_by, None, 10).unwrap();
+
+        let runs = 25usize;
         let t_maxscore = Instant::now();
         let mut last_got = Vec::new();
         for _ in 0..runs {
@@ -85,7 +91,8 @@ fn main() {
 
         let t_exh = Instant::now();
         let mut last_exh = Vec::new();
-        for _ in 0..runs {
+        let exh_runs = if n <= 20_000 { runs } else { 5 };
+        for _ in 0..exh_runs {
             let mut scores = Vec::with_capacity(n);
             for (id, ad) in &analyzed_docs {
                 let mut s = 0.0f32;
@@ -113,14 +120,19 @@ fn main() {
             scores.truncate(10);
             last_exh = scores;
         }
-        let exh_us = t_exh.elapsed().as_secs_f64() * 1e6 / runs as f64;
+        let exh_us = t_exh.elapsed().as_secs_f64() * 1e6 / exh_runs as f64;
 
         assert_eq!(
             last_got.iter().map(|r| r.id).collect::<Vec<_>>(),
             last_exh.iter().map(|r| r.id).collect::<Vec<_>>()
         );
         println!(
-            "{label:24} -> MAXSCORE={maxscore_us:7.1}us, Exhaustive={exh_us:7.1}us (exact top-10 match)"
+            "  {label:24} -> SIMD-MAXSCORE={maxscore_us:7.1}us, Exhaustive={exh_us:8.1}us ({:.1}x speedup)",
+            exh_us / maxscore_us
         );
     }
+}
+
+fn main() {
+    run_suite(10_000, 1_000);
 }

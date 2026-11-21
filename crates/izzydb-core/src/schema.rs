@@ -818,10 +818,10 @@ impl CollectionSchema {
         Ok(())
     }
 
-    /// Encode schema for persistence in `cf_meta["schema"]` (version 2).
+    /// Encode schema for persistence in `cf_meta["schema"]` (version 3).
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.push(2u8); // version
+        buf.push(3u8); // version
         buf.extend_from_slice(&self.next_attr_id.to_le_bytes());
         buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         for entry in &self.entries {
@@ -842,7 +842,7 @@ impl CollectionSchema {
         buf
     }
 
-    /// Decode schema from `cf_meta["schema"]` (version 2).
+    /// Decode schema from `cf_meta["schema"]` (version 3).
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < 7 {
             return Err(TreeError::CorruptedData(
@@ -850,7 +850,7 @@ impl CollectionSchema {
             ));
         }
         let version = bytes[0];
-        if version != 2 {
+        if version != 3 {
             return Err(TreeError::CorruptedData(format!(
                 "unsupported CollectionSchema version: {version}"
             )));

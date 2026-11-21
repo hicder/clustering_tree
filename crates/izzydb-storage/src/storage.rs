@@ -36,6 +36,7 @@ pub const CF_FTS_REV_DOC_MAP: &str = "cf_fts_rev_doc_map";
 pub const CF_FTS_TERMS: &str = "cf_fts_terms";
 pub const CF_FTS_POSTINGS: &str = "cf_fts_postings";
 pub const CF_FTS_POSITIONS: &str = "cf_fts_positions";
+pub const CF_FTS_DOC_LENS: &str = "cf_fts_doc_lens";
 
 const META_KEY: &[u8] = b"tree_meta";
 const SCHEMA_KEY: &[u8] = b"schema";
@@ -122,6 +123,7 @@ impl Storage {
                 CF_FTS_POSITIONS,
                 point_lookup_cf_opts(&block_cache, false),
             ),
+            ColumnFamilyDescriptor::new(CF_FTS_DOC_LENS, point_lookup_cf_opts(&block_cache, true)),
         ];
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors).map_err(map_db_err)?;
@@ -624,14 +626,28 @@ impl Storage {
         self.db.get_cf(cf, key).map_err(map_db_err)
     }
 
+    pub fn get_fts_doc_len_bytes(&self, key: &[u8; 6]) -> Result<Option<Vec<u8>>> {
+        let cf = self.cf(CF_FTS_DOC_LENS)?;
+        self.db.get_cf(cf, key).map_err(map_db_err)
+    }
+
+    pub fn get_fts_doc_len_pinned(&self, key: &[u8; 6]) -> Result<Option<DBPinnableSlice<'_>>> {
+        let cf = self.cf(CF_FTS_DOC_LENS)?;
+        self.db.get_pinned_cf(cf, key).map_err(map_db_err)
+    }
+
     pub fn open_fts_posting_cursor(&self, prefix: Vec<u8>) -> Result<RocksPostingCursor<'_>> {
         let cf = self.cf(CF_FTS_POSTINGS)?;
         let mut iter = self.db.raw_iterator_cf(cf);
         iter.seek(&prefix);
         let valid = check_posting_iter(&iter, &prefix)?;
+        let prefix_len = prefix.len();
+        let mut seek_buf = prefix;
+        seek_buf.reserve(4);
         Ok(RocksPostingCursor {
             iter,
-            prefix,
+            seek_buf,
+            prefix_len,
             valid,
         })
     }
@@ -678,6 +694,16 @@ impl Storage {
 
     pub fn all_fts_positions(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let cf = self.cf(CF_FTS_POSITIONS)?;
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (k, v) = item.map_err(map_db_err)?;
+            out.push((k.to_vec(), v.to_vec()));
+        }
+        Ok(out)
+    }
+
+    pub fn all_fts_doc_lens(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cf = self.cf(CF_FTS_DOC_LENS)?;
         let mut out = Vec::new();
         for item in self.db.iterator_cf(cf, IteratorMode::Start) {
             let (k, v) = item.map_err(map_db_err)?;
@@ -847,12 +873,23 @@ impl<'a> StorageBatch<'a> {
         let cf = self.storage.db.cf_handle(CF_FTS_POSITIONS).unwrap();
         self.batch.delete_cf(cf, key);
     }
+
+    pub fn put_fts_doc_len(&mut self, key: &[u8; 6], bytes: &[u8]) {
+        let cf = self.storage.db.cf_handle(CF_FTS_DOC_LENS).unwrap();
+        self.batch.put_cf(cf, key, bytes);
+    }
+
+    pub fn delete_fts_doc_len(&mut self, key: &[u8; 6]) {
+        let cf = self.storage.db.cf_handle(CF_FTS_DOC_LENS).unwrap();
+        self.batch.delete_cf(cf, key);
+    }
 }
 
 /// Prefix-bounded RocksDB cursor over `cf_fts_postings` for a single `(attr_id, escaped_token)`.
 pub struct RocksPostingCursor<'a> {
     iter: DBRawIteratorWithThreadMode<'a, DB>,
-    prefix: Vec<u8>,
+    seek_buf: Vec<u8>,
+    prefix_len: usize,
     valid: bool,
 }
 
@@ -863,7 +900,7 @@ impl<'a> RocksPostingCursor<'a> {
             return None;
         }
         let k = self.iter.key()?;
-        let off = self.prefix.len();
+        let off = self.prefix_len;
         if k.len() != off + 4 {
             return None;
         }
@@ -884,7 +921,7 @@ impl<'a> RocksPostingCursor<'a> {
             return Ok(());
         }
         self.iter.next();
-        self.valid = check_posting_iter(&self.iter, &self.prefix)?;
+        self.valid = check_posting_iter(&self.iter, &self.seek_buf[..self.prefix_len])?;
         Ok(())
     }
 
@@ -893,11 +930,10 @@ impl<'a> RocksPostingCursor<'a> {
         if !self.valid {
             return Ok(());
         }
-        let mut seek_key = Vec::with_capacity(self.prefix.len() + 4);
-        seek_key.extend_from_slice(&self.prefix);
-        seek_key.extend_from_slice(&target.to_be_bytes());
-        self.iter.seek(&seek_key);
-        self.valid = check_posting_iter(&self.iter, &self.prefix)?;
+        self.seek_buf.truncate(self.prefix_len);
+        self.seek_buf.extend_from_slice(&target.to_be_bytes());
+        self.iter.seek(&self.seek_buf);
+        self.valid = check_posting_iter(&self.iter, &self.seek_buf[..self.prefix_len])?;
         Ok(())
     }
 }
@@ -1021,6 +1057,7 @@ pub struct TxContext<'a> {
     dirty_fts_terms: HashMap<Vec<u8>, Option<Vec<u8>>>,
     dirty_fts_postings: HashMap<Vec<u8>, Option<Vec<u8>>>,
     dirty_fts_positions: HashMap<Vec<u8>, Option<Vec<u8>>>,
+    dirty_fts_doc_lens: HashMap<[u8; 6], Option<Vec<u8>>>,
 }
 
 impl<'a> TxContext<'a> {
@@ -1052,6 +1089,7 @@ impl<'a> TxContext<'a> {
             dirty_fts_terms: HashMap::new(),
             dirty_fts_postings: HashMap::new(),
             dirty_fts_positions: HashMap::new(),
+            dirty_fts_doc_lens: HashMap::new(),
         }
     }
 
@@ -1371,6 +1409,21 @@ impl<'a> TxContext<'a> {
         self.dirty_fts_positions.insert(key, None);
     }
 
+    pub fn get_fts_doc_len_bytes(&self, key: &[u8; 6]) -> Result<Option<Vec<u8>>> {
+        if let Some(opt) = self.dirty_fts_doc_lens.get(key) {
+            return Ok(opt.clone());
+        }
+        self.storage.get_fts_doc_len_bytes(key)
+    }
+
+    pub fn put_fts_doc_len_bytes(&mut self, key: [u8; 6], val: Vec<u8>) {
+        self.dirty_fts_doc_lens.insert(key, Some(val));
+    }
+
+    pub fn delete_fts_doc_len(&mut self, key: [u8; 6]) {
+        self.dirty_fts_doc_lens.insert(key, None);
+    }
+
     pub fn commit(mut self) -> Result<TreeMeta> {
         let mut batch = self.storage.new_batch();
         if self.meta_dirty {
@@ -1455,6 +1508,12 @@ impl<'a> TxContext<'a> {
             match opt {
                 Some(bytes) => batch.put_fts_position(&key, &bytes),
                 None => batch.delete_fts_position(&key),
+            }
+        }
+        for (key, opt) in self.dirty_fts_doc_lens {
+            match opt {
+                Some(bytes) => batch.put_fts_doc_len(&key, &bytes),
+                None => batch.delete_fts_doc_len(&key),
             }
         }
 

@@ -11,12 +11,13 @@ use izzydb_core::filter::{Filter, FtsPredicateKind, TokenQuery};
 use izzydb_core::rank::RankBy;
 use izzydb_core::schema::{AttributeValue, Attributes, CollectionSchema};
 use izzydb_fts::{
-    AnalyzedDoc, Bm25Result, DEFAULT_MAX_PREFIX_EXPANSIONS, FtsAnalyzer, FtsBlockCursor, FtsMeta,
-    FtsPostingSource, PackedPositionBlock, PackedPostingBlock, PostingBlockView, ReusableBuffer,
-    TermStats, execute_rank_by,
+    AnalyzedDoc, Bm25Result, DEFAULT_MAX_PREFIX_EXPANSIONS, DocLenBlock, FtsAnalyzer,
+    FtsBlockCursor, FtsMeta, FtsPostingSource, PackedPositionBlock, PackedPostingBlock,
+    PostingBlockView, ReusableBuffer, TermStats, execute_rank_by,
 };
 use izzydb_storage::codec::{
-    decode_fts_term_key, encode_fts_posting_key, encode_fts_posting_prefix, encode_fts_term_key,
+    decode_fts_term_key, encode_fts_doc_len_key, encode_fts_posting_key,
+    encode_fts_posting_prefix, encode_fts_term_key,
 };
 use izzydb_storage::{RocksPostingCursor, Storage, TxContext};
 
@@ -128,6 +129,22 @@ impl FtsPostingSource for StorageFtsSource<'_> {
     ) -> Result<Self::Cursor<'a>> {
         let prefix = encode_fts_posting_prefix(attr_id, token);
         Ok(StorageCursor(self.storage.open_fts_posting_cursor(prefix)?))
+    }
+
+    fn read_doc_len_block(
+        &self,
+        attr_id: AttrId,
+        block_id: FtsBlockId,
+        f: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<bool> {
+        let key = encode_fts_doc_len_key(attr_id, block_id);
+        match self.storage.get_fts_doc_len_pinned(&key)? {
+            Some(slice) => {
+                f(&slice)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     fn multi_get_doc_ids(&self, fts_doc_ids: &[FtsDocId]) -> Result<Vec<Option<DocId>>> {
@@ -704,9 +721,9 @@ fn eval_any_token(
         let mut cursor = storage.open_fts_posting_cursor(prefix)?;
         while let Some(block_id) = cursor.current_block_id() {
             let view = PostingBlockView::parse(cursor.current_block_bytes())?;
-            for &slot in view.slots {
+            view.for_each_slot(|slot| {
                 out.insert(make_fts_doc_id(block_id, slot));
-            }
+            });
             cursor.next_block()?;
         }
     }
@@ -731,9 +748,7 @@ fn eval_all_tokens_blocks(
             while let Some(block_id) = cursor.current_block_id() {
                 let view = PostingBlockView::parse(cursor.current_block_bytes())?;
                 let mask = by_block.entry(block_id).or_insert([0u64; 4]);
-                for &slot in view.slots {
-                    mask[(slot >> 6) as usize] |= 1u64 << (slot & 63);
-                }
+                view.or_slots_into_mask(mask);
                 cursor.next_block()?;
             }
         }
@@ -825,9 +840,7 @@ fn eval_all_tokens_blocks(
         for cur in &cursors {
             let view = PostingBlockView::parse(cur.current_block_bytes())?;
             let mut cur_mask = [0u64; 4];
-            for &slot in view.slots {
-                cur_mask[(slot >> 6) as usize] |= 1u64 << (slot & 63);
-            }
+            view.or_slots_into_mask(&mut cur_mask);
             for w in 0..4 {
                 mask[w] &= cur_mask[w];
             }
@@ -846,9 +859,7 @@ fn eval_all_tokens_blocks(
                 }
                 if pcur.current_block_id() == Some(target) {
                     let view = PostingBlockView::parse(pcur.current_block_bytes())?;
-                    for &slot in view.slots {
-                        prefix_mask[(slot >> 6) as usize] |= 1u64 << (slot & 63);
-                    }
+                    view.or_slots_into_mask(&mut prefix_mask);
                 }
             }
             for w in 0..4 {
@@ -880,13 +891,39 @@ fn apply_attr_token_diff(
     let old_dl = old_doc.map_or(0, |d| d.doc_len);
     let new_dl = new_doc.map_or(0, |d| d.doc_len);
 
+    let dl_key = encode_fts_doc_len_key(attr_id, block_id);
+    let mut doc_len_block = match tx.get_fts_doc_len_bytes(&dl_key)? {
+        Some(bytes) => DocLenBlock::decode(&bytes)?,
+        None => DocLenBlock::default(),
+    };
+    if old_dl != new_dl {
+        if new_dl > 0 {
+            doc_len_block.set(slot, new_dl);
+        } else {
+            doc_len_block.remove(slot);
+        }
+        if doc_len_block.is_empty() {
+            tx.delete_fts_doc_len(dl_key);
+        } else {
+            tx.put_fts_doc_len_bytes(dl_key, doc_len_block.encode());
+        }
+    }
+
     // 1. Removals
     if let Some(old) = old_doc {
         for tok in old.terms.keys() {
             if new_doc.is_some_and(|n| n.terms.contains_key(tok)) {
                 continue;
             }
-            remove_token_posting(tx, attr_id, tok, block_id, slot, index_positions)?;
+            remove_token_posting(
+                tx,
+                attr_id,
+                tok,
+                block_id,
+                slot,
+                index_positions,
+                &doc_len_block,
+            )?;
         }
     }
 
@@ -897,18 +934,24 @@ fn apply_attr_token_diff(
                 let tf_or_dl_changed = old_term.tf != new_term.tf || old_dl != new_dl;
                 let pos_changed = index_positions && old_term.positions != new_term.positions;
                 if tf_or_dl_changed {
-                    upsert_posting_block(tx, attr_id, tok, block_id, slot, new_term.tf, new_dl)?;
+                    upsert_posting_block(
+                        tx,
+                        attr_id,
+                        tok,
+                        block_id,
+                        slot,
+                        new_term.tf,
+                        &doc_len_block,
+                    )?;
                     let term_key = encode_fts_term_key(attr_id, tok);
                     let mut ts = match tx.get_fts_term_bytes(&term_key)? {
                         Some(b) => TermStats::decode(&b)?,
                         None => TermStats {
                             doc_freq: 1,
-                            max_tf: new_term.tf,
-                            min_dl: new_dl,
+                            ..TermStats::default()
                         },
                     };
-                    ts.max_tf = ts.max_tf.max(new_term.tf);
-                    ts.min_dl = ts.min_dl.min(new_dl);
+                    ts.observe(new_term.tf, new_dl);
                     tx.put_fts_term_bytes(term_key, ts.encode().to_vec());
                 }
                 if pos_changed {
@@ -922,7 +965,15 @@ fn apply_attr_token_diff(
                     )?;
                 }
             } else {
-                upsert_posting_block(tx, attr_id, tok, block_id, slot, new_term.tf, new_dl)?;
+                upsert_posting_block(
+                    tx,
+                    attr_id,
+                    tok,
+                    block_id,
+                    slot,
+                    new_term.tf,
+                    &doc_len_block,
+                )?;
                 if index_positions {
                     upsert_position_block(
                         tx,
@@ -936,15 +987,10 @@ fn apply_attr_token_diff(
                 let term_key = encode_fts_term_key(attr_id, tok);
                 let mut ts = match tx.get_fts_term_bytes(&term_key)? {
                     Some(b) => TermStats::decode(&b)?,
-                    None => TermStats {
-                        doc_freq: 0,
-                        max_tf: 0,
-                        min_dl: u32::MAX,
-                    },
+                    None => TermStats::default(),
                 };
                 ts.doc_freq = ts.doc_freq.saturating_add(1);
-                ts.max_tf = ts.max_tf.max(new_term.tf);
-                ts.min_dl = ts.min_dl.min(new_dl);
+                ts.observe(new_term.tf, new_dl);
                 tx.put_fts_term_bytes(term_key, ts.encode().to_vec());
             }
         }
@@ -960,11 +1006,12 @@ fn remove_token_posting(
     block_id: FtsBlockId,
     slot: u8,
     index_positions: bool,
+    doc_lens: &DocLenBlock,
 ) -> Result<()> {
     let pkey = encode_fts_posting_key(attr_id, token, block_id);
     if let Some(bytes) = tx.get_fts_posting_bytes(&pkey)? {
         let mut blk = PackedPostingBlock::decode(&bytes)?;
-        if blk.remove(slot) {
+        if blk.remove(slot, doc_lens) {
             if blk.is_empty() {
                 tx.delete_fts_posting(pkey.clone());
             } else {
@@ -1003,14 +1050,14 @@ fn upsert_posting_block(
     block_id: FtsBlockId,
     slot: u8,
     tf: u32,
-    dl: u32,
+    doc_lens: &DocLenBlock,
 ) -> Result<()> {
     let pkey = encode_fts_posting_key(attr_id, token, block_id);
     let mut blk = match tx.get_fts_posting_bytes(&pkey)? {
         Some(bytes) => PackedPostingBlock::decode(&bytes)?,
         None => PackedPostingBlock::default(),
     };
-    blk.upsert(slot, tf, dl);
+    blk.upsert(slot, tf, doc_lens);
     tx.put_fts_posting_bytes(pkey, blk.encode());
     Ok(())
 }

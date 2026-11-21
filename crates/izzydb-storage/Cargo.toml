@@ -1,0 +1,15 @@
+[package]
+name = "izzydb-storage"
+version.workspace = true
+edition.workspace = true
+description = "RocksDB-backed packed node storage and atomic transaction context for izzydb"
+
+[dependencies]
+bytemuck.workspace = true
+izzydb-core.workspace = true
+izzydb-rabitq.workspace = true
+rand.workspace = true
+rocksdb.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

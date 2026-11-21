@@ -3,11 +3,11 @@
 This document specifies the persistent RocksDB key-value encodings, packed node/vector blob formats, and RaBitQ bit-packing layouts used by `ClusteringTree`.
 
 Implementation sources:
-- Column families, RocksDB keys, and CF options: [`src/storage.rs`](../src/storage.rs)
-- Packed node/metadata serialization and zero-copy views: [`src/node.rs`](../src/node.rs)
-- Metric tags and ID aliases: [`src/config.rs`](../src/config.rs)
-- RaBitQ code and query bit-plane packing: [`src/rabitq.rs`](../src/rabitq.rs)
-- Structural invariants: [`src/verify.rs`](../src/verify.rs)
+- Column families, RocksDB keys, and CF options: [`crates/izzydb-storage/src/storage.rs`](../crates/izzydb-storage/src/storage.rs)
+- Packed node/metadata serialization and zero-copy views: [`crates/izzydb-storage/src/node.rs`](../crates/izzydb-storage/src/node.rs)
+- Metric tags and ID aliases: [`crates/izzydb-core/src/config.rs`](../crates/izzydb-core/src/config.rs)
+- RaBitQ code and query bit-plane packing: [`crates/izzydb-rabitq/src/quantizer.rs`](../crates/izzydb-rabitq/src/quantizer.rs)
+- Structural invariants: [`crates/izzydb/src/verify.rs`](../crates/izzydb/src/verify.rs)
 
 ---
 
@@ -182,7 +182,7 @@ Query encodings are ephemeral (kept in `QueryScratch`, never persisted):
 
 ## 5. Key Consistency Invariants
 
-Verified exhaustively by `verify_invariants` ([`src/verify.rs`](../src/verify.rs)):
+Verified exhaustively by `verify_invariants` ([`crates/izzydb/src/verify.rs`](../crates/izzydb/src/verify.rs)):
 
 1. **Disjoint node CFs:** Every `NodeId` reachable at `level > 0` exists only in `cf_internal_nodes`; every reachable `NodeId` at `level == 0` exists in `cf_leaf_entries` and never in `cf_internal_nodes`.
 2. **No orphaned blobs:** Every key present in `cf_internal_nodes` and `cf_leaf_entries` is reachable from `TreeMeta.root_id`, and every key in `cf_vectors` corresponds to an indexed `doc_id` in some reachable leaf.

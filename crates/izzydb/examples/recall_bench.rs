@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use clustering_tree::metric::{l2_squared, prepare_vector};
-use clustering_tree::{ClusteringTree, DistanceMetric, DocId, TreeConfig};
+use izzydb::metric::{l2_squared, prepare_vector};
+use izzydb::{ClusteringTree, DistanceMetric, DocId, TreeConfig};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use tempfile::TempDir;

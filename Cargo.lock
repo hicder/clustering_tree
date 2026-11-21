@@ -90,17 +90,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "clustering_tree"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "rand",
- "rocksdb",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -164,6 +153,46 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
 dependencies = [
  "either",
+]
+
+[[package]]
+name = "izzydb"
+version = "0.1.0"
+dependencies = [
+ "izzydb-core",
+ "izzydb-rabitq",
+ "izzydb-storage",
+ "rand",
+ "tempfile",
+]
+
+[[package]]
+name = "izzydb-core"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "thiserror",
+]
+
+[[package]]
+name = "izzydb-rabitq"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "izzydb-core",
+ "rand",
+]
+
+[[package]]
+name = "izzydb-storage"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "izzydb-core",
+ "izzydb-rabitq",
+ "rand",
+ "rocksdb",
+ "tempfile",
 ]
 
 [[package]]

@@ -1,8 +1,8 @@
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
-use crate::config::DistanceMetric;
-use crate::metric::{dot_product, l2_squared, search_distance};
+use izzydb_core::config::DistanceMetric;
+use izzydb_core::metric::{dot_product, l2_squared, search_distance};
 
 /// Number of randomized sign-flip + Walsh-Hadamard rounds used to approximate
 /// a Haar-uniform orthogonal rotation in O(D log D) time.
@@ -449,7 +449,7 @@ fn fwht_in_place(buf: &mut [f32], inv_sqrt_n: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metric::prepare_vector;
+    use izzydb_core::metric::prepare_vector;
 
     #[test]
     fn test_fwht_preserves_norm_and_dot_product() {

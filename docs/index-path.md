@@ -4,7 +4,7 @@ This document describes how `ClusteringTree` persists state in RocksDB and maint
 
 ## 1. RocksDB Storage Layout
 
-All state is persisted across six column families in [`src/storage.rs`](../src/storage.rs):
+All state is persisted across six column families in [`crates/izzydb-storage/src/storage.rs`](../crates/izzydb-storage/src/storage.rs):
 
 | Column Family | Key | Value | Access Pattern |
 |---|---|---|---|
@@ -19,7 +19,7 @@ All mutations in an operation go through `TxContext`, a read-your-own-writes ove
 
 ## 2. Insert & Upsert Flow (`add_leaf`)
 
-Implemented in [`ClusteringTree::add_leaf`](../src/tree.rs):
+Implemented in [`ClusteringTree::add_leaf`](../crates/izzydb/src/tree.rs):
 
 1. **Vector preparation (`prepare_vector`)**:
    - Validates `embedding.len() == config.dim` and all components are finite.
@@ -43,7 +43,7 @@ Implemented in [`ClusteringTree::add_leaf`](../src/tree.rs):
 
 ## 3. RaBitQ Quantization (`RabitqQuantizer::encode`)
 
-Implemented in [`src/rabitq.rs`](../src/rabitq.rs):
+Implemented in [`crates/izzydb-rabitq/src/quantizer.rs`](../crates/izzydb-rabitq/src/quantizer.rs):
 
 - **Dimensions & rotation:** Pads `dim` to `padded_dim = dim.next_power_of_two().max(64)`. Applies a deterministic orthogonal transform $P^{-1}$ built from 3 rounds of random $\pm 1$ sign flips (seeded by `TreeMeta.rabitq_seed`) followed by a normalized Fast Walsh-Hadamard Transform ($O(D \log D)$).
 - **Encoding relative to leaf centroid $c$:**
@@ -54,12 +54,12 @@ Implemented in [`src/rabitq.rs`](../src/rabitq.rs):
 
 ## 4. Splits, Root Growth, and SPFresh LIRE
 
-- **Leaf & internal splits (`split_node` in [`src/tree.rs`](../src/tree.rs)):**
-  - Leaf splits fetch full vectors for all leaf docs from `cf_vectors` and partition them via `balanced_two_means` ([`src/kmeans.rs`](../src/kmeans.rs)), which seeds two centroids deterministically (k-means++ style), runs up to 15 iterations of 2-means, and rebalances lowest-margin items if either partition falls below `min_leaf_size` (or `max_leaf_size` overflow).
+- **Leaf & internal splits (`split_node` in [`crates/izzydb/src/tree.rs`](../crates/izzydb/src/tree.rs)):**
+  - Leaf splits fetch full vectors for all leaf docs from `cf_vectors` and partition them via `balanced_two_means` ([`crates/izzydb-core/src/kmeans.rs`](../crates/izzydb-core/src/kmeans.rs)), which seeds two centroids deterministically (k-means++ style), runs up to 15 iterations of 2-means, and rebalances lowest-margin items if either partition falls below `min_leaf_size` (or `max_leaf_size` overflow).
   - Both halves are quantized against their new centroids (`centroid1`, `centroid2`) and written to `cf_leaf_entries` (`cf_vectors` is not rewritten).
   - Internal splits partition child `InternalEntry` centroids weighted by `subtree_count` with bounds `[min_internal_fanout, max_internal_fanout]`.
   - Splitting the root allocates a new root node at `level + 1`; splitting a non-root node cascades upward if the parent exceeds `max_internal_fanout`.
-- **SPFresh LIRE (`lire::run_lire` in [`src/lire.rs`](../src/lire.rs)):**
+- **SPFresh LIRE (`lire::run_lire` in [`crates/izzydb/src/lire.rs`](../crates/izzydb/src/lire.rs)):**
   - Bounded to `MAX_LIRE_ROUNDS = 4`.
   - Searches `lire_neighbor_count` nearest leaves to `pair.old_centroid`.
   - **Outward check:** Scans full vectors (from `cf_vectors`) in the split pair `(left_id, right_id)` and moves any vector closer to a neighbor centroid.

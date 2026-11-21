@@ -1,16 +1,13 @@
 //! A mutable, RocksDB-backed hierarchical clustering tree (~100x fanout)
 //! inspired by turbopuffer ANN v3 and SPFresh (LIRE).
 
-pub mod config;
-pub mod error;
-pub mod kmeans;
+pub use izzydb_core::{config, error, kmeans, metric};
+pub use izzydb_rabitq as rabitq;
+pub use izzydb_storage::{node, storage};
+
 pub mod lire;
-pub mod metric;
-pub mod node;
-pub mod rabitq;
 pub mod search;
 pub mod simd;
-pub mod storage;
 pub mod tree;
 pub mod verify;
 

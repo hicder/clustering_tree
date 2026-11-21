@@ -101,6 +101,26 @@ fn dispatch_score_leaf<const MASKED: bool>(
             return;
         }
     }
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    {
+        if cfg!(target_feature = "neon") || std::arch::is_aarch64_feature_detected!("neon") {
+            // Safety: checked `neon` at compile/runtime; slices validated by caller and unaligned byte loads are used.
+            unsafe {
+                match params.metric {
+                    DistanceMetric::L2Squared => {
+                        score_leaf_neon::<0, MASKED>(params, allowed_slots, out)
+                    }
+                    DistanceMetric::Cosine => {
+                        score_leaf_neon::<1, MASKED>(params, allowed_slots, out)
+                    }
+                    DistanceMetric::DotProduct => {
+                        score_leaf_neon::<2, MASKED>(params, allowed_slots, out)
+                    }
+                }
+            }
+            return;
+        }
+    }
     match params.metric {
         DistanceMetric::L2Squared => score_leaf_scalar::<0, MASKED>(params, allowed_slots, out),
         DistanceMetric::Cosine => score_leaf_scalar::<1, MASKED>(params, allowed_slots, out),
@@ -314,6 +334,172 @@ unsafe fn score_leaf_avx512<const METRIC: u8, const MASKED: bool>(
     }
 }
 
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+unsafe fn score_leaf_neon<const METRIC: u8, const MASKED: bool>(
+    params: &RabitqLeafScoreParams<'_>,
+    allowed_slots: &[u64],
+    out: &mut Vec<LeafCandidate>,
+) {
+    use std::arch::aarch64::*;
+
+    let n = params.entry_count;
+    let words = params.rabitq_words;
+    if !MASKED {
+        out.reserve(n);
+    }
+
+    let v_vl = vdupq_n_f32(params.vl);
+    let v_delta = vdupq_n_f32(params.delta);
+    let v_two = vdupq_n_f32(2.0);
+    let v_neg_sum_q = vdupq_n_f32(-params.sum_q);
+    let v_inv_sqrt = vdupq_n_f32(params.inv_sqrt_padded_dim);
+    let v_q_res_sq = vdupq_n_f32(params.q_res_norm_sq);
+    let v_half = vdupq_n_f32(0.5);
+    let v_zero = vdupq_n_f32(0.0);
+    let v_zero_res_dist = vdupq_n_f32(params.zero_res_dist);
+
+    let codes_ptr = params.codes_bytes.as_ptr();
+    let res_sq_ptr = params.res_norm_sqs_bytes.as_ptr();
+    let scales_ptr = params.scales_bytes.as_ptr();
+    let doc_ids_ptr = params.doc_ids_bytes.as_ptr();
+
+    let mut i = 0usize;
+    while i + 4 <= n {
+        let nibble_mask = if MASKED {
+            let m = ((allowed_slots[i / 64] >> (i % 64)) & 0xF) as u8;
+            if m == 0 {
+                i += 4;
+                continue;
+            }
+            m
+        } else {
+            0xF
+        };
+
+        let mut total_x = vdupq_n_u32(0);
+        let mut total_0 = vdupq_n_u32(0);
+        let mut total_1 = vdupq_n_u32(0);
+        let mut total_2 = vdupq_n_u32(0);
+        let mut total_3 = vdupq_n_u32(0);
+
+        // Process words in chunks of at most 1024 so `u16` pairwise sums never overflow.
+        let mut w_start = 0usize;
+        while w_start < words {
+            let w_end = (w_start + 1024).min(words);
+            let mut acc_x_lo = vdupq_n_u16(0);
+            let mut acc_0_lo = vdupq_n_u16(0);
+            let mut acc_1_lo = vdupq_n_u16(0);
+            let mut acc_2_lo = vdupq_n_u16(0);
+            let mut acc_3_lo = vdupq_n_u16(0);
+
+            let mut acc_x_hi = vdupq_n_u16(0);
+            let mut acc_0_hi = vdupq_n_u16(0);
+            let mut acc_1_hi = vdupq_n_u16(0);
+            let mut acc_2_hi = vdupq_n_u16(0);
+            let mut acc_3_hi = vdupq_n_u16(0);
+
+            for w in w_start..w_end {
+                unsafe {
+                    let base = (w * n + i) * 8;
+                    let x_lo = vld1q_u8(codes_ptr.add(base));
+                    let x_hi = vld1q_u8(codes_ptr.add(base + 16));
+
+                    let q0w = vreinterpretq_u8_u64(vdupq_n_u64(*params.q0.get_unchecked(w)));
+                    let q1w = vreinterpretq_u8_u64(vdupq_n_u64(*params.q1.get_unchecked(w)));
+                    let q2w = vreinterpretq_u8_u64(vdupq_n_u64(*params.q2.get_unchecked(w)));
+                    let q3w = vreinterpretq_u8_u64(vdupq_n_u64(*params.q3.get_unchecked(w)));
+
+                    acc_x_lo = vpadalq_u8(acc_x_lo, vcntq_u8(x_lo));
+                    acc_0_lo = vpadalq_u8(acc_0_lo, vcntq_u8(vandq_u8(x_lo, q0w)));
+                    acc_1_lo = vpadalq_u8(acc_1_lo, vcntq_u8(vandq_u8(x_lo, q1w)));
+                    acc_2_lo = vpadalq_u8(acc_2_lo, vcntq_u8(vandq_u8(x_lo, q2w)));
+                    acc_3_lo = vpadalq_u8(acc_3_lo, vcntq_u8(vandq_u8(x_lo, q3w)));
+
+                    acc_x_hi = vpadalq_u8(acc_x_hi, vcntq_u8(x_hi));
+                    acc_0_hi = vpadalq_u8(acc_0_hi, vcntq_u8(vandq_u8(x_hi, q0w)));
+                    acc_1_hi = vpadalq_u8(acc_1_hi, vcntq_u8(vandq_u8(x_hi, q1w)));
+                    acc_2_hi = vpadalq_u8(acc_2_hi, vcntq_u8(vandq_u8(x_hi, q2w)));
+                    acc_3_hi = vpadalq_u8(acc_3_hi, vcntq_u8(vandq_u8(x_hi, q3w)));
+                }
+            }
+
+            total_x = vaddq_u32(total_x, vpaddlq_u16(vpaddq_u16(acc_x_lo, acc_x_hi)));
+            total_0 = vaddq_u32(total_0, vpaddlq_u16(vpaddq_u16(acc_0_lo, acc_0_hi)));
+            total_1 = vaddq_u32(total_1, vpaddlq_u16(vpaddq_u16(acc_1_lo, acc_1_hi)));
+            total_2 = vaddq_u32(total_2, vpaddlq_u16(vpaddq_u16(acc_2_lo, acc_2_hi)));
+            total_3 = vaddq_u32(total_3, vpaddlq_u16(vpaddq_u16(acc_3_lo, acc_3_hi)));
+            w_start = w_end;
+        }
+
+        let w1 = vshlq_n_u32::<1>(total_1);
+        let w2 = vshlq_n_u32::<2>(total_2);
+        let w3 = vshlq_n_u32::<3>(total_3);
+        let weighted_u32 = vaddq_u32(vaddq_u32(total_0, w1), vaddq_u32(w2, w3));
+
+        let px_f = vcvtq_f32_u32(total_x);
+        let wp_f = vcvtq_f32_u32(weighted_u32);
+
+        let sum_x_q = vfmaq_f32(vmulq_f32(v_vl, px_f), v_delta, wp_f);
+        let o_bar_dot_q = vmulq_f32(vfmaq_f32(v_neg_sum_q, v_two, sum_x_q), v_inv_sqrt);
+
+        let v_scale = unsafe { vreinterpretq_f32_u8(vld1q_u8(scales_ptr.add(i * 4))) };
+        let v_res_sq = unsafe { vreinterpretq_f32_u8(vld1q_u8(res_sq_ptr.add(i * 4))) };
+        let est_r_dot_q = vmulq_f32(v_scale, o_bar_dot_q);
+
+        let raw_dist = match METRIC {
+            0 => {
+                // max(0, res_sq + q_res_sq - 2 * est_r_dot_q)
+                let d = vfmsq_f32(vaddq_f32(v_res_sq, v_q_res_sq), v_two, est_r_dot_q);
+                vmaxq_f32(v_zero, d)
+            }
+            1 => {
+                let d = vfmsq_f32(vaddq_f32(v_res_sq, v_q_res_sq), v_two, est_r_dot_q);
+                vmaxq_f32(v_zero, vmulq_f32(v_half, d))
+            }
+            _ => vsubq_f32(v_zero_res_dist, est_r_dot_q),
+        };
+
+        let zero_mask = vceqq_f32(v_res_sq, v_zero);
+        let final_dist = vbslq_f32(zero_mask, v_zero_res_dist, raw_dist);
+
+        let mut dists = [0.0f32; 4];
+        let mut doc_ids = [0u64; 4];
+        unsafe {
+            vst1q_f32(dists.as_mut_ptr(), final_dist);
+            std::ptr::copy_nonoverlapping(doc_ids_ptr.add(i * 8), doc_ids.as_mut_ptr() as *mut u8, 32);
+        }
+
+        if !MASKED || nibble_mask == 0xF {
+            for lane in 0..4 {
+                out.push(LeafCandidate {
+                    doc_id: doc_ids[lane],
+                    dist: dists[lane],
+                });
+            }
+        } else {
+            for lane in 0..4 {
+                if (nibble_mask >> lane) & 1 != 0 {
+                    out.push(LeafCandidate {
+                        doc_id: doc_ids[lane],
+                        dist: dists[lane],
+                    });
+                }
+            }
+        }
+
+        i += 4;
+    }
+
+    // Scalar tail for remaining `< 4` entries
+    while i < n {
+        if !MASKED || ((allowed_slots[i / 64] >> (i % 64)) & 1 != 0) {
+            out.push(score_single_entry_scalar::<METRIC>(params, i));
+        }
+        i += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +675,120 @@ mod tests {
                 assert_eq!(cand.doc_id, simd_out[slot].doc_id);
                 assert!((cand.dist - simd_out[slot].dist).abs() < 1e-6);
             }
+        }
+    }
+
+    #[test]
+    fn test_simd_leaf_scoring_multiword_mask_and_unaligned_slices() {
+        let mut rng = SmallRng::seed_from_u64(99);
+        let dim = 384;
+        let qtz = RabitqQuantizer::new(dim, 1234);
+        let words = qtz.num_words();
+
+        let raw_c: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let c = prepare_vector(&raw_c, dim, DistanceMetric::Cosine).unwrap();
+        let raw_q: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let q = prepare_vector(&raw_q, dim, DistanceMetric::Cosine).unwrap();
+        let rotated_c = qtz.rotate_new(&c);
+        let rotated_c_bytes: Vec<u8> = rotated_c.iter().flat_map(|x| x.to_le_bytes()).collect();
+
+        // 70 entries spans 2 mask words (0..64 and 64..70) and leaves a 2-entry tail.
+        let n = 70usize;
+        let mut scratch_enc = EncodeScratch::default();
+        let mut entries = Vec::with_capacity(n);
+        let mut doc_ids = Vec::with_capacity(n);
+        let mut res_norm_sqs = Vec::with_capacity(n);
+        let mut scales = Vec::with_capacity(n);
+        let mut word_major_codes = vec![0u64; n * words];
+
+        for idx in 0..n {
+            let doc_id = (idx as u64) * 3 + 7;
+            let raw_x: Vec<f32> = c.iter().map(|&v| v + rng.random_range(-0.3..0.3)).collect();
+            let x = prepare_vector(&raw_x, dim, DistanceMetric::Cosine).unwrap();
+            let mut code = vec![0u64; words];
+            let (res_norm_sq, scale) = qtz.encode_into(&x, &c, &mut scratch_enc, &mut code);
+            doc_ids.push(doc_id);
+            res_norm_sqs.push(res_norm_sq);
+            scales.push(scale);
+            for (w, &word) in code.iter().enumerate() {
+                word_major_codes[w * n + idx] = word;
+            }
+            entries.push((doc_id, res_norm_sq, scale, code));
+        }
+
+        let shift_bytes = |raw: Vec<u8>, shift: usize| -> Vec<u8> {
+            let mut out = vec![0xA5u8; shift + raw.len() + 3];
+            out[shift..shift + raw.len()].copy_from_slice(&raw);
+            out
+        };
+        let doc_ids_buf = shift_bytes(doc_ids.iter().flat_map(|v| v.to_le_bytes()).collect(), 1);
+        let codes_buf = shift_bytes(
+            word_major_codes.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            3,
+        );
+        let res_buf = shift_bytes(
+            res_norm_sqs.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            1,
+        );
+        let scales_buf = shift_bytes(scales.iter().flat_map(|v| v.to_le_bytes()).collect(), 2);
+
+        let mut q_scratch = QueryScratch::new(qtz.padded_dim(), words);
+        qtz.rotate_into(&q, &mut q_scratch.rot_q);
+        let q_res_norm_sq = l2_squared(&q, &c);
+        let zero_res_dist = (1.0 - dot_product(&q, &c)).max(0.0);
+        let q_meta = pack_query_bits_from_diff_bytes_into(
+            &q_scratch.rot_q,
+            &rotated_c_bytes,
+            &mut q_scratch.rot_diff,
+            &mut q_scratch.planes,
+        );
+
+        let params = RabitqLeafScoreParams {
+            entry_count: n,
+            rabitq_words: words,
+            doc_ids_bytes: &doc_ids_buf[1..1 + n * 8],
+            codes_bytes: &codes_buf[3..3 + n * words * 8],
+            res_norm_sqs_bytes: &res_buf[1..1 + n * 4],
+            scales_bytes: &scales_buf[2..2 + n * 4],
+            q0: &q_scratch.planes[0],
+            q1: &q_scratch.planes[1],
+            q2: &q_scratch.planes[2],
+            q3: &q_scratch.planes[3],
+            vl: q_meta.vl,
+            delta: q_meta.delta,
+            sum_q: q_meta.sum_q,
+            inv_sqrt_padded_dim: qtz.inv_sqrt_padded_dim(),
+            q_res_norm_sq,
+            zero_res_dist,
+            metric: DistanceMetric::Cosine,
+        };
+
+        let mut out = Vec::new();
+        score_leaf_rabitq(&params, &mut out);
+        assert_eq!(out.len(), n);
+
+        let ref_state = qtz.prepare_leaf_query(&q, &c, DistanceMetric::Cosine, None);
+        for (cand, &(doc_id, res_norm_sq, scale, ref code)) in out.iter().zip(entries.iter()) {
+            assert_eq!(cand.doc_id, doc_id);
+            let ref_dist = ref_state.estimate_distance(res_norm_sq, scale, code);
+            assert!(
+                (cand.dist - ref_dist).abs() < 1e-3,
+                "doc={doc_id}: simd={} vs ref={ref_dist}",
+                cand.dist
+            );
+        }
+
+        let kept_slots = [4usize, 7, 63, 64, 67, 69];
+        let mut mask = [0u64; 2];
+        for &slot in &kept_slots {
+            mask[slot / 64] |= 1u64 << (slot % 64);
+        }
+        let mut masked_out = Vec::new();
+        score_leaf_rabitq_masked(&params, Some(&mask), &mut masked_out);
+        assert_eq!(masked_out.len(), kept_slots.len());
+        for (cand, &slot) in masked_out.iter().zip(kept_slots.iter()) {
+            assert_eq!(cand.doc_id, out[slot].doc_id);
+            assert!((cand.dist - out[slot].dist).abs() < 1e-6);
         }
     }
 }

@@ -38,17 +38,17 @@ Implementation sources:
 | `cf_meta` | `CF_META` | ASCII literal `b"tree_meta"` (9 B) | `TreeMeta` (39 B) | Default | Point `get_cf` |
 | `cf_internal_nodes` | `CF_INTERNAL_NODES` | `node_id` (`u64` BE, 8 B) | `PackedInternalNode` | Default | Full CF load on `open()` |
 | `cf_leaf_entries` | `CF_LEAF_ENTRIES` | `leaf_id` (`u64` BE, 8 B) | `PackedLeafNode` | `None` | `batched_multi_get_cf` (pinned) |
-| `cf_leaf_vectors` | `CF_LEAF_VECTORS` | `leaf_id` (`u64` BE, 8 B) | `PackedLeafVectors` | `None` | `get_pinned_cf` / `batched_multi_get_cf` |
+| `cf_vectors` | `CF_VECTORS` | `doc_id` (`u64` BE, 8 B) | `[f32; dim]` LE (`dim * 4` B) | `None` | `get_pinned_cf` / `batched_multi_get_cf` |
 | `cf_doc_loc` | `CF_DOC_LOC` | `doc_id` (`u64` BE, 8 B) | `leaf_id` (`u64` BE, 8 B) | Default | Point `get_pinned_cf` |
 
 ### RocksDB Tuning for Point-Lookup CFs
 
-`cf_internal_nodes`, `cf_leaf_entries`, `cf_leaf_vectors`, and `cf_doc_loc` share `point_lookup_cf_opts`:
+`cf_internal_nodes`, `cf_leaf_entries`, `cf_vectors`, and `cf_doc_loc` share `point_lookup_cf_opts`:
 - Shared 128 MiB LRU block cache (`BLOCK_CACHE_BYTES = 128 * 1024 * 1024`)
 - 10.0 bits/key full-key Bloom filter (`set_bloom_filter(10.0, false)`)
 - `set_memtable_whole_key_filtering(true)`
 - `set_cache_index_and_filter_blocks(true)` and `set_pin_l0_filter_and_index_blocks_in_cache(true)`
-- `DBCompressionType::None` on `cf_leaf_entries` and `cf_leaf_vectors` to keep pinned `DBPinnableSlice` reads zero-copy on hot query paths
+- `DBCompressionType::None` on `cf_leaf_entries` and `cf_vectors` to keep pinned `DBPinnableSlice` reads zero-copy on hot query paths
 
 ### ID Allocation & Initial Database State
 
@@ -56,7 +56,6 @@ Implementation sources:
 - On fresh database creation (`cf_meta` missing `"tree_meta"`), `Storage::open` atomically writes:
   - `cf_meta["tree_meta"]`: `root_id = 1`, `root_level = 0`, `next_node_id = 2`, `dim = config.dim as u32`, `metric = config.metric`, `num_vectors = 0`, `rabitq_seed = rand::random::<u64>()`, `rabitq_bits = 1`.
   - `cf_leaf_entries[1u64.to_be_bytes()]`: empty `PackedLeafNode` (`parent_id = None`, `n = 0`).
-  - `cf_leaf_vectors[1u64.to_be_bytes()]`: empty `PackedLeafVectors` (`n = 0`).
 - Every subsequent node allocation increments `TreeMeta.next_node_id` (`TxContext::alloc_node_id`).
 
 ---
@@ -139,27 +138,14 @@ Note that `doc_ids` and `codes` are placed immediately after the 24-byte header 
 | `res_norm_sqs` | `n * 4` | `[f32; n]` LE | Squared residual norm $\|x_i - c\|_2^2$ |
 | `scales` | `n * 4` | `[f32; n]` LE | $\|x_i - c\|_2 / \langle \bar{o}_i, \tilde{o}_i \rangle$, or `0.0` when `res_norm_sq == 0.0` |
 
-### 3.5 `PackedLeafVectors` (`cf_leaf_vectors`)
+### 3.5 Global Vectors (`cf_vectors`)
 
-Co-locates all full-precision vectors belonging to a leaf in the exact same sorted `doc_ids` slot order as `PackedLeafNode`.
+Stores each document's full-precision vector directly under its `doc_id` (`u64` BE, 8 bytes), decoupled from leaf membership so leaf splits, merges, and LIRE reassignments never move or rewrite full-vector payloads.
 
-Total size: **`8 + n * 8 + n * dim * 4` bytes**, where `n` is the number of vectors in the leaf.
+- **Key:** `node_key(doc_id)` (`doc_id.to_be_bytes()`, 8 bytes).
+- **Value:** raw little-endian `[f32; dim]` (`dim * 4` bytes, no header). L2-normalized at insert when `metric == Cosine`.
 
-#### Header (`LEAF_VECS_HEADER_LEN = 8` bytes)
-
-| Offset | Size | Field | Type | Notes |
-|---:|---:|---|---|---|
-| `0` | 4 | `n` | `u32` LE | Number of vectors in this leaf |
-| `4` | 4 | reserved | `u32` | Written as `0` |
-
-#### Body (starting at byte `8`)
-
-| Section | Size (bytes) | Type | Layout / Semantics |
-|---|---:|---|---|
-| `doc_ids` | `n * 8` | `[u64; n]` LE | Strictly sorted ascending; must equal `PackedLeafNode.doc_ids` |
-| `vectors` | `n * dim * 4` | `[f32; n * dim]` LE | Slot `i` occupies `[i * dim .. (i + 1) * dim]`; L2-normalized at insert when `metric == Cosine` |
-
-`LeafVectorsView::find_vec_bytes` binary-searches `doc_ids` in-place on the pinned RocksDB slice and returns the `dim * 4`-byte vector slice for slot `i`.
+Both `Storage::get_vector(doc_id)` (`get_pinned_cf`) and Stage 2 reranking / leaf re-encoding (`batched_multi_get_cf` on sorted ascending `doc_id`s) read directly from `cf_vectors` with `DBCompressionType::None` for zero-copy `DBPinnableSlice` access.
 
 ---
 
@@ -198,8 +184,8 @@ Query encodings are ephemeral (kept in `QueryScratch`, never persisted):
 
 Verified exhaustively by `verify_invariants` ([`src/verify.rs`](../src/verify.rs)):
 
-1. **Disjoint node CFs:** Every `NodeId` reachable at `level > 0` exists only in `cf_internal_nodes`; every reachable `NodeId` at `level == 0` exists in both `cf_leaf_entries` and `cf_leaf_vectors`, and never in `cf_internal_nodes`.
-2. **No orphaned blobs:** Every key present in `cf_internal_nodes`, `cf_leaf_entries`, and `cf_leaf_vectors` is reachable from `TreeMeta.root_id`.
-3. **Leaf slot alignment:** For every leaf `leaf_id`, `PackedLeafNode.doc_ids == PackedLeafVectors.doc_ids` (identical sorted order and length).
+1. **Disjoint node CFs:** Every `NodeId` reachable at `level > 0` exists only in `cf_internal_nodes`; every reachable `NodeId` at `level == 0` exists in `cf_leaf_entries` and never in `cf_internal_nodes`.
+2. **No orphaned blobs:** Every key present in `cf_internal_nodes` and `cf_leaf_entries` is reachable from `TreeMeta.root_id`, and every key in `cf_vectors` corresponds to an indexed `doc_id` in some reachable leaf.
+3. **Vector completeness:** Every `doc_id` in every reachable `PackedLeafNode.doc_ids` has a valid `dim * 4`-byte finite vector in `cf_vectors`, and `cf_vectors.len() == TreeMeta.num_vectors`.
 4. **Bijection in `cf_doc_loc`:** Every `(doc_id, leaf_id)` in `cf_doc_loc` matches the exact leaf containing `doc_id`, `cf_doc_loc` contains no orphans, and `cf_doc_loc.len() == TreeMeta.num_vectors`.
-5. **Atomic updates:** All key/value mutations across `cf_meta`, `cf_internal_nodes`, `cf_leaf_entries`, `cf_leaf_vectors`, and `cf_doc_loc` are staged in `TxContext` and committed in a single `rocksdb::WriteBatch` before updating the in-memory `internal_cache`.
+5. **Atomic updates:** All key/value mutations across `cf_meta`, `cf_internal_nodes`, `cf_leaf_entries`, `cf_vectors`, and `cf_doc_loc` are staged in `TxContext` and committed in a single `rocksdb::WriteBatch` before updating the in-memory `internal_cache`.

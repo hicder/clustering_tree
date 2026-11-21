@@ -63,12 +63,12 @@ pub fn verify_invariants(
     }
 
     let disk_leaves: HashMap<NodeId, _> = storage.all_leaf_nodes()?.into_iter().collect();
-    let disk_leaf_vecs: HashMap<NodeId, _> = storage.all_leaf_vectors()?.into_iter().collect();
-    if disk_leaves.len() != disk_leaf_vecs.len() {
+    let disk_vectors: HashMap<DocId, Vec<f32>> = storage.all_vectors()?.into_iter().collect();
+    if disk_vectors.len() != disk_meta.num_vectors as usize {
         return Err(TreeError::InvariantViolation(format!(
-            "cf_leaf_entries count {} != cf_leaf_vectors count {}",
-            disk_leaves.len(),
-            disk_leaf_vecs.len()
+            "cf_vectors count {} != meta.num_vectors {}",
+            disk_vectors.len(),
+            disk_meta.num_vectors
         )));
     }
 
@@ -102,11 +102,6 @@ pub fn verify_invariants(
             let leaf = disk_leaves.get(&node_id).ok_or_else(|| {
                 TreeError::InvariantViolation(format!("missing leaf {node_id} in cf_leaf_entries"))
             })?;
-            let leaf_vecs = disk_leaf_vecs.get(&node_id).ok_or_else(|| {
-                TreeError::InvariantViolation(format!(
-                    "missing leaf {node_id} in cf_leaf_vectors"
-                ))
-            })?;
 
             if leaf.parent_id != expected_parent {
                 return Err(TreeError::InvariantViolation(format!(
@@ -117,16 +112,6 @@ pub fn verify_invariants(
             if leaf.centroid.len() != config.dim || leaf.centroid.iter().any(|x| !x.is_finite()) {
                 return Err(TreeError::InvariantViolation(format!(
                     "leaf {node_id} has invalid centroid"
-                )));
-            }
-            if leaf.doc_ids != leaf_vecs.doc_ids {
-                return Err(TreeError::InvariantViolation(format!(
-                    "leaf {node_id} doc_ids mismatch between cf_leaf_entries and cf_leaf_vectors"
-                )));
-            }
-            if leaf_vecs.vectors.iter().any(|x| !x.is_finite()) {
-                return Err(TreeError::InvariantViolation(format!(
-                    "leaf {node_id} contains non-finite vector component"
                 )));
             }
 
@@ -149,6 +134,16 @@ pub fn verify_invariants(
             max_leaf = max_leaf.max(count);
 
             for (i, &doc_id) in leaf.doc_ids.iter().enumerate() {
+                let vec = disk_vectors.get(&doc_id).ok_or_else(|| {
+                    TreeError::InvariantViolation(format!(
+                        "missing vector for doc {doc_id} (leaf {node_id}) in cf_vectors"
+                    ))
+                })?;
+                if vec.len() != config.dim || vec.iter().any(|x| !x.is_finite()) {
+                    return Err(TreeError::InvariantViolation(format!(
+                        "doc {doc_id} in cf_vectors has invalid vector"
+                    )));
+                }
                 let res_norm_sq = leaf.res_norm_sqs[i];
                 let scale = leaf.scales[i];
                 if !res_norm_sq.is_finite()
@@ -169,9 +164,9 @@ pub fn verify_invariants(
             }
         } else {
             visited_internal.insert(node_id);
-            if disk_leaves.contains_key(&node_id) || disk_leaf_vecs.contains_key(&node_id) {
+            if disk_leaves.contains_key(&node_id) {
                 return Err(TreeError::InvariantViolation(format!(
-                    "internal node {node_id} unexpectedly present in leaf CFs"
+                    "internal node {node_id} unexpectedly present in cf_leaf_entries"
                 )));
             }
             let node = disk_internals.get(&node_id).ok_or_else(|| {
@@ -279,10 +274,17 @@ pub fn verify_invariants(
             )));
         }
     }
-    for lid in disk_leaf_vecs.keys() {
-        if !visited_leaves.contains(lid) {
+    if disk_vectors.len() != seen_docs.len() {
+        return Err(TreeError::InvariantViolation(format!(
+            "cf_vectors count {} != reachable doc count {}",
+            disk_vectors.len(),
+            seen_docs.len()
+        )));
+    }
+    for doc_id in disk_vectors.keys() {
+        if !seen_docs.contains_key(doc_id) {
             return Err(TreeError::InvariantViolation(format!(
-                "orphaned leaf vector blob {lid} not reachable from root"
+                "orphaned vector {doc_id} in cf_vectors not reachable from root"
             )));
         }
     }

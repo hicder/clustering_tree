@@ -413,3 +413,176 @@ fn test_posting_list_stores_quantized_code_and_vectors_cf_stores_full_vector() {
     assert_eq!(tree.get_vector(20).unwrap(), Some(v1));
     tree.verify_invariants().unwrap();
 }
+
+#[test]
+fn test_add_leaf_fast_path_and_reencode_paths() {
+    let dir = TempDir::new().unwrap();
+    let dim = 16;
+    let mut cfg = TreeConfig::new(dim, DistanceMetric::L2Squared);
+    cfg.min_leaf_size = 8;
+    cfg.max_leaf_size = 40;
+    cfg.centroid_drift_eps = 1e-3;
+    cfg.enable_lire = false;
+
+    let mut tree = ClusteringTree::open(dir.path(), cfg).unwrap();
+    let mut rng = SmallRng::seed_from_u64(5150);
+    let mut oracle = HashMap::new();
+
+    // 1..=16: <= 16 and % 16 == 0 re-encode paths
+    // 17..=31: tight vectors near [1.0; dim] -> fast path (no drift, not % 16)
+    // 32: % 16 == 0 exact mean + re-encode path
+    let base = vec![1.0f32; dim];
+    for id in 0..33u64 {
+        let v: Vec<f32> = if id < 16 {
+            base.iter()
+                .map(|&x| x + rng.random_range(-0.02f32..0.02f32))
+                .collect()
+        } else {
+            // Very small perturbation keeps drift well below centroid_drift_eps = 1e-3.
+            base.iter()
+                .map(|&x| x + rng.random_range(-0.001f32..0.001f32))
+                .collect()
+        };
+        tree.add_leaf(id, &v).unwrap();
+        oracle.insert(id, v);
+    }
+
+    // 34th vector (new_count = 34, not % 16): large offset triggers drifted re-encode path.
+    let outlier = vec![10.0f32; dim];
+    tree.add_leaf(33, &outlier).unwrap();
+    oracle.insert(33, outlier.clone());
+
+    let stats = tree.verify_invariants().unwrap();
+    assert_eq!(stats.num_vectors, 34);
+    assert_eq!(stats.leaf_nodes, 1);
+
+    for (id, expected) in &oracle {
+        assert_eq!(tree.get_vector(*id).unwrap().as_ref(), Some(expected));
+    }
+
+    // Both quantized Stage 1 and Stage 2 rerank must locate the outlier immediately.
+    let q_res = tree.search(&outlier, 1, 1).unwrap();
+    assert_eq!(q_res[0].0, 33);
+    let rerank_res = tree.search_with_rerank(&outlier, 3, 1, 10).unwrap();
+    assert_eq!(rerank_res[0].0, 33);
+    assert!(rerank_res[0].1 < 1e-6);
+}
+
+#[test]
+fn test_split_and_underflow_merge_and_redistribution() {
+    let dir = TempDir::new().unwrap();
+    let dim = 8;
+    let mut cfg = small_config(dim, DistanceMetric::L2Squared, false);
+    cfg.min_leaf_size = 3;
+    cfg.max_leaf_size = 7;
+    cfg.min_internal_fanout = 2;
+    cfg.max_internal_fanout = 5;
+
+    let mut tree = ClusteringTree::open(dir.path(), cfg).unwrap();
+    let mut rng = SmallRng::seed_from_u64(31415);
+    let mut oracle = HashMap::new();
+
+    // Insert two separated clusters (4 + 4 = 8 > max_leaf_size=7) so split creates 2 leaves of 4 each.
+    for id in 0..4u64 {
+        let v: Vec<f32> = (0..dim).map(|_| -5.0 + rng.random_range(-0.1..0.1)).collect();
+        tree.add_leaf(id, &v).unwrap();
+        oracle.insert(id, v);
+    }
+    for id in 4..8u64 {
+        let v: Vec<f32> = (0..dim).map(|_| 5.0 + rng.random_range(-0.1..0.1)).collect();
+        tree.add_leaf(id, &v).unwrap();
+        oracle.insert(id, v);
+    }
+    let stats = tree.verify_invariants().unwrap();
+    assert_eq!(stats.leaf_nodes, 2);
+    assert_eq!(stats.num_vectors, 8);
+
+    // Delete 2 items from the positive cluster (4 -> 3 -> 2 < min_leaf_size=3):
+    // combined count is 4 + 2 = 6 <= max_leaf_size=7 -> triggers merge back to 1 root leaf.
+    for id in 4..6u64 {
+        let v = oracle.remove(&id).unwrap();
+        tree.remove_leaf(id, &v).unwrap();
+        tree.verify_invariants().unwrap();
+    }
+    let stats = tree.verify_invariants().unwrap();
+    assert_eq!(stats.leaf_nodes, 1);
+    assert_eq!(stats.root_level, 0);
+    assert_eq!(stats.num_vectors, 6);
+
+    // Grow to 6 negative + 4 positive = 10 vectors across 2 leaves (4 neg + 2 pos + 2 neg + 2 pos):
+    // deleting 2 positive vectors leaves 6 + 2 = 8 > max_leaf_size=7 -> triggers redistribution!
+    for id in 10..12u64 {
+        let v: Vec<f32> = (0..dim).map(|_| -5.0 + rng.random_range(-0.1..0.1)).collect();
+        tree.add_leaf(id, &v).unwrap();
+        oracle.insert(id, v);
+    }
+    for id in 20..22u64 {
+        let v: Vec<f32> = (0..dim).map(|_| 5.0 + rng.random_range(-0.1..0.1)).collect();
+        tree.add_leaf(id, &v).unwrap();
+        oracle.insert(id, v);
+    }
+    let stats = tree.verify_invariants().unwrap();
+    assert_eq!(stats.leaf_nodes, 2);
+    assert_eq!(stats.num_vectors, 10);
+
+    // Delete positive vectors down to 2 in the positive leaf (total remaining >= 8 > 7).
+    let pos_ids: Vec<DocId> = oracle
+        .iter()
+        .filter(|(_, v)| v[0] > 0.0)
+        .map(|(&id, _)| id)
+        .collect();
+    for &id in pos_ids.iter().take(pos_ids.len() - 2) {
+        let v = oracle.remove(&id).unwrap();
+        tree.remove_leaf(id, &v).unwrap();
+        tree.verify_invariants().unwrap();
+    }
+
+    let stats = tree.verify_invariants().unwrap();
+    assert_eq!(stats.leaf_nodes, 2);
+    assert_eq!(stats.num_vectors, oracle.len() as u64);
+    for (id, expected) in &oracle {
+        assert_eq!(tree.get_vector(*id).unwrap().as_ref(), Some(expected));
+    }
+}
+
+#[test]
+fn test_lire_reassignment_preserves_vectors_and_invariants() {
+    let dir = TempDir::new().unwrap();
+    let dim = 8;
+    let mut cfg = small_config(dim, DistanceMetric::L2Squared, true);
+    cfg.min_leaf_size = 3;
+    cfg.max_leaf_size = 7;
+    cfg.lire_neighbor_count = 4;
+
+    let mut tree = ClusteringTree::open(dir.path(), cfg).unwrap();
+    let mut rng = SmallRng::seed_from_u64(8080);
+    let mut oracle = HashMap::new();
+
+    // Insert 45 vectors across 4 overlapping clusters so splits trigger both outward and inward LIRE moves.
+    let centers = [-2.0f32, -0.5, 0.5, 2.0];
+    for id in 0..45u64 {
+        let c = centers[(id as usize) % centers.len()];
+        let v: Vec<f32> = (0..dim)
+            .map(|_| c + rng.random_range(-0.8f32..0.8f32))
+            .collect();
+        tree.add_leaf(id, &v).unwrap();
+        oracle.insert(id, v);
+    }
+
+    let stats = tree.verify_invariants().unwrap();
+    assert_eq!(stats.num_vectors, 45);
+    assert!(stats.leaf_nodes >= 7);
+
+    for (id, expected) in &oracle {
+        assert_eq!(tree.get_vector(*id).unwrap().as_ref(), Some(expected));
+    }
+
+    for c in centers {
+        let q = vec![c; dim];
+        let got = tree.search_with_rerank(&q, 5, 8, 20).unwrap();
+        let exact = brute_force_topk(&oracle, &q, 5, DistanceMetric::L2Squared);
+        let exact_ids: HashSet<DocId> = exact.iter().map(|&(id, _)| id).collect();
+        let hits = got.iter().filter(|&&(id, _)| exact_ids.contains(&id)).count();
+        assert!(hits >= 4, "expected >= 4/5 reranked hits near {c}, got {hits}");
+    }
+}

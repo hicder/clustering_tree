@@ -1,12 +1,10 @@
-use crate::config::{DistanceMetric, DocId, NodeId};
+use crate::config::{DistanceMetric, DocId};
 
 /// Candidate scored during Stage 1 RaBitQ leaf scanning.
 #[derive(Debug, Clone, Copy)]
 pub struct LeafCandidate {
     pub doc_id: DocId,
     pub dist: f32,
-    pub leaf_id: NodeId,
-    pub slot: u32,
 }
 
 /// Squared Euclidean distance `sum((a[i] - b[i])^2)` using runtime-dispatched SIMD.
@@ -104,7 +102,6 @@ pub fn dot_product_bytes(a: &[f32], b_bytes: &[u8]) -> f32 {
 
 /// Parameters needed to batch-score a packed leaf node using RaBitQ bitwise popcount.
 pub struct RabitqLeafScoreParams<'a> {
-    pub leaf_id: NodeId,
     pub entry_count: usize,
     pub rabitq_words: usize,
     pub doc_ids_bytes: &'a [u8],
@@ -261,12 +258,7 @@ fn score_single_entry_scalar<const METRIC: u8>(
             _ => params.zero_res_dist - est_r_dot_q,
         }
     };
-    LeafCandidate {
-        doc_id,
-        dist,
-        leaf_id: params.leaf_id,
-        slot: i as u32,
-    }
+    LeafCandidate { doc_id, dist }
 }
 
 #[inline]
@@ -633,8 +625,6 @@ unsafe fn score_leaf_avx512<const METRIC: u8>(
             out.push(LeafCandidate {
                 doc_id: doc_ids[lane],
                 dist: dists[lane],
-                leaf_id: params.leaf_id,
-                slot: (i + lane) as u32,
             });
         }
 
@@ -737,7 +727,6 @@ mod tests {
             let mut simd_out = Vec::new();
             score_leaf_rabitq(
                 &RabitqLeafScoreParams {
-                    leaf_id: 1,
                     entry_count: view.entry_count,
                     rabitq_words: qtz.num_words(),
                     doc_ids_bytes: view.doc_ids_bytes,

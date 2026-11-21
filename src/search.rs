@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use crate::config::{DistanceMetric, DocId, NodeId, TreeConfig};
 use crate::error::{Result, TreeError};
 use crate::metric::{cluster_distance, prepare_vector_cow, search_distance, search_distance_bytes};
-use crate::node::{LeafNodeView, LeafVectorsView, PackedInternalNode, TreeMeta};
+use crate::node::{LeafNodeView, PackedInternalNode, TreeMeta};
 use crate::rabitq::{
     QueryScratch, RabitqQuantizer, pack_query_bits_from_diff_bytes_into, pack_query_bits_into,
 };
@@ -192,7 +192,6 @@ pub fn search(
 
         simd::score_leaf_rabitq(
             &simd::RabitqLeafScoreParams {
-                leaf_id,
                 entry_count: view.entry_count,
                 rabitq_words,
                 doc_ids_bytes: view.doc_ids_bytes,
@@ -226,32 +225,24 @@ pub fn search(
         return Ok(Vec::new());
     }
 
-    // Fetch only the distinct leaves present in the shortlist (at most `beam_width`).
-    let mut vec_leaf_ids: Vec<NodeId> = Vec::with_capacity(leaf_ids.len());
-    for c in &candidates {
-        if !vec_leaf_ids.contains(&c.leaf_id) {
-            vec_leaf_ids.push(c.leaf_id);
-        }
-    }
-    vec_leaf_ids.sort_unstable();
+    // Fetch only the shortlisted doc_ids in sorted ascending order for RocksDB batched multi-get.
+    candidates.sort_unstable_by_key(|c| c.doc_id);
+    let sorted_doc_ids: Vec<DocId> = candidates.iter().map(|c| c.doc_id).collect();
+    let vec_slices = storage.multi_get_vectors_pinned(&sorted_doc_ids)?;
 
-    let vec_slices = storage.multi_get_leaf_vectors_pinned(&vec_leaf_ids)?;
-    let mut vec_views: Vec<(NodeId, LeafVectorsView<'_>)> = Vec::with_capacity(vec_leaf_ids.len());
-    for (lid, opt_slice) in vec_leaf_ids.iter().copied().zip(vec_slices.iter()) {
-        let slice = opt_slice.as_ref().ok_or_else(|| {
-            TreeError::CorruptedData(format!("missing leaf vectors blob for leaf {lid}"))
-        })?;
-        vec_views.push((lid, LeafVectorsView::parse(slice, dim)?));
-    }
-
+    let expected_bytes = dim * 4;
     let mut reranked: Vec<(DocId, f32)> = Vec::with_capacity(candidates.len());
-    for c in &candidates {
-        let (_, view) = vec_views
-            .iter()
-            .find(|&&(lid, _)| lid == c.leaf_id)
-            .expect("shortlist leaf must exist in vec_views");
-        let vec_bytes = view.vec_bytes_at(c.slot as usize, dim);
-        reranked.push((c.doc_id, search_distance_bytes(config.metric, &q, vec_bytes)));
+    for (doc_id, opt_slice) in sorted_doc_ids.iter().copied().zip(vec_slices.iter()) {
+        let slice = opt_slice.as_ref().ok_or_else(|| {
+            TreeError::CorruptedData(format!("missing vector {doc_id} in cf_vectors"))
+        })?;
+        if slice.len() != expected_bytes {
+            return Err(TreeError::CorruptedData(format!(
+                "vector {doc_id} expected {expected_bytes} bytes, got {}",
+                slice.len()
+            )));
+        }
+        reranked.push((doc_id, search_distance_bytes(config.metric, &q, slice)));
     }
     select_top_k(&mut reranked, k, cmp_dist_id);
     Ok(reranked)

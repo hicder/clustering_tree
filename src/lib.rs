@@ -9,6 +9,7 @@ pub mod metric;
 pub mod node;
 pub mod rabitq;
 pub mod search;
+pub mod simd;
 pub mod storage;
 pub mod tree;
 pub mod verify;

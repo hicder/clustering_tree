@@ -1,5 +1,8 @@
+use std::borrow::Cow;
+
 use crate::config::DistanceMetric;
 use crate::error::{Result, TreeError};
+use crate::simd;
 
 /// Validate vector length and ensure all components are finite.
 pub fn validate_vector(v: &[f32], expected_dim: usize) -> Result<()> {
@@ -36,61 +39,33 @@ pub fn prepare_vector(v: &[f32], dim: usize, metric: DistanceMetric) -> Result<V
     Ok(out)
 }
 
-/// Squared Euclidean distance using a 4-way unrolled accumulator for auto-vectorization.
+/// Validate and borrow `v` when no normalization is needed, or allocate only for `Cosine`.
 #[inline]
-pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    let mut s0 = 0.0f32;
-    let mut s1 = 0.0f32;
-    let mut s2 = 0.0f32;
-    let mut s3 = 0.0f32;
-
-    let (chunks_a, rem_a) = a.as_chunks::<4>();
-    let (chunks_b, rem_b) = b.as_chunks::<4>();
-
-    for (ca, cb) in chunks_a.iter().zip(chunks_b.iter()) {
-        let d0 = ca[0] - cb[0];
-        let d1 = ca[1] - cb[1];
-        let d2 = ca[2] - cb[2];
-        let d3 = ca[3] - cb[3];
-        s0 += d0 * d0;
-        s1 += d1 * d1;
-        s2 += d2 * d2;
-        s3 += d3 * d3;
+pub fn prepare_vector_cow<'a>(
+    v: &'a [f32],
+    dim: usize,
+    metric: DistanceMetric,
+) -> Result<Cow<'a, [f32]>> {
+    validate_vector(v, dim)?;
+    if metric == DistanceMetric::Cosine {
+        let mut out = v.to_vec();
+        normalize_in_place(&mut out);
+        Ok(Cow::Owned(out))
+    } else {
+        Ok(Cow::Borrowed(v))
     }
-
-    let mut sum = (s0 + s1) + (s2 + s3);
-    for (&x, &y) in rem_a.iter().zip(rem_b.iter()) {
-        let d = x - y;
-        sum += d * d;
-    }
-    sum
 }
 
-/// Inner product using a 4-way unrolled accumulator for auto-vectorization.
+/// Squared Euclidean distance using SIMD.
+#[inline]
+pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
+    simd::l2_squared(a, b)
+}
+
+/// Inner product using SIMD.
 #[inline]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    let mut s0 = 0.0f32;
-    let mut s1 = 0.0f32;
-    let mut s2 = 0.0f32;
-    let mut s3 = 0.0f32;
-
-    let (chunks_a, rem_a) = a.as_chunks::<4>();
-    let (chunks_b, rem_b) = b.as_chunks::<4>();
-
-    for (ca, cb) in chunks_a.iter().zip(chunks_b.iter()) {
-        s0 += ca[0] * cb[0];
-        s1 += ca[1] * cb[1];
-        s2 += ca[2] * cb[2];
-        s3 += ca[3] * cb[3];
-    }
-
-    let mut sum = (s0 + s1) + (s2 + s3);
-    for (&x, &y) in rem_a.iter().zip(rem_b.iter()) {
-        sum += x * y;
-    }
-    sum
+    simd::dot_product(a, b)
 }
 
 /// Search distance where smaller means more similar.
@@ -102,6 +77,16 @@ pub fn search_distance(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
         DistanceMetric::L2Squared => l2_squared(a, b),
         DistanceMetric::Cosine => (1.0 - dot_product(a, b)).max(0.0),
         DistanceMetric::DotProduct => -dot_product(a, b),
+    }
+}
+
+/// Search distance against an unaligned little-endian `f32` byte slice.
+#[inline]
+pub fn search_distance_bytes(metric: DistanceMetric, a: &[f32], b_bytes: &[u8]) -> f32 {
+    match metric {
+        DistanceMetric::L2Squared => simd::l2_squared_bytes(a, b_bytes),
+        DistanceMetric::Cosine => (1.0 - simd::dot_product_bytes(a, b_bytes)).max(0.0),
+        DistanceMetric::DotProduct => -simd::dot_product_bytes(a, b_bytes),
     }
 }
 
@@ -153,6 +138,57 @@ pub fn compute_weighted_centroid(
     }
     let mut acc = vec![0.0f64; dim];
     for &(v, w) in items {
+        if w == 0 {
+            continue;
+        }
+        let wf = w as f64;
+        for (a, &x) in acc.iter_mut().zip(v.iter()) {
+            *a += (x as f64) * wf;
+        }
+    }
+    let inv = 1.0 / (total_weight as f64);
+    let mut out: Vec<f32> = acc.into_iter().map(|s| (s * inv) as f32).collect();
+    if metric == DistanceMetric::Cosine {
+        normalize_in_place(&mut out);
+    }
+    out
+}
+
+/// Compute the unweighted centroid of `count` packed vectors of length `dim` stored contiguously.
+pub fn compute_mean_centroid_flat(vecs: &[f32], count: usize, dim: usize, metric: DistanceMetric) -> Vec<f32> {
+    if count == 0 {
+        return vec![0.0; dim];
+    }
+    let mut acc = vec![0.0f64; dim];
+    for v in vecs.chunks_exact(dim) {
+        for (a, &x) in acc.iter_mut().zip(v.iter()) {
+            *a += x as f64;
+        }
+    }
+    let inv = 1.0 / (count as f64);
+    let mut out: Vec<f32> = acc.into_iter().map(|s| (s * inv) as f32).collect();
+    if metric == DistanceMetric::Cosine {
+        normalize_in_place(&mut out);
+    }
+    out
+}
+
+/// Compute the subtree-weighted centroid of packed `centroids` (`count * dim`) with `weights`.
+pub fn compute_weighted_centroid_flat(
+    centroids: &[f32],
+    weights: &[u64],
+    dim: usize,
+    metric: DistanceMetric,
+) -> Vec<f32> {
+    if weights.is_empty() {
+        return vec![0.0; dim];
+    }
+    let total_weight: u64 = weights.iter().sum();
+    if total_weight == 0 {
+        return compute_mean_centroid_flat(centroids, weights.len(), dim, metric);
+    }
+    let mut acc = vec![0.0f64; dim];
+    for (v, &w) in centroids.chunks_exact(dim).zip(weights.iter()) {
         if w == 0 {
             continue;
         }

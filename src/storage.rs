@@ -1,31 +1,33 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use rocksdb::{
-    BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options,
-    ReadOptions, SliceTransform, WriteBatch, DEFAULT_COLUMN_FAMILY_NAME,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBCompressionType,
+    DBPinnableSlice, IteratorMode, Options, WriteBatch, DB, DEFAULT_COLUMN_FAMILY_NAME,
 };
 
 use crate::config::{DocId, NodeId, TreeConfig};
 use crate::error::{Result, TreeError};
 use crate::node::{
-    borrow_f32_slice, decode_f32_slice, encode_f32_slice, InternalEntry, NodeHeader, TreeMeta,
+    LeafVectorsView, PackedInternalNode, PackedLeafNode, PackedLeafVectors, TreeMeta,
+    decode_f32_slice,
 };
-use crate::rabitq::{decode_u64_words, QuantizedEntry};
 
 pub const CF_META: &str = "cf_meta";
-pub const CF_NODE_HEADER: &str = "cf_node_header";
-pub const CF_INTERNAL_ENTRIES: &str = "cf_internal_entries";
+pub const CF_INTERNAL_NODES: &str = "cf_internal_nodes";
 pub const CF_LEAF_ENTRIES: &str = "cf_leaf_entries";
+pub const CF_LEAF_VECTORS: &str = "cf_leaf_vectors";
 pub const CF_DOC_LOC: &str = "cf_doc_loc";
-pub const CF_VECTORS: &str = "cf_vectors";
 
 const META_KEY: &[u8] = b"tree_meta";
+const BLOCK_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
-/// RocksDB storage wrapper managing column families, prefix scans, and atomic batches.
+/// RocksDB storage wrapper managing packed node column families, block cache, and atomic batches.
 pub struct Storage {
     db: DB,
+    _block_cache: Cache,
     dim: usize,
+    padded_dim: usize,
     rabitq_words: usize,
 }
 
@@ -36,21 +38,25 @@ impl Storage {
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
 
+        let block_cache = Cache::new_lru_cache(BLOCK_CACHE_BYTES);
+
         let cf_descriptors = vec![
             ColumnFamilyDescriptor::new(DEFAULT_COLUMN_FAMILY_NAME, Options::default()),
             ColumnFamilyDescriptor::new(CF_META, Options::default()),
-            ColumnFamilyDescriptor::new(CF_NODE_HEADER, point_lookup_cf_opts()),
-            ColumnFamilyDescriptor::new(CF_INTERNAL_ENTRIES, prefix_scan_cf_opts()),
-            ColumnFamilyDescriptor::new(CF_LEAF_ENTRIES, prefix_scan_cf_opts()),
-            ColumnFamilyDescriptor::new(CF_DOC_LOC, point_lookup_cf_opts()),
-            ColumnFamilyDescriptor::new(CF_VECTORS, point_lookup_cf_opts()),
+            ColumnFamilyDescriptor::new(CF_INTERNAL_NODES, point_lookup_cf_opts(&block_cache, false)),
+            ColumnFamilyDescriptor::new(CF_LEAF_ENTRIES, point_lookup_cf_opts(&block_cache, true)),
+            ColumnFamilyDescriptor::new(CF_LEAF_VECTORS, point_lookup_cf_opts(&block_cache, true)),
+            ColumnFamilyDescriptor::new(CF_DOC_LOC, point_lookup_cf_opts(&block_cache, false)),
         ];
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
-        let rabitq_words = config.dim.next_power_of_two().max(64) / 64;
+        let padded_dim = config.dim.next_power_of_two().max(64);
+        let rabitq_words = padded_dim / 64;
         let storage = Self {
             db,
+            _block_cache: block_cache,
             dim: config.dim,
+            padded_dim,
             rabitq_words,
         };
 
@@ -89,16 +95,12 @@ impl Storage {
                     rabitq_seed: rand::random::<u64>(),
                     rabitq_bits: 1,
                 };
-                let init_root = NodeHeader {
-                    level: 0,
-                    parent_id: None,
-                    entry_count: 0,
-                    subtree_count: 0,
-                    centroid: vec![0.0; config.dim],
-                };
+                let init_leaf = PackedLeafNode::empty(None, config.dim, padded_dim);
+                let init_vecs = PackedLeafVectors::empty();
                 let mut batch = storage.new_batch();
                 batch.put_meta(&init_meta);
-                batch.put_node_header(1, &init_root);
+                batch.put_leaf_node(1, &init_leaf);
+                batch.put_leaf_vectors(1, &init_vecs);
                 storage.write_batch(batch)?;
                 init_meta
             }
@@ -109,6 +111,10 @@ impl Storage {
 
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    pub fn padded_dim(&self) -> usize {
+        self.padded_dim
     }
 
     pub fn rabitq_words(&self) -> usize {
@@ -135,216 +141,132 @@ impl Storage {
         }
     }
 
-    pub fn get_node_header(&self, node_id: NodeId) -> Result<Option<NodeHeader>> {
-        let cf = self.cf(CF_NODE_HEADER)?;
-        match self.db.get_cf(cf, node_key(node_id))? {
-            Some(bytes) => Ok(Some(NodeHeader::decode(&bytes, self.dim)?)),
-            None => Ok(None),
-        }
-    }
-
     pub fn get_doc_loc(&self, doc_id: DocId) -> Result<Option<NodeId>> {
         let cf = self.cf(CF_DOC_LOC)?;
-        match self.db.get_cf(cf, node_key(doc_id))? {
+        match self.db.get_pinned_cf(cf, node_key(doc_id))? {
             Some(bytes) => Ok(Some(decode_u64_key(&bytes)?)),
             None => Ok(None),
         }
     }
 
     pub fn get_vector(&self, doc_id: DocId) -> Result<Option<Vec<f32>>> {
-        let cf = self.cf(CF_VECTORS)?;
-        match self.db.get_cf(cf, node_key(doc_id))? {
-            Some(bytes) => Ok(Some(decode_f32_slice(&bytes, self.dim)?)),
+        let Some(leaf_id) = self.get_doc_loc(doc_id)? else {
+            return Ok(None);
+        };
+        let cf = self.cf(CF_LEAF_VECTORS)?;
+        let Some(slice) = self.db.get_pinned_cf(cf, node_key(leaf_id))? else {
+            return Err(TreeError::CorruptedData(format!(
+                "missing cf_leaf_vectors for leaf {leaf_id}"
+            )));
+        };
+        let view = LeafVectorsView::parse(&slice, self.dim)?;
+        match view.find_vec_bytes(doc_id, self.dim) {
+            Some(bytes) => Ok(Some(decode_f32_slice(bytes, self.dim)?)),
+            None => Err(TreeError::CorruptedData(format!(
+                "doc {doc_id} missing from leaf {leaf_id} vector blob"
+            ))),
+        }
+    }
+
+    pub fn get_internal_node(&self, node_id: NodeId) -> Result<Option<PackedInternalNode>> {
+        let cf = self.cf(CF_INTERNAL_NODES)?;
+        match self.db.get_pinned_cf(cf, node_key(node_id))? {
+            Some(bytes) => Ok(Some(PackedInternalNode::decode(&bytes, self.dim)?)),
             None => Ok(None),
         }
     }
 
-    pub fn multi_get_vectors(&self, doc_ids: &[DocId]) -> Result<Vec<Option<Vec<f32>>>> {
-        if doc_ids.is_empty() {
+    pub fn get_leaf_node(&self, leaf_id: NodeId) -> Result<Option<PackedLeafNode>> {
+        let cf = self.cf(CF_LEAF_ENTRIES)?;
+        match self.db.get_pinned_cf(cf, node_key(leaf_id))? {
+            Some(bytes) => Ok(Some(PackedLeafNode::decode(
+                &bytes,
+                self.dim,
+                self.padded_dim,
+                self.rabitq_words,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_leaf_vectors(&self, leaf_id: NodeId) -> Result<Option<PackedLeafVectors>> {
+        let cf = self.cf(CF_LEAF_VECTORS)?;
+        match self.db.get_pinned_cf(cf, node_key(leaf_id))? {
+            Some(bytes) => Ok(Some(PackedLeafVectors::decode(&bytes, self.dim)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Zero-copy batched lookup of quantized leaf blobs, assuming `sorted_leaf_ids` is sorted ascending.
+    pub fn multi_get_leaf_nodes_pinned(
+        &self,
+        sorted_leaf_ids: &[NodeId],
+    ) -> Result<Vec<Option<DBPinnableSlice<'_>>>> {
+        self.batched_multi_get_pinned(CF_LEAF_ENTRIES, sorted_leaf_ids, true)
+    }
+
+    /// Zero-copy batched lookup of full-vector leaf blobs, assuming `sorted_leaf_ids` is sorted ascending.
+    pub fn multi_get_leaf_vectors_pinned(
+        &self,
+        sorted_leaf_ids: &[NodeId],
+    ) -> Result<Vec<Option<DBPinnableSlice<'_>>>> {
+        self.batched_multi_get_pinned(CF_LEAF_VECTORS, sorted_leaf_ids, true)
+    }
+
+    fn batched_multi_get_pinned(
+        &self,
+        cf_name: &str,
+        leaf_ids: &[NodeId],
+        sorted_input: bool,
+    ) -> Result<Vec<Option<DBPinnableSlice<'_>>>> {
+        if leaf_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let cf = self.cf(CF_VECTORS)?;
-        let keys: Vec<[u8; 8]> = doc_ids.iter().map(|&id| node_key(id)).collect();
-        let results = self.db.multi_get_cf(keys.iter().map(|k| (cf, k)));
-        let mut out = Vec::with_capacity(doc_ids.len());
+        let cf = self.cf(cf_name)?;
+        let keys: Vec<[u8; 8]> = leaf_ids.iter().map(|&id| node_key(id)).collect();
+        let results = self.db.batched_multi_get_cf(cf, keys.iter(), sorted_input);
+        let mut out = Vec::with_capacity(leaf_ids.len());
         for res in results {
-            match res? {
-                Some(bytes) => out.push(Some(decode_f32_slice(&bytes, self.dim)?)),
-                None => out.push(None),
-            }
+            out.push(res?);
         }
         Ok(out)
     }
 
-    pub fn get_internal_entry(
-        &self,
-        node_id: NodeId,
-        child_id: NodeId,
-    ) -> Result<Option<InternalEntry>> {
-        let cf = self.cf(CF_INTERNAL_ENTRIES)?;
-        match self.db.get_cf(cf, entry_key(node_id, child_id))? {
-            Some(bytes) => Ok(Some(InternalEntry::decode(&bytes, self.dim)?)),
-            None => Ok(None),
-        }
-    }
-
-    pub fn scan_internal_entries(&self, node_id: NodeId) -> Result<Vec<(NodeId, InternalEntry)>> {
-        let cf = self.cf(CF_INTERNAL_ENTRIES)?;
-        let prefix = node_key(node_id);
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_prefix_same_as_start(true);
-
-        let mut out = Vec::new();
-        let iter = self.db.iterator_cf_opt(
-            cf,
-            read_opts,
-            IteratorMode::From(&prefix, Direction::Forward),
-        );
-        for item in iter {
-            let (key, val) = item?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            let (_, child_id) = decode_entry_key(&key)?;
-            out.push((child_id, InternalEntry::decode(&val, self.dim)?));
-        }
-        Ok(out)
-    }
-
-    pub fn scan_leaf_entries(&self, leaf_id: NodeId) -> Result<Vec<(DocId, QuantizedEntry)>> {
-        let cf = self.cf(CF_LEAF_ENTRIES)?;
-        let prefix = node_key(leaf_id);
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_prefix_same_as_start(true);
-
-        let mut out = Vec::new();
-        let iter = self.db.iterator_cf_opt(
-            cf,
-            read_opts,
-            IteratorMode::From(&prefix, Direction::Forward),
-        );
-        for item in iter {
-            let (key, val) = item?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            let (_, doc_id) = decode_entry_key(&key)?;
-            out.push((doc_id, QuantizedEntry::decode(&val, self.rabitq_words)?));
-        }
-        Ok(out)
-    }
-
-    pub fn scan_leaf_doc_ids(&self, leaf_id: NodeId) -> Result<Vec<DocId>> {
-        let cf = self.cf(CF_LEAF_ENTRIES)?;
-        let prefix = node_key(leaf_id);
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_prefix_same_as_start(true);
-
-        let mut out = Vec::new();
-        let iter = self.db.iterator_cf_opt(
-            cf,
-            read_opts,
-            IteratorMode::From(&prefix, Direction::Forward),
-        );
-        for item in iter {
-            let (key, _) = item?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            let (_, doc_id) = decode_entry_key(&key)?;
-            out.push(doc_id);
-        }
-        Ok(out)
-    }
-
-    /// Scan all quantized posting-list entries in `leaf_id`, invoking
-    /// `f(doc_id, residual_norm, o_bar_dot_o, code_words)` with minimal copying.
-    pub fn scan_leaf_codes_with<F>(&self, leaf_id: NodeId, mut f: F) -> Result<()>
-    where
-        F: FnMut(DocId, f32, f32, &[u64]),
-    {
-        let cf = self.cf(CF_LEAF_ENTRIES)?;
-        let prefix = node_key(leaf_id);
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_prefix_same_as_start(true);
-
-        let expected_len = QuantizedEntry::encoded_len(self.rabitq_words);
-        let mut scratch = Vec::new();
-
-        let iter = self.db.iterator_cf_opt(
-            cf,
-            read_opts,
-            IteratorMode::From(&prefix, Direction::Forward),
-        );
-        for item in iter {
-            let (key, val) = item?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            if val.len() != expected_len {
-                return Err(TreeError::CorruptedData(format!(
-                    "QuantizedEntry expected {expected_len} bytes, got {}",
-                    val.len()
-                )));
-            }
-            let (_, doc_id) = decode_entry_key(&key)?;
-            let residual_norm = f32::from_le_bytes(val[0..4].try_into().unwrap());
-            let o_bar_dot_o = f32::from_le_bytes(val[4..8].try_into().unwrap());
-            let code_bytes = &val[8..];
-
-            #[cfg(target_endian = "little")]
-            if let Ok(words) = bytemuck::try_cast_slice::<u8, u64>(code_bytes) {
-                f(doc_id, residual_norm, o_bar_dot_o, words);
-                continue;
-            }
-            scratch.clear();
-            scratch.extend(decode_u64_words(code_bytes, self.rabitq_words));
-            f(doc_id, residual_norm, o_bar_dot_o, &scratch);
-        }
-        Ok(())
-    }
-
-    /// Scan all internal entries of `node_id`, invoking `f(child_id, subtree_count, centroid)`.
-    pub fn scan_internal_with<F>(&self, node_id: NodeId, mut f: F) -> Result<()>
-    where
-        F: FnMut(NodeId, u64, &[f32]),
-    {
-        let cf = self.cf(CF_INTERNAL_ENTRIES)?;
-        let prefix = node_key(node_id);
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_prefix_same_as_start(true);
-
-        let iter = self.db.iterator_cf_opt(
-            cf,
-            read_opts,
-            IteratorMode::From(&prefix, Direction::Forward),
-        );
-        for item in iter {
-            let (key, val) = item?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            let (_, child_id) = decode_entry_key(&key)?;
-            if val.len() != 8 + self.dim * 4 {
-                return Err(TreeError::CorruptedData(format!(
-                    "InternalEntry expected {} bytes, got {}",
-                    8 + self.dim * 4,
-                    val.len()
-                )));
-            }
-            let subtree_count = u64::from_le_bytes(val[0..8].try_into().unwrap());
-            let centroid = borrow_f32_slice(&val[8..], self.dim)?;
-            f(child_id, subtree_count, &centroid);
-        }
-        Ok(())
-    }
-
-    pub fn all_node_headers(&self) -> Result<Vec<(NodeId, NodeHeader)>> {
-        let cf = self.cf(CF_NODE_HEADER)?;
+    pub fn all_internal_nodes(&self) -> Result<Vec<(NodeId, PackedInternalNode)>> {
+        let cf = self.cf(CF_INTERNAL_NODES)?;
         let mut out = Vec::new();
         for item in self.db.iterator_cf(cf, IteratorMode::Start) {
             let (k, v) = item?;
-            out.push((decode_u64_key(&k)?, NodeHeader::decode(&v, self.dim)?));
+            out.push((
+                decode_u64_key(&k)?,
+                PackedInternalNode::decode(&v, self.dim)?,
+            ));
+        }
+        Ok(out)
+    }
+
+    pub fn all_leaf_nodes(&self) -> Result<Vec<(NodeId, PackedLeafNode)>> {
+        let cf = self.cf(CF_LEAF_ENTRIES)?;
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (k, v) = item?;
+            out.push((
+                decode_u64_key(&k)?,
+                PackedLeafNode::decode(&v, self.dim, self.padded_dim, self.rabitq_words)?,
+            ));
+        }
+        Ok(out)
+    }
+
+    pub fn all_leaf_vectors(&self) -> Result<Vec<(NodeId, PackedLeafVectors)>> {
+        let cf = self.cf(CF_LEAF_VECTORS)?;
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (k, v) = item?;
+            out.push((
+                decode_u64_key(&k)?,
+                PackedLeafVectors::decode(&v, self.dim)?,
+            ));
         }
         Ok(out)
     }
@@ -355,36 +277,6 @@ impl Storage {
         for item in self.db.iterator_cf(cf, IteratorMode::Start) {
             let (k, v) = item?;
             out.push((decode_u64_key(&k)?, decode_u64_key(&v)?));
-        }
-        Ok(out)
-    }
-
-    pub fn all_vectors(&self) -> Result<Vec<(DocId, Vec<f32>)>> {
-        let cf = self.cf(CF_VECTORS)?;
-        let mut out = Vec::new();
-        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
-            let (k, v) = item?;
-            out.push((decode_u64_key(&k)?, decode_f32_slice(&v, self.dim)?));
-        }
-        Ok(out)
-    }
-
-    pub fn all_internal_entry_keys(&self) -> Result<Vec<(NodeId, NodeId)>> {
-        let cf = self.cf(CF_INTERNAL_ENTRIES)?;
-        let mut out = Vec::new();
-        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
-            let (k, _) = item?;
-            out.push(decode_entry_key(&k)?);
-        }
-        Ok(out)
-    }
-
-    pub fn all_leaf_entry_keys(&self) -> Result<Vec<(NodeId, DocId)>> {
-        let cf = self.cf(CF_LEAF_ENTRIES)?;
-        let mut out = Vec::new();
-        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
-            let (k, _) = item?;
-            out.push(decode_entry_key(&k)?);
         }
         Ok(out)
     }
@@ -408,36 +300,44 @@ impl<'a> StorageBatch<'a> {
         self.batch.put_cf(cf, META_KEY, meta.encode());
     }
 
-    pub fn put_node_header(&mut self, node_id: NodeId, header: &NodeHeader) {
-        let cf = self.storage.db.cf_handle(CF_NODE_HEADER).unwrap();
-        self.batch.put_cf(cf, node_key(node_id), header.encode());
+    pub fn put_internal_node(&mut self, node_id: NodeId, node: &PackedInternalNode) {
+        let cf = self.storage.db.cf_handle(CF_INTERNAL_NODES).unwrap();
+        self.batch
+            .put_cf(cf, node_key(node_id), node.encode(self.storage.dim));
     }
 
-    pub fn delete_node_header(&mut self, node_id: NodeId) {
-        let cf = self.storage.db.cf_handle(CF_NODE_HEADER).unwrap();
+    pub fn delete_internal_node(&mut self, node_id: NodeId) {
+        let cf = self.storage.db.cf_handle(CF_INTERNAL_NODES).unwrap();
         self.batch.delete_cf(cf, node_key(node_id));
     }
 
-    pub fn put_internal_entry(&mut self, node_id: NodeId, child_id: NodeId, entry: &InternalEntry) {
-        let cf = self.storage.db.cf_handle(CF_INTERNAL_ENTRIES).unwrap();
-        self.batch
-            .put_cf(cf, entry_key(node_id, child_id), entry.encode());
-    }
-
-    pub fn delete_internal_entry(&mut self, node_id: NodeId, child_id: NodeId) {
-        let cf = self.storage.db.cf_handle(CF_INTERNAL_ENTRIES).unwrap();
-        self.batch.delete_cf(cf, entry_key(node_id, child_id));
-    }
-
-    pub fn put_leaf_entry(&mut self, leaf_id: NodeId, doc_id: DocId, entry: &QuantizedEntry) {
+    pub fn put_leaf_node(&mut self, leaf_id: NodeId, leaf: &PackedLeafNode) {
         let cf = self.storage.db.cf_handle(CF_LEAF_ENTRIES).unwrap();
-        self.batch
-            .put_cf(cf, entry_key(leaf_id, doc_id), entry.encode());
+        self.batch.put_cf(
+            cf,
+            node_key(leaf_id),
+            leaf.encode(
+                self.storage.dim,
+                self.storage.padded_dim,
+                self.storage.rabitq_words,
+            ),
+        );
     }
 
-    pub fn delete_leaf_entry(&mut self, leaf_id: NodeId, doc_id: DocId) {
+    pub fn delete_leaf_node(&mut self, leaf_id: NodeId) {
         let cf = self.storage.db.cf_handle(CF_LEAF_ENTRIES).unwrap();
-        self.batch.delete_cf(cf, entry_key(leaf_id, doc_id));
+        self.batch.delete_cf(cf, node_key(leaf_id));
+    }
+
+    pub fn put_leaf_vectors(&mut self, leaf_id: NodeId, vecs: &PackedLeafVectors) {
+        let cf = self.storage.db.cf_handle(CF_LEAF_VECTORS).unwrap();
+        self.batch
+            .put_cf(cf, node_key(leaf_id), vecs.encode(self.storage.dim));
+    }
+
+    pub fn delete_leaf_vectors(&mut self, leaf_id: NodeId) {
+        let cf = self.storage.db.cf_handle(CF_LEAF_VECTORS).unwrap();
+        self.batch.delete_cf(cf, node_key(leaf_id));
     }
 
     pub fn put_doc_loc(&mut self, doc_id: DocId, leaf_id: NodeId) {
@@ -449,30 +349,11 @@ impl<'a> StorageBatch<'a> {
         let cf = self.storage.db.cf_handle(CF_DOC_LOC).unwrap();
         self.batch.delete_cf(cf, node_key(doc_id));
     }
-
-    pub fn put_vector(&mut self, doc_id: DocId, vec: &[f32]) {
-        let cf = self.storage.db.cf_handle(CF_VECTORS).unwrap();
-        self.batch
-            .put_cf(cf, node_key(doc_id), encode_f32_slice(vec));
-    }
-
-    pub fn delete_vector(&mut self, doc_id: DocId) {
-        let cf = self.storage.db.cf_handle(CF_VECTORS).unwrap();
-        self.batch.delete_cf(cf, node_key(doc_id));
-    }
 }
 
 #[inline]
-fn node_key(id: u64) -> [u8; 8] {
+pub(crate) fn node_key(id: u64) -> [u8; 8] {
     id.to_be_bytes()
-}
-
-#[inline]
-fn entry_key(prefix_id: u64, item_id: u64) -> [u8; 16] {
-    let mut buf = [0u8; 16];
-    buf[0..8].copy_from_slice(&prefix_id.to_be_bytes());
-    buf[8..16].copy_from_slice(&item_id.to_be_bytes());
-    buf
 }
 
 #[inline]
@@ -486,68 +367,56 @@ fn decode_u64_key(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
 }
 
-#[inline]
-fn decode_entry_key(bytes: &[u8]) -> Result<(u64, u64)> {
-    if bytes.len() != 16 {
-        return Err(TreeError::CorruptedData(format!(
-            "expected 16-byte composite key, got {}",
-            bytes.len()
-        )));
+fn point_lookup_cf_opts(block_cache: &Cache, disable_compression: bool) -> Options {
+    let mut opts = Options::default();
+    opts.set_memtable_whole_key_filtering(true);
+    if disable_compression {
+        opts.set_compression_type(DBCompressionType::None);
     }
-    let a = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
-    let b = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-    Ok((a, b))
-}
-
-fn prefix_scan_cf_opts() -> Options {
-    let mut opts = Options::default();
-    opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(8));
-    opts.set_memtable_prefix_bloom_ratio(0.2);
 
     let mut bbo = BlockBasedOptions::default();
+    bbo.set_block_cache(block_cache);
     bbo.set_bloom_filter(10.0, false);
-    bbo.set_whole_key_filtering(false);
+    bbo.set_cache_index_and_filter_blocks(true);
+    bbo.set_pin_l0_filter_and_index_blocks_in_cache(true);
     opts.set_block_based_table_factory(&bbo);
     opts
 }
 
-fn point_lookup_cf_opts() -> Options {
-    let mut opts = Options::default();
-    let mut bbo = BlockBasedOptions::default();
-    bbo.set_bloom_filter(10.0, false);
-    opts.set_block_based_table_factory(&bbo);
-    opts
-}
-
-/// Read-your-own-writes transaction overlay that commits all mutations in one atomic `WriteBatch`.
+/// Read-your-own-writes transaction overlay that commits all mutations in one atomic `WriteBatch`
+/// and updates the in-memory internal node cache only after RocksDB persistence succeeds.
 pub struct TxContext<'a> {
     storage: &'a Storage,
+    internal_cache: &'a mut HashMap<NodeId, PackedInternalNode>,
     meta: TreeMeta,
     meta_dirty: bool,
-    headers: HashMap<NodeId, Option<NodeHeader>>,
-    internal_entries: HashMap<NodeId, BTreeMap<NodeId, InternalEntry>>,
-    dirty_internal: HashMap<(NodeId, NodeId), Option<InternalEntry>>,
-    leaf_entries: HashMap<NodeId, BTreeMap<DocId, QuantizedEntry>>,
-    dirty_leaf: HashMap<(NodeId, DocId), Option<QuantizedEntry>>,
+    internal_nodes: HashMap<NodeId, Option<PackedInternalNode>>,
+    dirty_internal: HashSet<NodeId>,
+    leaf_nodes: HashMap<NodeId, Option<PackedLeafNode>>,
+    dirty_leaf: HashSet<NodeId>,
+    leaf_vectors: HashMap<NodeId, Option<PackedLeafVectors>>,
+    dirty_leaf_vecs: HashSet<NodeId>,
     dirty_doc_loc: HashMap<DocId, Option<NodeId>>,
-    vectors: HashMap<DocId, Option<Vec<f32>>>,
-    dirty_vectors: HashMap<DocId, Option<Vec<f32>>>,
 }
 
 impl<'a> TxContext<'a> {
-    pub fn new(storage: &'a Storage, meta: TreeMeta) -> Self {
+    pub fn new(
+        storage: &'a Storage,
+        internal_cache: &'a mut HashMap<NodeId, PackedInternalNode>,
+        meta: TreeMeta,
+    ) -> Self {
         Self {
             storage,
+            internal_cache,
             meta,
             meta_dirty: false,
-            headers: HashMap::new(),
-            internal_entries: HashMap::new(),
-            dirty_internal: HashMap::new(),
-            leaf_entries: HashMap::new(),
-            dirty_leaf: HashMap::new(),
+            internal_nodes: HashMap::new(),
+            dirty_internal: HashSet::new(),
+            leaf_nodes: HashMap::new(),
+            dirty_leaf: HashSet::new(),
+            leaf_vectors: HashMap::new(),
+            dirty_leaf_vecs: HashSet::new(),
             dirty_doc_loc: HashMap::new(),
-            vectors: HashMap::new(),
-            dirty_vectors: HashMap::new(),
         }
     }
 
@@ -567,112 +436,86 @@ impl<'a> TxContext<'a> {
         id
     }
 
-    pub fn get_header(&mut self, node_id: NodeId) -> Result<NodeHeader> {
-        if let Some(opt) = self.headers.get(&node_id) {
+    pub fn is_internal_node(&self, node_id: NodeId) -> bool {
+        if let Some(opt) = self.internal_nodes.get(&node_id) {
+            return opt.is_some();
+        }
+        self.internal_cache.contains_key(&node_id)
+    }
+
+    pub fn get_internal_node(&mut self, node_id: NodeId) -> Result<PackedInternalNode> {
+        if let Some(opt) = self.internal_nodes.get(&node_id) {
             return opt.clone().ok_or_else(|| {
-                TreeError::CorruptedData(format!("node {node_id} was deleted in transaction"))
+                TreeError::CorruptedData(format!("internal node {node_id} was deleted in tx"))
             });
         }
-        let header = self
+        let node = self
+            .internal_cache
+            .get(&node_id)
+            .cloned()
+            .ok_or_else(|| {
+                TreeError::CorruptedData(format!("missing internal node {node_id}"))
+            })?;
+        self.internal_nodes.insert(node_id, Some(node.clone()));
+        Ok(node)
+    }
+
+    pub fn put_internal_node(&mut self, node_id: NodeId, node: PackedInternalNode) {
+        self.internal_nodes.insert(node_id, Some(node));
+        self.dirty_internal.insert(node_id);
+    }
+
+    pub fn delete_internal_node(&mut self, node_id: NodeId) {
+        self.internal_nodes.insert(node_id, None);
+        self.dirty_internal.insert(node_id);
+    }
+
+    pub fn get_leaf_node(&mut self, leaf_id: NodeId) -> Result<PackedLeafNode> {
+        if let Some(opt) = self.leaf_nodes.get(&leaf_id) {
+            return opt.clone().ok_or_else(|| {
+                TreeError::CorruptedData(format!("leaf {leaf_id} was deleted in tx"))
+            });
+        }
+        let leaf = self
             .storage
-            .get_node_header(node_id)?
-            .ok_or_else(|| TreeError::CorruptedData(format!("missing NodeHeader for {node_id}")))?;
-        self.headers.insert(node_id, Some(header.clone()));
-        Ok(header)
+            .get_leaf_node(leaf_id)?
+            .ok_or_else(|| TreeError::CorruptedData(format!("missing leaf node {leaf_id}")))?;
+        self.leaf_nodes.insert(leaf_id, Some(leaf.clone()));
+        Ok(leaf)
     }
 
-    pub fn put_header(&mut self, node_id: NodeId, header: NodeHeader) {
-        self.headers.insert(node_id, Some(header));
+    pub fn put_leaf_node(&mut self, leaf_id: NodeId, leaf: PackedLeafNode) {
+        self.leaf_nodes.insert(leaf_id, Some(leaf));
+        self.dirty_leaf.insert(leaf_id);
     }
 
-    pub fn delete_header(&mut self, node_id: NodeId) {
-        self.headers.insert(node_id, None);
+    pub fn delete_leaf_node(&mut self, leaf_id: NodeId) {
+        self.leaf_nodes.insert(leaf_id, None);
+        self.dirty_leaf.insert(leaf_id);
     }
 
-    pub fn get_internal_entries(
-        &mut self,
-        node_id: NodeId,
-    ) -> Result<BTreeMap<NodeId, InternalEntry>> {
-        if !self.internal_entries.contains_key(&node_id) {
-            let mut map: BTreeMap<NodeId, InternalEntry> = self
-                .storage
-                .scan_internal_entries(node_id)?
-                .into_iter()
-                .collect();
-            for (&(nid, cid), val) in &self.dirty_internal {
-                if nid == node_id {
-                    match val {
-                        Some(entry) => {
-                            map.insert(cid, entry.clone());
-                        }
-                        None => {
-                            map.remove(&cid);
-                        }
-                    }
-                }
-            }
-            self.internal_entries.insert(node_id, map);
+    pub fn get_leaf_vectors(&mut self, leaf_id: NodeId) -> Result<PackedLeafVectors> {
+        if let Some(opt) = self.leaf_vectors.get(&leaf_id) {
+            return opt.clone().ok_or_else(|| {
+                TreeError::CorruptedData(format!("leaf vectors {leaf_id} deleted in tx"))
+            });
         }
-        Ok(self.internal_entries.get(&node_id).unwrap().clone())
+        let vecs = self
+            .storage
+            .get_leaf_vectors(leaf_id)?
+            .ok_or_else(|| TreeError::CorruptedData(format!("missing leaf vectors {leaf_id}")))?;
+        self.leaf_vectors.insert(leaf_id, Some(vecs.clone()));
+        Ok(vecs)
     }
 
-    pub fn put_internal_entry(&mut self, node_id: NodeId, child_id: NodeId, entry: InternalEntry) {
-        if let Some(map) = self.internal_entries.get_mut(&node_id) {
-            map.insert(child_id, entry.clone());
-        }
-        self.dirty_internal.insert((node_id, child_id), Some(entry));
+    pub fn put_leaf_vectors(&mut self, leaf_id: NodeId, vecs: PackedLeafVectors) {
+        self.leaf_vectors.insert(leaf_id, Some(vecs));
+        self.dirty_leaf_vecs.insert(leaf_id);
     }
 
-    pub fn delete_internal_entry(&mut self, node_id: NodeId, child_id: NodeId) {
-        if let Some(map) = self.internal_entries.get_mut(&node_id) {
-            map.remove(&child_id);
-        }
-        self.dirty_internal.insert((node_id, child_id), None);
-    }
-
-    pub fn get_leaf_entries(
-        &mut self,
-        leaf_id: NodeId,
-    ) -> Result<BTreeMap<DocId, QuantizedEntry>> {
-        if !self.leaf_entries.contains_key(&leaf_id) {
-            let mut map: BTreeMap<DocId, QuantizedEntry> = self
-                .storage
-                .scan_leaf_entries(leaf_id)?
-                .into_iter()
-                .collect();
-            for (&(lid, did), val) in &self.dirty_leaf {
-                if lid == leaf_id {
-                    match val {
-                        Some(entry) => {
-                            map.insert(did, entry.clone());
-                        }
-                        None => {
-                            map.remove(&did);
-                        }
-                    }
-                }
-            }
-            self.leaf_entries.insert(leaf_id, map);
-        }
-        Ok(self.leaf_entries.get(&leaf_id).unwrap().clone())
-    }
-
-    pub fn get_leaf_doc_ids(&mut self, leaf_id: NodeId) -> Result<Vec<DocId>> {
-        Ok(self.get_leaf_entries(leaf_id)?.into_keys().collect())
-    }
-
-    pub fn put_leaf_entry(&mut self, leaf_id: NodeId, doc_id: DocId, entry: QuantizedEntry) {
-        if let Some(map) = self.leaf_entries.get_mut(&leaf_id) {
-            map.insert(doc_id, entry.clone());
-        }
-        self.dirty_leaf.insert((leaf_id, doc_id), Some(entry));
-    }
-
-    pub fn delete_leaf_entry(&mut self, leaf_id: NodeId, doc_id: DocId) {
-        if let Some(map) = self.leaf_entries.get_mut(&leaf_id) {
-            map.remove(&doc_id);
-        }
-        self.dirty_leaf.insert((leaf_id, doc_id), None);
+    pub fn delete_leaf_vectors(&mut self, leaf_id: NodeId) {
+        self.leaf_vectors.insert(leaf_id, None);
+        self.dirty_leaf_vecs.insert(leaf_id);
     }
 
     pub fn put_doc_loc(&mut self, doc_id: DocId, leaf_id: NodeId) {
@@ -683,65 +526,27 @@ impl<'a> TxContext<'a> {
         self.dirty_doc_loc.insert(doc_id, None);
     }
 
-    pub fn put_vector(&mut self, doc_id: DocId, vec: Vec<f32>) {
-        self.vectors.insert(doc_id, Some(vec.clone()));
-        self.dirty_vectors.insert(doc_id, Some(vec));
-    }
-
-    pub fn delete_vector(&mut self, doc_id: DocId) {
-        self.vectors.insert(doc_id, None);
-        self.dirty_vectors.insert(doc_id, None);
-    }
-
-    pub fn get_vectors_batch(&mut self, doc_ids: &[DocId]) -> Result<Vec<(DocId, Vec<f32>)>> {
-        let missing: Vec<DocId> = doc_ids
-            .iter()
-            .copied()
-            .filter(|id| !self.vectors.contains_key(id))
-            .collect();
-        if !missing.is_empty() {
-            let fetched = self.storage.multi_get_vectors(&missing)?;
-            for (doc_id, opt_vec) in missing.into_iter().zip(fetched) {
-                self.vectors.insert(doc_id, opt_vec);
-            }
-        }
-
-        let mut out = Vec::with_capacity(doc_ids.len());
-        for &doc_id in doc_ids {
-            let vec = self
-                .vectors
-                .get(&doc_id)
-                .and_then(|opt| opt.as_ref())
-                .ok_or_else(|| {
-                    TreeError::CorruptedData(format!("missing full vector for doc {doc_id}"))
-                })?
-                .clone();
-            out.push((doc_id, vec));
-        }
-        Ok(out)
-    }
-
-    pub fn commit(self) -> Result<TreeMeta> {
+    pub fn commit(mut self) -> Result<TreeMeta> {
         let mut batch = self.storage.new_batch();
         if self.meta_dirty {
             batch.put_meta(&self.meta);
         }
-        for (node_id, opt) in self.headers {
-            match opt {
-                Some(header) => batch.put_node_header(node_id, &header),
-                None => batch.delete_node_header(node_id),
+        for &node_id in &self.dirty_internal {
+            match self.internal_nodes.get(&node_id).and_then(|o| o.as_ref()) {
+                Some(node) => batch.put_internal_node(node_id, node),
+                None => batch.delete_internal_node(node_id),
             }
         }
-        for ((node_id, child_id), opt) in self.dirty_internal {
-            match opt {
-                Some(entry) => batch.put_internal_entry(node_id, child_id, &entry),
-                None => batch.delete_internal_entry(node_id, child_id),
+        for &leaf_id in &self.dirty_leaf {
+            match self.leaf_nodes.get(&leaf_id).and_then(|o| o.as_ref()) {
+                Some(leaf) => batch.put_leaf_node(leaf_id, leaf),
+                None => batch.delete_leaf_node(leaf_id),
             }
         }
-        for ((leaf_id, doc_id), opt) in self.dirty_leaf {
-            match opt {
-                Some(entry) => batch.put_leaf_entry(leaf_id, doc_id, &entry),
-                None => batch.delete_leaf_entry(leaf_id, doc_id),
+        for &leaf_id in &self.dirty_leaf_vecs {
+            match self.leaf_vectors.get(&leaf_id).and_then(|o| o.as_ref()) {
+                Some(vecs) => batch.put_leaf_vectors(leaf_id, vecs),
+                None => batch.delete_leaf_vectors(leaf_id),
             }
         }
         for (doc_id, opt) in self.dirty_doc_loc {
@@ -750,13 +555,20 @@ impl<'a> TxContext<'a> {
                 None => batch.delete_doc_loc(doc_id),
             }
         }
-        for (doc_id, opt) in self.dirty_vectors {
-            match opt {
-                Some(vec) => batch.put_vector(doc_id, &vec),
-                None => batch.delete_vector(doc_id),
+
+        self.storage.write_batch(batch)?;
+
+        // Update in-memory internal node cache only after RocksDB commit succeeds.
+        for node_id in self.dirty_internal {
+            match self.internal_nodes.remove(&node_id).flatten() {
+                Some(node) => {
+                    self.internal_cache.insert(node_id, node);
+                }
+                None => {
+                    self.internal_cache.remove(&node_id);
+                }
             }
         }
-        self.storage.write_batch(batch)?;
         Ok(self.meta)
     }
 }

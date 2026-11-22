@@ -137,7 +137,7 @@ Offset              Size                 Field
 44                  256 * width B        tfs: [u8 | u16 | u32; 256] LE (slot-indexed 0..255; 0 if absent)
 ```
 
-At $\ge 96/256$ ($\ge 37.5\%$) occupancy—especially with `U8` or `U16` `tf`s—a 256-slot array plus a 32-byte bitmap eliminates `slots` indirection: every slot `s` maps directly to `tfs[s]`, `dl_norm[s]`, and `scores[s]` at the same vector lane index.
+At $\ge 96/256$ ($\ge 37.5$%) occupancy—especially with `U8` or `U16` `tf`s—a 256-slot array plus a 32-byte bitmap eliminates `slots` indirection: every slot `s` maps directly to `tfs[s]`, `dl_norm[s]`, and `scores[s]` at the same vector lane index.
 
 ---
 
@@ -145,14 +145,14 @@ At $\ge 96/256$ ($\ge 37.5\%$) occupancy—especially with `U8` or `U16` `tf`s�
 
 For a posting `(tf, dl)`, the BM25 term contribution is:
 
-$$\text{score}(tf, dl) = \frac{\text{num\_scale} \cdot tf}{tf + k_1(1 - b) + \frac{k_1 b}{\text{avgdl}} \cdot dl} = \frac{\text{num\_scale}}{1 + \frac{k_1(1 - b)}{tf} + \frac{k_1 b}{\text{avgdl}} \cdot \frac{dl}{tf}}$$
+$$\text{score}(tf, dl) = \frac{\text{num\textunderscore{}scale} \cdot tf}{tf + k_1(1 - b) + \frac{k_1 b}{\text{avgdl}} \cdot dl} = \frac{\text{num\textunderscore{}scale}}{1 + \frac{k_1(1 - b)}{tf} + \frac{k_1 b}{\text{avgdl}} \cdot \frac{dl}{tf}}$$
 
-where $\text{num\_scale} = \text{weight} \cdot \text{idf} \cdot \text{qtf\_norm} \cdot (k_1 + 1)$.
+where $\text{num\textunderscore{}scale} = \text{weight} \cdot \text{idf} \cdot \text{qtf\textunderscore{}norm} \cdot (k_1 + 1)$.
 
-- **Write-time bound tracking (`dl_over_tf_lower_bound`):** For every posting `(tf, dl)`, `PackedPostingBlock::recompute_bounds` and `TermStats::observe` compute `exact = (dl as f64) / (tf as f64)`, cast `r = exact as f32`, and apply `r.next_down()` if `(r as f64) > exact`. This guarantees $\text{min\_dl\_over\_tf} \le dl / tf$ in exact arithmetic.
+- **Write-time bound tracking (`dl_over_tf_lower_bound`):** For every posting `(tf, dl)`, `PackedPostingBlock::recompute_bounds` and `TermStats::observe` compute `exact = (dl as f64) / (tf as f64)`, cast `r = exact as f32`, and apply `r.next_down()` if `(r as f64) > exact`. This guarantees $\text{min\textunderscore{}dl\textunderscore{}over\textunderscore{}tf} \le dl / tf$ in exact arithmetic.
 - **Query-time upper bound (`Bm25TermScorer::upper_bound`):** Evaluates the denominator in `f64` using the term or block `max_tf` and `min_dl_over_tf`:
 
-  $$\text{ub} = \frac{\text{num\_scale}}{1 + \frac{k_1(1 - b)}{\max\_tf} + \frac{k_1 b}{\text{avgdl}} \cdot \text{min\_dl\_over\_tf}}$$
+  $$\text{ub} = \frac{\text{num\textunderscore{}scale}}{1 + \frac{k_1(1 - b)}{\text{max\textunderscore{}tf}} + \frac{k_1 b}{\text{avgdl}} \cdot \text{min\textunderscore{}dl\textunderscore{}over\textunderscore{}tf}}$$
 
   Because `avgdl` is only applied at query time, skip bounds and `TermStats` never go stale across inserts or deletes.
 
@@ -177,7 +177,7 @@ At query startup (`execute_rank_by`), `SimdTier::detect()` selects the widest su
 
 Notice that in the BM25 formula, the document-length term:
 
-$$\text{dl\_norm}[s] = \max\left(c_1 + c_2 \cdot dl[s],\ \text{f32::MIN\_POSITIVE}\right), \qquad c_1 = k_1(1 - b),\quad c_2 = \frac{k_1 b}{\text{avgdl}}$$
+$$\text{dl\textunderscore{}norm}[s] = \max\left(c_1 + c_2 \cdot dl[s],\ \text{f32::MIN\textunderscore{}POSITIVE}\right), \qquad c_1 = k_1(1 - b),\quad c_2 = \frac{k_1 b}{\text{avgdl}}$$
 
 is identical for every query term targeting the same `(attr_id, c1, c2)`.
 

@@ -5,6 +5,7 @@ An embedded, RocksDB-backed hybrid search engine in Rust for vector, full-text, 
 - **Vector search:** Mutable ~100x-fanout clustering tree (inspired by turbopuffer ANN v3 and SPFresh LIRE) with 1-bit RaBitQ quantization (8-wide SIMD-tiled codes, pre-stored popcounts) and optional exact reranking.
 - **Attribute filtering:** Typed document schemas with cluster-aware inverted indexes (`cf_attr_clusters`, cluster-first `cf_attr_postings` with compact `LeafPosting` bitsets, cached per-leaf `AttrZoneMap`s) and zero-copy `DocView` lazy evaluation.
 - **Full-text & hybrid:** `TermId`-indexed Block-Max MAXSCORE BM25 with out-of-line `cf_fts_skips`, inline rare-term postings, stemming, phrase matching, and Reciprocal Rank Fusion (`hybrid_search`).
+- **Faceting:** Exact `Terms`, `Ranges`, `Stats`, and `Histogram` facets over filter, BM25, vector, and hybrid queries, with multi-select (disjunctive) faceting and O(values) unfiltered counts from maintained per-value counters.
 - **Persistent & accelerated:** Atomic RocksDB `WriteBatch` commits and runtime-dispatched SIMD (`x86_64` AVX2/AVX-512, `aarch64` NEON).
 
 ## Workspace Crates
@@ -202,6 +203,62 @@ let complex = Filter::Or(vec![
 ]);
 ```
 
+### Facet Examples
+
+Every `filterable` attribute is facetable. Facets are exact; each `FacetSpec` needs a unique output name (use `with_alias` for several facets on one attribute).
+
+```rust
+use izzydb::{
+    FacetRange, FacetSort, FacetSpec, Filter, HybridFacetScope, RankBy, SearchOptions,
+    VectorFacetScope,
+};
+
+let facets = vec![
+    // Top categories; `exclude_self` drops the category clause from this facet's filter so the
+    // other categories stay visible (multi-select / disjunctive faceting).
+    FacetSpec::terms("category").with_limit(5).with_missing().exclude_self(),
+    // Typeahead over array values, ordered by value.
+    FacetSpec::terms("tags").with_alias("tag_search").with_prefix("sa").with_sort(FacetSort::ValueAsc),
+    FacetSpec::ranges("price", vec![
+        FacetRange::below(25.0_f64).with_label("budget"),
+        FacetRange::between(25.0_f64, 100.0_f64),
+        FacetRange::from_value(100.0_f64),
+    ]),
+    FacetSpec::stats("price").with_alias("price_stats"),
+    FacetSpec::histogram("price", 20.0).with_alias("price_hist"),
+];
+
+let filter = Filter::And(vec![
+    Filter::Eq("category".into(), "shoes".into()),
+    Filter::Eq("in_stock".into(), true.into()),
+]);
+
+// Filter-only: facets over every document matching `filter`.
+let results = col.facet(Some(&filter), &facets)?;
+if let Some(cats) = results.terms("category") {
+    for b in &cats.buckets {
+        println!("{:?}: {}", b.value, b.count);
+    }
+}
+let price = results.stats("price_stats").unwrap();
+println!("avg price {:?}, missing {}", price.avg, price.missing_count);
+
+// Vector search + facets (default scope: all docs matching `filter`).
+let resp = col.search_with_facets(
+    &query, SearchOptions::new(10, 8), Some(&filter), &facets, VectorFacetScope::FilterMatches,
+)?;
+println!("{} matches, {} hits", resp.total_hits, resp.hits.len());
+
+// BM25 + facets: population is every document with BM25 score > 0 that matches `filter`.
+let rank_by = RankBy::bm25("title", "trail runner");
+let resp = col.query_bm25_with_facets(&rank_by, Some(&filter), 10, &facets)?;
+
+// Hybrid RRF + facets over the BM25 matches that also pass `filter`.
+let resp = col.hybrid_search_with_facets(
+    &query, &rank_by, hybrid_opts, Some(&filter), &facets, HybridFacetScope::Bm25AndFilterMatches,
+)?;
+```
+
 ## Documentation
 
 - [Key & Binary Encoding](docs/architecture/key-encoding.md) — RocksDB column families, big-endian key formats, packed SoA node/vector layouts, and RaBitQ bit-packing.
@@ -220,6 +277,7 @@ cargo test
 cargo run --release -p izzydb --example recall_bench
 cargo run --release -p izzydb --example filtered_bench
 cargo run --release -p izzydb --example fts_bench
+cargo run --release -p izzydb --example facet_bench
 cargo run --release -p izzydb --example encoding_bench
 ```
 

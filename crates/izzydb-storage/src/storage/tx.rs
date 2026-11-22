@@ -19,7 +19,7 @@ use crate::node::{PackedInternalNode, PackedLeafNode, TreeMeta, decode_f32_into}
 
 use super::batch::StorageBatch;
 use super::types::{AttrZoneMap, DocLoc, FtsRevBlock, map_db_err};
-use super::{ATTR_POSTING_PREFIX_LEN, CF_ATTR_POSTINGS, CF_FTS_SKIPS, Storage};
+use super::{ATTR_COUNT_TAG, ATTR_POSTING_PREFIX_LEN, CF_ATTR_POSTINGS, CF_FTS_SKIPS, Storage};
 
 /// Read-your-own-writes key/value overlay mapping `K -> Option<V>` (`None` = deleted).
 struct OverlayMap<K, V>(HashMap<K, Option<V>>);
@@ -70,6 +70,7 @@ pub struct TxContext<'a> {
     dirty_docs: OverlayMap<DocId, Vec<u8>>,
     dirty_attr_clusters: HashMap<Vec<u8>, RoaringBitmap>,
     dirty_attr_postings: HashMap<Vec<u8>, LeafPosting>,
+    dirty_attr_count_deltas: HashMap<Vec<u8>, i64>,
     fts_meta_bytes: Option<Vec<u8>>,
     fts_meta_dirty: bool,
     fts_free_ids: Option<RoaringBitmap>,
@@ -105,6 +106,7 @@ impl<'a> TxContext<'a> {
             dirty_docs: OverlayMap::default(),
             dirty_attr_clusters: HashMap::new(),
             dirty_attr_postings: HashMap::new(),
+            dirty_attr_count_deltas: HashMap::new(),
             fts_meta_bytes: None,
             fts_meta_dirty: false,
             fts_free_ids: None,
@@ -421,6 +423,21 @@ impl<'a> TxContext<'a> {
         Ok(())
     }
 
+    /// Record a signed change to the global document count of index key `cluster_key`
+    /// (`default[0x06]`). Deltas coalesce within the transaction and are applied at commit.
+    ///
+    /// Only document-level changes (insert / delete / attribute edits) call this; moving
+    /// documents between leaves (`ClusterDelta`) never changes global counts.
+    pub fn adjust_attr_count(&mut self, cluster_key: &[u8], delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        *self
+            .dirty_attr_count_deltas
+            .entry(cluster_key.to_vec())
+            .or_insert(0) += delta;
+    }
+
     fn mutate_attr_cluster(
         &mut self,
         cluster_key: &[u8],
@@ -649,6 +666,7 @@ impl<'a> TxContext<'a> {
         self.stage_tree_and_docs(&mut batch);
         let dirty_rev_blocks = self.stage_doc_locs_and_rev_blocks(&mut batch)?;
         let updated_zone_attrs = self.stage_attr_indexes(&mut batch)?;
+        self.stage_attr_counts(&mut batch)?;
         self.stage_fts_writes(&mut batch)?;
 
         self.storage.write_batch(batch)?;
@@ -748,6 +766,55 @@ impl<'a> TxContext<'a> {
             }
         }
         Ok(dirty_rev_blocks)
+    }
+
+    fn stage_attr_counts(&self, batch: &mut StorageBatch<'_>) -> Result<()> {
+        let mut deltas: Vec<(&Vec<u8>, i64)> = self
+            .dirty_attr_count_deltas
+            .iter()
+            .filter(|&(_, &d)| d != 0)
+            .map(|(k, &d)| (k, d))
+            .collect();
+        if deltas.is_empty() {
+            return Ok(());
+        }
+        deltas.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let db_keys: Vec<Vec<u8>> = deltas
+            .iter()
+            .map(|(k, _)| {
+                let mut key = Vec::with_capacity(1 + k.len());
+                key.push(ATTR_COUNT_TAG);
+                key.extend_from_slice(k);
+                key
+            })
+            .collect();
+        let current = self.storage.db.multi_get(db_keys.iter());
+        for ((cluster_key, delta), cur) in deltas.iter().zip(current) {
+            let cur = match cur.map_err(map_db_err)? {
+                Some(bytes) => {
+                    let arr: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
+                        TreeError::CorruptedData(format!(
+                            "attr count expected 8 bytes, got {}",
+                            bytes.len()
+                        ))
+                    })?;
+                    u64::from_le_bytes(arr) as i128
+                }
+                None => 0,
+            };
+            let next = cur + *delta as i128;
+            if next < 0 {
+                return Err(TreeError::InvariantViolation(format!(
+                    "attr count underflow for key {cluster_key:?}: {cur} + {delta}"
+                )));
+            }
+            if next == 0 {
+                batch.delete_attr_count(cluster_key);
+            } else {
+                batch.put_attr_count(cluster_key, next as u64);
+            }
+        }
+        Ok(())
     }
 
     fn stage_attr_indexes(

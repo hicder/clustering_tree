@@ -5,7 +5,8 @@ This document describes both the unfiltered and attribute-filtered ANN search pa
 ## Entry Points
 
 - `Collection::search(query, opts, None)` / `ClusteringTree::search*`: unfiltered beam traversal fast path with zero filtering overhead.
-- `Collection::search(query, opts, Some(filter))`: cluster-aware filtered vector search (`search::search_filtered`).
+- `Collection::search(query, opts, Some(filter))`: cluster-aware filtered vector search (`search::search_filtered`, a thin wrapper over `search::search_filtered_prepared`).
+- `Collection::{search_with_facets, query_bm25_with_facets, hybrid_search_with_facets}`: the same ranking paths plus exact facets (see below).
 
 ---
 
@@ -55,3 +56,22 @@ For broader filters (`All` or `bm.len() > exhaustive_cluster_threshold`):
    - Passes `mask.as_slice()` directly to `score_leaf_rabitq_masked` (`0..view.slot_cap`) with no `local_id -> slot` translation loop, skipping 8-entry SIMD tiles whose mask byte is `0`.
 4. **Dynamic expansion:** Continues pulling leaf batches until `candidates.len() >= target && probed_leaves >= opts.beam_width` (where `target = rerank_candidates.unwrap_or(k).max(k)`), the heap is empty, or `probed_leaves >= opts.max_expanded_leaves.unwrap_or(beam_width * 16)`.
 5. **Stage 2 exact reranking:** Identical to unfiltered search (`cf_vectors` batched multi-get + exact `search_distance_bytes`).
+
+---
+
+## Faceted Search (`Collection::*_with_facets`)
+
+Ranking is executed exactly as above; faceting is a second, independent pass over the *facet population* (details in [filtering-and-inverted-index.md](filtering-and-inverted-index.md#7-faceting)).
+
+| Entry point | Facet population |
+|---|---|
+| `facet(filter, facets)` | all live docs matching `filter` (whole collection if `None`) |
+| `search_with_facets(.., VectorFacetScope::FilterMatches)` | all docs matching `filter`; the `PreparedFilter` built for ANN search is reused via `search_filtered_prepared` |
+| `search_with_facets(.., TopK)` | the returned top-`k` hits |
+| `search_with_facets(.., Candidates(n))` | the top-`max(n, k)` scored ANN candidates (hits are the first `k`) |
+| `query_bm25_with_facets` | docs with BM25 score `> 0` for `rank_by` **and** matching `filter` (`FtsIndex::eval_rank_by_match_bitmap`) |
+| `hybrid_search_with_facets(.., FilterMatches)` | all docs matching `filter` |
+| `hybrid_search_with_facets(.., FusedCandidates)` | union of vector and BM25 candidates entering RRF |
+| `hybrid_search_with_facets(.., Bm25AndFilterMatches)` | docs matching `rank_by` and `filter` |
+
+`FacetedSearchResponse::total_hits` is the size of the primary population (the effective filter equal to the query filter).

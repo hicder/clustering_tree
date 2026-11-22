@@ -536,6 +536,7 @@ fn verify_attr_indexes(
     let mut expected_clusters: HashMap<Vec<u8>, RoaringBitmap> = HashMap::new();
     let mut expected_postings: HashMap<Vec<u8>, LeafPosting> = HashMap::new();
     let mut expected_zones: HashMap<Vec<u8>, AttrZoneMap> = HashMap::new();
+    let mut expected_counts: HashMap<Vec<u8>, u64> = HashMap::new();
 
     for (&doc_id, raw_bytes) in docs_bytes {
         let loc = doc_locs.get(&doc_id).ok_or_else(|| {
@@ -544,6 +545,7 @@ fn verify_attr_indexes(
         let entries = decode_attribute_entries(raw_bytes)?;
         let keys = extract_index_keys_from_entries(schema, &entries)?;
         for cluster_key in keys {
+            *expected_counts.entry(cluster_key.clone()).or_insert(0) += 1;
             expected_clusters
                 .entry(cluster_key.clone())
                 .or_default()
@@ -621,6 +623,38 @@ fn verify_attr_indexes(
             "cf_attr_clusters mismatch: disk has {} entries, expected {}",
             disk_clusters.len(),
             expected_clusters.len()
+        )));
+    }
+
+    if !storage.has_attr_counts_marker()? {
+        return Err(TreeError::InvariantViolation(
+            "missing default[0x06] attr counts marker".into(),
+        ));
+    }
+    let disk_counts: HashMap<Vec<u8>, u64> = storage.all_attr_counts()?.into_iter().collect();
+    for (k, &c) in &disk_counts {
+        if c == 0 {
+            return Err(TreeError::InvariantViolation(format!(
+                "zero attr count persisted in default[0x06] for key {k:?}"
+            )));
+        }
+    }
+    if disk_counts != expected_counts {
+        let mismatch = expected_counts
+            .iter()
+            .find(|(k, v)| disk_counts.get(*k) != Some(v))
+            .map(|(k, v)| format!("key {k:?}: expected {v}, disk {:?}", disk_counts.get(k)))
+            .or_else(|| {
+                disk_counts
+                    .keys()
+                    .find(|k| !expected_counts.contains_key(*k))
+                    .map(|k| format!("unexpected disk key {k:?}"))
+            })
+            .unwrap_or_default();
+        return Err(TreeError::InvariantViolation(format!(
+            "default[0x06] attr counts mismatch: disk has {} entries, expected {} ({mismatch})",
+            disk_counts.len(),
+            expected_counts.len()
         )));
     }
 

@@ -251,10 +251,33 @@ After `filter.validate(schema)` and `prepare_vector_cow`, `AttributeIndex::prepa
 
 ---
 
-## 7. Consistency Invariants (`Collection::verify_invariants`)
+## 7. Faceting
+
+Every `filterable: true` attribute is facetable (`Collection::facet`, `search_with_facets`, `query_bm25_with_facets`, `hybrid_search_with_facets`; types in [`crates/izzydb-core/src/facet.rs`](../../crates/izzydb-core/src/facet.rs), engine in [`crates/izzydb/src/facet.rs`](../../crates/izzydb/src/facet.rs)). Non-filterable attributes are rejected with `InvalidQuery` so faceting never degrades into an unindexed `cf_docs` scan.
+
+**Facet kinds.** `Terms` (limit / sort / `min_count` / `String` prefix typeahead), `Ranges` (overlapping, open-ended, inclusive/exclusive bounds), `Stats` (`count`, `missing_count`, `min`, `max`, `sum`, `avg`), and `Histogram` (`interval`, `offset`, `min_count`). `missing_count` is only computed when `include_missing` is set.
+
+**One accumulator model.** `Terms`, scalar `Ranges`, `Stats` and `Histogram` are all finalized from a sorted list of `(encoded_value, doc_count)` pairs, so every strategy only has to produce per-value document counts. Array-attribute `Ranges` are the exception: a document with `[10, 20]` inside `[0, 50)` must count once, so they keep per-bucket document counts (strategy 3: any element in range; strategy 4: OR matching postings into a per-bucket scratch `LeafMask`, then one `and_count`).
+
+**Disjunctive faceting.** Each facet's `FacetFilterMode` rewrites the query filter (`strip_filter_attributes`: flatten top-level `And` conjuncts and drop those whose attribute set is a non-empty subset of the excluded attributes; mixed `Or` / `Not` conjuncts survive). Facets with an identical effective filter form one `FacetGroup`, which evaluates its population once; the primary group shares the search's `PreparedFilter`.
+
+**Strategy dispatch per group** (recorded for tests in `facet::take_strategy_trace`):
+
+| Strategy | Trigger | Cost |
+|---|---|---|
+| `global` | no effective filter, no BM25 restriction, no array `Ranges` | ordered scan of `default[0x06 \|\| attr_id \|\| type_tag]` (seeked to the `Prefix` / `Ranges` span); zero leaf, posting or `cf_docs` reads |
+| `complement` | top-level `Not` / `NotEq` / `NotIn` whose positive inner filter resolves to `<= 16` leaves and `<= 2048` docs | global counts minus a forward pass over the inner docs |
+| `docs` | explicit doc set (`TopK`, `Candidates`, `FusedCandidates`), a small BM25 match set, or a filter resolving to `<= 16` candidate leaves and `<= 2048` docs | `multi_get_doc_bytes_pinned` in 512-doc chunks, zero-copy `DocView::get_raw_field` into the accumulators |
+| `leaf_masks_no_views` / `leaf_masks_views` | everything else | per-leaf `LeafMask`s once per group; when `!PreparedFilter::needs_live_mask()` they are built from `cf_attr_postings` / FTS reverse maps only (width `max_leaf_size.div_ceil(64)`, no `cf_leaf_entries` read), then `LeafPostingView::count_and_mask` (`POPCNT`) over a prefix scan of `(attr_id, type_tag, leaf_id, *)` |
+
+**BM25 population.** `FtsIndex::eval_rank_by_match_bitmap` returns the exact set of documents with BM25 score `> 0` (`Sum` / `Max` union, `Product(w, e)` = `e` iff the accumulated weight is `> 0`, `last_as_prefix` and `max_prefix_expansions` honored); `AttributeIndex::prepare_filter_with_fts_and_rank_bm` intersects it with the filter as a `LeafSlotMasks` node. Top-`k` MAXSCORE pruning is untouched.
+
+**Search scopes.** Vector: `FilterMatches` (default) / `TopK` / `Candidates(n)`; hybrid: `FilterMatches` (default) / `FusedCandidates` / `Bm25AndFilterMatches`. Explicit-doc scopes ignore per-facet filter modes.
+
+## 8. Consistency Invariants (`Collection::verify_invariants`)
 
 `verify_collection_invariants` ([`crates/izzydb/src/verify.rs`](../../crates/izzydb/src/verify.rs)) exhaustively verifies:
 
 1. **Schema parity:** `default[b"\x01schema"]` matches the in-memory `CollectionSchema`.
 2. **Document bijection:** `cf_docs` forms a 1-to-1 bijection with `cf_doc_loc`, `cf_vectors`, and reachable slot-indexed leaf entries (`local_id == slot`, `slot_cap <= max_leaf_size`).
-3. **Full inverted-index & zone-map reconstruction check:** re-decodes every `cf_docs` entry, pairs it with `cf_doc_loc`, and asserts byte/set equality for `cf_attr_postings` (`LeafPosting`), `cf_attr_clusters` (`RoaringBitmap`), and attribute zones in `default` (`AttrZoneMap`).
+3. **Full inverted-index, zone-map & global-count reconstruction check:** re-decodes every `cf_docs` entry, pairs it with `cf_doc_loc`, and asserts byte/set equality for `cf_attr_postings` (`LeafPosting`), `cf_attr_clusters` (`RoaringBitmap`), and attribute zones in `default` (`AttrZoneMap`).

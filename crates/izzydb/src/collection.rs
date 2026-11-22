@@ -8,10 +8,17 @@ use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 
-use crate::attr_index::{AttributeIndex, ClusterCandidates};
-use crate::codec::{DocView, decode_attribute_entries, decode_attributes, encode_attributes};
+use crate::attr_index::{AttributeIndex, ClusterCandidates, PreparedFilter};
+use crate::codec::{
+    DocView, decode_attribute_entries, decode_attributes, encode_attributes,
+    extract_index_keys_from_entries,
+};
 use crate::config::{AttrId, DocId, FtsDocId, NodeId, TreeConfig};
 use crate::error::{Result, TreeError};
+use crate::facet::{
+    self, FacetEnv, FacetResults, FacetSpec, FacetedSearchResponse, HybridFacetScope, Population,
+    VectorFacetScope, validate_facet_specs,
+};
 use crate::filter::Filter;
 use crate::fts_index::{FtsIndex, has_fts_attr_changes, has_fts_patch_changes};
 use crate::lire;
@@ -198,6 +205,26 @@ impl Collection {
                 (created, false)
             }
         };
+
+        // One-time atomic backfill of `default[0x06]` global attribute value counts for databases
+        // created before they existed (and the marker for fresh databases).
+        if !storage.has_attr_counts_marker()? {
+            let mut counts: HashMap<Vec<u8>, u64> = HashMap::new();
+            if meta.num_vectors > 0 {
+                for (_, raw_bytes) in storage.all_docs_bytes()? {
+                    let entries = decode_attribute_entries(&raw_bytes)?;
+                    for key in extract_index_keys_from_entries(&schema, &entries)? {
+                        *counts.entry(key).or_insert(0) += 1;
+                    }
+                }
+            }
+            let mut batch = storage.new_batch();
+            for (key, count) in &counts {
+                batch.put_attr_count(key, *count);
+            }
+            batch.put_attr_counts_marker();
+            storage.write_batch(batch)?;
+        }
 
         let storage = Arc::new(storage);
         let mut vector_index = ClusteringTree::from_storage(Arc::clone(&storage), meta, config.tree)?;
@@ -815,6 +842,19 @@ impl Collection {
         opts: HybridSearchOptions,
         filter: Option<&Filter>,
     ) -> Result<Vec<HybridSearchResult>> {
+        Ok(self
+            .hybrid_search_inner(query_vec, rank_by, opts, filter)?
+            .0)
+    }
+
+    /// Fused RRF results plus every candidate `DocId` that entered fusion (sorted, deduplicated).
+    fn hybrid_search_inner(
+        &self,
+        query_vec: &[f32],
+        rank_by: &RankBy,
+        opts: HybridSearchOptions,
+        filter: Option<&Filter>,
+    ) -> Result<(Vec<HybridSearchResult>, Vec<DocId>)> {
         opts.validate()?;
         rank_by.validate(&self.schema)?;
         if let Some(f) = filter {
@@ -826,10 +866,6 @@ impl Collection {
             .bm25_candidates
             .unwrap_or_else(|| opts.vector_search.k.max(opts.k.saturating_mul(2)));
         let bm25_hits = self.query_bm25(rank_by, filter, bm25_k)?;
-
-        if opts.k == 0 {
-            return Ok(Vec::new());
-        }
 
         let mut by_doc: HashMap<DocId, HybridSearchResult> =
             HashMap::with_capacity(vec_hits.len() + bm25_hits.len());
@@ -860,10 +896,251 @@ impl Collection {
             entry.bm25_rank = Some(rank);
         }
 
+        let mut candidates: Vec<DocId> = by_doc.keys().copied().collect();
+        candidates.sort_unstable();
+
+        if opts.k == 0 {
+            return Ok((Vec::new(), candidates));
+        }
         let mut results: Vec<HybridSearchResult> = by_doc.into_values().collect();
         results.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
         results.truncate(opts.k);
+        Ok((results, candidates))
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Faceting
+    // ------------------------------------------------------------------------------------
+
+    fn facet_env(&self) -> FacetEnv<'_> {
+        FacetEnv {
+            storage: &self.storage,
+            schema: &self.schema,
+            attr_index: &self.attr_index,
+            fts_index: &self.fts_index,
+            config: &self.vector_index.config,
+            quantizer: &self.vector_index.quantizer,
+            meta: &self.vector_index.meta,
+            leaf_parent: &self.vector_index.leaf_parent,
+        }
+    }
+
+    fn validate_facet_request(&self, filter: Option<&Filter>, facets: &[FacetSpec]) -> Result<()> {
+        if let Some(f) = filter {
+            f.validate(&self.schema)?;
+        }
+        validate_facet_specs(&self.schema, facets)
+    }
+
+    /// Exact facet aggregations over all documents matching `filter` (or the whole collection).
+    ///
+    /// Every faceted attribute must be `filterable`. Each facet's [`FacetFilterMode`]
+    /// (`ExcludeSelf`, `ExcludeAttributes`, `Custom`) enables disjunctive / multi-select faceting.
+    ///
+    /// [`FacetFilterMode`]: crate::FacetFilterMode
+    pub fn facet(&self, filter: Option<&Filter>, facets: &[FacetSpec]) -> Result<FacetResults> {
+        self.validate_facet_request(filter, facets)?;
+        let (results, _) = facet::compute_facets(
+            &self.facet_env(),
+            facets,
+            Population::Query {
+                filter,
+                rank_bm: None,
+                prepared: None,
+            },
+        )?;
         Ok(results)
+    }
+
+    /// Vector ANN search plus facets. `scope` selects the facet population:
+    /// all `filter` matches (default), only the returned top-`k`, or the top-`n` ANN candidates.
+    ///
+    /// For `TopK` / `Candidates`, the population is a fixed document set, so per-facet
+    /// [`FacetFilterMode`](crate::FacetFilterMode)s are ignored.
+    pub fn search_with_facets(
+        &self,
+        query: &[f32],
+        opts: SearchOptions,
+        filter: Option<&Filter>,
+        facets: &[FacetSpec],
+        scope: VectorFacetScope,
+    ) -> Result<FacetedSearchResponse<SearchResult>> {
+        self.validate_facet_request(filter, facets)?;
+        let env = self.facet_env();
+        match scope {
+            VectorFacetScope::FilterMatches => {
+                let prepared = match filter {
+                    Some(f) => Some(self.attr_index.prepare_filter_with_fts(
+                        &self.storage,
+                        &self.schema,
+                        f,
+                        Some(&self.fts_index),
+                    )?),
+                    None => None,
+                };
+                let hits = self.search_hits(query, opts, prepared.as_ref())?;
+                let (facets, total_hits) = facet::compute_facets(
+                    &env,
+                    facets,
+                    Population::Query {
+                        filter,
+                        rank_bm: None,
+                        prepared: prepared.as_ref(),
+                    },
+                )?;
+                Ok(FacetedSearchResponse {
+                    hits,
+                    facets,
+                    total_hits,
+                })
+            }
+            VectorFacetScope::TopK => {
+                let hits = self.search(query, opts, filter)?;
+                let ids: Vec<DocId> = hits.iter().map(|h| h.id).collect();
+                let (facets, total_hits) =
+                    facet::compute_facets(&env, facets, Population::Docs(&ids))?;
+                Ok(FacetedSearchResponse {
+                    hits,
+                    facets,
+                    total_hits,
+                })
+            }
+            VectorFacetScope::Candidates(n) => {
+                let mut wide = opts;
+                wide.k = n.max(opts.k);
+                let mut cands = self.search(query, wide, filter)?;
+                let ids: Vec<DocId> = cands.iter().map(|h| h.id).collect();
+                cands.truncate(opts.k);
+                let (facets, total_hits) =
+                    facet::compute_facets(&env, facets, Population::Docs(&ids))?;
+                Ok(FacetedSearchResponse {
+                    hits: cands,
+                    facets,
+                    total_hits,
+                })
+            }
+        }
+    }
+
+    /// BM25 ranking plus facets over every document with BM25 score `> 0` for `rank_by` that also
+    /// matches `filter`. Top-`k` pruning is unaffected: the exact match set is computed from
+    /// posting unions without scoring.
+    pub fn query_bm25_with_facets(
+        &self,
+        rank_by: &RankBy,
+        filter: Option<&Filter>,
+        top_k: usize,
+        facets: &[FacetSpec],
+    ) -> Result<FacetedSearchResponse<Bm25Result>> {
+        self.validate_facet_request(filter, facets)?;
+        rank_by.validate(&self.schema)?;
+        let hits = self.query_bm25(rank_by, filter, top_k)?;
+        let rank_bm = self.rank_match_bitmap(rank_by)?;
+        let (facets, total_hits) = facet::compute_facets(
+            &self.facet_env(),
+            facets,
+            Population::Query {
+                filter,
+                rank_bm: Some(&rank_bm),
+                prepared: None,
+            },
+        )?;
+        Ok(FacetedSearchResponse {
+            hits,
+            facets,
+            total_hits,
+        })
+    }
+
+    /// Hybrid RRF search plus facets. `scope` selects the facet population: all `filter` matches
+    /// (default), the fused vector + BM25 candidates, or all BM25 matches that also match `filter`.
+    pub fn hybrid_search_with_facets(
+        &self,
+        query_vec: &[f32],
+        rank_by: &RankBy,
+        opts: HybridSearchOptions,
+        filter: Option<&Filter>,
+        facets: &[FacetSpec],
+        scope: HybridFacetScope,
+    ) -> Result<FacetedSearchResponse<HybridSearchResult>> {
+        self.validate_facet_request(filter, facets)?;
+        let (hits, candidates) = self.hybrid_search_inner(query_vec, rank_by, opts, filter)?;
+        let env = self.facet_env();
+        let (facets, total_hits) = match scope {
+            HybridFacetScope::FilterMatches => facet::compute_facets(
+                &env,
+                facets,
+                Population::Query {
+                    filter,
+                    rank_bm: None,
+                    prepared: None,
+                },
+            )?,
+            HybridFacetScope::FusedCandidates => {
+                facet::compute_facets(&env, facets, Population::Docs(&candidates))?
+            }
+            HybridFacetScope::Bm25AndFilterMatches => {
+                let rank_bm = self.rank_match_bitmap(rank_by)?;
+                facet::compute_facets(
+                    &env,
+                    facets,
+                    Population::Query {
+                        filter,
+                        rank_bm: Some(&rank_bm),
+                        prepared: None,
+                    },
+                )?
+            }
+        };
+        Ok(FacetedSearchResponse {
+            hits,
+            facets,
+            total_hits,
+        })
+    }
+
+    fn rank_match_bitmap(&self, rank_by: &RankBy) -> Result<RoaringBitmap> {
+        if self.is_empty() {
+            return Ok(RoaringBitmap::new());
+        }
+        self.fts_index
+            .eval_rank_by_match_bitmap(&self.storage, &self.schema, rank_by)
+    }
+
+    /// ANN search over an optional pre-prepared (already validated) filter plan.
+    fn search_hits(
+        &self,
+        query: &[f32],
+        opts: SearchOptions,
+        prepared: Option<&PreparedFilter>,
+    ) -> Result<Vec<SearchResult>> {
+        let hits = match prepared {
+            None => search::search(
+                &self.storage,
+                &self.vector_index.internal_cache,
+                &self.vector_index.meta,
+                &self.vector_index.quantizer,
+                query,
+                opts,
+                &self.vector_index.config,
+            )?,
+            Some(p) => search::search_filtered_prepared(
+                &self.storage,
+                &self.vector_index.internal_cache,
+                &self.vector_index.leaf_parent,
+                &self.vector_index.meta,
+                &self.vector_index.quantizer,
+                &self.attr_index,
+                query,
+                opts,
+                p,
+                &self.vector_index.config,
+            )?,
+        };
+        Ok(hits
+            .into_iter()
+            .map(|(id, distance)| SearchResult { id, distance })
+            .collect())
     }
 
     fn try_pushdown_filter(&self, filter: &Filter) -> Result<FilterPushdown> {

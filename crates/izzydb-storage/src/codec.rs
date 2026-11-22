@@ -203,6 +203,116 @@ pub fn encode_str_ordered(bytes: &[u8], out: &mut Vec<u8>) {
     out.push(0x00);
 }
 
+/// Escaped prefix encoding for typeahead scans: `0x00 -> 0x00 0xFF` with **no** terminator, so the
+/// result is a byte prefix of [`encode_str_ordered`] for every string starting with `bytes`.
+#[inline]
+pub fn encode_str_prefix_ordered(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    for &b in bytes {
+        if b == 0x00 {
+            out.push(0x00);
+            out.push(0xFF);
+        } else {
+            out.push(b);
+        }
+    }
+    out
+}
+
+/// Inverse of [`encode_i64_ordered`].
+#[inline]
+pub fn decode_i64_ordered(bytes: [u8; 8]) -> i64 {
+    (u64::from_be_bytes(bytes) ^ (1u64 << 63)) as i64
+}
+
+/// Inverse of [`encode_f64_ordered`].
+#[inline]
+pub fn decode_f64_ordered(bytes: [u8; 8]) -> f64 {
+    let ordered = u64::from_be_bytes(bytes);
+    let bits = if (ordered >> 63) != 0 {
+        ordered ^ (1u64 << 63)
+    } else {
+        !ordered
+    };
+    f64::from_bits(bits)
+}
+
+/// Inverse of [`encode_str_ordered`]: un-escape `0x00 0xFF` and require the `0x00 0x00` terminator.
+pub fn decode_str_ordered(bytes: &[u8]) -> Result<String> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    loop {
+        match bytes.get(i) {
+            None => {
+                return Err(TreeError::CorruptedData(
+                    "ordered string missing terminator".into(),
+                ));
+            }
+            Some(0x00) => match bytes.get(i + 1) {
+                Some(0x00) => {
+                    if i + 2 != bytes.len() {
+                        return Err(TreeError::CorruptedData(
+                            "ordered string has trailing bytes".into(),
+                        ));
+                    }
+                    break;
+                }
+                Some(0xFF) => {
+                    out.push(0x00);
+                    i += 2;
+                }
+                _ => {
+                    return Err(TreeError::CorruptedData(
+                        "ordered string has invalid escape".into(),
+                    ));
+                }
+            },
+            Some(&b) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out)
+        .map_err(|e| TreeError::CorruptedData(format!("invalid utf8 in ordered string: {e}")))
+}
+
+/// Decode an `encoded_val` from a `(type_tag, encoded_val)` index key back into a [`ScalarValue`].
+/// `TAG_PRESENT` decodes to [`ScalarValue::Null`].
+pub fn decode_scalar_val_bytes(type_tag: u8, bytes: &[u8]) -> Result<ScalarValue> {
+    let arr8 = |b: &[u8]| -> Result<[u8; 8]> {
+        b.try_into().map_err(|_| {
+            TreeError::CorruptedData(format!("expected 8 encoded bytes, got {}", b.len()))
+        })
+    };
+    match type_tag {
+        TAG_PRESENT => Ok(ScalarValue::Null),
+        TAG_BOOL => match bytes {
+            [0] => Ok(ScalarValue::Bool(false)),
+            [1] => Ok(ScalarValue::Bool(true)),
+            _ => Err(TreeError::CorruptedData("invalid encoded bool".into())),
+        },
+        TAG_INT => Ok(ScalarValue::Int(decode_i64_ordered(arr8(bytes)?))),
+        TAG_UINT => Ok(ScalarValue::Uint(u64::from_be_bytes(arr8(bytes)?))),
+        TAG_FLOAT => Ok(ScalarValue::Float(decode_f64_ordered(arr8(bytes)?))),
+        TAG_STRING => Ok(ScalarValue::String(decode_str_ordered(bytes)?)),
+        other => Err(TreeError::CorruptedData(format!(
+            "unknown index type_tag {other}"
+        ))),
+    }
+}
+
+/// `type_tag` under which an attribute's *values* (array elements for array types) are indexed.
+pub fn attr_type_value_tag(attr_type: AttributeType) -> u8 {
+    match attr_type.scalar_type() {
+        AttributeType::Bool => TAG_BOOL,
+        AttributeType::Int => TAG_INT,
+        AttributeType::Uint => TAG_UINT,
+        AttributeType::Float => TAG_FLOAT,
+        _ => TAG_STRING,
+    }
+}
+
 /// Compact per-leaf posting set stored in `cf_attr_postings` using sparse `u16`s,
 /// dense `[u64; words]` bitsets, or a `RoaringBitmap` fallback for very large `LocalId`s.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -386,6 +496,55 @@ impl<'a> LeafPostingView<'a> {
             }
         }
         Ok(())
+    }
+}
+
+impl LeafPostingView<'_> {
+    /// Number of local ids in the posting (no allocation for `Sparse` / `Dense`).
+    pub fn count(&self) -> Result<u64> {
+        match self {
+            Self::Sparse(slice) => Ok((slice.len() / 2) as u64),
+            Self::Dense(slice) => Ok(slice
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes(c.try_into().unwrap()).count_ones() as u64)
+                .sum()),
+            Self::Roaring(slice) => Ok(decode_roaring_bitmap(slice)?.len()),
+        }
+    }
+
+    /// Number of local ids in the posting that are also set in `mask` (little-endian slot words).
+    /// Ids beyond `mask.len() * 64` are ignored. No allocation for `Sparse` / `Dense`.
+    pub fn count_and_mask(&self, mask: &[u64]) -> Result<u64> {
+        match self {
+            Self::Sparse(slice) => {
+                let mut n = 0u64;
+                for chunk in slice.chunks_exact(2) {
+                    let id = u16::from_le_bytes([chunk[0], chunk[1]]) as usize;
+                    if let Some(&w) = mask.get(id >> 6) {
+                        n += (w >> (id & 63)) & 1;
+                    }
+                }
+                Ok(n)
+            }
+            Self::Dense(slice) => {
+                let mut n = 0u64;
+                for (chunk, &m) in slice.chunks_exact(8).zip(mask.iter()) {
+                    n += (u64::from_le_bytes(chunk.try_into().unwrap()) & m).count_ones() as u64;
+                }
+                Ok(n)
+            }
+            Self::Roaring(slice) => {
+                let bm = decode_roaring_bitmap(slice)?;
+                let mut n = 0u64;
+                for id in bm.iter() {
+                    let id = id as usize;
+                    if let Some(&w) = mask.get(id >> 6) {
+                        n += (w >> (id & 63)) & 1;
+                    }
+                }
+                Ok(n)
+            }
+        }
     }
 }
 
@@ -656,6 +815,14 @@ impl<'a> DocView<'a> {
         decode_payload_value(kind, payload).map(Some)
     }
 
+    /// Zero-copy typed access to one attribute (`None` if the document has no entry for it).
+    pub fn get_raw_field(&self, attr_id: AttrId) -> Result<Option<DocFieldRef<'a>>> {
+        let Some((kind, payload)) = self.find_entry(attr_id) else {
+            return Ok(None);
+        };
+        DocFieldRef::from_raw(kind, payload).map(Some)
+    }
+
     /// Evaluate a [`Filter`] directly against this `DocView` without decoding untouched fields.
     pub fn matches_filter<F>(
         &self,
@@ -820,6 +987,131 @@ impl<'a> DocView<'a> {
             return Ok(None);
         };
         raw_cmp_scalar(kind, payload, target)
+    }
+}
+
+/// One scalar element borrowed from a `cf_docs` blob.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RawScalar<'a> {
+    Bool(bool),
+    Int(i64),
+    Uint(u64),
+    Float(f64),
+    /// UTF-8 string bytes (not escaped).
+    Str(&'a [u8]),
+}
+
+impl RawScalar<'_> {
+    /// Append the order-preserving index encoding of this value to `out` (normalizing `-0.0`)
+    /// and return its `type_tag`.
+    #[inline]
+    pub fn encode_into(&self, out: &mut Vec<u8>) -> u8 {
+        match *self {
+            RawScalar::Bool(b) => {
+                out.push(b as u8);
+                TAG_BOOL
+            }
+            RawScalar::Int(v) => {
+                out.extend_from_slice(&encode_i64_ordered(v));
+                TAG_INT
+            }
+            RawScalar::Uint(v) => {
+                out.extend_from_slice(&v.to_be_bytes());
+                TAG_UINT
+            }
+            RawScalar::Float(v) => {
+                // NaN is rejected at write time; fall back to canonical bits defensively.
+                let bytes = encode_f64_ordered(v).unwrap_or([0xFF; 8]);
+                out.extend_from_slice(&bytes);
+                TAG_FLOAT
+            }
+            RawScalar::Str(s) => {
+                encode_str_ordered(s, out);
+                TAG_STRING
+            }
+        }
+    }
+}
+
+/// Zero-copy borrowed attribute value from a [`DocView`].
+#[derive(Debug, Clone, Copy)]
+pub enum DocFieldRef<'a> {
+    Null,
+    Scalar(RawScalar<'a>),
+    StringArray(&'a [u8]),
+    IntArray(&'a [u8]),
+    UintArray(&'a [u8]),
+}
+
+impl<'a> DocFieldRef<'a> {
+    fn from_raw(kind: u8, payload: &'a [u8]) -> Result<Self> {
+        let fixed8 = |what: &str| -> Result<[u8; 8]> {
+            payload
+                .try_into()
+                .map_err(|_| TreeError::CorruptedData(format!("cf_docs {what} truncated")))
+        };
+        Ok(match kind {
+            DOC_VAL_NULL => Self::Null,
+            DOC_VAL_BOOL => match payload {
+                [0] => Self::Scalar(RawScalar::Bool(false)),
+                [1] => Self::Scalar(RawScalar::Bool(true)),
+                _ => return Err(TreeError::CorruptedData("cf_docs bool invalid".into())),
+            },
+            DOC_VAL_INT => Self::Scalar(RawScalar::Int(i64::from_le_bytes(fixed8("i64")?))),
+            DOC_VAL_UINT => Self::Scalar(RawScalar::Uint(u64::from_le_bytes(fixed8("u64")?))),
+            DOC_VAL_FLOAT => Self::Scalar(RawScalar::Float(f64::from_le_bytes(fixed8("f64")?))),
+            DOC_VAL_STRING => Self::Scalar(RawScalar::Str(payload)),
+            DOC_VAL_STRING_ARRAY => Self::StringArray(payload),
+            DOC_VAL_INT_ARRAY => Self::IntArray(payload),
+            DOC_VAL_UINT_ARRAY => Self::UintArray(payload),
+            other => {
+                return Err(TreeError::CorruptedData(format!(
+                    "unknown cf_docs value kind: {other}"
+                )));
+            }
+        })
+    }
+
+    #[inline]
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    /// Visit every element (the single value for scalars, each element for arrays, nothing for
+    /// `Null` or empty arrays). Duplicate array elements are visited once per occurrence.
+    pub fn for_each_scalar(&self, mut f: impl FnMut(RawScalar<'a>)) -> Result<()> {
+        match *self {
+            Self::Null => {}
+            Self::Scalar(v) => f(v),
+            Self::StringArray(payload) => {
+                let mut r = ByteReader::new(payload);
+                let len = r.read_u32_le("cf_docs string array len")? as usize;
+                for _ in 0..len {
+                    let n = r.read_u32_le("cf_docs string elem len")? as usize;
+                    f(RawScalar::Str(r.read_bytes(n, "cf_docs string elem")?));
+                }
+                r.expect_eof("cf_docs string array")?;
+            }
+            Self::IntArray(payload) => {
+                let mut r = ByteReader::new(payload);
+                let len = r.read_u32_le("cf_docs int array len")? as usize;
+                let body = r.read_bytes(len * 8, "cf_docs int array")?;
+                r.expect_eof("cf_docs int array")?;
+                for c in body.chunks_exact(8) {
+                    f(RawScalar::Int(i64::from_le_bytes(c.try_into().unwrap())));
+                }
+            }
+            Self::UintArray(payload) => {
+                let mut r = ByteReader::new(payload);
+                let len = r.read_u32_le("cf_docs uint array len")? as usize;
+                let body = r.read_bytes(len * 8, "cf_docs uint array")?;
+                r.expect_eof("cf_docs uint array")?;
+                for c in body.chunks_exact(8) {
+                    f(RawScalar::Uint(u64::from_le_bytes(c.try_into().unwrap())));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1395,5 +1687,123 @@ mod tests {
         let mut words = [0u64; 2];
         LeafPostingView::parse(&b2).unwrap().or_into_words(&mut words).unwrap();
         assert_eq!(words[0].count_ones() + words[1].count_ones(), 40);
+    }
+    #[test]
+    fn ordered_decoders_roundtrip() {
+        for v in [i64::MIN, -1, 0, 1, i64::MAX] {
+            assert_eq!(decode_i64_ordered(encode_i64_ordered(v)), v);
+        }
+        for v in [f64::NEG_INFINITY, -1.5, 0.0, 2.25, f64::MAX, f64::INFINITY] {
+            assert_eq!(decode_f64_ordered(encode_f64_ordered(v).unwrap()), v);
+        }
+        // -0.0 normalizes to +0.0
+        assert_eq!(
+            decode_f64_ordered(encode_f64_ordered(-0.0).unwrap()).to_bits(),
+            0.0f64.to_bits()
+        );
+        for s in ["", "abc", "a\0b", "\0", "héllo \u{1F600}", "a\0\0"] {
+            let mut buf = Vec::new();
+            encode_str_ordered(s.as_bytes(), &mut buf);
+            assert_eq!(decode_str_ordered(&buf).unwrap(), s);
+            let pre = encode_str_prefix_ordered(s.as_bytes());
+            assert!(buf.starts_with(&pre));
+        }
+        assert!(decode_str_ordered(b"abc").is_err());
+        let vals = [
+            ScalarValue::Bool(true),
+            ScalarValue::Int(-7),
+            ScalarValue::Uint(u64::MAX),
+            ScalarValue::Float(3.5),
+            ScalarValue::String("x\0y".into()),
+        ];
+        for v in vals {
+            let mut buf = Vec::new();
+            let tag = encode_scalar_val_bytes(&v, &mut buf).unwrap();
+            assert_eq!(decode_scalar_val_bytes(tag, &buf).unwrap(), v);
+        }
+        assert_eq!(
+            decode_scalar_val_bytes(TAG_PRESENT, &[]).unwrap(),
+            ScalarValue::Null
+        );
+    }
+
+    #[test]
+    fn prefix_encoding_is_not_confused_by_nul() {
+        let mut a = Vec::new();
+        encode_str_ordered(b"a", &mut a);
+        let mut a_nul = Vec::new();
+        encode_str_ordered(b"a\0x", &mut a_nul);
+        let pre = encode_str_prefix_ordered(b"a\0");
+        assert!(a_nul.starts_with(&pre));
+        assert!(!a.starts_with(&pre));
+    }
+
+    #[test]
+    fn leaf_posting_count_and_mask_all_forms() {
+        let mut sparse = LeafPosting::default();
+        for id in [1u32, 5, 70, 130] {
+            sparse.insert(id);
+        }
+        let mut dense = LeafPosting::default();
+        for id in 0..40u32 {
+            dense.insert(id * 3);
+        }
+        let mut roaring = LeafPosting::default();
+        for id in [3u32, 5000, 70000] {
+            roaring.insert(id);
+        }
+        let mask = [0xFFu64, u64::MAX, 0];
+        for (lp, expect_count) in [(&sparse, 4u64), (&dense, 40), (&roaring, 3)] {
+            let bytes = lp.encode().unwrap();
+            let view = LeafPostingView::parse(&bytes).unwrap();
+            assert_eq!(view.count().unwrap(), expect_count);
+            let mut words = [0u64; 3];
+            view.or_into_words(&mut words).unwrap();
+            let expected: u64 = words
+                .iter()
+                .zip(mask.iter())
+                .map(|(w, m)| (w & m).count_ones() as u64)
+                .sum();
+            assert_eq!(view.count_and_mask(&mask).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn doc_view_raw_fields() {
+        use izzydb_core::config::{DistanceMetric, TreeConfig};
+        use izzydb_core::schema::CollectionConfig;
+        let cfg = CollectionConfig::new(TreeConfig::new(4, DistanceMetric::L2Squared))
+            .with_attribute("s", AttributeType::String, true)
+            .with_attribute("i", AttributeType::Int, true)
+            .with_attribute("sa", AttributeType::StringArray, true)
+            .with_attribute("ia", AttributeType::IntArray, true)
+            .with_attribute("e", AttributeType::UintArray, true)
+            .with_attribute("m", AttributeType::Float, true);
+        let schema = CollectionSchema::from_config(&cfg).unwrap();
+        let mut attrs = Attributes::new();
+        attrs.insert("s".into(), "hi".into());
+        attrs.insert("i".into(), AttributeValue::Int(-5));
+        attrs.insert("sa".into(), vec!["a".to_string(), "b".to_string(), "a".to_string()].into());
+        attrs.insert("ia".into(), vec![3i64, 1].into());
+        attrs.insert("e".into(), Vec::<u64>::new().into());
+        let bytes = encode_attributes(&schema, &attrs).unwrap();
+        let view = DocView::parse(&bytes).unwrap();
+        let id = |n: &str| schema.get_by_name(n).unwrap().id;
+
+        let mut got = Vec::new();
+        view.get_raw_field(id("s")).unwrap().unwrap().for_each_scalar(|v| got.push(v)).unwrap();
+        assert_eq!(got, vec![RawScalar::Str(b"hi")]);
+        got.clear();
+        view.get_raw_field(id("sa")).unwrap().unwrap().for_each_scalar(|v| got.push(v)).unwrap();
+        assert_eq!(got, vec![RawScalar::Str(b"a"), RawScalar::Str(b"b"), RawScalar::Str(b"a")]);
+        got.clear();
+        view.get_raw_field(id("ia")).unwrap().unwrap().for_each_scalar(|v| got.push(v)).unwrap();
+        assert_eq!(got, vec![RawScalar::Int(3), RawScalar::Int(1)]);
+        got.clear();
+        let empty = view.get_raw_field(id("e")).unwrap().unwrap();
+        assert!(!empty.is_null());
+        empty.for_each_scalar(|v| got.push(v)).unwrap();
+        assert!(got.is_empty());
+        assert!(view.get_raw_field(id("m")).unwrap().is_none());
     }
 }

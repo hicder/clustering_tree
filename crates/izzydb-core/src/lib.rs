@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod error;
+pub mod facet;
 pub mod filter;
 pub mod kmeans;
 pub mod metric;
@@ -14,6 +15,11 @@ pub use config::{
     TreeConfig, fts_block_id, fts_slot, make_fts_doc_id,
 };
 pub use error::{Result, TreeError};
+pub use facet::{
+    FacetBucket, FacetFilterMode, FacetKind, FacetRange, FacetResult, FacetResults, FacetSort,
+    FacetSpec, FacetedSearchResponse, HistogramBucket, HistogramFacetResult, HybridFacetScope,
+    RangeBucket, RangeFacetResult, StatsFacetResult, TermFacetResult, VectorFacetScope,
+};
 pub use filter::{Filter, FtsPredicateKind, TokenQuery};
 pub use rank::{Bm25Overrides, RankBy};
 pub use schema::{

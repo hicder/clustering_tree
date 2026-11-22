@@ -69,6 +69,50 @@ pub struct PackedInternalNode {
 }
 
 impl PackedInternalNode {
+    /// Construct a [`PackedInternalNode`] from `(child_id, subtree_count, centroid)` entries,
+    /// sorting children by `NodeId` and computing `subtree_count` and weighted `centroid`.
+    pub fn from_children(
+        level: u8,
+        parent_id: Option<NodeId>,
+        children: &[(NodeId, u64, &[f32])],
+        dim: usize,
+        metric: DistanceMetric,
+    ) -> Self {
+        let mut sorted: Vec<(NodeId, u64, &[f32])> = children.to_vec();
+        sorted.sort_unstable_by_key(|&(id, _, _)| id);
+
+        let n = sorted.len();
+        let mut child_ids = Vec::with_capacity(n);
+        let mut child_subtree_counts = Vec::with_capacity(n);
+        let mut child_centroids = Vec::with_capacity(n * dim);
+        let mut subtree_count = 0u64;
+
+        for (cid, sub, cent) in sorted {
+            debug_assert_eq!(cent.len(), dim);
+            child_ids.push(cid);
+            child_subtree_counts.push(sub);
+            child_centroids.extend_from_slice(cent);
+            subtree_count += sub;
+        }
+
+        let centroid = compute_weighted_centroid_flat(
+            &child_centroids,
+            &child_subtree_counts,
+            dim,
+            metric,
+        );
+
+        Self {
+            level,
+            parent_id,
+            subtree_count,
+            centroid,
+            child_ids,
+            child_subtree_counts,
+            child_centroids,
+        }
+    }
+
     pub fn entry_count(&self) -> usize {
         self.child_ids.len()
     }
@@ -216,6 +260,28 @@ pub struct PackedLeafNode {
 }
 
 impl PackedLeafNode {
+    /// Construct a dense, encoded [`PackedLeafNode`] directly from `(centroid, doc_ids, flat_vectors)`
+    /// without a `TxContext`.
+    pub fn from_entries(
+        parent_id: Option<NodeId>,
+        centroid: Vec<f32>,
+        doc_ids: &[DocId],
+        flat_vectors: &[f32],
+        quantizer: &RabitqQuantizer,
+        dim: usize,
+        scratch: &mut EncodeScratch,
+    ) -> Self {
+        let padded_dim = quantizer.padded_dim();
+        let mut leaf = Self::empty(parent_id, dim, padded_dim);
+        leaf.centroid = centroid;
+        if doc_ids.is_empty() {
+            quantizer.rotate_into(&leaf.centroid, &mut leaf.rotated_centroid);
+        } else {
+            leaf.reset_and_encode(doc_ids, flat_vectors, quantizer, dim, scratch);
+        }
+        leaf
+    }
+
     pub fn empty(parent_id: Option<NodeId>, dim: usize, padded_dim: usize) -> Self {
         Self {
             parent_id,

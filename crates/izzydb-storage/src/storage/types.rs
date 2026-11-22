@@ -14,12 +14,12 @@ pub(super) fn map_db_err(err: rocksdb::Error) -> TreeError {
 }
 
 #[inline]
-pub(crate) fn node_key(id: NodeId) -> [u8; 4] {
+pub fn node_key(id: NodeId) -> [u8; 4] {
     id.to_be_bytes()
 }
 
 #[inline]
-pub(crate) fn doc_key(id: DocId) -> [u8; 8] {
+pub fn doc_key(id: DocId) -> [u8; 8] {
     id.to_be_bytes()
 }
 

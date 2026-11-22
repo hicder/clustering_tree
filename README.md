@@ -264,6 +264,10 @@ You can also split SST generation and ingestion across machines with `build_ssts
 
 ## Documentation
 
+- **[User Guide](docs/guide/README.md)** — task-oriented walkthrough: getting started, schema, documents, vector/filtered/full-text/hybrid search, faceting, bulk import, and operations.
+
+### Architecture & Performance
+
 - [Key & Binary Encoding](docs/architecture/key-encoding.md) — RocksDB column families, big-endian key formats, packed SoA node/vector layouts, and RaBitQ bit-packing.
 - [Index Path](docs/architecture/index-path.md) — write path, RocksDB layout, RaBitQ quantization, splits, merges, and LIRE.
 - [Search Path](docs/architecture/search-path.md) — beam traversal, asymmetric 4-bit RaBitQ `popcount` scanning, cluster-aware filtering, and full-vector reranking.

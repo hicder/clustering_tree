@@ -22,12 +22,12 @@ This document describes both the unfiltered and attribute-filtered ANN search pa
 
 ### Step 1: Cluster-Level Pruning (`AttributeIndex::prepare_filter_with_fts`)
 
-Evaluates the validated `Filter` AST against `cf_attr_clusters`, cached `cf_attr_zones` (`AttrZoneMap`), and `FtsIndex` to produce `ClusterCandidates`:
+Evaluates the validated `Filter` AST against `cf_attr_clusters`, cached attribute zones in `default` (`AttrZoneMap`), and `FtsIndex` to produce `ClusterCandidates`:
 
 - `Eq(attr, val)` / `Contains(attr, val)` / `IsNotNull(attr)`: point lookup in `cf_attr_clusters` $\to$ `Subset(bm)`.
 - `In(attr, vals)` / `ContainsAny(attr, vals)`: batched `multi_get_attr_cluster_bitmaps` + bitwise `|` $\to$ `Subset(union)`.
-- `Lt` / `Lte` / `Gt` / `Gte`: pruned in RAM via cached `cf_attr_zones` (`AttrZoneMap`) against per-leaf `[min_b, max_b]` bounds (0 cluster RocksDB lookups), producing a `PreparedNode::Range` evaluated later via prefix-bounded cluster-first range scans on `cf_attr_postings`. Adjacent/sibling `Range` nodes on the same attribute inside `And` are coalesced into one `[lo, hi]` scan and ordered after selective equality/FTS predicates.
-- `ContainsAllTokens` / `ContainsAnyToken` / `ContainsTokenSequence`: evaluates matching `FtsDocId`s in `FtsIndex` and resolves `(leaf_id, slot_mask)` directly in RAM via cached `cf_fts_rev_doc_map` (`FtsRevBlock`) into `PreparedNode::LeafSlotMasks`.
+- `Lt` / `Lte` / `Gt` / `Gte`: pruned in RAM via cached attribute zones in `default` (`AttrZoneMap`) against per-leaf `[min_b, max_b]` bounds (0 cluster RocksDB lookups), producing a `PreparedNode::Range` evaluated later via prefix-bounded cluster-first range scans on `cf_attr_postings`. Adjacent/sibling `Range` nodes on the same attribute inside `And` are coalesced into one `[lo, hi]` scan and ordered after selective equality/FTS predicates.
+- `ContainsAllTokens` / `ContainsAnyToken` / `ContainsTokenSequence`: evaluates matching `FtsDocId`s in `FtsIndex` and resolves `(leaf_id, slot_mask)` directly in RAM via cached FTS reverse-map blocks in `default` (`FtsRevBlock`) into `PreparedNode::LeafSlotMasks`.
 - `And`: intersects `Subset` bitmaps (`&=`), short-circuiting immediately to empty if any child is empty.
 - `Or`: returns `All` if any child is `All`, otherwise unions `Subset` bitmaps (`|=`).
 - `Not` / `NotEq` / `NotIn` / `IsNull`: returns `All` (except `NotEq(attr, Null)`, which prunes like `IsNotNull`), deferring exact negation to per-leaf evaluation.

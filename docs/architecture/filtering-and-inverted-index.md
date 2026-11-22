@@ -24,11 +24,11 @@ Primary implementation sources:
 1. **Forward Document Store (`cf_docs` + `cf_vectors`):**
    Stores full-precision vectors (`cf_vectors`) and v2 offset-directory document attributes (`cf_docs`, zero-copy `DocView`) keyed by `DocId` (`u64` BE). Storing forward attributes allows `Collection::get` to reconstruct documents, lazy BM25 filters (`DocView::matches_filter`) to skip full deserialization, and `Collection::upsert`, `Collection::delete`, and tree reorganizations (`ClusterDelta`) to look up which index keys a document owns without scanning the inverted index.
 2. **Vector Index (`ClusteringTree`):**
-   Owns `cf_internal_nodes`, `cf_leaf_entries`, and `cf_doc_loc` (`doc_id -> (leaf_id, local_id, fts_doc_id)`). Each leaf cluster has a `NodeId` (`u32`), and each resident vector occupies a stable slot `slot` where **`local_id == slot`** tracked via `live_mask`.
+   Owns internal nodes in `default`, `cf_leaf_entries`, and `cf_doc_loc` (`doc_id -> (leaf_id, local_id, fts_doc_id)`). Each leaf cluster has a `NodeId` (`u32`), and each resident vector occupies a stable slot `slot` where **`local_id == slot`** tracked via `live_mask`.
 3. **Cluster-Aware Inverted Index (`AttributeIndex`):**
    Maintains cluster summaries, compact per-leaf postings, and per-leaf zone maps:
    - **Cluster summary index (`cf_attr_clusters`):** maps `(attr_id, type_tag, encoded_val)` $\to$ `RoaringBitmap` of leaf `NodeId`s (`cluster_id: u32`) containing at least one document with that attribute value.
-   - **Per-leaf zone maps (`cf_attr_zones`):** maps `(attr_id, type_tag)` $\to$ `BTreeMap<NodeId, (min_val, max_val)>`, cached in RAM (`Storage::attr_zones_cache`) for zero-I/O cluster pruning on range queries (`Lt`/`Lte`/`Gt`/`Gte`).
+   - **Per-leaf zone maps in `default`:** maps `(attr_id, type_tag)` $\to$ `BTreeMap<NodeId, (min_val, max_val)>`, cached in RAM (`Storage::attr_zones_cache`) for zero-I/O cluster pruning on range queries (`Lt`/`Lte`/`Gt`/`Gte`).
    - **Cluster-first per-leaf posting index (`cf_attr_postings`):** maps `(attr_id, type_tag, cluster_id, encoded_val)` $\to$ compact `LeafPosting` (sparse sorted `u16` slots for `<= 16`, inline `[u64; words]` bitset for denser leaves, `RoaringBitmap` fallback). Supports both single-point `batched_multi_get_cf` lookups and prefix-bounded intra-leaf range scans (`7`-byte prefix `(attr_id || type_tag || cluster_id)`).
 
 ```text
@@ -53,7 +53,7 @@ Filter AST
 
 ## 2. Schema & Attribute Type System
 
-Schemas are configured via `CollectionConfig` and persisted as `CollectionSchema` in `cf_meta` under the key `b"schema"`.
+Schemas are configured via `CollectionConfig` and persisted as `CollectionSchema` in `default` under the key `b"\x01schema"`.
 
 ### 2.1 Supported `AttributeType`s
 
@@ -75,7 +75,7 @@ Each `AttributeConfig` declares:
 - `name: String` (must be non-empty and unique across the collection).
 - `attr_type: AttributeType`.
 - `filterable: bool`:
-  - **`true`:** The attribute is stored in `cf_docs` **and** indexed in `cf_attr_clusters` / `cf_attr_postings` / `cf_attr_zones`. Queries may reference it in `Filter` predicates.
+  - **`true`:** The attribute is stored in `cf_docs` **and** indexed in `cf_attr_clusters`, `cf_attr_postings`, and the attribute zones in `default`. Queries may reference it in `Filter` predicates.
   - **`false`:** Payload-only attribute. Stored in `cf_docs` and returned by `Collection::get`, but skipped during inverted index extraction (`extract_index_keys`) and rejected by `Filter::validate` with `TreeError::InvalidFilter`.
 
 `CollectionSchema` assigns each attribute a monotonic `AttrId = u16` starting at `0` (up to `AttrId::MAX` attributes). Using `AttrId` instead of attribute name strings keeps `cf_docs` payloads and inverted-index RocksDB keys compact.
@@ -91,11 +91,11 @@ Each `AttributeConfig` declares:
 
 On `Collection::open`:
 
-1. If `cf_meta["schema"]` is absent and `meta.num_vectors == 0`, `CollectionSchema::from_config` creates and writes the initial schema (`version = 3`).
-2. If `cf_meta["schema"]` is absent and `meta.num_vectors > 0`, opening fails with `TreeError::InvalidSchema`.
-3. If `cf_meta["schema"]` exists, `CollectionSchema::reconcile` verifies every declared attribute in `CollectionConfig`:
+1. If `default[b"\x01schema"]` is absent and `meta.num_vectors == 0`, `CollectionSchema::from_config` creates and writes the initial schema (`version = 3`).
+2. If `default[b"\x01schema"]` is absent and `meta.num_vectors > 0`, opening fails with `TreeError::InvalidSchema`.
+3. If `default[b"\x01schema"]` exists, `CollectionSchema::reconcile` verifies every declared attribute in `CollectionConfig`:
    - Existing attributes must match both `attr_type` (`field: "attribute_type"`) and `filterable` (`field: "attribute_filterable"`), or `open` fails with `TreeError::ConfigMismatch`.
-   - New attributes not yet in the persisted schema are appended with new monotonic `AttrId`s, and the updated schema is persisted back to `cf_meta["schema"]`. Pre-existing documents do not need rewriting; they implicitly evaluate as missing/`Null` for newly added attributes.
+   - New attributes not yet in the persisted schema are appended with new monotonic `AttrId`s, and the updated schema is persisted back to `default[b"\x01schema"]`. Pre-existing documents do not need rewriting; they implicitly evaluate as missing/`Null` for newly added attributes.
 
 ---
 
@@ -139,7 +139,7 @@ On `Collection::open`:
 | `cf_doc_loc` | `doc_id` (`u64` BE, 8 B) | `leaf_id` (`u32` BE) \|\| `local_id` (`u32` BE) \|\| `fts_doc_id` (`u32` BE, `u32::MAX` = None) | Point-lookup CF |
 | `cf_attr_clusters` | `attr_id` (`u16` BE) \|\| `type_tag` (`u8`) \|\| `encoded_val` | `RoaringBitmap` of `cluster_id: u32` | 3-byte fixed prefix extractor (`attr_id \|\| type_tag`), 10 bpk Bloom (`whole_key_filtering = true`) |
 | `cf_attr_postings` | `attr_id` (`u16` BE) \|\| `type_tag` (`u8`) \|\| `cluster_id` (`u32` BE) \|\| `encoded_val` | `LeafPosting` (`Sparse` / `Dense` / `Roaring`) | 7-byte fixed prefix extractor (`attr_id \|\| type_tag \|\| cluster_id`), 10 bpk Bloom, uncompressed |
-| `cf_attr_zones` | `attr_id` (`u16` BE) \|\| `type_tag` (`u8`) (3 B) | `AttrZoneMap` (`leaf_id -> (min_b, max_b)`) | Point-lookup CF, lazily loaded into `Storage::attr_zones_cache` |
+| attribute zones in `default` | `0x03` \|\| `attr_id` (`u16` BE) \|\| `type_tag` (`u8`) (4 B) | `AttrZoneMap` (`leaf_id -> (min_b, max_b)`) | Namespace scan on first load into `Storage::attr_zones_cache` |
 
 Only non-empty `RoaringBitmap`s, `LeafPosting`s, and `AttrZoneMap`s are persisted. Whenever a mutation empties an entry, `TxContext::commit` deletes that key from RocksDB.
 
@@ -255,6 +255,6 @@ After `filter.validate(schema)` and `prepare_vector_cow`, `AttributeIndex::prepa
 
 `verify_collection_invariants` ([`crates/izzydb/src/verify.rs`](../../crates/izzydb/src/verify.rs)) exhaustively verifies:
 
-1. **Schema parity:** `cf_meta["schema"]` matches the in-memory `CollectionSchema`.
+1. **Schema parity:** `default[b"\x01schema"]` matches the in-memory `CollectionSchema`.
 2. **Document bijection:** `cf_docs` forms a 1-to-1 bijection with `cf_doc_loc`, `cf_vectors`, and reachable slot-indexed leaf entries (`local_id == slot`, `slot_cap <= max_leaf_size`).
-3. **Full inverted-index & zone-map reconstruction check:** re-decodes every `cf_docs` entry, pairs it with `cf_doc_loc`, and asserts byte/set equality for `cf_attr_postings` (`LeafPosting`), `cf_attr_clusters` (`RoaringBitmap`), and `cf_attr_zones` (`AttrZoneMap`).
+3. **Full inverted-index & zone-map reconstruction check:** re-decodes every `cf_docs` entry, pairs it with `cf_doc_loc`, and asserts byte/set equality for `cf_attr_postings` (`LeafPosting`), `cf_attr_clusters` (`RoaringBitmap`), and attribute zones in `default` (`AttrZoneMap`).

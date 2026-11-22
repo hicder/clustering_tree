@@ -11,7 +11,7 @@
   - `simd.rs`: Runtime-dispatched AVX-512F, AVX2+FMA, aarch64 NEON, and scalar kernels for `dl_norm` preparation, dense/sparse BM25 block accumulation, masked max-reduction, threshold bitmask filtering (`filter_ge_256`), and `PrefixMax`/`MaxBranches` vector merges.
   - `bm25.rs`: BM25 IDF/TF/QTF scoring, `min_dl_over_tf`-based upper bounds, and SIMD block scatter/dense accumulators.
   - `maxscore.rs`: SIMD Vectorized Block-Max MAXSCORE top-$k$ execution supporting `Sum`, `Max`, `Product`, `last_as_prefix` disjunctions, batched skip cursor opening, progressive non-essential slot pruning, pushdown `RoaringBitmap<FtsDocId>` masks, and lazy filter predicates.
-- **`izzydb-storage`:** 5 dedicated FTS RocksDB column families (`cf_fts_rev_doc_map`, `cf_fts_terms`, `cf_fts_skips`, `cf_fts_postings`, `cf_fts_positions`, `cf_fts_doc_lens` — 6 including `cf_fts_doc_lens`; forward `fts_doc_id` lives inside `cf_doc_loc`), `RocksSkipCursor` (batched chunk-0 pinned skip fast path + lazy sequential `cf_fts_postings` iterator), cached `FtsRevBlock` table, cached `RocksDocLenCursor`, and atomic `TxContext` overlays.
+- **`izzydb-storage`:** Four dedicated FTS RocksDB column families (`cf_fts_terms`, `cf_fts_skips`, `cf_fts_postings`, `cf_fts_positions`), with reverse-map blocks and document lengths in `default` and forward `fts_doc_id` in `cf_doc_loc`. It provides `RocksSkipCursor` (batched chunk-0 pinned skip fast path + lazy sequential `cf_fts_postings` iterator), cached `FtsRevBlock` table, cached `RocksDocLenCursor`, and atomic `TxContext` overlays.
 - **`izzydb`:** `FtsIndex`, `Collection::query_bm25` / `Collection::query`, `Collection::hybrid_search`, `Collection::compact_fts_stats`, FTS filter integration in `Collection::search` and `Collection::resolve_filter_doc_ids`, and exhaustive `verify_collection_invariants` parity checks.
 
 ## 2. Cluster-Decoupled Posting Blocks, `TermId` Dictionary & `FtsDocId` Recycling
@@ -21,15 +21,15 @@ Rather than keying FTS postings by vector `(cluster_id, local_id)` (which causes
 - `block_id = fts_doc_id >> 8`
 - `slot = (fts_doc_id & 0xFF) as u8`
 
-Reverse mapping (`FtsDocId -> (DocId, leaf_id, local_id)`) is stored in 256-slot `FtsRevBlock` blobs in `cf_fts_rev_doc_map` and cached in `Storage::fts_rev_map_cache`, enabling RAM-speed translation from `RoaringBitmap<FtsDocId>` hits to `(leaf_id, slot_mask)` without RocksDB lookups during hybrid/filtered vector search.
+Reverse mapping (`FtsDocId -> (DocId, leaf_id, local_id)`) is stored in 256-slot `FtsRevBlock` blobs in `default` and cached in `Storage::fts_rev_map_cache`, enabling RAM-speed translation from `RoaringBitmap<FtsDocId>` hits to `(leaf_id, slot_mask)` without RocksDB lookups during hybrid/filtered vector search.
 
-To avoid block fragmentation under churn, deleted `FtsDocId`s are persisted in `cf_meta["fts_free_ids"]` (`RoaringBitmap`, managed transactionally via `TxContext`):
+To avoid block fragmentation under churn, deleted `FtsDocId`s are persisted in `default[b"\x01fts_free_ids"]` (`RoaringBitmap`, managed transactionally via `TxContext`):
 - **Deallocation (`remove_doc`):** inserts `fts_doc_id` into `fts_free_ids` and shrinks `meta.next_fts_doc_id` while `next_fts_doc_id - 1` is present in `fts_free_ids`. When tail blocks empty out, `TxContext::commit` trims trailing `None` entries from `Storage::fts_doc_lens_cache` and `Storage::fts_rev_map_cache`.
 - **Allocation (`upsert_doc`):** pops `fts_free_ids.min()` first to refill earlier 256-slot blocks densely before advancing `meta.next_fts_doc_id`.
 
 Each `(attr_id, token)` in `cf_fts_terms` stores a `TermRecord` containing a unique monotonic `term_id: TermId (u32)`, `TermStats`, and—for single-block terms with `doc_freq <= INLINE_TERM_MAX_DF` (`8`)—the encoded v3 posting block inline. Out-of-line `cf_fts_skips`, `cf_fts_postings`, and `cf_fts_positions` rows use compact 8-byte keys `term_id (u32 BE) || block_or_chunk_id (u32 BE)` with 4-byte prefix Bloom filters (`cf_fts_postings` and `cf_fts_skips` uncompressed).
 
-Document lengths are stored once per `(attr_id, block_id)` in `cf_fts_doc_lens` (`DocLenBlock`), while each posting block holds a v3 `PackedPostingBlock` storing only `tf` (switching automatically between sparse `(tfs, slots)` and dense `(bitmap, [tf; 256])` at `POSTING_DENSE_THRESHOLD = 96`) plus exact `(max_tf, min_dl_over_tf)` bounds mirrored into 256-block `SkipBlock` chunks in `cf_fts_skips`.
+Document lengths are stored once per `(attr_id, block_id)` in `default` (`DocLenBlock`), while each posting block holds a v3 `PackedPostingBlock` storing only `tf` (switching automatically between sparse `(tfs, slots)` and dense `(bitmap, [tf; 256])` at `POSTING_DENSE_THRESHOLD = 96`) plus exact `(max_tf, min_dl_over_tf)` bounds mirrored into 256-block `SkipBlock` chunks in `cf_fts_skips`.
 
 When a delete or update lowers a posting's `(tf, dl/tf)` contribution at a term's current `TermStats` extreme (`max_tf` or `min_dl_over_tf`) and the term spans `<= 64` posting blocks (`INLINE_TERM_STATS_RECOMPUTE_MAX_BLOCKS`), `FtsIndex` recomputes exact `TermStats` inline from `cf_fts_skips` chunk summaries (or inline `TermRecord` headers); `Collection::compact_fts_stats` recomputes exact bounds across all terms on demand. Updates whose FTS attributes did not change skip `FtsIndex` analysis and I/O altogether.
 

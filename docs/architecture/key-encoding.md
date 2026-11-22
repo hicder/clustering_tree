@@ -40,42 +40,42 @@ Implementation sources:
 
 ## 2. RocksDB Column Families & Key-Value Map
 
-`Storage::open` opens sixteen column families (fifteen custom CFs plus RocksDB's required `default` CF, which is unused):
+`Storage::open` opens eleven column families. The `default` family groups metadata and cached indexes by one-byte tags. Scans are bounded to a tag or, for document lengths, a tag and attribute ID. Databases created with the previous layout require a fresh database path.
 
 | Column Family | Constant | Key Format | Value Format | Compression | Read Pattern |
 |---|---|---|---|---|---|
-| `default` | `DEFAULT_COLUMN_FAMILY_NAME` | — | — | Default | Unused |
-| `cf_meta` | `CF_META` | `b"tree_meta"` / `b"schema"` / `b"fts_meta"` / `b"fts_free_ids"` | `TreeMeta` (31 B) / `CollectionSchema` (v3) / `FtsMeta` / `RoaringBitmap` | Default | Point `get_cf` |
-| `cf_internal_nodes` | `CF_INTERNAL_NODES` | `node_id` (`u32` BE, 4 B) | `PackedInternalNode` | Default | Full CF load on `open()` |
+| `default` (metadata) | `DEFAULT_COLUMN_FAMILY_NAME` | `b"\x01tree_meta"` / `b"\x01schema"` / `b"\x01fts_meta"` / `b"\x01fts_free_ids"` | `TreeMeta` (31 B) / `CollectionSchema` (v3) / `FtsMeta` / `RoaringBitmap` | Default | Point `get` |
+| `default` (internal nodes) | `DEFAULT_COLUMN_FAMILY_NAME` | `0x02` \|\| `node_id` (`u32` BE, 5 B total) | `PackedInternalNode` | Default | Namespace load on `open()` |
 | `cf_leaf_entries` | `CF_LEAF_ENTRIES` | `leaf_id` (`u32` BE, 4 B) | Slot-indexed `PackedLeafNode` (`live_mask`, `code_popcounts`, 8-wide tiled `codes`) | `None` | `batched_multi_get_cf` (pinned) |
 | `cf_vectors` | `CF_VECTORS` | `doc_id` (`u64` BE, 8 B) | `[f32; dim]` LE (`dim * 4` B) | `None` | `get_pinned_cf` / `batched_multi_get_cf` |
 | `cf_doc_loc` | `CF_DOC_LOC` | `doc_id` (`u64` BE, 8 B) | `leaf_id` (`u32` BE) \|\| `local_id` (`u32` BE) \|\| `fts_doc_id` (`u32` BE, `u32::MAX` = None) (12 B) | Default | Point `get_pinned_cf` / `batched_multi_get_cf` |
 | `cf_docs` | `CF_DOCS` | `doc_id` (`u64` BE, 8 B) | v2 directory-indexed forward `Attributes` (`DocView`) | Default | Point pinned / `batched_multi_get_cf` |
 | `cf_attr_clusters` | `CF_ATTR_CLUSTERS` | `attr_id` (`u16` BE) \|\| `type_tag` (`u8`) \|\| `encoded_val` | `RoaringBitmap` of `cluster_id: u32` | Default | Point `multi_get_cf` / `AttrZoneMap` for ranges |
 | `cf_attr_postings` | `CF_ATTR_POSTINGS` | `attr_id` (`u16` BE) \|\| `type_tag` (`u8`) \|\| `cluster_id` (`u32` BE) \|\| `encoded_val` | `LeafPosting` (sparse `u16` / dense bitset / Roaring) | `None` | `batched_multi_get_cf` / 7-byte prefix range scan |
-| `cf_attr_zones` | `CF_ATTR_ZONES` | `attr_id` (`u16` BE) \|\| `type_tag` (`u8`) (3 B) | `AttrZoneMap` (`leaf_id -> (min_b, max_b)`) | Default | Loaded into `Storage::attr_zones_cache` on demand |
-| `cf_fts_rev_doc_map` | `CF_FTS_REV_DOC_MAP` | `block_id` (`u32` BE, 4 B) | `FtsRevBlock` (`present`, `doc_ids[256]`, `leaf_ids[256]`, `local_ids[256]`, 4,128 B) | `None` | Cached in `Storage::fts_rev_map_cache` |
+| `default` (attribute zones) | `DEFAULT_COLUMN_FAMILY_NAME` | `0x03` \|\| `attr_id` (`u16` BE) \|\| `type_tag` (`u8`) (4 B total) | `AttrZoneMap` (`leaf_id -> (min_b, max_b)`) | Default | Loaded into `Storage::attr_zones_cache` on demand |
+| `default` (FTS reverse-map blocks) | `DEFAULT_COLUMN_FAMILY_NAME` | `0x04` \|\| `block_id` (`u32` BE, 5 B total) | `FtsRevBlock` (`present`, `doc_ids[256]`, `leaf_ids[256]`, `local_ids[256]`, 4,128 B) | Default | Cached in `Storage::fts_rev_map_cache` |
 | `cf_fts_terms` | `CF_FTS_TERMS` | `attr_id` (`u16` BE) \|\| `token_utf8` | `TermRecord` (`term_id` + `TermStats` + optional inline v3 posting block) | Default | Sorted `batched_multi_get_cf` / 2-byte prefix scan |
 | `cf_fts_skips` | `CF_FTS_SKIPS` | `term_id` (`u32` BE) \|\| `chunk_id` (`u32` BE) (8 B) | `SkipBlock` (up to 256 blocks' bounds) | `None` | Batched `chunk 0` pin / 4-byte prefix `RocksSkipCursor` |
 | `cf_fts_postings` | `CF_FTS_POSTINGS` | `term_id` (`u32` BE) \|\| `block_id` (`u32` BE) (8 B) | v3 `PackedPostingBlock` (TF-only, aligned `tfs`) | `None` | Lazy sequential 4-byte prefix iterator / prefix visit |
 | `cf_fts_positions` | `CF_FTS_POSITIONS` | `term_id` (`u32` BE) \|\| `block_id` (`u32` BE) (8 B) | `PackedPositionBlock` (`u16` or `u32` offsets + LEB128 deltas) | Default | Batched `multi_get_fts_positions_pinned` (`ContainsTokenSequence` only) |
-| `cf_fts_doc_lens` | `CF_FTS_DOC_LENS` | `attr_id` (`u16` BE) \|\| `block_id` (`u32` BE) (6 B) | `DocLenBlock` (260 / 516 / 1,028 B) | `None` | Lazy per-`attr_id` load into `fts_doc_lens_cache` |
+| `default` (FTS document lengths) | `DEFAULT_COLUMN_FAMILY_NAME` | `0x05` \|\| `attr_id` (`u16` BE) \|\| `block_id` (`u32` BE) (7 B total) | `DocLenBlock` (260 / 516 / 1,028 B) | Default | Lazy per-`attr_id` load into `fts_doc_lens_cache` |
 
 ### RocksDB Tuning
 
-- Shared 128 MiB LRU block cache (`BLOCK_CACHE_BYTES = 128 * 1024 * 1024`) across all point-lookup, attribute, and FTS CFs.
-- `cf_internal_nodes`, `cf_leaf_entries`, `cf_vectors`, `cf_doc_loc`, `cf_docs`, `cf_attr_zones`, `cf_fts_rev_doc_map`, and `cf_fts_doc_lens` use `point_lookup_cf_opts` (10.0 bits/key full-key Bloom filter, `set_memtable_whole_key_filtering(true)`, cached & pinned L0 filter/index blocks).
+- Shared 128 MiB LRU block cache (`BLOCK_CACHE_BYTES = 128 * 1024 * 1024`) across all column families.
+- Shared 128 MiB write-buffer threshold across column families.
+- `default`, `cf_leaf_entries`, `cf_vectors`, `cf_doc_loc`, and `cf_docs` use `point_lookup_cf_opts` (10.0 bits/key full-key Bloom filter, `set_memtable_whole_key_filtering(true)`, cached & pinned L0 filter/index blocks).
 - `cf_attr_clusters` uses a 3-byte fixed prefix extractor (`attr_id (2 B) || type_tag (1 B)`), 10.0 bits/key Bloom filter with `set_whole_key_filtering(true)`.
 - `cf_attr_postings` uses a **7-byte** fixed prefix extractor (`attr_id (2 B) || type_tag (1 B) || cluster_id (4 B)`), `set_whole_key_filtering(true)`, and `set_prefix_same_as_start(true)` on per-leaf range scans.
 - `cf_fts_terms` uses a 2-byte fixed prefix extractor (`attr_id (2 B)`), `set_whole_key_filtering(true)`, and `set_prefix_same_as_start(true)` on `last_as_prefix` term scans.
 - `cf_fts_skips`, `cf_fts_postings`, and `cf_fts_positions` use a **4-byte** fixed prefix extractor (`term_id (4 B)`), 10.0 bits/key Bloom filter with `set_whole_key_filtering(true)`.
-- `DBCompressionType::None` on `cf_leaf_entries`, `cf_vectors`, `cf_attr_postings`, `cf_fts_rev_doc_map`, `cf_fts_skips`, `cf_fts_postings`, and `cf_fts_doc_lens` for zero-copy `DBPinnableSlice` / raw iterator access on hot query paths.
+- `DBCompressionType::None` on `cf_leaf_entries`, `cf_vectors`, `cf_attr_postings`, `cf_fts_skips`, and `cf_fts_postings` for zero-copy `DBPinnableSlice` / raw iterator access on hot query paths.
 
 ---
 
 ## 3. Binary Value Specifications
 
-### 3.1 `TreeMeta` (`cf_meta`, key `b"tree_meta"`)
+### 3.1 `TreeMeta` (`default`, key `b"\x01tree_meta"`)
 
 Fixed size: **31 bytes** (`META_LEN = 31`). Any other byte length fails decoding with `TreeError::CorruptedData`.
 
@@ -90,7 +90,7 @@ Fixed size: **31 bytes** (`META_LEN = 31`). Any other byte length fails decoding
 | `22` | 8 | `rabitq_seed` | `u64` LE | Seed for deterministic FWHT sign-flip rotation $P^{-1}$ |
 | `30` | 1 | `rabitq_bits` | `u8` | Must be `1` (1-bit RaBitQ); other values rejected on `open()` |
 
-### 3.2 `CollectionSchema` (`cf_meta`, key `b"schema"`)
+### 3.2 `CollectionSchema` (`default`, key `b"\x01schema"`)
 
 Header: `version: u8` (`3`), `next_attr_id: u16` LE, `count: u32` LE (7 bytes), followed by `count` entries:
 
@@ -102,16 +102,16 @@ Header: `version: u8` (`3`), `next_attr_id: u16` LE, `count: u32` LE (7 bytes), 
   `tokenizer: u8` (`1=WordV4`, `2=Whitespace`, `3=PreTokenizedArray`, `4=SmartCn`, `5=Kuromoji`, `6=Nori`), `language: u8` (`1..=18`), `case_sensitive: u8`, `stemming: u8`, `remove_stopwords: u8`, `ascii_folding: u8`, `max_token_length: u16` LE, `k1: f32` LE, `b: f32` LE, `k3: f32` LE, `index_positions: u8`
 - `name_len: u32` LE \|\| `name_utf8`
 
-### 3.2b `FtsMeta` & `fts_free_ids` (`cf_meta`, keys `b"fts_meta"`, `b"fts_free_ids"`)
+### 3.2b `FtsMeta` & `fts_free_ids` (`default`, keys `b"\x01fts_meta"`, `b"\x01fts_free_ids"`)
 
-- **`b"fts_meta"`:** `next_fts_doc_id: u32` LE, `next_term_id: u32` LE, `count: u32` LE (12-byte header), followed by `count` entries of `(attr_id: u16 LE, doc_count: u64 LE, total_tokens: u64 LE)` (18 B each). `FtsDocId::MAX` (`u32::MAX`) is reserved as the absent sentinel in `cf_doc_loc`.
-- **`b"fts_free_ids"`:** Optional serialized `RoaringBitmap` of recycled `FtsDocId: u32` values strictly `< next_fts_doc_id` (key deleted when empty).
+- **`b"\x01fts_meta"`:** `next_fts_doc_id: u32` LE, `next_term_id: u32` LE, `count: u32` LE (12-byte header), followed by `count` entries of `(attr_id: u16 LE, doc_count: u64 LE, total_tokens: u64 LE)` (18 B each). `FtsDocId::MAX` (`u32::MAX`) is reserved as the absent sentinel in `cf_doc_loc`.
+- **`b"\x01fts_free_ids"`:** Optional serialized `RoaringBitmap` of recycled `FtsDocId: u32` values strictly `< next_fts_doc_id` (key deleted when empty).
 
 ### 3.3 `cf_doc_loc` Value (`DocLoc`)
 
 Fixed size: **12 bytes**: `leaf_id` (`u32` BE, `0..4`) \|\| `local_id` (`u32` BE, `4..8`) \|\| `fts_doc_id` (`u32` BE, `8..12`; `u32::MAX` when absent).
 
-### 3.4 `PackedInternalNode` (`cf_internal_nodes`)
+### 3.4 `PackedInternalNode` (internal nodes in `default`)
 
 Variable size: **`24 + 12 * n + (1 + n) * dim * 4` bytes**, where `n` is `entry_count`.
 
@@ -199,11 +199,11 @@ Every entry's stable `LocalId` equals its slot index (`local_id == slot`), elimi
 
 `DocView` binary-searches the 8-byte directory on `attr_id` and evaluates non-FTS filter predicates directly on borrowed slices without allocating an `Attributes` `BTreeMap`.
 
-### 3.8 Order-Preserving Attribute Index Keys, `LeafPosting`, and `cf_attr_zones`
+### 3.8 Order-Preserving Attribute Index Keys, `LeafPosting`, and attribute zones in `default`
 
 - **`cf_attr_clusters` key:** `attr_id (u16 BE) || type_tag (u8) || encoded_val` (value: `RoaringBitmap<NodeId>`)
 - **`cf_attr_postings` key (cluster-first):** `attr_id (u16 BE) || type_tag (u8) || cluster_id (u32 BE) || encoded_val`
-- **`cf_attr_zones` key:** `attr_id (u16 BE) || type_tag (u8)` (3 B)
+- **`default` attribute-zone key:** `0x03 || attr_id (u16 BE) || type_tag (u8)` (4 B)
 
 | `type_tag` | Meaning | `encoded_val` |
 |---:|---|---|
@@ -224,7 +224,7 @@ Array attributes (`StringArray`, `IntArray`, `UintArray`) index each distinct el
 | `0x01` | `Dense` | `len > 16` and `max_id <= 4095` | `num_words: u16 LE || [u64; num_words] LE` |
 | `0x02` | `Roaring` | Fallback | `RoaringBitmap::serialize_into` bytes |
 
-#### `AttrZoneMap` (`cf_attr_zones` value, scalar ordered types only)
+#### `AttrZoneMap` (attribute zones in `default` value, scalar ordered types only)
 
 - `leaf_count: u32 LE` followed by `leaf_count` entries of `(leaf_id: u32 LE, min_len: u16 LE, max_len: u16 LE, min_bytes, max_bytes)` sorted by `leaf_id` (storing each leaf's minimum and maximum order-preserving `encoded_val`).
 
@@ -237,9 +237,9 @@ Each document in an FTS-enabled collection is assigned a dense `FtsDocId: u32` (
 
 #### FTS Key Formats
 
-- **`cf_fts_rev_doc_map`:** `block_id` (`u32` BE, 4 B) $\to$ fixed **4,128-byte** `FtsRevBlock`: `present: [u64; 4]` LE (32 B) \|\| `doc_ids: [u64; 256]` LE \|\| `leaf_ids: [u32; 256]` LE \|\| `local_ids: [u32; 256]` LE.
+- **`default` FTS reverse-map key:** `0x04 || block_id (u32 BE)` (5 B) $\to$ fixed **4,128-byte** `FtsRevBlock`: `present: [u64; 4]` LE (32 B) \|\| `doc_ids: [u64; 256]` LE \|\| `leaf_ids: [u32; 256]` LE \|\| `local_ids: [u32; 256]` LE.
 - **`cf_fts_terms`:** `attr_id` (`u16` BE, 2 B) \|\| `token_utf8`.
-- **`cf_fts_doc_lens`:** `attr_id` (`u16` BE, 2 B) \|\| `block_id` (`u32` BE, 4 B) (6 B).
+- **`default` FTS document-length key:** `0x05 || attr_id (u16 BE) || block_id (u32 BE)` (7 B).
 - **`cf_fts_skips`:** `term_id` (`u32` BE, 4 B) \|\| `chunk_id` (`u32` BE, 4 B) (`chunk_id = block_id >> 8`, 8 B).
 - **`cf_fts_postings` & `cf_fts_positions`:** `term_id` (`u32` BE, 4 B) \|\| `block_id` (`u32` BE, 4 B) (8 B).
 
@@ -270,7 +270,7 @@ Stored when a term has `flags == 0x00` (`out-of-line`):
 - **Header (4 B):** `width: u8` (`IntWidth` for `max_tf`), `reserved: u8` (`0`), `count: u16` LE (`1..=256`).
 - **Body (`count * (4 + width + 1)` B):** `min_dl_over_tfs: [f32; count]` LE \|\| `max_tfs: [u8 | u16 | u32; count]` LE \|\| `rel_block_ids: [u8; count]` (strictly sorted ascending `block_id & 0xFF`).
 
-#### `DocLenBlock` (`cf_fts_doc_lens`, 260 / 516 / 1,028 bytes)
+#### `DocLenBlock` (FTS document lengths in `default`, 260 / 516 / 1,028 bytes)
 
 Stored once per `(attr_id, block_id)` whenever at least one slot in the block has `dl > 0`:
 
@@ -303,9 +303,9 @@ Stored inline in `TermRecord` when single-block and `doc_freq <= 8`, or out-of-l
 
 Verified exhaustively by `verify_invariants` and `verify_collection_invariants` ([`crates/izzydb/src/verify.rs`](../../crates/izzydb/src/verify.rs)):
 
-1. **Disjoint node CFs & cache parity:** Reachable internal nodes match `internal_cache` and `cf_internal_nodes`; reachable leaves match `leaf_parent` and `cf_leaf_entries` with no orphans.
+1. **Node keyspaces & cache parity:** Reachable internal nodes match `internal_cache` and the internal-node records in `default`; reachable leaves match `leaf_parent` and `cf_leaf_entries` with no orphans.
 2. **Slot-indexed leaf invariants:** Every leaf satisfies `slot_cap <= config.max_leaf_size`, `live_mask` popcount equals `live_count`, and every live slot satisfies vector validity (`cf_vectors`) and non-negative finite `res_norm_sqs` / `scales`.
 3. **Vector, doc, and `DocLoc` completeness:** `cf_vectors`, `cf_docs`, and `cf_doc_loc` are exact 1-to-1 bijections with reachable leaf `(doc_id, leaf_id, local_id == slot)` entries and `TreeMeta.num_vectors`.
-4. **Attribute postings, zone maps & cluster summary exactness:** Every key in `cf_attr_postings` (`LeafPosting`) is non-empty and matches the exact set of slots reconstructed from `cf_docs` + `cf_doc_loc`; `cf_attr_clusters[k]` equals the exact `RoaringBitmap` of non-empty leaves; `cf_attr_zones` matches the exact `(min_val, max_val)` per leaf for ordered scalar types.
-5. **FTS index parity:** `cf_doc_loc` `fts_doc_id`s and `cf_fts_rev_doc_map` (`FtsRevBlock`) form a 1-to-1 bijection with `cf_docs` and `(doc_id, leaf_id, local_id)` when FTS attributes exist; `cf_meta["fts_free_ids"]` is strictly disjoint from live `FtsDocId`s, bounded below `next_fts_doc_id`, and trimmed at the tail; `cf_meta["fts_meta"]` per-attribute `(doc_count, total_tokens)`, `cf_fts_terms` (`TermRecord` with unique `term_id < next_term_id`, valid inline terms `df <= 8` on 1 block, `TermStats` sound globally and exact for `<= 64`-block terms), `cf_fts_skips`, `cf_fts_doc_lens`, `cf_fts_postings`, and `cf_fts_positions` match a full re-analysis of `cf_docs`.
-6. **Atomic updates:** All mutations across `cf_meta`, `cf_internal_nodes`, `cf_leaf_entries`, `cf_vectors`, `cf_doc_loc`, `cf_docs`, `cf_attr_clusters`, `cf_attr_postings`, `cf_attr_zones`, `cf_fts_rev_doc_map`, and all FTS column families commit in a single `rocksdb::WriteBatch` before updating in-memory caches (`internal_cache`, `leaf_parent`, `attr_zones_cache`, `fts_rev_map_cache`, and `fts_doc_lens_cache`).
+4. **Attribute postings, zone maps & cluster summary exactness:** Every key in `cf_attr_postings` (`LeafPosting`) is non-empty and matches the exact set of slots reconstructed from `cf_docs` + `cf_doc_loc`; `cf_attr_clusters[k]` equals the exact `RoaringBitmap` of non-empty leaves; attribute zones in `default` match the exact `(min_val, max_val)` per leaf for ordered scalar types.
+5. **FTS index parity:** `cf_doc_loc` `fts_doc_id`s and FTS reverse-map blocks in `default` (`FtsRevBlock`) form a 1-to-1 bijection with `cf_docs` and `(doc_id, leaf_id, local_id)` when FTS attributes exist; `default[b"\x01fts_free_ids"]` is strictly disjoint from live `FtsDocId`s, bounded below `next_fts_doc_id`, and trimmed at the tail; `default[b"\x01fts_meta"]` per-attribute `(doc_count, total_tokens)`, `cf_fts_terms` (`TermRecord` with unique `term_id < next_term_id`, valid inline terms `df <= 8` on 1 block, `TermStats` sound globally and exact for `<= 64`-block terms), `cf_fts_skips`, FTS document lengths in `default`, `cf_fts_postings`, and `cf_fts_positions` match a full re-analysis of `cf_docs`.
+6. **Atomic updates:** All mutations across the column families commit in a single `rocksdb::WriteBatch` before updating in-memory caches (`internal_cache`, `leaf_parent`, `attr_zones_cache`, `fts_rev_map_cache`, and `fts_doc_lens_cache`).

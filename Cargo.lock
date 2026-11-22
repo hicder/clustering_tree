@@ -351,6 +351,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "izzydb-bench"
+version = "0.1.0"
+dependencies = [
+ "izzydb",
+ "rand",
+ "tempfile",
+]
+
+[[package]]
 name = "izzydb-core"
 version = "0.1.0"
 dependencies = [

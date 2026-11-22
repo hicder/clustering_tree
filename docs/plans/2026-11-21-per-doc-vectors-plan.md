@@ -126,4 +126,4 @@ Replace the per-leaf full-precision vector blob in `cf_leaf_vectors` (`leaf_id -
 
 1. Run `cargo test` to verify all unit and integration tests (`crates/izzydb/tests/tree_tests.rs`, `crates/izzydb-storage/src/node.rs`, `crates/izzydb-rabitq/src/simd.rs`), including `verify_invariants` and `get_vector` upsert/delete/reopen checks.
 2. Add targeted tests covering `add_leaf` fast-path vs. re-encode, splits, underflow merges/redistributions, and LIRE reassignments under `cf_vectors`.
-3. Run `cargo run --release -p izzydb --example recall_bench` to verify recall parity and measure insert + `search_with_rerank` latency.
+3. Run `cargo run --release -p izzydb-bench --bin recall_bench` to verify recall parity and measure insert + `search_with_rerank` latency.

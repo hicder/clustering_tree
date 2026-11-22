@@ -25,7 +25,7 @@ A fixed 256-slot block geometry aligns storage, caching, and SIMD execution arou
 
 1. **Compact 256-bit masks (`[u64; 4]`, 32 bytes):** Presence bitmaps, filter masks, touched-slot sets, and candidate hit masks all share the same four `u64` words. Bitwise set operations (`&`, `|`), popcount checks, and SIMD predicate comparisons map 1-to-1 onto 256 slots.
 2. **L1-resident working buffers (`[f32; 256]`, 1 KiB each):** Both the per-block score accumulator (`scores`) and precomputed document-length normalization array (`dl_norm`) fit in 1 KiB on the stack—16 AVX-512 vectors, 32 AVX2 vectors, or 64 NEON vectors.
-3. **Out-of-line document lengths (`cf_fts_doc_lens`):** Document lengths (`dl`) depend only on `(attr_id, block_id)`, not on individual query terms. Storing them once per block eliminates `dl` duplication from every term's posting block and lets all query terms on the same attribute share one SIMD-computed `dl_norm` array.
+3. **Out-of-line document lengths in `default`:** Document lengths (`dl`) depend only on `(attr_id, block_id)`, not on individual query terms. Storing them once per block eliminates `dl` duplication from every term's posting block and lets all query terms on the same attribute share one SIMD-computed `dl_norm` array.
 4. **Out-of-line skip summaries (`cf_fts_skips`) + inline rare terms:** Block-Max upper bounds `(max_tf, min_dl_over_tf)` for 256 posting blocks are packed into a single `SkipBlock` KV so MAXSCORE pruning reads compact skip chunks (`RocksSkipCursor`) and touches `cf_fts_postings` only on blocks that survive pruning. Single-block rare terms (`doc_freq <= 8`) inline their v3 posting block directly inside `cf_fts_terms` (`TermRecord`).
 
 ---
@@ -34,15 +34,15 @@ A fixed 256-slot block geometry aligns storage, caching, and SIMD execution arou
 
 ### 2.1 RocksDB Column Families & Keys
 
-Block-Max MAXSCORE reads from `cf_fts_terms`, `cf_fts_skips`, `cf_fts_doc_lens`, and lazily from `cf_fts_postings` (plus `cf_meta["fts_meta"]` for `doc_count`/`total_tokens` and `cf_fts_rev_doc_map` to resolve top-$k$ `FtsDocId -> DocId`):
+Block-Max MAXSCORE reads from `cf_fts_terms`, `cf_fts_skips`, FTS document lengths in `default`, and lazily from `cf_fts_postings` (plus `default[b"\x01fts_meta"]` for `doc_count`/`total_tokens` and FTS reverse-map blocks in `default` to resolve top-$k$ `FtsDocId -> DocId`):
 
 | Column Family | Key Format | Value Format | Access & Caching Pattern |
 |---|---|---|---|
 | `cf_fts_terms` | `attr_id` (`u16` BE) \|\| `token_utf8` | `TermRecord` (`term_id`, `TermStats`, optional inline v3 block) | Sorted `batched_multi_get_cf` (or 2-byte prefix scan for `last_as_prefix`) |
 | `cf_fts_skips` | `term_id` (`u32` BE) \|\| `chunk_id` (`u32` BE) (8 B) | `SkipBlock` (up to 256 blocks' bounds) | Uncompressed CF, 4 B prefix Bloom; batched `chunk 0` pin + lazy `skip_iter` |
-| `cf_fts_doc_lens` | `attr_id` (`u16` BE) \|\| `block_id` (`u32` BE) (6 B) | `DocLenBlock` (260 / 516 / 1,028 B) | Uncompressed CF; lazily loaded into `Storage::fts_doc_lens_cache` per `attr_id` |
+| FTS document lengths in `default` | `0x05` \|\| `attr_id` (`u16` BE) \|\| `block_id` (`u32` BE) (7 B) | `DocLenBlock` (260 / 516 / 1,028 B) | Lazily loaded into `Storage::fts_doc_lens_cache` per `attr_id` |
 | `cf_fts_postings` | `term_id` (`u32` BE) \|\| `block_id` (`u32` BE) (8 B) | v3 `PackedPostingBlock` (TF-only) | Uncompressed CF, 4 B prefix Bloom; lazy sequential `posting_iter` inside `RocksSkipCursor` |
-| `cf_fts_rev_doc_map` | `block_id` (`u32` BE, 4 B) | `FtsRevBlock` (4,128 B) | Uncompressed CF; cached in `Storage::fts_rev_map_cache` |
+| FTS reverse-map blocks in `default` | `0x04` \|\| `block_id` (`u32` BE) (5 B) | `FtsRevBlock` (4,128 B) | Cached in `Storage::fts_rev_map_cache` |
 
 ### 2.2 Adaptive Integer Width (`IntWidth`)
 
@@ -84,7 +84,7 @@ Offset                 Size                  Field
 
 `SkipBlockLayout::parse` validates a chunk once on load and slices views without re-parsing the header across `next_block()` / `seek_block()`.
 
-### 2.5 `DocLenBlock` (`cf_fts_doc_lens`)
+### 2.5 `DocLenBlock` (FTS document lengths in `default`)
 
 Fixed-slot 256-entry block stored once per `(attr_id, block_id)` whenever at least one document in the block has a non-zero token count (`count: 1..=256`). Deleted or absent slots store `dl = 0`.
 
@@ -240,7 +240,7 @@ All 256-slot kernels live in [`crates/izzydb-fts/src/simd.rs`](../../crates/izzy
 
 Key execution details:
 
-1. **Out-of-line skip pruning:** `TermStream::block_upper_bound` reads `(max_tf, min_dl_over_tf)` directly from the `SkipBlockView` pinned in `RocksSkipCursor` (or an inline `TermRecord`). Neither `cf_fts_postings` nor `cf_fts_doc_lens` is touched unless a block survives pruning.
+1. **Out-of-line skip pruning:** `TermStream::block_upper_bound` reads `(max_tf, min_dl_over_tf)` directly from the `SkipBlockView` pinned in `RocksSkipCursor` (or an inline `TermRecord`). A block must survive pruning before the cursor reads postings or document lengths for it.
 2. **Batched `chunk 0` & lazy sequential `cf_fts_postings` cursors:** `open_fts_skip_cursors` batch-fetches `chunk 0` of `cf_fts_skips` (covering docs `0..65,535`) via a single sorted `batched_multi_get_cf`, avoiding per-term skip iterators; each `RocksSkipCursor` opens a sequential `DBRawIterator` on `cf_fts_postings` lazily only on its first surviving block.
 3. **Descending non-essential seek & early exit:** Non-essential clauses are sought in **descending** global `term_max` order using skip bounds only, stopping as soon as `(max_ess + non_ess_block_ub + rem_global) < theta`.
 4. **Progressive `active_mask` narrowing:** Before each surviving non-essential clause, `filter_ge_256` clears bits in `active_mask` that can no longer reach `theta`, driving masked accumulation into scalar fast paths and terminating early when `active_mask == [0; 4]`.

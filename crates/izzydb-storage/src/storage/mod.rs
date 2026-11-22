@@ -12,9 +12,9 @@ use std::sync::{Arc, RwLock};
 
 use roaring::RoaringBitmap;
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DBCompressionType,
-    DBPinnableSlice, Direction, IteratorMode, Options, ReadOptions, SliceTransform, WriteBatch, DB,
-    DEFAULT_COLUMN_FAMILY_NAME,
+    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DB, DBCompressionType,
+    DBPinnableSlice, DEFAULT_COLUMN_FAMILY_NAME, Direction, IteratorMode, Options, PrefixRange,
+    ReadOptions, SliceTransform, WriteBatch,
 };
 
 use izzydb_core::config::{
@@ -25,7 +25,7 @@ use izzydb_core::schema::CollectionSchema;
 use izzydb_fts::TermRecord;
 
 use crate::codec::{
-    LeafPosting, LeafPostingView, decode_roaring_bitmap, decode_zone_map,
+    LeafPosting, LeafPostingView, decode_roaring_bitmap, decode_zone_map, encode_fts_block_key,
     encode_fts_term_id_key, encode_fts_term_id_prefix, encode_posting_prefix,
 };
 use crate::node::{PackedInternalNode, PackedLeafNode, TreeMeta, decode_f32_slice};
@@ -40,27 +40,29 @@ use types::{
     map_db_err, node_key,
 };
 
-pub const CF_META: &str = "cf_meta";
-pub const CF_INTERNAL_NODES: &str = "cf_internal_nodes";
 pub const CF_LEAF_ENTRIES: &str = "cf_leaf_entries";
 pub const CF_VECTORS: &str = "cf_vectors";
 pub const CF_DOC_LOC: &str = "cf_doc_loc";
 pub const CF_DOCS: &str = "cf_docs";
 pub const CF_ATTR_CLUSTERS: &str = "cf_attr_clusters";
 pub const CF_ATTR_POSTINGS: &str = "cf_attr_postings";
-pub const CF_ATTR_ZONES: &str = "cf_attr_zones";
-pub const CF_FTS_REV_DOC_MAP: &str = "cf_fts_rev_doc_map";
 pub const CF_FTS_TERMS: &str = "cf_fts_terms";
 pub const CF_FTS_SKIPS: &str = "cf_fts_skips";
 pub const CF_FTS_POSTINGS: &str = "cf_fts_postings";
 pub const CF_FTS_POSITIONS: &str = "cf_fts_positions";
-pub const CF_FTS_DOC_LENS: &str = "cf_fts_doc_lens";
 
-const META_KEY: &[u8] = b"tree_meta";
-const SCHEMA_KEY: &[u8] = b"schema";
-const FTS_META_KEY: &[u8] = b"fts_meta";
-const FTS_FREE_IDS_KEY: &[u8] = b"fts_free_ids";
+// Each keyspace in the default column family starts with a distinct byte.
+const INTERNAL_NODE_TAG: u8 = 2;
+const ATTR_ZONE_TAG: u8 = 3;
+const FTS_REV_BLOCK_TAG: u8 = 4;
+const FTS_DOC_LEN_TAG: u8 = 5;
+
+const META_KEY: &[u8] = b"\x01tree_meta";
+const SCHEMA_KEY: &[u8] = b"\x01schema";
+const FTS_META_KEY: &[u8] = b"\x01fts_meta";
+const FTS_FREE_IDS_KEY: &[u8] = b"\x01fts_free_ids";
 const BLOCK_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const DB_WRITE_BUFFER_BYTES: usize = 128 * 1024 * 1024;
 const ATTR_POSTING_PREFIX_LEN: usize = 7;
 
 /// Ordered byte range bounds (`(value_bytes, inclusive)`) for prefix-bounded RocksDB scans.
@@ -88,13 +90,15 @@ impl Storage {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+        db_opts.set_db_write_buffer_size(DB_WRITE_BUFFER_BYTES);
 
         let block_cache = Cache::new_lru_cache(BLOCK_CACHE_BYTES);
 
-        let cf_descriptors = vec![
-            ColumnFamilyDescriptor::new(DEFAULT_COLUMN_FAMILY_NAME, Options::default()),
-            ColumnFamilyDescriptor::new(CF_META, Options::default()),
-            ColumnFamilyDescriptor::new(CF_INTERNAL_NODES, point_lookup_cf_opts(&block_cache, false)),
+        let cf_descriptors = [
+            ColumnFamilyDescriptor::new(
+                DEFAULT_COLUMN_FAMILY_NAME,
+                point_lookup_cf_opts(&block_cache, false),
+            ),
             ColumnFamilyDescriptor::new(CF_LEAF_ENTRIES, point_lookup_cf_opts(&block_cache, true)),
             ColumnFamilyDescriptor::new(CF_VECTORS, point_lookup_cf_opts(&block_cache, true)),
             ColumnFamilyDescriptor::new(CF_DOC_LOC, point_lookup_cf_opts(&block_cache, false)),
@@ -104,16 +108,10 @@ impl Storage {
                 CF_ATTR_POSTINGS,
                 prefix_cf_opts(&block_cache, ATTR_POSTING_PREFIX_LEN, true),
             ),
-            ColumnFamilyDescriptor::new(CF_ATTR_ZONES, point_lookup_cf_opts(&block_cache, false)),
-            ColumnFamilyDescriptor::new(
-                CF_FTS_REV_DOC_MAP,
-                point_lookup_cf_opts(&block_cache, true),
-            ),
             ColumnFamilyDescriptor::new(CF_FTS_TERMS, prefix_cf_opts(&block_cache, 2, false)),
             ColumnFamilyDescriptor::new(CF_FTS_SKIPS, prefix_cf_opts(&block_cache, 4, true)),
             ColumnFamilyDescriptor::new(CF_FTS_POSTINGS, prefix_cf_opts(&block_cache, 4, true)),
             ColumnFamilyDescriptor::new(CF_FTS_POSITIONS, prefix_cf_opts(&block_cache, 4, false)),
-            ColumnFamilyDescriptor::new(CF_FTS_DOC_LENS, point_lookup_cf_opts(&block_cache, true)),
         ];
 
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors).map_err(map_db_err)?;
@@ -202,16 +200,14 @@ impl Storage {
     }
 
     pub fn get_meta(&self) -> Result<Option<TreeMeta>> {
-        let cf = self.cf(CF_META)?;
-        match self.db.get_cf(cf, META_KEY).map_err(map_db_err)? {
+        match self.db.get(META_KEY).map_err(map_db_err)? {
             Some(bytes) => Ok(Some(TreeMeta::decode(&bytes)?)),
             None => Ok(None),
         }
     }
 
     pub fn get_schema(&self) -> Result<Option<CollectionSchema>> {
-        let cf = self.cf(CF_META)?;
-        match self.db.get_cf(cf, SCHEMA_KEY).map_err(map_db_err)? {
+        match self.db.get(SCHEMA_KEY).map_err(map_db_err)? {
             Some(bytes) => Ok(Some(CollectionSchema::decode(&bytes)?)),
             None => Ok(None),
         }
@@ -275,8 +271,8 @@ impl Storage {
     }
 
     pub fn get_internal_node(&self, node_id: NodeId) -> Result<Option<PackedInternalNode>> {
-        let cf = self.cf(CF_INTERNAL_NODES)?;
-        match self.db.get_pinned_cf(cf, node_key(node_id)).map_err(map_db_err)? {
+        let key = tagged_key::<5>(INTERNAL_NODE_TAG, &node_key(node_id));
+        match self.db.get_pinned(key).map_err(map_db_err)? {
             Some(bytes) => Ok(Some(PackedInternalNode::decode(&bytes, self.dim)?)),
             None => Ok(None),
         }
@@ -428,20 +424,19 @@ impl Storage {
             return Ok(Arc::clone(table));
         }
 
-        let cf = self.cf(CF_ATTR_ZONES)?;
         let mut map: HashMap<(AttrId, u8), AttrZoneMap> = HashMap::new();
-        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
-            let (k, v) = item.map_err(map_db_err)?;
+        self.visit_default(&[ATTR_ZONE_TAG], |k, v| {
             if k.len() != 3 {
                 return Err(TreeError::CorruptedData(format!(
-                    "cf_attr_zones key expected 3 bytes, got {}",
+                    "attribute zone key expected 3 bytes after its tag, got {}",
                     k.len()
                 )));
             }
             let attr_id = u16::from_be_bytes([k[0], k[1]]);
             let type_tag = k[2];
-            map.insert((attr_id, type_tag), decode_zone_map(&v)?);
-        }
+            map.insert((attr_id, type_tag), decode_zone_map(v)?);
+            Ok(())
+        })?;
         let table = Arc::new(map);
         *write_guard = Some(Arc::clone(&table));
         Ok(table)
@@ -547,8 +542,38 @@ impl Storage {
         Ok(out)
     }
 
+    fn visit_default(
+        &self,
+        prefix: &[u8],
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let mut options = ReadOptions::default();
+        options.set_iterate_range(PrefixRange(prefix));
+        let mut iter = self.db.raw_iterator_opt(options);
+        iter.seek(prefix);
+        while let Some((key, value)) = iter.item() {
+            visit(&key[prefix.len()..], value)?;
+            iter.next();
+        }
+        iter.status().map_err(map_db_err)
+    }
+
+    fn scan_default<K, V>(
+        &self,
+        tag: u8,
+        mut decode_key: impl FnMut(&[u8]) -> Result<K>,
+        mut decode_val: impl FnMut(&[u8]) -> Result<V>,
+    ) -> Result<Vec<(K, V)>> {
+        let mut out = Vec::new();
+        self.visit_default(&[tag], |key, value| {
+            out.push((decode_key(key)?, decode_val(value)?));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     pub fn all_internal_nodes(&self) -> Result<Vec<(NodeId, PackedInternalNode)>> {
-        self.scan_cf(CF_INTERNAL_NODES, decode_u32_key, |v| {
+        self.scan_default(INTERNAL_NODE_TAG, decode_u32_key, |v| {
             PackedInternalNode::decode(v, self.dim)
         })
     }
@@ -580,17 +605,15 @@ impl Storage {
     }
 
     pub fn all_attr_zones(&self) -> Result<Vec<(Vec<u8>, AttrZoneMap)>> {
-        self.scan_cf(CF_ATTR_ZONES, |k| Ok(k.to_vec()), decode_zone_map)
+        self.scan_default(ATTR_ZONE_TAG, |k| Ok(k.to_vec()), decode_zone_map)
     }
 
     pub fn get_fts_meta_bytes(&self) -> Result<Option<Vec<u8>>> {
-        let cf = self.cf(CF_META)?;
-        self.db.get_cf(cf, FTS_META_KEY).map_err(map_db_err)
+        self.db.get(FTS_META_KEY).map_err(map_db_err)
     }
 
     pub fn get_fts_free_ids(&self) -> Result<RoaringBitmap> {
-        let cf = self.cf(CF_META)?;
-        match self.db.get_pinned_cf(cf, FTS_FREE_IDS_KEY).map_err(map_db_err)? {
+        match self.db.get_pinned(FTS_FREE_IDS_KEY).map_err(map_db_err)? {
             Some(bytes) => decode_roaring_bitmap(&bytes),
             None => Ok(RoaringBitmap::new()),
         }
@@ -626,29 +649,24 @@ impl Storage {
             return Ok(Arc::clone(table));
         }
 
-        let cf = self.cf(CF_FTS_REV_DOC_MAP)?;
         let mut blocks: Vec<Option<Arc<FtsRevBlock>>> = Vec::new();
-        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
-            let (k, v) = item.map_err(map_db_err)?;
-            let block_id = decode_u32_key(&k)? as usize;
-            let blk = Arc::new(FtsRevBlock::decode(&v)?);
+        self.visit_default(&[FTS_REV_BLOCK_TAG], |k, v| {
+            let block_id = decode_u32_key(k)? as usize;
+            let blk = Arc::new(FtsRevBlock::decode(v)?);
             if blocks.len() <= block_id {
                 blocks.resize_with(block_id + 1, || None);
             }
             blocks[block_id] = Some(blk);
-        }
+            Ok(())
+        })?;
         let table = Arc::new(blocks);
         *write_guard = Some(Arc::clone(&table));
         Ok(table)
     }
 
     pub fn get_fts_rev_block(&self, block_id: FtsBlockId) -> Result<Option<FtsRevBlock>> {
-        let cf = self.cf(CF_FTS_REV_DOC_MAP)?;
-        match self
-            .db
-            .get_pinned_cf(cf, crate::codec::encode_fts_block_key(block_id))
-            .map_err(map_db_err)?
-        {
+        let key = tagged_key::<5>(FTS_REV_BLOCK_TAG, &encode_fts_block_key(block_id));
+        match self.db.get_pinned(key).map_err(map_db_err)? {
             Some(bytes) => Ok(Some(FtsRevBlock::decode(&bytes)?)),
             None => Ok(None),
         }
@@ -835,8 +853,8 @@ impl Storage {
     }
 
     pub fn get_fts_doc_len_bytes(&self, key: &[u8; 6]) -> Result<Option<Vec<u8>>> {
-        let cf = self.cf(CF_FTS_DOC_LENS)?;
-        self.db.get_cf(cf, key).map_err(map_db_err)
+        let key = tagged_key::<7>(FTS_DOC_LEN_TAG, key);
+        self.db.get(key).map_err(map_db_err)
     }
 
     fn build_skip_cursor<'a>(
@@ -923,32 +941,23 @@ impl Storage {
             });
         }
 
-        let cf = self.cf(CF_FTS_DOC_LENS)?;
-        let prefix = attr_id.to_be_bytes();
-        let mut iter = self.db.raw_iterator_cf(cf);
-        iter.seek(prefix);
+        let prefix = tagged_key::<3>(FTS_DOC_LEN_TAG, &attr_id.to_be_bytes());
         let mut blocks: Vec<Option<Box<[u8]>>> = Vec::new();
-        while let Some(k) = iter.key() {
-            if k.len() != 6 || k[0] != prefix[0] || k[1] != prefix[1] {
-                break;
+        self.visit_default(&prefix, |key, value| {
+            let block_id = decode_u32_key(key)? as usize;
+            if blocks.len() <= block_id {
+                blocks.resize_with(block_id + 1, || None);
             }
-            let block_id = u32::from_be_bytes(k[2..6].try_into().unwrap()) as usize;
-            if let Some(val) = iter.value() {
-                if blocks.len() <= block_id {
-                    blocks.resize_with(block_id + 1, || None);
-                }
-                blocks[block_id] = Some(val.to_vec().into_boxed_slice());
-            }
-            iter.next();
-        }
-        iter.status().map_err(map_db_err)?;
+            blocks[block_id] = Some(value.into());
+            Ok(())
+        })?;
         let table = Arc::new(blocks);
         write_guard.insert(attr_id, Arc::clone(&table));
         Ok(RocksDocLenCursor { blocks: table })
     }
 
     pub fn all_fts_rev_blocks(&self) -> Result<Vec<(FtsBlockId, FtsRevBlock)>> {
-        self.scan_cf(CF_FTS_REV_DOC_MAP, decode_u32_key, FtsRevBlock::decode)
+        self.scan_default(FTS_REV_BLOCK_TAG, decode_u32_key, FtsRevBlock::decode)
     }
 
     pub fn all_fts_terms(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
@@ -968,7 +977,7 @@ impl Storage {
     }
 
     pub fn all_fts_doc_lens(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.scan_cf(CF_FTS_DOC_LENS, |k| Ok(k.to_vec()), |v| Ok(v.to_vec()))
+        self.scan_default(FTS_DOC_LEN_TAG, |k| Ok(k.to_vec()), |v| Ok(v.to_vec()))
     }
 
     pub(super) fn cf(&self, name: &str) -> Result<&ColumnFamily> {
@@ -976,6 +985,12 @@ impl Storage {
             .cf_handle(name)
             .ok_or_else(|| TreeError::CorruptedData(format!("missing column family {name}")))
     }
+}
+
+fn tagged_key<const N: usize>(tag: u8, key: &[u8]) -> [u8; N] {
+    let mut tagged = [tag; N];
+    tagged[1..].copy_from_slice(key);
+    tagged
 }
 
 fn point_lookup_cf_opts(block_cache: &Cache, disable_compression: bool) -> Options {

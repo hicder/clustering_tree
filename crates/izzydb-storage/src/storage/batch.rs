@@ -8,10 +8,10 @@ use crate::node::{PackedInternalNode, PackedLeafNode, TreeMeta, encode_f32_slice
 
 use super::types::{DocLoc, doc_key, node_key};
 use super::{
-    CF_ATTR_CLUSTERS, CF_ATTR_POSTINGS, CF_ATTR_ZONES, CF_DOC_LOC, CF_DOCS, CF_FTS_DOC_LENS,
-    CF_FTS_POSITIONS, CF_FTS_POSTINGS, CF_FTS_REV_DOC_MAP, CF_FTS_SKIPS, CF_FTS_TERMS,
-    CF_INTERNAL_NODES, CF_LEAF_ENTRIES, CF_META, CF_VECTORS, FTS_FREE_IDS_KEY, FTS_META_KEY,
-    META_KEY, SCHEMA_KEY, Storage,
+    ATTR_ZONE_TAG, CF_ATTR_CLUSTERS, CF_ATTR_POSTINGS, CF_DOC_LOC, CF_DOCS, CF_FTS_POSITIONS,
+    CF_FTS_POSTINGS, CF_FTS_SKIPS, CF_FTS_TERMS, CF_LEAF_ENTRIES, CF_VECTORS, FTS_DOC_LEN_TAG,
+    FTS_FREE_IDS_KEY, FTS_META_KEY, FTS_REV_BLOCK_TAG, INTERNAL_NODE_TAG, META_KEY, SCHEMA_KEY,
+    Storage, tagged_key,
 };
 
 /// Typed wrapper around `rocksdb::WriteBatch` for atomic tree and attribute index mutations.
@@ -32,19 +32,21 @@ impl<'a> StorageBatch<'a> {
     }
 
     pub fn put_meta(&mut self, meta: &TreeMeta) {
-        self.put_cf(CF_META, META_KEY, &meta.encode());
+        self.batch.put(META_KEY, meta.encode());
     }
 
     pub fn put_schema(&mut self, schema: &CollectionSchema) {
-        self.put_cf(CF_META, SCHEMA_KEY, &schema.encode());
+        self.batch.put(SCHEMA_KEY, schema.encode());
     }
 
     pub fn put_internal_node(&mut self, node_id: NodeId, node: &PackedInternalNode) {
-        self.put_cf(CF_INTERNAL_NODES, &node_key(node_id), &node.encode(self.storage.dim));
+        let key = tagged_key::<5>(INTERNAL_NODE_TAG, &node_key(node_id));
+        self.batch.put(key, node.encode(self.storage.dim));
     }
 
     pub fn delete_internal_node(&mut self, node_id: NodeId) {
-        self.delete_cf(CF_INTERNAL_NODES, &node_key(node_id));
+        self.batch
+            .delete(tagged_key::<5>(INTERNAL_NODE_TAG, &node_key(node_id)));
     }
 
     pub fn put_leaf_node(&mut self, leaf_id: NodeId, leaf: &PackedLeafNode) {
@@ -101,31 +103,33 @@ impl<'a> StorageBatch<'a> {
     }
 
     pub fn put_attr_zone(&mut self, key: &[u8; 3], bytes: &[u8]) {
-        self.put_cf(CF_ATTR_ZONES, key, bytes);
+        self.batch.put(tagged_key::<4>(ATTR_ZONE_TAG, key), bytes);
     }
 
     pub fn delete_attr_zone(&mut self, key: &[u8; 3]) {
-        self.delete_cf(CF_ATTR_ZONES, key);
+        self.batch.delete(tagged_key::<4>(ATTR_ZONE_TAG, key));
     }
 
     pub fn put_fts_meta_bytes(&mut self, bytes: &[u8]) {
-        self.put_cf(CF_META, FTS_META_KEY, bytes);
+        self.batch.put(FTS_META_KEY, bytes);
     }
 
     pub fn put_fts_free_ids(&mut self, bytes: &[u8]) {
-        self.put_cf(CF_META, FTS_FREE_IDS_KEY, bytes);
+        self.batch.put(FTS_FREE_IDS_KEY, bytes);
     }
 
     pub fn delete_fts_free_ids(&mut self) {
-        self.delete_cf(CF_META, FTS_FREE_IDS_KEY);
+        self.batch.delete(FTS_FREE_IDS_KEY);
     }
 
     pub fn put_fts_rev_block(&mut self, block_id: FtsBlockId, bytes: &[u8]) {
-        self.put_cf(CF_FTS_REV_DOC_MAP, &encode_fts_block_key(block_id), bytes);
+        let key = tagged_key::<5>(FTS_REV_BLOCK_TAG, &encode_fts_block_key(block_id));
+        self.batch.put(key, bytes);
     }
 
     pub fn delete_fts_rev_block(&mut self, block_id: FtsBlockId) {
-        self.delete_cf(CF_FTS_REV_DOC_MAP, &encode_fts_block_key(block_id));
+        let key = tagged_key::<5>(FTS_REV_BLOCK_TAG, &encode_fts_block_key(block_id));
+        self.batch.delete(key);
     }
 
     pub fn put_fts_term(&mut self, key: &[u8], bytes: &[u8]) {
@@ -161,10 +165,10 @@ impl<'a> StorageBatch<'a> {
     }
 
     pub fn put_fts_doc_len(&mut self, key: &[u8; 6], bytes: &[u8]) {
-        self.put_cf(CF_FTS_DOC_LENS, key, bytes);
+        self.batch.put(tagged_key::<7>(FTS_DOC_LEN_TAG, key), bytes);
     }
 
     pub fn delete_fts_doc_len(&mut self, key: &[u8; 6]) {
-        self.delete_cf(CF_FTS_DOC_LENS, key);
+        self.batch.delete(tagged_key::<7>(FTS_DOC_LEN_TAG, key));
     }
 }

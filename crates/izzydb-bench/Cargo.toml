@@ -7,6 +7,10 @@ description = "Benchmarks for izzydb"
 publish = false
 
 [dependencies]
+arrow-array = "55.2"
+arrow-schema = "55.2"
 izzydb.workspace = true
+izzydb-bulk = { path = "../izzydb-bulk" }
+parquet = { version = "55.2", default-features = false, features = ["arrow"] }
 rand.workspace = true
 tempfile.workspace = true

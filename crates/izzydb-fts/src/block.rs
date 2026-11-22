@@ -98,6 +98,18 @@ pub struct FtsMeta {
 }
 
 impl FtsMeta {
+    pub fn new(
+        next_fts_doc_id: FtsDocId,
+        next_term_id: TermId,
+        per_attr_stats: BTreeMap<AttrId, AttrFtsStats>,
+    ) -> Self {
+        Self {
+            next_fts_doc_id,
+            next_term_id,
+            per_attr_stats,
+        }
+    }
+
     pub fn alloc_doc_id(&mut self) -> Result<FtsDocId> {
         let id = self.next_fts_doc_id;
         // Reserve FtsDocId::MAX (u32::MAX) as sentinel for "absent" in DocLoc.
@@ -240,6 +252,27 @@ impl TermRecord {
         Self {
             term_id,
             stats: TermStats::default(),
+            inline_block: None,
+        }
+    }
+
+    pub fn with_inline(
+        term_id: TermId,
+        stats: TermStats,
+        block_id: FtsBlockId,
+        block_bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            term_id,
+            stats,
+            inline_block: Some((block_id, block_bytes)),
+        }
+    }
+
+    pub fn out_of_line(term_id: TermId, stats: TermStats) -> Self {
+        Self {
+            term_id,
+            stats,
             inline_block: None,
         }
     }
@@ -423,6 +456,25 @@ pub struct SkipBlock {
 }
 
 impl SkipBlock {
+    /// Construct a [`SkipBlock`] directly from strictly sorted `(rel_block_id, max_tf, min_dl_over_tf)` entries.
+    pub fn from_sorted_bounds(entries: &[(u8, u32, f32)]) -> Self {
+        debug_assert!(!entries.is_empty() && entries.len() <= FTS_SKIP_CHUNK_SIZE);
+        debug_assert!(entries.windows(2).all(|w| w[0].0 < w[1].0));
+        let mut rel_block_ids = Vec::with_capacity(entries.len());
+        let mut max_tfs = Vec::with_capacity(entries.len());
+        let mut min_dl_over_tfs = Vec::with_capacity(entries.len());
+        for &(rel, max_tf, min_ratio) in entries {
+            rel_block_ids.push(rel);
+            max_tfs.push(max_tf);
+            min_dl_over_tfs.push(min_ratio);
+        }
+        Self {
+            rel_block_ids,
+            max_tfs,
+            min_dl_over_tfs,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.rel_block_ids.is_empty()
     }
@@ -582,6 +634,20 @@ impl Default for DocLenBlock {
 }
 
 impl DocLenBlock {
+    /// Construct a [`DocLenBlock`] directly from a slice of up to 256 per-slot document lengths.
+    pub fn from_dls(slot_dls: &[u32]) -> Self {
+        debug_assert!(slot_dls.len() <= FTS_BLOCK_SIZE);
+        let mut dls = [0u32; FTS_BLOCK_SIZE];
+        let mut count = 0u16;
+        for (i, &dl) in slot_dls.iter().enumerate() {
+            if dl > 0 {
+                dls[i] = dl;
+                count += 1;
+            }
+        }
+        Self { dls, count }
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.count == 0
@@ -882,6 +948,32 @@ impl Default for PackedPostingBlock {
 }
 
 impl PackedPostingBlock {
+    /// Construct a [`PackedPostingBlock`] directly from strictly sorted `(slot, tf)` pairs
+    /// using `slot_dl` to compute exact `max_tf` and `min_dl_over_tf` bounds.
+    pub fn from_sorted_with_dl(entries: &[(u8, u32)], slot_dl: impl Fn(u8) -> u32) -> Self {
+        debug_assert!(entries.len() <= FTS_BLOCK_SIZE);
+        debug_assert!(entries.windows(2).all(|w| w[0].0 < w[1].0));
+        let mut slots = Vec::with_capacity(entries.len());
+        let mut tfs = Vec::with_capacity(entries.len());
+        for &(s, tf) in entries {
+            slots.push(s);
+            tfs.push(tf);
+        }
+        let mut blk = Self {
+            slots,
+            tfs,
+            max_tf: 0,
+            min_dl_over_tf: f32::INFINITY,
+        };
+        blk.recompute_bounds_with(slot_dl);
+        blk
+    }
+
+    /// Encode sorted `(slot, tf)` pairs directly against `doc_lens`.
+    pub fn encode_from_sorted(entries: &[(u8, u32)], doc_lens: &DocLenBlock) -> Vec<u8> {
+        Self::from_sorted_with_dl(entries, |s| doc_lens.get(s)).encode()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
@@ -914,6 +1006,10 @@ impl PackedPostingBlock {
     }
 
     pub fn recompute_bounds(&mut self, doc_lens: &DocLenBlock) {
+        self.recompute_bounds_with(|slot| doc_lens.get(slot));
+    }
+
+    pub fn recompute_bounds_with(&mut self, slot_dl: impl Fn(u8) -> u32) {
         if self.slots.is_empty() {
             self.max_tf = 0;
             self.min_dl_over_tf = f32::INFINITY;
@@ -925,7 +1021,7 @@ impl PackedPostingBlock {
             if tf > max_tf {
                 max_tf = tf;
             }
-            let dl = doc_lens.get(slot);
+            let dl = slot_dl(slot);
             let ratio = dl_over_tf_lower_bound(dl, tf);
             if ratio < min_ratio {
                 min_ratio = ratio;
@@ -1188,6 +1284,21 @@ impl PackedPositionBlock {
         true
     }
 
+    /// Encode sorted `(slot, positions)` slices directly into `cf_fts_positions` bytes.
+    pub fn encode_from_sorted_slices(entries: &[(u8, &[u32])]) -> Vec<u8> {
+        debug_assert!(!entries.is_empty() && entries.len() <= FTS_BLOCK_SIZE);
+        debug_assert!(entries.windows(2).all(|w| w[0].0 < w[1].0));
+        let count = entries.len();
+        let mut offsets: Vec<u32> = Vec::with_capacity(count + 1);
+        let mut varints: Vec<u8> = Vec::with_capacity(count * 4);
+        offsets.push(0);
+        for &(_, pos_list) in entries {
+            encode_delta_varints(pos_list, &mut varints);
+            offsets.push(varints.len() as u32);
+        }
+        finish_position_block_encode(entries.iter().map(|&(s, _)| s), &offsets, &varints)
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         debug_assert!(!self.slots.is_empty() && self.slots.len() <= FTS_BLOCK_SIZE);
         let count = self.slots.len();
@@ -1198,25 +1309,7 @@ impl PackedPositionBlock {
             encode_delta_varints(pos_list, &mut varints);
             offsets.push(varints.len() as u32);
         }
-
-        let u32_offsets = varints.len() > u16::MAX as usize;
-        let off_width = if u32_offsets { 4usize } else { 2usize };
-        let flags = if u32_offsets { POS_FLAG_U32_OFFSETS } else { 0 };
-        let mut buf = Vec::with_capacity(2 + count + (count + 1) * off_width + varints.len());
-        buf.push(flags);
-        buf.push((count - 1) as u8);
-        buf.extend_from_slice(&self.slots);
-        if u32_offsets {
-            for off in offsets {
-                buf.extend_from_slice(&off.to_le_bytes());
-            }
-        } else {
-            for off in offsets {
-                buf.extend_from_slice(&(off as u16).to_le_bytes());
-            }
-        }
-        buf.extend_from_slice(&varints);
-        buf
+        finish_position_block_encode(self.slots.iter().copied(), &offsets, &varints)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
@@ -1238,6 +1331,32 @@ impl PackedPositionBlock {
             positions,
         })
     }
+}
+
+fn finish_position_block_encode(
+    slots: impl ExactSizeIterator<Item = u8>,
+    offsets: &[u32],
+    varints: &[u8],
+) -> Vec<u8> {
+    let count = slots.len();
+    let u32_offsets = varints.len() > u16::MAX as usize;
+    let off_width = if u32_offsets { 4usize } else { 2usize };
+    let flags = if u32_offsets { POS_FLAG_U32_OFFSETS } else { 0 };
+    let mut buf = Vec::with_capacity(2 + count + (count + 1) * off_width + varints.len());
+    buf.push(flags);
+    buf.push((count - 1) as u8);
+    buf.extend(slots);
+    if u32_offsets {
+        for &off in offsets {
+            buf.extend_from_slice(&off.to_le_bytes());
+        }
+    } else {
+        for &off in offsets {
+            buf.extend_from_slice(&(off as u16).to_le_bytes());
+        }
+    }
+    buf.extend_from_slice(varints);
+    buf
 }
 
 fn encode_delta_varints(positions: &[u32], out: &mut Vec<u8>) {

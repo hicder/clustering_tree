@@ -59,6 +59,25 @@ pub(crate) fn route_to_leaf_in_tx(
         .ok_or_else(|| TreeError::CorruptedData("route_to_leaf_in_tx reached empty frontier".into()))
 }
 
+/// Route a prepared vector to the single closest leaf via an arbitrary internal-node lookup closure.
+pub fn route_to_leaf_with<'a, F>(
+    get_internal: F,
+    meta: &TreeMeta,
+    prepared_vec: &[f32],
+    beam_width: usize,
+    config: &TreeConfig,
+) -> Result<NodeId>
+where
+    F: Fn(NodeId) -> Result<&'a PackedInternalNode>,
+{
+    let leaves = search_leaves_with(get_internal, meta, prepared_vec, 1, beam_width, config)?;
+    leaves
+        .into_iter()
+        .next()
+        .map(|(id, _)| id)
+        .ok_or_else(|| TreeError::CorruptedData("route_to_leaf reached empty frontier".into()))
+}
+
 /// Find the top `count` closest leaves to `prepared_vec` using in-memory `cluster_distance` beam search.
 pub fn search_leaves(
     internal_cache: &HashMap<NodeId, PackedInternalNode>,
@@ -82,7 +101,7 @@ pub fn search_leaves(
     )
 }
 
-fn search_leaves_with<'a, F>(
+pub fn search_leaves_with<'a, F>(
     get_internal: F,
     meta: &TreeMeta,
     prepared_vec: &[f32],

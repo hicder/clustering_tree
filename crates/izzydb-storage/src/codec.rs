@@ -325,6 +325,47 @@ impl LeafPosting {
         Self { bm }
     }
 
+    pub fn from_slots(slots: &[LocalId]) -> Self {
+        let mut bm = RoaringBitmap::new();
+        for &slot in slots {
+            bm.insert(slot);
+        }
+        Self { bm }
+    }
+
+    /// Encode sorted unique `LocalId` slots directly without constructing a `RoaringBitmap`
+    /// for the common sparse and dense cases.
+    pub fn encode_sorted_slots(slots: &[LocalId]) -> Result<Vec<u8>> {
+        debug_assert!(slots.windows(2).all(|w| w[0] < w[1]));
+        let len = slots.len();
+        let max_id = slots.last().copied().unwrap_or(0);
+        if len <= LEAF_POSTING_SPARSE_MAX && max_id <= u16::MAX as u32 {
+            let mut buf = Vec::with_capacity(1 + len * 2);
+            buf.push(LEAF_POSTING_SPARSE);
+            for &id in slots {
+                buf.extend_from_slice(&(id as u16).to_le_bytes());
+            }
+            return Ok(buf);
+        }
+        if max_id <= LEAF_POSTING_DENSE_MAX_LOCAL_ID {
+            let num_words = (max_id as usize / 64) + 1;
+            let mut words = vec![0u64; num_words];
+            for &id in slots {
+                words[(id as usize) >> 6] |= 1u64 << (id & 63);
+            }
+            let mut buf = Vec::with_capacity(3 + num_words * 8);
+            buf.push(LEAF_POSTING_DENSE);
+            buf.extend_from_slice(&(num_words as u16).to_le_bytes());
+            for w in words {
+                buf.extend_from_slice(&w.to_le_bytes());
+            }
+            return Ok(buf);
+        }
+        let bm = RoaringBitmap::from_sorted_iter(slots.iter().copied())
+            .map_err(|e| TreeError::Storage(format!("roaring build error: {e}")))?;
+        Self::from_bitmap(bm).encode()
+    }
+
     pub fn into_bitmap(self) -> RoaringBitmap {
         self.bm
     }

@@ -7,14 +7,14 @@ mod tx;
 mod types;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use roaring::RoaringBitmap;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DB, DBCompressionType,
-    DBPinnableSlice, DEFAULT_COLUMN_FAMILY_NAME, Direction, IteratorMode, Options, PrefixRange,
-    ReadOptions, SliceTransform, WriteBatch,
+    DBPinnableSlice, DEFAULT_COLUMN_FAMILY_NAME, Direction, IngestExternalFileOptions,
+    IteratorMode, Options, PrefixRange, ReadOptions, SliceTransform, WriteBatch, WriteOptions,
 };
 
 use izzydb_core::config::{
@@ -33,13 +33,11 @@ use crate::node::{PackedInternalNode, PackedLeafNode, TreeMeta, decode_f32_slice
 pub use batch::StorageBatch;
 pub use fts_cursors::{RocksDocLenCursor, RocksSkipCursor};
 pub use tx::TxContext;
-pub use types::{AttrZoneMap, DocLoc, FtsRevBlock};
+pub use types::{AttrZoneMap, DocLoc, FtsRevBlock, doc_key, node_key};
 
-use types::{
-    AttrZoneTable, DocLenBlockTable, FtsRevBlockTable, decode_u32_key, decode_u64_key, doc_key,
-    map_db_err, node_key,
-};
+use types::{AttrZoneTable, DocLenBlockTable, FtsRevBlockTable, decode_u32_key, decode_u64_key, map_db_err};
 
+pub const DEFAULT_CF_NAME: &str = DEFAULT_COLUMN_FAMILY_NAME;
 pub const CF_LEAF_ENTRIES: &str = "cf_leaf_entries";
 pub const CF_VECTORS: &str = "cf_vectors";
 pub const CF_DOC_LOC: &str = "cf_doc_loc";
@@ -51,21 +49,36 @@ pub const CF_FTS_SKIPS: &str = "cf_fts_skips";
 pub const CF_FTS_POSTINGS: &str = "cf_fts_postings";
 pub const CF_FTS_POSITIONS: &str = "cf_fts_positions";
 
+pub const ALL_DATA_CF_NAMES: [&str; 10] = [
+    CF_VECTORS,
+    CF_DOCS,
+    CF_DOC_LOC,
+    CF_LEAF_ENTRIES,
+    CF_ATTR_CLUSTERS,
+    CF_ATTR_POSTINGS,
+    CF_FTS_POSITIONS,
+    CF_FTS_POSTINGS,
+    CF_FTS_SKIPS,
+    CF_FTS_TERMS,
+];
+
 // Each keyspace in the default column family starts with a distinct byte.
-const INTERNAL_NODE_TAG: u8 = 2;
-const ATTR_ZONE_TAG: u8 = 3;
-const FTS_REV_BLOCK_TAG: u8 = 4;
-const FTS_DOC_LEN_TAG: u8 = 5;
+pub const INTERNAL_NODE_TAG: u8 = 2;
+pub const ATTR_ZONE_TAG: u8 = 3;
+pub const FTS_REV_BLOCK_TAG: u8 = 4;
+pub const FTS_DOC_LEN_TAG: u8 = 5;
 /// `default` CF keyspace tag for global per-value document counts:
 /// `0x06 || cluster_key (attr_id BE || type_tag || encoded_val) -> doc_count: u64 LE`.
 pub const ATTR_COUNT_TAG: u8 = 6;
 
-const META_KEY: &[u8] = b"\x01tree_meta";
-const SCHEMA_KEY: &[u8] = b"\x01schema";
-const FTS_META_KEY: &[u8] = b"\x01fts_meta";
-const FTS_FREE_IDS_KEY: &[u8] = b"\x01fts_free_ids";
+pub const META_KEY: &[u8] = b"\x01tree_meta";
+pub const SCHEMA_KEY: &[u8] = b"\x01schema";
+pub const FTS_META_KEY: &[u8] = b"\x01fts_meta";
+pub const FTS_FREE_IDS_KEY: &[u8] = b"\x01fts_free_ids";
 /// Marker recording that `default[0x06]` global attribute counts are present and maintained.
 pub const ATTR_COUNTS_VERSION_KEY: &[u8] = b"\x01attr_counts_v1";
+/// Marker persisted during external SST bulk ingestion to detect incomplete multi-CF ingests.
+pub const BULK_IMPORT_MARKER_KEY: &[u8] = b"\x01bulk_import_v1";
 const BLOCK_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const DB_WRITE_BUFFER_BYTES: usize = 128 * 1024 * 1024;
 const ATTR_POSTING_PREFIX_LEN: usize = 7;
@@ -92,46 +105,14 @@ pub struct Storage {
 impl Storage {
     /// Open or initialize the RocksDB instance and validate/create `TreeMeta`.
     pub fn open(path: impl AsRef<Path>, config: &TreeConfig) -> Result<(Self, TreeMeta)> {
-        let mut db_opts = Options::default();
-        db_opts.create_if_missing(true);
-        db_opts.create_missing_column_families(true);
-        db_opts.set_db_write_buffer_size(DB_WRITE_BUFFER_BYTES);
+        let block_cache = default_sst_block_cache();
+        let storage = Self::open_raw(path, config, &block_cache)?;
 
-        let block_cache = Cache::new_lru_cache(BLOCK_CACHE_BYTES);
-
-        let cf_descriptors = [
-            ColumnFamilyDescriptor::new(
-                DEFAULT_COLUMN_FAMILY_NAME,
-                point_lookup_cf_opts(&block_cache, false),
-            ),
-            ColumnFamilyDescriptor::new(CF_LEAF_ENTRIES, point_lookup_cf_opts(&block_cache, true)),
-            ColumnFamilyDescriptor::new(CF_VECTORS, point_lookup_cf_opts(&block_cache, true)),
-            ColumnFamilyDescriptor::new(CF_DOC_LOC, point_lookup_cf_opts(&block_cache, false)),
-            ColumnFamilyDescriptor::new(CF_DOCS, point_lookup_cf_opts(&block_cache, false)),
-            ColumnFamilyDescriptor::new(CF_ATTR_CLUSTERS, prefix_cf_opts(&block_cache, 3, false)),
-            ColumnFamilyDescriptor::new(
-                CF_ATTR_POSTINGS,
-                prefix_cf_opts(&block_cache, ATTR_POSTING_PREFIX_LEN, true),
-            ),
-            ColumnFamilyDescriptor::new(CF_FTS_TERMS, prefix_cf_opts(&block_cache, 2, false)),
-            ColumnFamilyDescriptor::new(CF_FTS_SKIPS, prefix_cf_opts(&block_cache, 4, true)),
-            ColumnFamilyDescriptor::new(CF_FTS_POSTINGS, prefix_cf_opts(&block_cache, 4, true)),
-            ColumnFamilyDescriptor::new(CF_FTS_POSITIONS, prefix_cf_opts(&block_cache, 4, false)),
-        ];
-
-        let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors).map_err(map_db_err)?;
-        let padded_dim = config.dim.next_power_of_two().max(64);
-        let rabitq_words = padded_dim / 64;
-        let storage = Self {
-            db,
-            _block_cache: block_cache,
-            dim: config.dim,
-            padded_dim,
-            rabitq_words,
-            fts_doc_lens_cache: RwLock::new(HashMap::new()),
-            fts_rev_map_cache: RwLock::new(None),
-            attr_zones_cache: RwLock::new(None),
-        };
+        if storage.has_bulk_import_marker()? {
+            return Err(TreeError::CorruptedData(
+                "incomplete bulk import; delete the database directory and re-run".into(),
+            ));
+        }
 
         let meta = match storage.get_meta()? {
             Some(existing) => {
@@ -168,7 +149,7 @@ impl Storage {
                     rabitq_seed: rand::random::<u64>(),
                     rabitq_bits: 1,
                 };
-                let init_leaf = PackedLeafNode::empty(None, config.dim, padded_dim);
+                let init_leaf = PackedLeafNode::empty(None, config.dim, storage.padded_dim);
                 let mut batch = storage.new_batch();
                 batch.put_meta(&init_meta);
                 batch.put_leaf_node(1, &init_leaf);
@@ -178,6 +159,204 @@ impl Storage {
         };
 
         Ok((storage, meta))
+    }
+
+    fn open_raw(
+        path: impl AsRef<Path>,
+        config: &TreeConfig,
+        block_cache: &Cache,
+    ) -> Result<Self> {
+        let mut db_opts = Options::default();
+        db_opts.create_if_missing(true);
+        db_opts.create_missing_column_families(true);
+        db_opts.set_db_write_buffer_size(DB_WRITE_BUFFER_BYTES);
+
+        let cf_names = [
+            DEFAULT_COLUMN_FAMILY_NAME,
+            CF_LEAF_ENTRIES,
+            CF_VECTORS,
+            CF_DOC_LOC,
+            CF_DOCS,
+            CF_ATTR_CLUSTERS,
+            CF_ATTR_POSTINGS,
+            CF_FTS_TERMS,
+            CF_FTS_SKIPS,
+            CF_FTS_POSTINGS,
+            CF_FTS_POSITIONS,
+        ];
+        let mut cf_descriptors = Vec::with_capacity(cf_names.len());
+        for name in cf_names {
+            cf_descriptors.push(ColumnFamilyDescriptor::new(
+                name,
+                cf_options_for(name, block_cache)?,
+            ));
+        }
+
+        let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors).map_err(map_db_err)?;
+        let padded_dim = config.dim.next_power_of_two().max(64);
+        let rabitq_words = padded_dim / 64;
+        Ok(Self {
+            db,
+            _block_cache: block_cache.clone(),
+            dim: config.dim,
+            padded_dim,
+            rabitq_words,
+            fts_doc_lens_cache: RwLock::new(HashMap::new()),
+            fts_rev_map_cache: RwLock::new(None),
+            attr_zones_cache: RwLock::new(None),
+        })
+    }
+
+    /// Open a fresh or empty database path for external SST bulk ingestion.
+    ///
+    /// Does not write initial `TreeMeta` or root leaf; refuses if a bulk-import marker is
+    /// already present or if the database contains any vectors, FTS state, or attribute state.
+    pub fn open_for_bulk_ingest(path: impl AsRef<Path>, config: &TreeConfig) -> Result<Self> {
+        config.validate()?;
+        let block_cache = default_sst_block_cache();
+        let storage = Self::open_raw(path, config, &block_cache)?;
+
+        if storage.has_bulk_import_marker()? {
+            return Err(TreeError::CorruptedData(
+                "incomplete bulk import; delete the database directory and re-run".into(),
+            ));
+        }
+
+        if let Some(meta) = storage.get_meta()?
+            && meta.num_vectors > 0
+        {
+            return Err(TreeError::InvalidConfig(
+                "bulk import requires an empty collection".into(),
+            ));
+        }
+
+        for cf_name in [
+            CF_VECTORS,
+            CF_DOCS,
+            CF_DOC_LOC,
+            CF_ATTR_CLUSTERS,
+            CF_ATTR_POSTINGS,
+            CF_FTS_TERMS,
+            CF_FTS_SKIPS,
+            CF_FTS_POSTINGS,
+            CF_FTS_POSITIONS,
+        ] {
+            let cf = storage.cf(cf_name)?;
+            if storage.db.iterator_cf(cf, IteratorMode::Start).next().is_some() {
+                return Err(TreeError::InvalidConfig(
+                    "bulk import requires an empty collection".into(),
+                ));
+            }
+        }
+
+        for item in storage.db.iterator(IteratorMode::Start) {
+            let (k, _) = item.map_err(map_db_err)?;
+            let allowed = k.as_ref() == META_KEY
+                || k.as_ref() == SCHEMA_KEY
+                || k.as_ref() == ATTR_COUNTS_VERSION_KEY;
+            if !allowed {
+                return Err(TreeError::InvalidConfig(
+                    "bulk import requires an empty collection".into(),
+                ));
+            }
+        }
+
+        let leaf_cf = storage.cf(CF_LEAF_ENTRIES)?;
+        for (idx, item) in storage.db.iterator_cf(leaf_cf, IteratorMode::Start).enumerate() {
+            let (k, v) = item.map_err(map_db_err)?;
+            if idx > 0 || k.as_ref() != node_key(1) {
+                return Err(TreeError::InvalidConfig(
+                    "bulk import requires an empty collection".into(),
+                ));
+            }
+            let leaf = PackedLeafNode::decode(
+                &v,
+                storage.dim,
+                storage.padded_dim,
+                storage.rabitq_words,
+            )?;
+            if leaf.live_count > 0 {
+                return Err(TreeError::InvalidConfig(
+                    "bulk import requires an empty collection".into(),
+                ));
+            }
+        }
+
+        Ok(storage)
+    }
+
+    /// Build RocksDB [`Options`] matching this storage instance's live CF configuration.
+    pub fn cf_options(&self, cf_name: &str) -> Result<Options> {
+        cf_options_for(cf_name, &self._block_cache)
+    }
+
+    /// Whether the incomplete-bulk-import marker is currently set in `default`.
+    pub fn has_bulk_import_marker(&self) -> Result<bool> {
+        Ok(self
+            .db
+            .get_pinned(BULK_IMPORT_MARKER_KEY)
+            .map_err(map_db_err)?
+            .is_some())
+    }
+
+    /// Persist the pending bulk-import marker with WAL sync, clearing any empty initial root leaf.
+    pub fn put_bulk_import_marker(&self, build_id: u64) -> Result<()> {
+        let mut val = [0u8; 9];
+        val[0] = 1;
+        val[1..9].copy_from_slice(&build_id.to_le_bytes());
+
+        let mut batch = WriteBatch::default();
+        batch.put(BULK_IMPORT_MARKER_KEY, val);
+        let leaf_cf = self.cf(CF_LEAF_ENTRIES)?;
+        if self
+            .db
+            .get_pinned_cf(leaf_cf, node_key(1))
+            .map_err(map_db_err)?
+            .is_some()
+        {
+            batch.delete_cf(leaf_cf, node_key(1));
+        }
+        let mut wo = WriteOptions::default();
+        wo.set_sync(true);
+        self.db.write_opt(batch, &wo).map_err(map_db_err)?;
+        Ok(())
+    }
+
+    /// Clear the bulk-import marker with WAL sync after all column families have been ingested.
+    pub fn clear_bulk_import_marker(&self) -> Result<()> {
+        let mut wo = WriteOptions::default();
+        wo.set_sync(true);
+        self.db
+            .delete_opt(BULK_IMPORT_MARKER_KEY, &wo)
+            .map_err(map_db_err)?;
+        Ok(())
+    }
+
+    /// Ingest external SST files into `cf_name` by moving (hard-linking) them.
+    pub fn ingest_cf(&self, cf_name: &str, files: &[PathBuf]) -> Result<()> {
+        self.ingest_cf_with_move(cf_name, files, true)
+    }
+
+    /// Ingest external SST files into `cf_name`, optionally moving (`true`) or copying (`false`).
+    pub fn ingest_cf_with_move(
+        &self,
+        cf_name: &str,
+        files: &[PathBuf],
+        move_files: bool,
+    ) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let cf = self.cf(cf_name)?;
+        let mut opts = IngestExternalFileOptions::default();
+        opts.set_move_files(move_files);
+        opts.set_allow_global_seqno(true);
+        opts.set_allow_blocking_flush(true);
+        opts.set_snapshot_consistency(false);
+        self.db
+            .ingest_external_file_cf_opts(cf, &opts, files.to_vec())
+            .map_err(map_db_err)?;
+        Ok(())
     }
 
     pub fn dim(&self) -> usize {
@@ -1092,6 +1271,11 @@ impl Storage {
     }
 }
 
+#[inline]
+pub fn encode_count(count: u64) -> [u8; 8] {
+    count.to_le_bytes()
+}
+
 fn decode_count(bytes: &[u8]) -> Result<u64> {
     let arr: [u8; 8] = bytes.try_into().map_err(|_| {
         TreeError::CorruptedData(format!("attr count expected 8 bytes, got {}", bytes.len()))
@@ -1099,10 +1283,42 @@ fn decode_count(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_le_bytes(arr))
 }
 
-fn tagged_key<const N: usize>(tag: u8, key: &[u8]) -> [u8; N] {
+#[inline]
+pub fn tagged_key<const N: usize>(tag: u8, key: &[u8]) -> [u8; N] {
     let mut tagged = [tag; N];
     tagged[1..].copy_from_slice(key);
     tagged
+}
+
+#[inline]
+pub fn tagged_vec(tag: u8, key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + key.len());
+    out.push(tag);
+    out.extend_from_slice(key);
+    out
+}
+
+/// Create a shared LRU block cache configured identically to [`Storage::open`] for offline SST builders.
+pub fn default_sst_block_cache() -> Cache {
+    Cache::new_lru_cache(BLOCK_CACHE_BYTES)
+}
+
+/// Build the exact RocksDB [`Options`] used by [`Storage::open`] for `cf_name`.
+pub fn cf_options_for(cf_name: &str, block_cache: &Cache) -> Result<Options> {
+    match cf_name {
+        DEFAULT_COLUMN_FAMILY_NAME | CF_DOC_LOC | CF_DOCS => {
+            Ok(point_lookup_cf_opts(block_cache, false))
+        }
+        CF_LEAF_ENTRIES | CF_VECTORS => Ok(point_lookup_cf_opts(block_cache, true)),
+        CF_ATTR_CLUSTERS => Ok(prefix_cf_opts(block_cache, 3, false)),
+        CF_ATTR_POSTINGS => Ok(prefix_cf_opts(block_cache, ATTR_POSTING_PREFIX_LEN, true)),
+        CF_FTS_TERMS => Ok(prefix_cf_opts(block_cache, 2, false)),
+        CF_FTS_SKIPS | CF_FTS_POSTINGS => Ok(prefix_cf_opts(block_cache, 4, true)),
+        CF_FTS_POSITIONS => Ok(prefix_cf_opts(block_cache, 4, false)),
+        other => Err(TreeError::InvalidConfig(format!(
+            "unknown column family '{other}'"
+        ))),
+    }
 }
 
 fn point_lookup_cf_opts(block_cache: &Cache, disable_compression: bool) -> Options {
@@ -1137,4 +1353,58 @@ fn prefix_cf_opts(block_cache: &Cache, prefix_len: usize, disable_compression: b
     bbo.set_pin_l0_filter_and_index_blocks_in_cache(true);
     opts.set_block_based_table_factory(&bbo);
     opts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use izzydb_core::config::DistanceMetric;
+    use rocksdb::SstFileWriter;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_sst_ingest_and_bulk_import_marker() {
+        let dir = TempDir::new().unwrap();
+        let sst_dir = TempDir::new().unwrap();
+        let cfg = TreeConfig::new(4, DistanceMetric::L2Squared);
+
+        let storage = Storage::open_for_bulk_ingest(dir.path(), &cfg).unwrap();
+        storage.put_bulk_import_marker(42).unwrap();
+        assert!(storage.has_bulk_import_marker().unwrap());
+
+        let sst_path = sst_dir.path().join("docs.sst");
+        {
+            let opts = storage.cf_options(CF_DOCS).unwrap();
+            let mut writer = SstFileWriter::create(&opts);
+            writer.open(&sst_path).unwrap();
+            writer.put(doc_key(10), b"doc-10").unwrap();
+            writer.put(doc_key(20), b"doc-20").unwrap();
+            writer.finish().unwrap();
+        }
+        storage.ingest_cf(CF_DOCS, std::slice::from_ref(&sst_path)).unwrap();
+        drop(storage);
+
+        // Leftover marker must make Storage::open fail.
+        assert!(matches!(
+            Storage::open(dir.path(), &cfg),
+            Err(TreeError::CorruptedData(msg)) if msg.contains("incomplete bulk import")
+        ));
+
+        // Re-open raw / clear marker, then normal open succeeds and reads ingested docs.
+        {
+            let block_cache = default_sst_block_cache();
+            let raw = Storage::open_raw(dir.path(), &cfg, &block_cache).unwrap();
+            raw.clear_bulk_import_marker().unwrap();
+        }
+        let (reopened, _meta) = Storage::open(dir.path(), &cfg).unwrap();
+        assert_eq!(reopened.get_doc_bytes(10).unwrap().as_deref(), Some(b"doc-10".as_slice()));
+        assert_eq!(reopened.get_doc_bytes(20).unwrap().as_deref(), Some(b"doc-20".as_slice()));
+        drop(reopened);
+
+        // Non-empty target must be rejected by open_for_bulk_ingest.
+        assert!(matches!(
+            Storage::open_for_bulk_ingest(dir.path(), &cfg),
+            Err(TreeError::InvalidConfig(_))
+        ));
+    }
 }

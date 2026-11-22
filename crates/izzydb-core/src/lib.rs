@@ -21,7 +21,10 @@ pub use facet::{
     RangeBucket, RangeFacetResult, StatsFacetResult, TermFacetResult, VectorFacetScope,
 };
 pub use filter::{Filter, FtsPredicateKind, TokenQuery};
-pub use rank::{Bm25Overrides, RankBy};
+pub use rank::{
+    Bm25Overrides, DecayMode, NullsOrder, OrderBySpec, OrderedResult, RankBy, SortDirection,
+    eval_decay, eval_saturate, validate_order_by,
+};
 pub use schema::{
     AttributeConfig, AttributeType, AttributeValue, Attributes, CollectionConfig, CollectionSchema,
     FullTextSearchConfig, Language, ScalarValue, Tokenizer,

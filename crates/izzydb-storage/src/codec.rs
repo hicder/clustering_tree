@@ -864,6 +864,33 @@ impl<'a> DocView<'a> {
         DocFieldRef::from_raw(kind, payload).map(Some)
     }
 
+    /// Zero-copy numeric read of a scalar `Int` / `Uint` / `Float` attribute as `f64`.
+    /// Returns `None` when the attribute is absent, `Null`, or not numeric.
+    #[inline]
+    pub fn get_numeric_f64(&self, attr_id: AttrId) -> Result<Option<f64>> {
+        Ok(match self.get_raw_field(attr_id)? {
+            Some(DocFieldRef::Scalar(RawScalar::Int(v))) => Some(v as f64),
+            Some(DocFieldRef::Scalar(RawScalar::Uint(v))) => Some(v as f64),
+            Some(DocFieldRef::Scalar(RawScalar::Float(v))) => Some(v),
+            _ => None,
+        })
+    }
+
+    /// Read a scalar attribute as an owned [`ScalarValue`] (`Null` if absent, `Null`, or an array).
+    pub fn get_scalar(&self, attr_id: AttrId) -> Result<ScalarValue> {
+        Ok(match self.get_raw_field(attr_id)? {
+            Some(DocFieldRef::Scalar(RawScalar::Bool(v))) => ScalarValue::Bool(v),
+            Some(DocFieldRef::Scalar(RawScalar::Int(v))) => ScalarValue::Int(v),
+            Some(DocFieldRef::Scalar(RawScalar::Uint(v))) => ScalarValue::Uint(v),
+            Some(DocFieldRef::Scalar(RawScalar::Float(v))) => ScalarValue::Float(v),
+            Some(DocFieldRef::Scalar(RawScalar::Str(b))) => ScalarValue::String(
+                String::from_utf8(b.to_vec())
+                    .map_err(|_| TreeError::CorruptedData("cf_docs string not utf-8".into()))?,
+            ),
+            _ => ScalarValue::Null,
+        })
+    }
+
     /// Evaluate a [`Filter`] directly against this `DocView` without decoding untouched fields.
     pub fn matches_filter<F>(
         &self,
@@ -1656,6 +1683,47 @@ mod tests {
         for w in enc_strs.windows(2) {
             assert!(w[0] < w[1], "{:?} not < {:?}", w[0], w[1]);
         }
+    }
+
+    #[test]
+    fn test_docview_numeric_and_scalar_accessors() {
+        let cfg = CollectionConfig::new(TreeConfig::new(4, DistanceMetric::L2Squared))
+            .with_attribute("i", AttributeType::Int, true)
+            .with_attribute("u", AttributeType::Uint, false)
+            .with_attribute("f", AttributeType::Float, true)
+            .with_attribute("s", AttributeType::String, true)
+            .with_attribute("tags", AttributeType::StringArray, true)
+            .with_attribute("absent", AttributeType::Int, true);
+        let schema = CollectionSchema::from_config(&cfg).unwrap();
+        let id = |n: &str| schema.get_by_name(n).unwrap().id;
+
+        let mut attrs = Attributes::new();
+        attrs.insert("i".into(), AttributeValue::Int(-7));
+        attrs.insert("u".into(), AttributeValue::Uint(u64::from(u32::MAX) + 5));
+        attrs.insert("f".into(), AttributeValue::Float(-2.5));
+        attrs.insert("s".into(), "héllo".into());
+        attrs.insert("tags".into(), vec!["a".to_string()].into());
+        let bytes = encode_attributes(&schema, &attrs).unwrap();
+        let view = DocView::parse(&bytes).unwrap();
+
+        assert_eq!(view.get_numeric_f64(id("i")).unwrap(), Some(-7.0));
+        assert_eq!(
+            view.get_numeric_f64(id("u")).unwrap(),
+            Some((u64::from(u32::MAX) + 5) as f64)
+        );
+        assert_eq!(view.get_numeric_f64(id("f")).unwrap(), Some(-2.5));
+        assert_eq!(view.get_numeric_f64(id("s")).unwrap(), None);
+        assert_eq!(view.get_numeric_f64(id("tags")).unwrap(), None);
+        assert_eq!(view.get_numeric_f64(id("absent")).unwrap(), None);
+
+        assert_eq!(view.get_scalar(id("i")).unwrap(), ScalarValue::Int(-7));
+        assert_eq!(view.get_scalar(id("f")).unwrap(), ScalarValue::Float(-2.5));
+        assert_eq!(
+            view.get_scalar(id("s")).unwrap(),
+            ScalarValue::String("héllo".into())
+        );
+        assert_eq!(view.get_scalar(id("tags")).unwrap(), ScalarValue::Null);
+        assert_eq!(view.get_scalar(id("absent")).unwrap(), ScalarValue::Null);
     }
 
     #[test]

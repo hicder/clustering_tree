@@ -16,6 +16,10 @@ pub mod facet;
 pub mod fts_index;
 /// SPFresh LIRE boundary reassignment after leaf splits.
 pub mod lire;
+/// Attribute-ordered top-k queries over the order-preserving attribute indexes.
+pub mod order_by;
+/// Generalized `RankBy` execution (filter boosts, attribute scores, products).
+pub mod rank_eval;
 /// Beam-search tree traversal, RaBitQ leaf scanning, and exact reranking.
 pub mod search;
 /// Re-exported RaBitQ SIMD leaf-scoring kernels.
@@ -38,7 +42,9 @@ pub use error::{Result, TreeError};
 pub use filter::{Filter, FtsPredicateKind, TokenQuery};
 pub use fts_index::FtsIndex;
 pub use izzydb_fts::Bm25Result;
-pub use rank::{Bm25Overrides, RankBy};
+pub use rank::{
+    Bm25Overrides, DecayMode, NullsOrder, OrderBySpec, OrderedResult, RankBy, SortDirection,
+};
 pub use schema::{
     AttributeConfig, AttributeType, AttributeValue, Attributes, CollectionConfig, CollectionSchema,
     FullTextSearchConfig, Language, ScalarValue, Tokenizer,

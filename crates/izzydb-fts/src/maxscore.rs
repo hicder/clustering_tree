@@ -520,6 +520,14 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
     }
 }
 
+fn not_lexical_err() -> TreeError {
+    TreeError::InvalidQuery(
+        "MAXSCORE executes only pure lexical RankBy expressions (BM25 combined with Sum / Max / \
+         constant-weight Product)"
+            .into(),
+    )
+}
+
 struct CompileContext<'a, 'b, S: FtsPostingSource + 'a> {
     source: &'a S,
     schema: &'a CollectionSchema,
@@ -539,7 +547,30 @@ fn compile_clauses<'a, S: FtsPostingSource>(
         return Ok(());
     }
     match expr {
-        RankBy::Product(w, inner) => compile_clauses(ctx, inner, weight * *w, out),
+        RankBy::Product(children) => {
+            // Callers guarantee `is_pure_lexical()`: constants plus exactly one lexical factor.
+            let mut w = weight;
+            let mut lexical: Option<&RankBy> = None;
+            for child in children {
+                match child {
+                    RankBy::Const(c) => w *= *c,
+                    other => {
+                        if lexical.replace(other).is_some() {
+                            return Err(not_lexical_err());
+                        }
+                    }
+                }
+            }
+            match lexical {
+                Some(inner) => compile_clauses(ctx, inner, w, out),
+                None => Err(not_lexical_err()),
+            }
+        }
+        RankBy::Const(_)
+        | RankBy::Filter(_)
+        | RankBy::Attribute { .. }
+        | RankBy::Saturate { .. }
+        | RankBy::Decay { .. } => Err(not_lexical_err()),
         RankBy::Sum(children) => {
             for child in children {
                 compile_clauses(ctx, child, weight, out)?;
@@ -827,17 +858,66 @@ impl BlockFilterMask {
     }
 }
 
-/// Execute a validated [`RankBy`] query using SIMD Vectorized Block-Max MAXSCORE.
+/// Per-document score modifier applied on top of a pure lexical expression `L(doc)`:
+/// `score(doc) = L(doc) * m(doc) + a(doc)` with `0 <= m <= mult_ub` and `0 <= a <= add_ub`.
+///
+/// MAXSCORE runs on `L * mult_ub` (an upper bound of the lexical part of the true score) and
+/// prunes against `theta - add_ub`; only candidates that survive pruning reach `rescore`.
+pub struct RankModifier<'f> {
+    /// Finite upper bound `> 0` of the multiplicative factor `m(doc)`.
+    pub mult_ub: f32,
+    /// Finite upper bound `>= 0` of the additive term `a(doc)`.
+    pub add_ub: f32,
+    /// Maps `(doc_id, L(doc) * mult_ub)` to the exact final score (`<= 0` drops the document).
+    pub rescore: &'f mut dyn FnMut(DocId, f32) -> Result<f32>,
+}
+
+/// Execute a validated pure-lexical [`RankBy`] query using SIMD Vectorized Block-Max MAXSCORE.
 pub fn execute_rank_by<S: FtsPostingSource>(
     source: &S,
     schema: &CollectionSchema,
     rank_by: &RankBy,
     top_k: usize,
     doc_filter: Option<&RoaringBitmap>,
+    lazy_filter: Option<&mut dyn FnMut(DocId) -> Result<bool>>,
+    buffer: &mut ReusableBuffer,
+) -> Result<Vec<Bm25Result>> {
+    execute_rank_by_with(
+        source, schema, rank_by, top_k, doc_filter, lazy_filter, None, buffer,
+    )
+}
+
+/// [`execute_rank_by`] with an optional [`RankModifier`] (multiplicative and/or additive
+/// per-document factors evaluated lazily on surviving candidates).
+#[allow(clippy::too_many_arguments)]
+pub fn execute_rank_by_with<S: FtsPostingSource>(
+    source: &S,
+    schema: &CollectionSchema,
+    rank_by: &RankBy,
+    top_k: usize,
+    doc_filter: Option<&RoaringBitmap>,
     mut lazy_filter: Option<&mut dyn FnMut(DocId) -> Result<bool>>,
+    modifier: Option<RankModifier<'_>>,
     buffer: &mut ReusableBuffer,
 ) -> Result<Vec<Bm25Result>> {
     rank_by.validate(schema)?;
+    let rank_by = rank_by.normalize();
+    if !rank_by.is_pure_lexical() {
+        return Err(not_lexical_err());
+    }
+    let (mult_ub, add_ub) = match &modifier {
+        Some(m) => {
+            if !(m.mult_ub.is_finite() && m.mult_ub > 0.0 && m.add_ub.is_finite() && m.add_ub >= 0.0)
+            {
+                return Err(TreeError::InvalidQuery(
+                    "RankModifier bounds must be finite (mult_ub > 0, add_ub >= 0)".into(),
+                ));
+            }
+            (m.mult_ub, m.add_ub)
+        }
+        None => (1.0, 0.0),
+    };
+    let mut rescore_fn = modifier.map(|m| m.rescore);
     if top_k == 0 {
         return Ok(Vec::new());
     }
@@ -862,7 +942,7 @@ pub fn execute_rank_by<S: FtsPostingSource>(
             buffer,
             dl_cache: &mut dl_cache,
         };
-        compile_clauses(&mut ctx, rank_by, 1.0, &mut clauses)?;
+        compile_clauses(&mut ctx, &rank_by, mult_ub, &mut clauses)?;
     }
     if clauses.is_empty() {
         return Ok(Vec::new());
@@ -906,7 +986,10 @@ pub fn execute_rank_by<S: FtsPostingSource>(
         };
 
         // Block-Max skip pruning BEFORE reading any posting blocks or doc_len blocks.
-        if theta > 0.0 && essential_block_pruned(&clauses[essential_start..], block_id, non_ess_ub, theta)
+        // Lexical-scale pruning threshold: a doc needs `L * mult_ub + add_ub > theta`.
+        let prune_theta = if theta > add_ub { theta - add_ub } else { 0.0 };
+        if prune_theta > 0.0
+            && essential_block_pruned(&clauses[essential_start..], block_id, non_ess_ub, prune_theta)
         {
             advance_clauses_past(&mut clauses[essential_start..], block_id)?;
             continue;
@@ -938,7 +1021,7 @@ pub fn execute_rank_by<S: FtsPostingSource>(
                 block_id,
                 touched,
                 non_ess_ub,
-                theta,
+                prune_theta,
                 &mut scores,
                 &mut non_ess_ubs,
                 &mut dl_cache,
@@ -952,7 +1035,7 @@ pub fn execute_rank_by<S: FtsPostingSource>(
             let cand_thresh = if heap.len() < top_k {
                 f32::MIN_POSITIVE
             } else {
-                theta
+                prune_theta.max(f32::MIN_POSITIVE)
             };
             let hit_mask = filter_ge_256(tier, &scores, &active_mask, cand_thresh);
             if hit_mask != [0u64; 4] {
@@ -965,14 +1048,17 @@ pub fn execute_rank_by<S: FtsPostingSource>(
                         theta,
                         &mut heap,
                         &mut lazy_filter,
+                        rescore_fn.as_deref_mut(),
                     )?;
                 }
             }
         }
 
         // Dynamically shrink essential set as theta rises.
-        if heap.len() == top_k && theta > 0.0 {
-            while essential_start < n_clauses && ub_below_threshold(prefix_max_sum[essential_start], theta)
+        let prune_theta = if theta > add_ub { theta - add_ub } else { 0.0 };
+        if heap.len() == top_k && prune_theta > 0.0 {
+            while essential_start < n_clauses
+                && ub_below_threshold(prefix_max_sum[essential_start], prune_theta)
             {
                 essential_start += 1;
             }
@@ -1100,15 +1186,17 @@ fn collect_block_candidates(
     });
 }
 
-fn insert_candidates_into_heap<S: FtsPostingSource>(
+fn insert_candidates_into_heap<'r, S: FtsPostingSource>(
     source: &S,
     candidates: &[(f32, FtsDocId)],
     top_k: usize,
     mut theta: f32,
     heap: &mut BinaryHeap<TopKEntry>,
     lazy_filter: &mut Option<&mut dyn FnMut(DocId) -> Result<bool>>,
+    mut rescore: Option<&mut (dyn FnMut(DocId, f32) -> Result<f32> + 'r)>,
 ) -> Result<f32> {
     let needs_doc_ids = lazy_filter.is_some()
+        || rescore.is_some()
         || (heap.len() == top_k && candidates.iter().any(|&(s, _)| s == theta));
 
     let resolved_ids: Vec<Option<DocId>> = if needs_doc_ids {
@@ -1127,6 +1215,20 @@ fn insert_candidates_into_heap<S: FtsPostingSource>(
                 continue;
             }
         }
+        let s = match rescore.as_mut() {
+            Some(f) => {
+                let Some(doc_id) = opt_doc_id else {
+                    continue;
+                };
+                let exact = f(doc_id, s)?;
+                // Heap entries hold exact scores; non-positive scores are excluded.
+                if exact.is_nan() || exact <= 0.0 || !exact.is_finite() || (heap.len() == top_k && exact < theta) {
+                    continue;
+                }
+                exact
+            }
+            None => s,
+        };
 
         if heap.len() < top_k {
             heap.push(TopKEntry {

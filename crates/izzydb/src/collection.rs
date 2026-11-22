@@ -10,7 +10,7 @@ use roaring::RoaringBitmap;
 
 use crate::attr_index::{AttributeIndex, ClusterCandidates, PreparedFilter};
 use crate::codec::{
-    DocView, decode_attribute_entries, decode_attributes, encode_attributes,
+    decode_attribute_entries, decode_attributes, encode_attributes,
     extract_index_keys_from_entries,
 };
 use crate::config::{AttrId, DocId, FtsDocId, NodeId, TreeConfig};
@@ -38,7 +38,7 @@ use izzydb_fts::Bm25Result;
 const MUTATION_CHUNK_SIZE: usize = 512;
 const PUSHDOWN_MAX_CANDIDATE_CLUSTERS: u64 = 64;
 
-enum FilterPushdown {
+pub(crate) enum FilterPushdown {
     None,
     Superset(RoaringBitmap),
     Exact(RoaringBitmap),
@@ -174,11 +174,11 @@ pub struct HybridSearchResult {
 /// [`Storage`], a [`ClusteringTree`] vector index, forward document attributes (`cf_docs`),
 /// a cluster-aware [`AttributeIndex`], and an inverted [`FtsIndex`].
 pub struct Collection {
-    storage: Arc<Storage>,
-    schema: CollectionSchema,
-    vector_index: ClusteringTree,
-    attr_index: AttributeIndex,
-    fts_index: FtsIndex,
+    pub(crate) storage: Arc<Storage>,
+    pub(crate) schema: CollectionSchema,
+    pub(crate) vector_index: ClusteringTree,
+    pub(crate) attr_index: AttributeIndex,
+    pub(crate) fts_index: FtsIndex,
 }
 
 impl Collection {
@@ -758,70 +758,19 @@ impl Collection {
             .collect())
     }
 
-    /// Execute a BM25 full-text ranking query with an optional [`Filter`].
+    /// Execute a ranking query with an optional [`Filter`].
+    ///
+    /// `rank_by` may be plain BM25, or any composition of BM25, filter boosts, numeric attribute
+    /// scores (`Attribute` / `Saturate` / `Decay`), constants, `Sum`, `Max`, and `Product`.
+    /// Results are the exact top-`top_k` by `score DESC, DocId ASC`; documents scoring `<= 0`
+    /// are excluded.
     pub fn query_bm25(
         &self,
         rank_by: &RankBy,
         filter: Option<&Filter>,
         top_k: usize,
     ) -> Result<Vec<Bm25Result>> {
-        rank_by.validate(&self.schema)?;
-        if let Some(f) = filter {
-            f.validate(&self.schema)?;
-        }
-        if top_k == 0 || self.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let Some(f) = filter else {
-            return self
-                .fts_index
-                .query_bm25(&self.storage, &self.schema, rank_by, top_k, None, None);
-        };
-
-        let pushdown = self.try_pushdown_filter(f)?;
-        let (pushdown_bm, is_exact) = match pushdown {
-            FilterPushdown::None => (None, false),
-            FilterPushdown::Superset(bm) => (Some(bm), false),
-            FilterPushdown::Exact(bm) => (Some(bm), true),
-        };
-        if let Some(ref bm) = pushdown_bm
-            && bm.is_empty()
-        {
-            return Ok(Vec::new());
-        }
-
-        if is_exact {
-            self.fts_index.query_bm25(
-                &self.storage,
-                &self.schema,
-                rank_by,
-                top_k,
-                pushdown_bm.as_ref(),
-                None,
-            )
-        } else {
-            let mut lazy = |doc_id: DocId| -> Result<bool> {
-                let Some(slice) = self.storage.get_doc_bytes_pinned(doc_id)? else {
-                    return Ok(false);
-                };
-                if !f.has_fts() {
-                    DocView::parse(&slice)?
-                        .matches_filter(&self.schema, f, &mut |_, _, _, _, _| false)
-                } else {
-                    let attrs = decode_attributes(&self.schema, &slice)?;
-                    Ok(self.fts_index.matches_filter(&self.schema, f, &attrs))
-                }
-            };
-            self.fts_index.query_bm25(
-                &self.storage,
-                &self.schema,
-                rank_by,
-                top_k,
-                pushdown_bm.as_ref(),
-                Some(&mut lazy),
-            )
-        }
+        self.rank_query(rank_by, filter, top_k)
     }
 
     /// Alias for [`Collection::query_bm25`].
@@ -831,7 +780,7 @@ impl Collection {
         filter: Option<&Filter>,
         top_k: usize,
     ) -> Result<Vec<Bm25Result>> {
-        self.query_bm25(rank_by, filter, top_k)
+        self.rank_query(rank_by, filter, top_k)
     }
 
     /// Run vector search and BM25 full-text search under `filter`, fusing rankings via RRF.
@@ -912,7 +861,7 @@ impl Collection {
     // Faceting
     // ------------------------------------------------------------------------------------
 
-    fn facet_env(&self) -> FacetEnv<'_> {
+    pub(crate) fn facet_env(&self) -> FacetEnv<'_> {
         FacetEnv {
             storage: &self.storage,
             schema: &self.schema,
@@ -1035,16 +984,7 @@ impl Collection {
         self.validate_facet_request(filter, facets)?;
         rank_by.validate(&self.schema)?;
         let hits = self.query_bm25(rank_by, filter, top_k)?;
-        let rank_bm = self.rank_match_bitmap(rank_by)?;
-        let (facets, total_hits) = facet::compute_facets(
-            &self.facet_env(),
-            facets,
-            Population::Query {
-                filter,
-                rank_bm: Some(&rank_bm),
-                prepared: None,
-            },
-        )?;
+        let (facets, total_hits) = self.facet_rank_population(rank_by, filter, facets)?;
         Ok(FacetedSearchResponse {
             hits,
             facets,
@@ -1080,16 +1020,7 @@ impl Collection {
                 facet::compute_facets(&env, facets, Population::Docs(&candidates))?
             }
             HybridFacetScope::Bm25AndFilterMatches => {
-                let rank_bm = self.rank_match_bitmap(rank_by)?;
-                facet::compute_facets(
-                    &env,
-                    facets,
-                    Population::Query {
-                        filter,
-                        rank_bm: Some(&rank_bm),
-                        prepared: None,
-                    },
-                )?
+                self.facet_rank_population(rank_by, filter, facets)?
             }
         };
         Ok(FacetedSearchResponse {
@@ -1099,12 +1030,41 @@ impl Collection {
         })
     }
 
-    fn rank_match_bitmap(&self, rank_by: &RankBy) -> Result<RoaringBitmap> {
+    /// Facets over every document with `rank_by` score `> 0` that also matches `filter`.
+    ///
+    /// Pure lexical expressions keep the posting-union bitmap population (per-facet filter modes
+    /// apply). Expressions with filter boosts / attribute scores / products are evaluated
+    /// exactly into a fixed document set, so per-facet filter modes are ignored for them.
+    fn facet_rank_population(
+        &self,
+        rank_by: &RankBy,
+        filter: Option<&Filter>,
+        facets: &[FacetSpec],
+    ) -> Result<(FacetResults, u64)> {
+        let norm = rank_by.normalize();
+        if norm.is_pure_lexical() {
+            let rank_bm = self.rank_match_bitmap(&norm)?;
+            return facet::compute_facets(
+                &self.facet_env(),
+                facets,
+                Population::Query {
+                    filter,
+                    rank_bm: Some(&rank_bm),
+                    prepared: None,
+                },
+            );
+        }
+        let ids = self.rank_matching_doc_ids(rank_by, filter)?;
+        facet::compute_facets(&self.facet_env(), facets, Population::Docs(&ids))
+    }
+
+    /// Exact `FtsDocId`s with score `> 0` for a *pure lexical* expression.
+    pub(crate) fn rank_match_bitmap(&self, rank_by: &RankBy) -> Result<RoaringBitmap> {
         if self.is_empty() {
             return Ok(RoaringBitmap::new());
         }
         self.fts_index
-            .eval_rank_by_match_bitmap(&self.storage, &self.schema, rank_by)
+            .eval_rank_by_match_bitmap(&self.storage, &self.schema, &rank_by.normalize())
     }
 
     /// ANN search over an optional pre-prepared (already validated) filter plan.
@@ -1143,7 +1103,7 @@ impl Collection {
             .collect())
     }
 
-    fn try_pushdown_filter(&self, filter: &Filter) -> Result<FilterPushdown> {
+    pub(crate) fn try_pushdown_filter(&self, filter: &Filter) -> Result<FilterPushdown> {
         if let Some((kind, attr, query, last_as_prefix)) = filter.as_fts_predicate() {
             let bm = self.fts_index.eval_fts_predicate(
                 &self.storage,

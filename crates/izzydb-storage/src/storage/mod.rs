@@ -13,7 +13,7 @@ use std::sync::{Arc, RwLock};
 use roaring::RoaringBitmap;
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DB, DBCompressionType,
-    DBPinnableSlice, DEFAULT_COLUMN_FAMILY_NAME, Direction, IngestExternalFileOptions,
+    DBIteratorWithThreadMode, DBPinnableSlice, DEFAULT_COLUMN_FAMILY_NAME, Direction, IngestExternalFileOptions,
     IteratorMode, Options, PrefixRange, ReadOptions, SliceTransform, WriteBatch, WriteOptions,
 };
 
@@ -91,6 +91,26 @@ pub struct ByteRange<'a> {
 }
 
 /// RocksDB storage wrapper managing packed node, document, and attribute index column families.
+/// Lazy iterator over `cf_attr_clusters` entries; see [`Storage::iter_attr_clusters_prefix`].
+pub struct AttrClusterIter<'a> {
+    inner: DBIteratorWithThreadMode<'a, DB>,
+}
+
+impl Iterator for AttrClusterIter<'_> {
+    type Item = Result<(Vec<u8>, RoaringBitmap)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = self.inner.next()?;
+        Some((|| {
+            let (k, v) = item.map_err(map_db_err)?;
+            if k.len() < 3 {
+                return Err(TreeError::CorruptedData("cf_attr_clusters key too short".into()));
+            }
+            Ok((k[3..].to_vec(), decode_roaring_bitmap(&v)?))
+        })())
+    }
+}
+
 pub struct Storage {
     pub(super) db: DB,
     _block_cache: Cache,
@@ -589,6 +609,29 @@ impl Storage {
         Ok(out)
     }
 
+    /// Lazily stream `cf_attr_clusters` entries under one `(attr_id, type_tag)` 3-byte `prefix`
+    /// in ascending (`reverse == false`) or descending (`reverse == true`) value order, without
+    /// materializing the attribute's whole value domain.
+    ///
+    /// Yields `(encoded_val_bytes, leaf_bitmap)` where `encoded_val_bytes` excludes the 3-byte prefix.
+    pub fn iter_attr_clusters_prefix(
+        &self,
+        prefix: [u8; 3],
+        reverse: bool,
+    ) -> Result<AttrClusterIter<'_>> {
+        let cf = self.cf(CF_ATTR_CLUSTERS)?;
+        let mut ro = ReadOptions::default();
+        ro.set_iterate_range(PrefixRange(prefix.to_vec()));
+        let mode = if reverse {
+            IteratorMode::End
+        } else {
+            IteratorMode::Start
+        };
+        Ok(AttrClusterIter {
+            inner: self.db.iterator_cf_opt(cf, ro, mode),
+        })
+    }
+
     /// Load or return cached per-attribute zone maps (`(attr_id, type_tag) -> BTreeMap<leaf_id, (min, max)>`).
     pub fn get_attr_zones_cached(&self) -> Result<AttrZoneTable> {
         {
@@ -774,6 +817,15 @@ impl Storage {
 
     pub fn all_doc_locs(&self) -> Result<Vec<(DocId, DocLoc)>> {
         self.scan_cf(CF_DOC_LOC, decode_u64_key, DocLoc::decode)
+    }
+
+    /// Ids of every stored document, ascending.
+    pub fn all_doc_ids(&self) -> Result<Vec<DocId>> {
+        Ok(self
+            .scan_cf(CF_DOC_LOC, decode_u64_key, |_| Ok(()))?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect())
     }
 
     pub fn all_docs_bytes(&self) -> Result<Vec<(DocId, Vec<u8>)>> {

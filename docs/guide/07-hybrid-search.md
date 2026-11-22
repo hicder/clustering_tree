@@ -61,4 +61,4 @@ Fusion still works: documents from the other list are returned (with `None` rank
 
 ## Hybrid with facets
 
-`hybrid_search_with_facets` returns hits plus aggregations over a chosen population — see [Faceting](08-faceting.md#hybrid).
+`hybrid_search_with_facets` returns hits plus aggregations over a chosen population — see [Faceting](09-faceting.md#hybrid).

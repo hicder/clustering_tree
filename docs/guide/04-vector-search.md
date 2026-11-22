@@ -59,4 +59,4 @@ Pick the metric your embedding model was trained for (most text embedders: `Cosi
 
 ## Search + facets
 
-To get facet counts alongside hits in one call use `search_with_facets` — see [Faceting](08-faceting.md#combining-facets-with-search).
+To get facet counts alongside hits in one call use `search_with_facets` — see [Faceting](09-faceting.md#combining-facets-with-search).

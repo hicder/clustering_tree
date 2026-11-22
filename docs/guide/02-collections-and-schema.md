@@ -112,7 +112,7 @@ let mut col = Collection::open("./my_collection", config)?;
 - Attributes that are in the database but **not** in your config are kept as-is. Still, pass your complete schema every time so the config in your code stays the source of truth.
 - Vector `dim` and `metric` must match the stored values.
 
-Things you **cannot** do in place: change an attribute's type, toggle `filterable`, change its full-text settings, or change `dim`/`metric`. To make such a change, create a new collection and re-ingest (see [Bulk Import](09-bulk-import.md)).
+Things you **cannot** do in place: change an attribute's type, toggle `filterable`, change its full-text settings, or change `dim`/`metric`. To make such a change, create a new collection and re-ingest (see [Bulk Import](10-bulk-import.md)).
 
 ## Inspecting a collection
 

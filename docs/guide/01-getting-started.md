@@ -106,7 +106,7 @@ if let Some(doc) = col.get(1)? {
 
 ## 5. Everything returns `Result`
 
-All fallible calls return `izzydb::Result<T>` with a [`TreeError`](10-operations.md#errors). The `?` operator in the examples above assumes your function returns `Result<_, izzydb::TreeError>` (or something `TreeError` converts into, e.g. `Box<dyn std::error::Error>`, since `TreeError` implements `std::error::Error`).
+All fallible calls return `izzydb::Result<T>` with a [`TreeError`](11-operations.md#errors). The `?` operator in the examples above assumes your function returns `Result<_, izzydb::TreeError>` (or something `TreeError` converts into, e.g. `Box<dyn std::error::Error>`, since `TreeError` implements `std::error::Error`).
 
 A complete minimal program:
 
@@ -148,4 +148,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - Model your data: [Collections & Schema](02-collections-and-schema.md)
 - Keep it fresh: [Documents](03-documents.md)
-- Loading a big dataset? Skip ahead to [Bulk Import](09-bulk-import.md).
+- Loading a big dataset? Skip ahead to [Bulk Import](10-bulk-import.md).

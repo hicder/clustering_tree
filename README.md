@@ -275,7 +275,7 @@ You can also split SST generation and ingestion across machines with `build_ssts
 
 ## Documentation
 
-- **[User Guide](docs/guide/README.md)** — task-oriented walkthrough: getting started, schema, documents, vector/filtered/full-text/hybrid search, faceting, bulk import, and operations.
+- **[User Guide](docs/guide/README.md)** — task-oriented walkthrough: getting started, schema, documents, vector/filtered/full-text/hybrid search, ranking & boosting, faceting, bulk import, and operations.
 
 ### Architecture & Performance
 

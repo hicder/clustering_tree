@@ -295,13 +295,52 @@ pub fn search_filtered(
         ));
     }
     filter.validate(schema)?;
-    let q = prepare_vector_cow(query, config.dim, config.metric)?;
     if opts.k == 0 || meta.num_vectors == 0 {
+        // Still validate the query vector for consistent error behavior.
+        prepare_vector_cow(query, config.dim, config.metric)?;
         return Ok(Vec::new());
     }
 
     // Step 1: Cluster-level pruning via cf_attr_clusters (and FtsIndex for FTS predicates).
     let prepared = attr_index.prepare_filter_with_fts(storage, schema, filter, fts_index)?;
+    search_filtered_prepared(
+        storage,
+        internal_cache,
+        leaf_parent,
+        meta,
+        quantizer,
+        attr_index,
+        query,
+        opts,
+        &prepared,
+        config,
+    )
+}
+
+/// [`search_filtered`] over an already-prepared (validated) filter, so callers that also need the
+/// filter's match set (e.g. faceting) can share one [`PreparedFilter`].
+#[allow(clippy::too_many_arguments)]
+pub fn search_filtered_prepared(
+    storage: &Storage,
+    internal_cache: &HashMap<NodeId, PackedInternalNode>,
+    leaf_parent: &HashMap<NodeId, NodeId>,
+    meta: &TreeMeta,
+    quantizer: &RabitqQuantizer,
+    attr_index: &AttributeIndex,
+    query: &[f32],
+    opts: SearchOptions,
+    prepared: &PreparedFilter,
+    config: &TreeConfig,
+) -> Result<Vec<(DocId, f32)>> {
+    if opts.beam_width == 0 {
+        return Err(TreeError::InvalidConfig(
+            "beam_width must be >= 1".into(),
+        ));
+    }
+    let q = prepare_vector_cow(query, config.dim, config.metric)?;
+    if opts.k == 0 || meta.num_vectors == 0 {
+        return Ok(Vec::new());
+    }
     if prepared.cluster_candidates.is_empty() {
         return Ok(Vec::new());
     }
@@ -317,7 +356,7 @@ pub fn search_filtered(
         return search_filtered_exhaustive(
             storage,
             attr_index,
-            &prepared,
+            prepared,
             bm,
             &q,
             opts.k,
@@ -414,7 +453,7 @@ pub fn search_filtered(
             .copied()
             .zip(parsed_views.iter().map(|v| v.as_ref()))
             .collect();
-        let masks = attr_index.eval_leaves_masks(storage, &prepared, &leaf_pairs)?;
+        let masks = attr_index.eval_leaves_masks(storage, prepared, &leaf_pairs)?;
 
         for (view_opt, mut mask) in parsed_views.iter().zip(masks) {
             let Some(view) = view_opt else {
@@ -548,7 +587,7 @@ fn expand_internal_node(
     Ok(())
 }
 
-fn parse_leaf_views<'a>(
+pub(crate) fn parse_leaf_views<'a>(
     leaf_ids: &[NodeId],
     leaf_slices: &'a [Option<DBPinnableSlice<'a>>],
     config: &TreeConfig,

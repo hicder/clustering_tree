@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use roaring::RoaringBitmap;
 
 use izzydb_core::config::{AttrId, DocId, LocalId, NodeId};
-use izzydb_core::error::Result;
+use izzydb_core::error::{Result, TreeError};
 use izzydb_core::filter::{Filter, FtsPredicateKind};
 use izzydb_core::schema::{AttributeValue, Attributes, CollectionSchema, ScalarValue};
 use izzydb_storage::codec::{
@@ -91,6 +91,22 @@ impl LeafMask {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.as_slice().iter().all(|&w| w == 0)
+    }
+
+    /// Number of set bits.
+    #[inline]
+    pub fn count_ones(&self) -> u64 {
+        self.as_slice().iter().map(|w| w.count_ones() as u64).sum()
+    }
+
+    /// Number of bit positions set in both `self` and `other` (hardware `POPCNT`).
+    #[inline]
+    pub fn and_count(&self, other: &Self) -> u64 {
+        self.as_slice()
+            .iter()
+            .zip(other.as_slice())
+            .map(|(a, b)| (a & b).count_ones() as u64)
+            .sum()
     }
 
     #[inline]
@@ -180,6 +196,15 @@ pub struct PreparedFilter {
     root: PreparedNode,
 }
 
+impl PreparedFilter {
+    /// Whether per-leaf evaluation needs the leaf's live-slot mask (i.e. the tree contains a
+    /// `True` or `Not` node). When `false`, masks derive purely from `cf_attr_postings` /
+    /// FTS reverse maps and leaf blobs never need to be read.
+    pub fn needs_live_mask(&self) -> bool {
+        self.root.needs_live_mask()
+    }
+}
+
 #[derive(Debug, Clone)]
 enum PreparedNode {
     True,
@@ -201,6 +226,37 @@ enum PreparedNode {
     LeafSlotMasks(HashMap<NodeId, Vec<u64>>),
 }
 
+impl PreparedNode {
+    fn needs_live_mask(&self) -> bool {
+        match self {
+            PreparedNode::True | PreparedNode::Not(_) => true,
+            PreparedNode::False
+            | PreparedNode::Keys(_)
+            | PreparedNode::Range { .. }
+            | PreparedNode::LeafSlotMasks(_) => false,
+            PreparedNode::And(c) | PreparedNode::Or(c) => c.iter().any(Self::needs_live_mask),
+        }
+    }
+}
+
+/// Per-leaf evaluation environment: mask width plus the (optional) live-slot mask source.
+struct LeafEnv<'a> {
+    word_count: usize,
+    /// `(live_mask_bytes, slot_cap)`; `None` when evaluating without reading the leaf blob.
+    live: Option<(&'a [u8], usize)>,
+}
+
+impl LeafEnv<'_> {
+    fn live_mask(&self) -> Result<LeafMask> {
+        match self.live {
+            Some((bytes, slot_cap)) => Ok(LeafMask::from_live_mask_bytes(bytes, slot_cap)),
+            None => Err(TreeError::InvariantViolation(
+                "filter requires a live-slot mask but no leaf view was provided".into(),
+            )),
+        }
+    }
+}
+
 /// Cluster-aware inverted attribute index backed by `cf_attr_clusters` and `cf_attr_postings`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AttributeIndex;
@@ -220,6 +276,7 @@ impl AttributeIndex {
             tx.mutate_attr_posting(&cluster_key, leaf_id, |bm| {
                 bm.insert(local_id);
             })?;
+            tx.adjust_attr_count(&cluster_key, 1);
         }
         Ok(())
     }
@@ -238,6 +295,7 @@ impl AttributeIndex {
             tx.mutate_attr_posting(&cluster_key, leaf_id, |bm| {
                 bm.insert(local_id);
             })?;
+            tx.adjust_attr_count(&cluster_key, 1);
         }
         Ok(())
     }
@@ -256,6 +314,7 @@ impl AttributeIndex {
             tx.mutate_attr_posting(&cluster_key, leaf_id, |bm| {
                 bm.remove(local_id);
             })?;
+            tx.adjust_attr_count(&cluster_key, -1);
         }
         Ok(())
     }
@@ -401,6 +460,95 @@ impl AttributeIndex {
         })
     }
 
+    /// Prepare `filter` (`None` = match everything) intersected with a BM25 match bitmap
+    /// (`rank_bm`, a set of `FtsDocId`s resolved via the FTS reverse map into per-leaf slot masks).
+    pub fn prepare_filter_with_fts_and_rank_bm(
+        &self,
+        storage: &Storage,
+        schema: &CollectionSchema,
+        filter: Option<&Filter>,
+        fts_index: Option<&FtsIndex>,
+        rank_bm: Option<&RoaringBitmap>,
+    ) -> Result<PreparedFilter> {
+        let (mut cands, mut root) = match filter {
+            Some(f) => eval_cluster_node(storage, schema, f, fts_index)?,
+            None => (ClusterCandidates::All, PreparedNode::True),
+        };
+        if let Some(bm) = rank_bm {
+            let (leaf_bm, per_leaf) = storage.resolve_fts_bitmap_to_leaf_masks(bm)?;
+            if leaf_bm.is_empty() {
+                return Ok(PreparedFilter {
+                    cluster_candidates: ClusterCandidates::Subset(RoaringBitmap::new()),
+                    root: PreparedNode::False,
+                });
+            }
+            cands = match cands {
+                ClusterCandidates::All => ClusterCandidates::Subset(leaf_bm),
+                ClusterCandidates::Subset(mut cur) => {
+                    cur &= &leaf_bm;
+                    ClusterCandidates::Subset(cur)
+                }
+            };
+            let rank_node = PreparedNode::LeafSlotMasks(per_leaf);
+            root = match root {
+                PreparedNode::True => rank_node,
+                PreparedNode::And(mut children) => {
+                    children.push(rank_node);
+                    PreparedNode::And(children)
+                }
+                other => PreparedNode::And(vec![other, rank_node]),
+            };
+        }
+        Ok(PreparedFilter {
+            cluster_candidates: cands,
+            root,
+        })
+    }
+
+    /// Evaluate exact matching slot masks for `leaf_ids` **without reading any leaf blob**.
+    ///
+    /// Only valid when `!prepared.needs_live_mask()`: every mask is derived from
+    /// `cf_attr_postings` / FTS reverse maps (which only contain live documents) and sized to
+    /// `word_count` words (`config.max_leaf_size.div_ceil(64)`; `slot_cap <= max_leaf_size`).
+    pub fn eval_leaves_masks_no_views(
+        &self,
+        storage: &Storage,
+        prepared: &PreparedFilter,
+        leaf_ids: &[NodeId],
+        word_count: usize,
+    ) -> Result<Vec<LeafMask>> {
+        if prepared.needs_live_mask() {
+            return Err(TreeError::InvariantViolation(
+                "eval_leaves_masks_no_views requires a filter without True/Not nodes".into(),
+            ));
+        }
+        if leaf_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut needed_keys: Vec<Vec<u8>> = Vec::new();
+        collect_posting_keys(&prepared.root, leaf_ids, &mut needed_keys);
+        needed_keys.sort_unstable();
+        needed_keys.dedup();
+        let fetched = storage.multi_get_attr_posting_slices(&needed_keys)?;
+        let env = LeafEnv {
+            word_count,
+            live: None,
+        };
+        leaf_ids
+            .iter()
+            .map(|&leaf_id| {
+                eval_prepared_leaf(
+                    storage,
+                    &prepared.root,
+                    leaf_id,
+                    &env,
+                    &needed_keys,
+                    &fetched,
+                )
+            })
+            .collect()
+    }
+
     /// Evaluate exact matching slot bitmasks for a batch of `(leaf_id, Option<&LeafNodeView>)`
     /// using a single `batched_multi_get_cf` on `cf_attr_postings` plus prefix-bounded range scans.
     pub fn eval_leaves_masks<'a>(
@@ -442,11 +590,15 @@ impl AttributeIndex {
                 out.push(LeafMask::default());
                 continue;
             }
+            let env = LeafEnv {
+                word_count: view.slot_cap.div_ceil(64),
+                live: Some((view.live_mask_bytes, view.slot_cap)),
+            };
             out.push(eval_prepared_leaf(
                 storage,
                 &prepared.root,
                 leaf_id,
-                view,
+                &env,
                 &needed_keys,
                 &fetched,
             )?);
@@ -469,12 +621,14 @@ fn diff_sorted_keys(
                 tx.mutate_attr_posting(&old_keys[i], leaf_id, |bm| {
                     bm.remove(local_id);
                 })?;
+                tx.adjust_attr_count(&old_keys[i], -1);
                 i += 1;
             }
             std::cmp::Ordering::Greater => {
                 tx.mutate_attr_posting(&new_keys[j], leaf_id, |bm| {
                     bm.insert(local_id);
                 })?;
+                tx.adjust_attr_count(&new_keys[j], 1);
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
@@ -487,12 +641,14 @@ fn diff_sorted_keys(
         tx.mutate_attr_posting(&old_keys[i], leaf_id, |bm| {
             bm.remove(local_id);
         })?;
+        tx.adjust_attr_count(&old_keys[i], -1);
         i += 1;
     }
     while j < new_keys.len() {
         tx.mutate_attr_posting(&new_keys[j], leaf_id, |bm| {
             bm.insert(local_id);
         })?;
+        tx.adjust_attr_count(&new_keys[j], 1);
         j += 1;
     }
     Ok(())
@@ -917,16 +1073,13 @@ fn eval_prepared_leaf(
     storage: &Storage,
     node: &PreparedNode,
     leaf_id: NodeId,
-    view: &LeafNodeView<'_>,
+    env: &LeafEnv<'_>,
     needed_keys: &[Vec<u8>],
     fetched: &[Option<DBPinnableSlice<'_>>],
 ) -> Result<LeafMask> {
-    let word_count = view.slot_cap.div_ceil(64);
+    let word_count = env.word_count;
     match node {
-        PreparedNode::True => Ok(LeafMask::from_live_mask_bytes(
-            view.live_mask_bytes,
-            view.slot_cap,
-        )),
+        PreparedNode::True => env.live_mask(),
         PreparedNode::False => Ok(LeafMask::empty(word_count)),
         PreparedNode::LeafSlotMasks(map) => match map.get(&leaf_id) {
             Some(words) => Ok(LeafMask::from_words_padded(words, word_count)),
@@ -957,7 +1110,7 @@ fn eval_prepared_leaf(
         PreparedNode::And(children) => {
             let mut acc: Option<LeafMask> = None;
             for child in children {
-                let mask = eval_prepared_leaf(storage, child, leaf_id, view, needed_keys, fetched)?;
+                let mask = eval_prepared_leaf(storage, child, leaf_id, env, needed_keys, fetched)?;
                 if mask.is_empty() {
                     return Ok(LeafMask::empty(word_count));
                 }
@@ -972,21 +1125,22 @@ fn eval_prepared_leaf(
                     None => mask,
                 });
             }
-            Ok(acc.unwrap_or_else(|| {
-                LeafMask::from_live_mask_bytes(view.live_mask_bytes, view.slot_cap)
-            }))
+            match acc {
+                Some(m) => Ok(m),
+                None => env.live_mask(),
+            }
         }
         PreparedNode::Or(children) => {
             let mut acc = LeafMask::empty(word_count);
             for child in children {
-                let mask = eval_prepared_leaf(storage, child, leaf_id, view, needed_keys, fetched)?;
+                let mask = eval_prepared_leaf(storage, child, leaf_id, env, needed_keys, fetched)?;
                 acc.or_assign(&mask);
             }
             Ok(acc)
         }
         PreparedNode::Not(child) => {
-            let sub = eval_prepared_leaf(storage, child, leaf_id, view, needed_keys, fetched)?;
-            let mut out = LeafMask::from_live_mask_bytes(view.live_mask_bytes, view.slot_cap);
+            let sub = eval_prepared_leaf(storage, child, leaf_id, env, needed_keys, fetched)?;
+            let mut out = env.live_mask()?;
             out.and_not_assign(&sub);
             Ok(out)
         }

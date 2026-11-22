@@ -59,6 +59,7 @@ Implementation sources:
 | `cf_fts_postings` | `CF_FTS_POSTINGS` | `term_id` (`u32` BE) \|\| `block_id` (`u32` BE) (8 B) | v3 `PackedPostingBlock` (TF-only, aligned `tfs`) | `None` | Lazy sequential 4-byte prefix iterator / prefix visit |
 | `cf_fts_positions` | `CF_FTS_POSITIONS` | `term_id` (`u32` BE) \|\| `block_id` (`u32` BE) (8 B) | `PackedPositionBlock` (`u16` or `u32` offsets + LEB128 deltas) | Default | Batched `multi_get_fts_positions_pinned` (`ContainsTokenSequence` only) |
 | `default` (FTS document lengths) | `DEFAULT_COLUMN_FAMILY_NAME` | `0x05` \|\| `attr_id` (`u16` BE) \|\| `block_id` (`u32` BE) (7 B total) | `DocLenBlock` (260 / 516 / 1,028 B) | Default | Lazy per-`attr_id` load into `fts_doc_lens_cache` |
+| `default` (global attribute value counts) | `DEFAULT_COLUMN_FAMILY_NAME` | `0x06` \|\| `attr_id` (`u16` BE) \|\| `type_tag` (`u8`) \|\| `encoded_val` (same suffix as `cf_attr_clusters`, including `TAG_PRESENT = 0x00`) | `doc_count: u64` LE (8 B; key deleted at `0`) | Default | `Storage::visit_attr_counts` ordered range scan / `get_attr_count` point read |
 
 ### RocksDB Tuning
 
@@ -228,6 +229,14 @@ Array attributes (`StringArray`, `IntArray`, `UintArray`) index each distinct el
 
 - `leaf_count: u32 LE` followed by `leaf_count` entries of `(leaf_id: u32 LE, min_len: u16 LE, max_len: u16 LE, min_bytes, max_bytes)` sorted by `leaf_id` (storing each leaf's minimum and maximum order-preserving `encoded_val`).
 
+### 3.8b Global Per-Value Document Counts (`default`, tag `0x06`, marker `b"\x01attr_counts_v1"`)
+
+- **Key:** `0x06 || attr_id (u16 BE) || type_tag (u8) || encoded_val` — byte-identical to the `cf_attr_clusters` key with a `0x06` prefix, so an ordered scan of `0x06 || attr_id || type_tag` yields values in value order (`TAG_PRESENT` holds the number of documents with a non-null value, empty arrays included).
+- **Value:** `doc_count: u64` LE (8 bytes). The key is deleted when the count reaches `0`.
+- **Semantics:** number of *documents* holding that index key — identical to the cardinality of the union of its per-leaf postings. Array elements are deduplicated per document (they are already deduplicated when index keys are extracted).
+- **Maintenance:** `TxContext::adjust_attr_count(cluster_key, ±1)` is called from `AttributeIndex::{insert_doc, insert_doc_entries, remove_doc_entries, diff_doc_in_place, diff_patched_in_place}` only. Deltas coalesce in `TxContext::dirty_attr_count_deltas` and commit with one sorted `multi_get` read-modify-write in `stage_attr_counts`, inside the same `WriteBatch` as the postings. `apply_cluster_delta` (leaf splits, merges, compaction, LIRE) never touches counts because relocating a document between leaves does not change its global value counts.
+- **Migration:** `default[b"\x01attr_counts_v1"]` marks the counters as complete. `Collection::open` backfills them from `cf_docs` in one atomic batch when the marker is absent (databases created before this keyspace existed) and writes the marker for fresh databases.
+
 ### 3.9 FTS Keys, `TermRecord`, `SkipBlock`, `FtsRevBlock`, `DocLenBlock`, Posting & Position Blocks
 
 Each document in an FTS-enabled collection is assigned a dense `FtsDocId: u32` (`< FtsDocId::MAX`), partitioned into 256-document blocks (`FTS_BLOCK_SIZE = 256`):
@@ -308,4 +317,5 @@ Verified exhaustively by `verify_invariants` and `verify_collection_invariants` 
 3. **Vector, doc, and `DocLoc` completeness:** `cf_vectors`, `cf_docs`, and `cf_doc_loc` are exact 1-to-1 bijections with reachable leaf `(doc_id, leaf_id, local_id == slot)` entries and `TreeMeta.num_vectors`.
 4. **Attribute postings, zone maps & cluster summary exactness:** Every key in `cf_attr_postings` (`LeafPosting`) is non-empty and matches the exact set of slots reconstructed from `cf_docs` + `cf_doc_loc`; `cf_attr_clusters[k]` equals the exact `RoaringBitmap` of non-empty leaves; attribute zones in `default` match the exact `(min_val, max_val)` per leaf for ordered scalar types.
 5. **FTS index parity:** `cf_doc_loc` `fts_doc_id`s and FTS reverse-map blocks in `default` (`FtsRevBlock`) form a 1-to-1 bijection with `cf_docs` and `(doc_id, leaf_id, local_id)` when FTS attributes exist; `default[b"\x01fts_free_ids"]` is strictly disjoint from live `FtsDocId`s, bounded below `next_fts_doc_id`, and trimmed at the tail; `default[b"\x01fts_meta"]` per-attribute `(doc_count, total_tokens)`, `cf_fts_terms` (`TermRecord` with unique `term_id < next_term_id`, valid inline terms `df <= 8` on 1 block, `TermStats` sound globally and exact for `<= 64`-block terms), `cf_fts_skips`, FTS document lengths in `default`, `cf_fts_postings`, and `cf_fts_positions` match a full re-analysis of `cf_docs`.
-6. **Atomic updates:** All mutations across the column families commit in a single `rocksdb::WriteBatch` before updating in-memory caches (`internal_cache`, `leaf_parent`, `attr_zones_cache`, `fts_rev_map_cache`, and `fts_doc_lens_cache`).
+6. **Global attribute counts:** `default[0x06 || cluster_key]` equals, for every `(attr_id, type_tag, encoded_val)` and `TAG_PRESENT`, the number of `cf_docs` documents whose extracted index keys contain it; no zero-valued entries are persisted and `default[b"\x01attr_counts_v1"]` exists.
+7. **Atomic updates:** All mutations across the column families commit in a single `rocksdb::WriteBatch` before updating in-memory caches (`internal_cache`, `leaf_parent`, `attr_zones_cache`, `fts_rev_map_cache`, and `fts_doc_lens_cache`).

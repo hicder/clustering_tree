@@ -8,7 +8,7 @@ use crate::node::{PackedInternalNode, PackedLeafNode, TreeMeta, encode_f32_slice
 
 use super::types::{DocLoc, doc_key, node_key};
 use super::{
-    ATTR_ZONE_TAG, CF_ATTR_CLUSTERS, CF_ATTR_POSTINGS, CF_DOC_LOC, CF_DOCS, CF_FTS_POSITIONS,
+    ATTR_COUNT_TAG, ATTR_COUNTS_VERSION_KEY, ATTR_ZONE_TAG, CF_ATTR_CLUSTERS, CF_ATTR_POSTINGS, CF_DOC_LOC, CF_DOCS, CF_FTS_POSITIONS,
     CF_FTS_POSTINGS, CF_FTS_SKIPS, CF_FTS_TERMS, CF_LEAF_ENTRIES, CF_VECTORS, FTS_DOC_LEN_TAG,
     FTS_FREE_IDS_KEY, FTS_META_KEY, FTS_REV_BLOCK_TAG, INTERNAL_NODE_TAG, META_KEY, SCHEMA_KEY,
     Storage, tagged_key,
@@ -100,6 +100,30 @@ impl<'a> StorageBatch<'a> {
 
     pub fn delete_attr_posting(&mut self, key: &[u8]) {
         self.delete_cf(CF_ATTR_POSTINGS, key);
+    }
+
+    /// Set `default[0x06 || cluster_key]` to `count` (callers delete the key instead of writing `0`).
+    pub fn put_attr_count(&mut self, cluster_key: &[u8], count: u64) {
+        let mut key = Vec::with_capacity(1 + cluster_key.len());
+        key.push(ATTR_COUNT_TAG);
+        key.extend_from_slice(cluster_key);
+        self.batch.put(key, count.to_le_bytes());
+    }
+
+    pub fn delete_attr_count(&mut self, cluster_key: &[u8]) {
+        let mut key = Vec::with_capacity(1 + cluster_key.len());
+        key.push(ATTR_COUNT_TAG);
+        key.extend_from_slice(cluster_key);
+        self.batch.delete(key);
+    }
+
+    /// Persist the marker declaring that `default[0x06]` counts are complete and maintained.
+    pub fn put_attr_counts_marker(&mut self) {
+        self.batch.put(ATTR_COUNTS_VERSION_KEY, [1u8]);
+    }
+
+    pub fn delete_attr_counts_marker(&mut self) {
+        self.batch.delete(ATTR_COUNTS_VERSION_KEY);
     }
 
     pub fn put_attr_zone(&mut self, key: &[u8; 3], bytes: &[u8]) {

@@ -56,11 +56,16 @@ const INTERNAL_NODE_TAG: u8 = 2;
 const ATTR_ZONE_TAG: u8 = 3;
 const FTS_REV_BLOCK_TAG: u8 = 4;
 const FTS_DOC_LEN_TAG: u8 = 5;
+/// `default` CF keyspace tag for global per-value document counts:
+/// `0x06 || cluster_key (attr_id BE || type_tag || encoded_val) -> doc_count: u64 LE`.
+pub const ATTR_COUNT_TAG: u8 = 6;
 
 const META_KEY: &[u8] = b"\x01tree_meta";
 const SCHEMA_KEY: &[u8] = b"\x01schema";
 const FTS_META_KEY: &[u8] = b"\x01fts_meta";
 const FTS_FREE_IDS_KEY: &[u8] = b"\x01fts_free_ids";
+/// Marker recording that `default[0x06]` global attribute counts are present and maintained.
+pub const ATTR_COUNTS_VERSION_KEY: &[u8] = b"\x01attr_counts_v1";
 const BLOCK_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const DB_WRITE_BUFFER_BYTES: usize = 128 * 1024 * 1024;
 const ATTR_POSTING_PREFIX_LEN: usize = 7;
@@ -604,6 +609,106 @@ impl Storage {
         self.scan_cf(CF_ATTR_POSTINGS, |k| Ok(k.to_vec()), LeafPosting::decode)
     }
 
+    /// Global number of documents holding the index key `cluster_key`
+    /// (`attr_id BE || type_tag || encoded_val`), from `default[0x06]`. `0` if absent.
+    pub fn get_attr_count(&self, cluster_key: &[u8]) -> Result<u64> {
+        let mut key = Vec::with_capacity(1 + cluster_key.len());
+        key.push(ATTR_COUNT_TAG);
+        key.extend_from_slice(cluster_key);
+        match self.db.get_pinned(key).map_err(map_db_err)? {
+            Some(bytes) => decode_count(&bytes),
+            None => Ok(0),
+        }
+    }
+
+    /// Visit `default[0x06]` counts for `(attr_id, type_tag)` in ascending `encoded_val` order,
+    /// seeking to `start_val`. `visit(encoded_val, count)` returns `false` to stop early.
+    pub fn visit_attr_counts(
+        &self,
+        attr_id: AttrId,
+        type_tag: u8,
+        start_val: &[u8],
+        mut visit: impl FnMut(&[u8], u64) -> Result<bool>,
+    ) -> Result<()> {
+        let a = attr_id.to_be_bytes();
+        let prefix = [ATTR_COUNT_TAG, a[0], a[1], type_tag];
+        let mut options = ReadOptions::default();
+        options.set_iterate_range(PrefixRange(&prefix[..]));
+        let mut iter = self.db.raw_iterator_opt(options);
+        let mut seek_key = Vec::with_capacity(prefix.len() + start_val.len());
+        seek_key.extend_from_slice(&prefix);
+        seek_key.extend_from_slice(start_val);
+        iter.seek(&seek_key);
+        while let Some((key, value)) = iter.item() {
+            if !visit(&key[prefix.len()..], decode_count(value)?)? {
+                break;
+            }
+            iter.next();
+        }
+        iter.status().map_err(map_db_err)
+    }
+
+    /// Prefix-scan `cf_attr_postings` for `(attr_id, type_tag, leaf_id)` in ascending `encoded_val`
+    /// order, seeking to `start_val`. `visit(encoded_val, raw_posting)` returns `false` to stop.
+    pub fn visit_leaf_attr_postings(
+        &self,
+        attr_id: AttrId,
+        type_tag: u8,
+        leaf_id: NodeId,
+        start_val: &[u8],
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<bool>,
+    ) -> Result<()> {
+        let cf = self.cf(CF_ATTR_POSTINGS)?;
+        let prefix = encode_posting_prefix(attr_id, type_tag, leaf_id);
+        let mut ro = ReadOptions::default();
+        ro.set_prefix_same_as_start(true);
+        let mut iter = self.db.raw_iterator_cf_opt(cf, ro);
+        let mut seek_key = Vec::with_capacity(prefix.len() + start_val.len());
+        seek_key.extend_from_slice(&prefix);
+        seek_key.extend_from_slice(start_val);
+        iter.seek(&seek_key);
+        while iter.valid() {
+            let Some(k) = iter.key() else { break };
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            if let Some(v) = iter.value()
+                && !visit(&k[ATTR_POSTING_PREFIX_LEN..], v)?
+            {
+                break;
+            }
+            iter.next();
+        }
+        iter.status().map_err(map_db_err)
+    }
+
+    /// All `default[0x06]` counts as `(cluster_key, count)` pairs.
+    pub fn all_attr_counts(&self) -> Result<Vec<(Vec<u8>, u64)>> {
+        self.scan_default(ATTR_COUNT_TAG, |k| Ok(k.to_vec()), decode_count)
+    }
+
+    /// Delete every `default[0x06]` count and the global-counts marker, reproducing the on-disk
+    /// state of a database created before global counts existed (the next `Collection::open`
+    /// backfills them). Intended for migration tests.
+    #[doc(hidden)]
+    pub fn clear_attr_counts(&self) -> Result<()> {
+        let mut batch = self.new_batch();
+        for (key, _) in self.all_attr_counts()? {
+            batch.delete_attr_count(&key);
+        }
+        batch.delete_attr_counts_marker();
+        self.write_batch(batch)
+    }
+
+    /// Whether the `default[0x06]` global-counts marker is persisted.
+    pub fn has_attr_counts_marker(&self) -> Result<bool> {
+        Ok(self
+            .db
+            .get_pinned(ATTR_COUNTS_VERSION_KEY)
+            .map_err(map_db_err)?
+            .is_some())
+    }
+
     pub fn all_attr_zones(&self) -> Result<Vec<(Vec<u8>, AttrZoneMap)>> {
         self.scan_default(ATTR_ZONE_TAG, |k| Ok(k.to_vec()), decode_zone_map)
     }
@@ -985,6 +1090,13 @@ impl Storage {
             .cf_handle(name)
             .ok_or_else(|| TreeError::CorruptedData(format!("missing column family {name}")))
     }
+}
+
+fn decode_count(bytes: &[u8]) -> Result<u64> {
+    let arr: [u8; 8] = bytes.try_into().map_err(|_| {
+        TreeError::CorruptedData(format!("attr count expected 8 bytes, got {}", bytes.len()))
+    })?;
+    Ok(u64::from_le_bytes(arr))
 }
 
 fn tagged_key<const N: usize>(tag: u8, key: &[u8]) -> [u8; N] {

@@ -586,6 +586,97 @@ impl FtsIndex {
         }
     }
 
+    /// Exact set of `FtsDocId`s whose BM25 score under `rank_by` is `> 0`.
+    ///
+    /// BM25 IDF is strictly positive whenever `df > 0`, so a document scores `> 0` iff it contains
+    /// at least one resolved term reachable through a positive-weight path of the `RankBy` AST
+    /// (`Sum` / `Max` = union, `Product(w, e)` = `e` when the accumulated weight is `> 0`).
+    /// Term resolution mirrors MAXSCORE compilation (query analysis, `last_as_prefix`, and
+    /// `max_prefix_expansions`) but needs no float math or doc-length reads.
+    pub fn eval_rank_by_match_bitmap(
+        &self,
+        storage: &Storage,
+        schema: &CollectionSchema,
+        rank_by: &RankBy,
+    ) -> Result<RoaringBitmap> {
+        let source = StorageFtsSource::new(storage);
+        self.rank_by_match(storage, &source, schema, rank_by, 1.0)
+    }
+
+    fn rank_by_match(
+        &self,
+        storage: &Storage,
+        source: &StorageFtsSource<'_>,
+        schema: &CollectionSchema,
+        expr: &RankBy,
+        weight: f32,
+    ) -> Result<RoaringBitmap> {
+        if weight <= 0.0 {
+            return Ok(RoaringBitmap::new());
+        }
+        match expr {
+            RankBy::Product(w, inner) => {
+                self.rank_by_match(storage, source, schema, inner, weight * *w)
+            }
+            RankBy::Sum(children) | RankBy::Max(children) => {
+                let mut acc = RoaringBitmap::new();
+                for child in children {
+                    acc |= self.rank_by_match(storage, source, schema, child, weight)?;
+                }
+                Ok(acc)
+            }
+            RankBy::Bm25 {
+                attr,
+                query,
+                params,
+            } => {
+                let entry = schema.get_by_name(attr).ok_or_else(|| {
+                    TreeError::InvalidQuery(format!("unknown attribute '{attr}'"))
+                })?;
+                let fts_cfg = entry.full_text_search.as_ref().ok_or_else(|| {
+                    TreeError::InvalidQuery(format!(
+                        "attribute '{attr}' does not have full_text_search enabled"
+                    ))
+                })?;
+                let qtokens = {
+                    let mut buf = self.acquire_buffer();
+                    FtsAnalyzer::new(fts_cfg.clone()).analyze_query(query, &mut buf)?
+                };
+                if qtokens.is_empty() {
+                    return Ok(RoaringBitmap::new());
+                }
+                let last_as_prefix = params
+                    .as_ref()
+                    .and_then(|p| p.last_as_prefix)
+                    .unwrap_or(false);
+                let max_expansions = params
+                    .as_ref()
+                    .and_then(|p| p.max_prefix_expansions)
+                    .unwrap_or(DEFAULT_MAX_PREFIX_EXPANSIONS);
+
+                let mut exact = exact_query_tokens(&qtokens, last_as_prefix);
+                exact.sort_unstable();
+                exact.dedup();
+                let mut records: Vec<TermRecord> = source
+                    .multi_get_term_records(entry.id, &exact)?
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                if last_as_prefix {
+                    let prefix = &qtokens.last().unwrap().text;
+                    records.extend(
+                        source
+                            .scan_prefix_terms(entry.id, prefix, max_expansions)?
+                            .into_iter()
+                            .map(|(_, rec)| rec),
+                    );
+                }
+                records.retain(|r| r.stats.doc_freq > 0);
+                eval_any_token_records(storage, &records)
+            }
+        }
+    }
+
     /// Evaluate a full [`Filter`] (supporting mixed attribute + FTS predicates) in memory
     /// against a document's attributes.
     pub fn matches_filter(

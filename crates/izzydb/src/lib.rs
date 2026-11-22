@@ -10,6 +10,8 @@ pub use izzydb_storage::{codec, node, storage};
 pub mod attr_index;
 /// High-level `Collection` coordinating vector, attribute, and full-text indexes.
 pub mod collection;
+/// Exact faceting engine (global counts, forward doc passes, inverted leaf-mask intersection).
+pub mod facet;
 /// Inverted full-text index manager and BM25 query execution.
 pub mod fts_index;
 /// SPFresh LIRE boundary reassignment after leaf splits.
@@ -25,6 +27,11 @@ pub mod verify;
 
 pub use collection::{
     Collection, Document, DocumentPatch, HybridSearchOptions, HybridSearchResult, SearchResult,
+};
+pub use facet::{
+    FacetBucket, FacetFilterMode, FacetKind, FacetRange, FacetResult, FacetResults, FacetSort,
+    FacetSpec, FacetedSearchResponse, HistogramBucket, HistogramFacetResult, HybridFacetScope,
+    RangeBucket, RangeFacetResult, StatsFacetResult, TermFacetResult, VectorFacetScope,
 };
 pub use config::{AttrId, DistanceMetric, DocId, FtsBlockId, FtsDocId, LocalId, NodeId, TreeConfig};
 pub use error::{Result, TreeError};

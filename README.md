@@ -256,11 +256,11 @@ let resp = col.hybrid_search_with_facets(
 
 ```bash
 cargo test
-cargo run --release -p izzydb --example recall_bench
-cargo run --release -p izzydb --example filtered_bench
-cargo run --release -p izzydb --example fts_bench
-cargo run --release -p izzydb --example facet_bench
-cargo run --release -p izzydb --example encoding_bench
+cargo run --release -p izzydb-bench --bin recall_bench
+cargo run --release -p izzydb-bench --bin filtered_bench
+cargo run --release -p izzydb-bench --bin fts_bench
+cargo run --release -p izzydb-bench --bin facet_bench
+cargo run --release -p izzydb-bench --bin encoding_bench
 ```
 
 ## License

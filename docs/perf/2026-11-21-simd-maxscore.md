@@ -78,7 +78,7 @@ Prior to this change, `FtsIndex` already executed Block-Max MAXSCORE over 256-do
 
 ## Benchmark & Speedup
 
-Measured apples-to-apples via `cargo run --release --example fts_bench` (1 warmup + 25 timed runs, `vocab = 1,000`, `top_k = 10` with exact top-10 ID agreement verified against exhaustive BM25 scoring) on an **AMD Ryzen 9 7950X (`SimdTier::Avx512`)**:
+Measured apples-to-apples via `cargo run --release -p izzydb-bench --bin fts_bench` (1 warmup + 25 timed runs, `vocab = 1,000`, `top_k = 10` with exact top-10 ID agreement verified against exhaustive BM25 scoring) on an **AMD Ryzen 9 7950X (`SimdTier::Avx512`)**:
 
 ### `n = 10,000`, `vocab = 1,000`
 

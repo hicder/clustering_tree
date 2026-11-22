@@ -4,7 +4,7 @@ This note documents the storage layout, caching, algorithmic, and SIMD changes m
 
 ## Bottlenecks in the Baseline
 
-Before these changes, running `cargo run --release --example recall_bench` on an AMD Ryzen 9 7950X showed ~556–668 µs per query at `beam = 4` (~70–135 µs per leaf scanned). Over 95% of query time was spent outside distance math:
+Before these changes, running `cargo run --release -p izzydb-bench --bin recall_bench` on an AMD Ryzen 9 7950X showed ~556–668 µs per query at `beam = 4` (~70–135 µs per leaf scanned). Over 95% of query time was spent outside distance math:
 
 1. **Per-entry RocksDB keys & prefix iterators:** `cf_internal_entries` and `cf_leaf_entries` stored one KV pair per child/vector, plus separate `cf_node_header` lookups per leaf. Every leaf or internal scan opened a `DBIterator`, allocated per entry, and walked over overwritten versions and tombstones from splits, drift re-quantization, and LIRE.
 2. **Repeated RocksDB tree traversal:** Top-down beam search scanned `cf_internal_entries` from RocksDB on every query and every `add_leaf` insert.
@@ -48,7 +48,7 @@ Added runtime feature detection (`is_x86_feature_detected!`) with scalar fallbac
 
 ## Benchmark Comparison
 
-Measured with `cargo run --release --example recall_bench` on AMD Ryzen 9 7950X:
+Measured with `cargo run --release -p izzydb-bench --bin recall_bench` on AMD Ryzen 9 7950X:
 
 ### `beam = 4` Summary
 

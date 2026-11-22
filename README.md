@@ -18,12 +18,18 @@ An embedded, RocksDB-backed hybrid search engine in Rust for vector, full-text, 
 
 ## Quick Start
 
-Define a schema on `CollectionConfig` (setting `filterable = true` for attributes you want indexed for filtering, or `.with_fts_attribute(...)` to enable full-text indexing), upsert vectors with `Attributes`, and query via `Collection::search`, `Collection::query_bm25`, or `Collection::hybrid_search`:
+Define a schema on `CollectionConfig` (setting `filterable = true` for attributes indexed for filtering and faceting, or `.with_fts_attribute(...)` to enable full-text indexing), upsert vectors with `Attributes`, and query via `Collection::search`, `Collection::query_bm25`, `Collection::hybrid_search`, or `Collection::facet`:
+
+- **Full-text search:** `FullTextSearchConfig` supports `Tokenizer::WordV4` (default UAX #29), `Tokenizer::Whitespace`, and `Tokenizer::PreTokenizedArray` (for `StringArray` attributes), along with Snowball stemming, stopword removal, ASCII folding, BM25 parameter tuning (`k1`, `b`, `k3`), and optional position indexing (`index_positions`).
+- **Filters:** Supported attribute types are `String`, `Int` (`i64`), `Uint` (`u64`), `Float` (`f64`), `Bool`, `StringArray`, `IntArray`, and `UintArray`. Attributes used in scalar/array predicates must be registered with `filterable = true`; attributes used in token predicates must have `FullTextSearchConfig` enabled (`ContainsTokenSequence` also requires `index_positions = true`, the default).
+- **Facets:** Every `filterable` attribute is facetable. Facets are exact; each `FacetSpec` needs a unique output name (use `with_alias` for several facets on one attribute).
 
 ```rust
 use izzydb::{
-    AttributeType, Attributes, Collection, CollectionConfig, DistanceMetric, Filter,
-    FullTextSearchConfig, HybridSearchOptions, Language, RankBy, SearchOptions, TreeConfig,
+    AttributeType, Attributes, Bm25Overrides, Collection, CollectionConfig, DistanceMetric,
+    FacetRange, FacetSort, FacetSpec, Filter, FullTextSearchConfig, HybridFacetScope,
+    HybridSearchOptions, Language, RankBy, SearchOptions, TokenQuery, Tokenizer, TreeConfig,
+    VectorFacetScope,
 };
 
 let fts_en = FullTextSearchConfig::default()
@@ -34,16 +40,24 @@ let fts_en = FullTextSearchConfig::default()
 
 let config = CollectionConfig::new(TreeConfig::new(128, DistanceMetric::Cosine))
     .with_attribute("category", AttributeType::String, true)
+    .with_attribute("rank", AttributeType::Int, true)
     .with_attribute("price", AttributeType::Float, true)
     .with_attribute("in_stock", AttributeType::Bool, true)
     .with_attribute("tags", AttributeType::StringArray, true)
     .with_fts_attribute("title", AttributeType::String, false, fts_en.clone())
-    .with_fts_attribute("description", AttributeType::String, false, fts_en);
+    .with_fts_attribute("description", AttributeType::String, false, fts_en)
+    .with_fts_attribute(
+        "keywords",
+        AttributeType::StringArray,
+        false,
+        FullTextSearchConfig::default().with_tokenizer(Tokenizer::PreTokenizedArray),
+    );
 
 let mut col = Collection::open("/tmp/my_collection", config)?;
 
 let mut attrs = Attributes::new();
 attrs.insert("category".into(), "shoes".into());
+attrs.insert("rank".into(), 5_i64.into());
 attrs.insert("price".into(), 79.99_f64.into());
 attrs.insert("in_stock".into(), true.into());
 attrs.insert("tags".into(), vec!["running".to_string(), "sale".to_string()].into());
@@ -52,8 +66,12 @@ attrs.insert(
     "description".into(),
     "Lightweight waterproof trail running shoe with high-traction sole.".into(),
 );
-
+attrs.insert("keywords".into(), vec!["gore-tex".to_string(), "vibram".to_string()].into());
 col.upsert(1, &vec![0.1; 128], attrs)?;
+
+let query = vec![0.1_f32; 128];
+
+// --- Vector Search ---
 
 // Unfiltered vector search
 let opts = SearchOptions::new(10, 8).with_rerank(100);
@@ -77,45 +95,11 @@ let filtered_opts = SearchOptions::new(10, 8)
     .with_max_expanded_leaves(256);
 let hits = col.search(&query, filtered_opts, Some(&filter))?;
 
-// BM25 full-text search (single field or weighted multi-field)
-let rank_by = RankBy::sum(vec![
-    RankBy::product(2.0, RankBy::bm25("title", "trail runner")),
-    RankBy::bm25("description", "waterproof trail shoe"),
-]);
-let bm25_hits = col.query_bm25(&rank_by, Some(&filter), 10)?;
-
-// Hybrid vector + BM25 search fused with Reciprocal Rank Fusion (RRF)
-let hybrid_opts = HybridSearchOptions::new(10, SearchOptions::new(20, 8).with_rerank(100))
-    .with_bm25_candidates(20)
-    .with_rrf_k(60.0)
-    .with_weights(1.0, 1.5);
-let hybrid_hits = col.hybrid_search(&query, &rank_by, hybrid_opts, Some(&filter))?;
-```
-
-### Full-Text Search Examples
-
-`FullTextSearchConfig` supports `Tokenizer::WordV4` (default UAX #29), `Tokenizer::Whitespace`, and `Tokenizer::PreTokenizedArray` (for `StringArray` attributes), along with Snowball stemming, stopword removal, ASCII folding, BM25 parameter tuning (`k1`, `b`, `k3`), and optional position indexing (`index_positions`).
-
-```rust
-use izzydb::{
-    AttributeType, Bm25Overrides, CollectionConfig, DistanceMetric, Filter, FullTextSearchConfig,
-    RankBy, TokenQuery, Tokenizer, TreeConfig,
-};
-
-// Pre-tokenized string array attribute (tokens stored verbatim)
-let config = CollectionConfig::new(TreeConfig::new(128, DistanceMetric::Cosine))
-    .with_fts_attribute("title", AttributeType::String, false, FullTextSearchConfig::default())
-    .with_fts_attribute("body", AttributeType::String, false, FullTextSearchConfig::default())
-    .with_fts_attribute(
-        "keywords",
-        AttributeType::StringArray,
-        false,
-        FullTextSearchConfig::default().with_tokenizer(Tokenizer::PreTokenizedArray),
-    );
+// --- Full-Text Search (BM25) ---
 
 // Single-field BM25 query (col.query is an alias for col.query_bm25)
-let simple = RankBy::bm25("body", "waterproof trail");
-let hits = col.query_bm25(&simple, None, 10)?;
+let simple = RankBy::bm25("description", "waterproof trail");
+let simple_hits = col.query_bm25(&simple, None, 10)?;
 
 // Prefix / autocomplete matching on the last token and query-time BM25 overrides
 let prefix_rank = RankBy::bm25_with(
@@ -128,10 +112,15 @@ let prefix_rank = RankBy::bm25_with(
 );
 
 // Composite multi-field ranking with Sum, Max, and Product weights
+let rank_by = RankBy::sum(vec![
+    RankBy::product(2.0, RankBy::bm25("title", "trail runner")),
+    RankBy::bm25("description", "waterproof trail shoe"),
+]);
 let multi_field = RankBy::max(vec![
     RankBy::product(2.5, RankBy::bm25("title", "trail shoe")),
-    RankBy::bm25("body", "trail shoe"),
+    RankBy::bm25("description", "trail shoe"),
 ]);
+let bm25_hits = col.query_bm25(&rank_by, Some(&filter), 10)?;
 
 // Querying a PreTokenizedArray attribute requires TokenQuery::PreTokenized
 let pre_tokenized = RankBy::bm25(
@@ -139,17 +128,15 @@ let pre_tokenized = RankBy::bm25(
     TokenQuery::PreTokenized(vec!["gore-tex".into(), "vibram".into()]),
 );
 
-// Filtered BM25 using any Filter (attribute, FTS, or combined)
-let only_in_stock = Filter::Eq("in_stock".into(), true.into());
-let filtered_bm25 = col.query_bm25(&multi_field, Some(&only_in_stock), 10)?;
-```
+// --- Hybrid Vector + BM25 Search (RRF) ---
 
-### Filter Examples
+let hybrid_opts = HybridSearchOptions::new(10, SearchOptions::new(20, 8).with_rerank(100))
+    .with_bm25_candidates(20)
+    .with_rrf_k(60.0)
+    .with_weights(1.0, 1.5);
+let hybrid_hits = col.hybrid_search(&query, &rank_by, hybrid_opts.clone(), Some(&filter))?;
 
-Supported attribute types are `String`, `Int` (`i64`), `Uint` (`u64`), `Float` (`f64`), `Bool`, `StringArray`, `IntArray`, and `UintArray`. Attributes used in scalar/array predicates must be registered with `filterable = true`; attributes used in token predicates must have `FullTextSearchConfig` enabled (`ContainsTokenSequence` also requires `index_positions = true`, the default).
-
-```rust
-use izzydb::{Filter, TokenQuery};
+// --- Filters ---
 
 // Equality and set membership (scalar attributes)
 let eq = Filter::Eq("category".into(), "books".into());
@@ -201,17 +188,8 @@ let complex = Filter::Or(vec![
     ]),
     Filter::Contains("tags".into(), "featured".into()),
 ]);
-```
 
-### Facet Examples
-
-Every `filterable` attribute is facetable. Facets are exact; each `FacetSpec` needs a unique output name (use `with_alias` for several facets on one attribute).
-
-```rust
-use izzydb::{
-    FacetRange, FacetSort, FacetSpec, Filter, HybridFacetScope, RankBy, SearchOptions,
-    VectorFacetScope,
-};
+// --- Facets ---
 
 let facets = vec![
     // Top categories; `exclude_self` drops the category clause from this facet's filter so the
@@ -228,13 +206,13 @@ let facets = vec![
     FacetSpec::histogram("price", 20.0).with_alias("price_hist"),
 ];
 
-let filter = Filter::And(vec![
+let facet_filter = Filter::And(vec![
     Filter::Eq("category".into(), "shoes".into()),
     Filter::Eq("in_stock".into(), true.into()),
 ]);
 
-// Filter-only: facets over every document matching `filter`.
-let results = col.facet(Some(&filter), &facets)?;
+// Filter-only: facets over every document matching `facet_filter`.
+let results = col.facet(Some(&facet_filter), &facets)?;
 if let Some(cats) = results.terms("category") {
     for b in &cats.buckets {
         println!("{:?}: {}", b.value, b.count);
@@ -243,19 +221,23 @@ if let Some(cats) = results.terms("category") {
 let price = results.stats("price_stats").unwrap();
 println!("avg price {:?}, missing {}", price.avg, price.missing_count);
 
-// Vector search + facets (default scope: all docs matching `filter`).
+// Vector search + facets (default scope: all docs matching `facet_filter`).
 let resp = col.search_with_facets(
-    &query, SearchOptions::new(10, 8), Some(&filter), &facets, VectorFacetScope::FilterMatches,
+    &query, SearchOptions::new(10, 8), Some(&facet_filter), &facets, VectorFacetScope::FilterMatches,
 )?;
 println!("{} matches, {} hits", resp.total_hits, resp.hits.len());
 
-// BM25 + facets: population is every document with BM25 score > 0 that matches `filter`.
-let rank_by = RankBy::bm25("title", "trail runner");
-let resp = col.query_bm25_with_facets(&rank_by, Some(&filter), 10, &facets)?;
+// BM25 + facets: population is every document with BM25 score > 0 that matches `facet_filter`.
+let resp = col.query_bm25_with_facets(&prefix_rank, Some(&facet_filter), 10, &facets)?;
 
-// Hybrid RRF + facets over the BM25 matches that also pass `filter`.
+// Hybrid RRF + facets over the BM25 matches that also pass `facet_filter`.
 let resp = col.hybrid_search_with_facets(
-    &query, &rank_by, hybrid_opts, Some(&filter), &facets, HybridFacetScope::Bm25AndFilterMatches,
+    &query,
+    &pre_tokenized,
+    hybrid_opts,
+    Some(&facet_filter),
+    &facets,
+    HybridFacetScope::Bm25AndFilterMatches,
 )?;
 ```
 

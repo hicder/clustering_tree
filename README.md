@@ -123,6 +123,17 @@ let multi_field = RankBy::max(vec![
 ]);
 let bm25_hits = col.query_bm25(&rank_by, Some(&filter), 10)?;
 
+// Boosting: filter boosts, recency / popularity signals, multiplicative products
+let boosted = RankBy::boost_multiplicative(
+    RankBy::bm25("description", "waterproof trail shoe"),
+    2.0,
+    RankBy::decay_from("created_at", now, 30.0 * DAY).with_decay_mode(DecayMode::Backward),
+);
+let boosted_hits = col.query(&boosted, Some(&filter), 10)?;
+
+// Sort by attributes (index-order scan, stops after top_k)
+let cheapest = col.query_ordered(&[OrderBySpec::asc("price")], Some(&filter), 10)?;
+
 // Querying a PreTokenizedArray attribute requires TokenQuery::PreTokenized
 let pre_tokenized = RankBy::bm25(
     "keywords",

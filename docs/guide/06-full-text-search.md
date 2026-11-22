@@ -101,6 +101,7 @@ let best_field = RankBy::max(vec![
 | `RankBy::sum(vec)` | sum of children |
 | `RankBy::max(vec)` | maximum of children |
 | `RankBy::product(w, expr)` | `w × score(expr)`, with `w ≥ 0` and finite |
+| `RankBy::product_all(vec)` | product of all children (see [Ranking & Boosting](11-ranking-and-boosting.md)) |
 
 Expressions nest. Each leaf may use a different attribute and a different query string.
 

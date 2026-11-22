@@ -421,17 +421,25 @@ fn brute_force_bm25_eval(
         buf: &mut ReusableBuffer,
     ) -> f32 {
         match expr {
-            RankBy::Product(w, inner) => {
-                w * eval_expr(
-                    doc_id,
-                    inner,
-                    schema,
-                    per_attr_counts,
-                    df_map,
-                    doc_analyzed,
-                    buf,
-                )
-            }
+            RankBy::Const(c) => *c,
+            RankBy::Product(children) => children
+                .iter()
+                .map(|c| {
+                    eval_expr(
+                        doc_id,
+                        c,
+                        schema,
+                        per_attr_counts,
+                        df_map,
+                        doc_analyzed,
+                        buf,
+                    )
+                })
+                .product(),
+            RankBy::Filter(_)
+            | RankBy::Attribute { .. }
+            | RankBy::Saturate { .. }
+            | RankBy::Decay { .. } => unreachable!("lexical reference evaluator"),
             RankBy::Sum(children) => children
                 .iter()
                 .map(|c| {

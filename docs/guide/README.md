@@ -24,6 +24,7 @@ New to IzzyDB? Read 1 → 3, then jump to whichever search mode you need.
 8. [Faceting](08-faceting.md) — `Terms`, `Ranges`, `Stats`, `Histogram`, multi-select facets.
 9. [Bulk Import](09-bulk-import.md) — loading millions of rows from Parquet with `izzydb-bulk`.
 10. [Operations & Troubleshooting](10-operations.md) — durability, reopening, concurrency, verification, errors, performance tips.
+11. [Ranking, Boosting & Sorting](11-ranking-and-boosting.md) — filter boosts, `Saturate` / `Decay` attribute scores, multiplicative boosts, `query_ordered`.
 
 ## Mental model in 60 seconds
 

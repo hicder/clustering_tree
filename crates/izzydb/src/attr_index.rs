@@ -197,6 +197,33 @@ pub struct PreparedFilter {
 }
 
 impl PreparedFilter {
+    /// Restrict this plan (`None` = match everything) to documents holding the index key
+    /// `cluster_key`, whose leaf bitmap is `key_leaves`.
+    pub(crate) fn restricted_to_key(
+        base: Option<&PreparedFilter>,
+        cluster_key: Vec<u8>,
+        key_leaves: RoaringBitmap,
+    ) -> PreparedFilter {
+        let mut leaves = key_leaves.clone();
+        let keys = PreparedNode::Keys(vec![(cluster_key, key_leaves)]);
+        let root = match base {
+            None => keys,
+            Some(b) => {
+                if let ClusterCandidates::Subset(c) = &b.cluster_candidates {
+                    leaves &= c;
+                }
+                match &b.root {
+                    PreparedNode::True => keys,
+                    other => PreparedNode::And(vec![other.clone(), keys]),
+                }
+            }
+        };
+        PreparedFilter {
+            cluster_candidates: ClusterCandidates::Subset(leaves),
+            root,
+        }
+    }
+
     /// Whether per-leaf evaluation needs the leaf's live-slot mask (i.e. the tree contains a
     /// `True` or `Not` node). When `false`, masks derive purely from `cf_attr_postings` /
     /// FTS reverse maps and leaf blobs never need to be read.

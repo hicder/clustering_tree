@@ -19,7 +19,7 @@ use izzydb_fts::{
     FtsAnalyzer, FtsDocLenCursor, FtsMeta, FtsPostingSource, FtsSkipCursor, INLINE_TERM_MAX_DF,
     PackedPositionBlock, PackedPostingBlock, PositionBlockView, PostingBlockHeader,
     PostingBlockView, ReusableBuffer, SkipBlock, SkipBlockView, TermRecord, TermStats,
-    dl_over_tf_lower_bound, execute_rank_by,
+    RankModifier, dl_over_tf_lower_bound, execute_rank_by, execute_rank_by_with,
 };
 use izzydb_storage::codec::{
     decode_fts_term_key, encode_fts_doc_len_key, encode_fts_term_id_key, encode_fts_term_key,
@@ -535,6 +535,25 @@ impl FtsIndex {
         )
     }
 
+    /// [`FtsIndex::query_bm25`] with an optional per-document [`RankModifier`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_bm25_with(
+        &self,
+        storage: &Storage,
+        schema: &CollectionSchema,
+        rank_by: &RankBy,
+        top_k: usize,
+        doc_filter: Option<&RoaringBitmap>,
+        lazy_filter: Option<&mut dyn FnMut(DocId) -> Result<bool>>,
+        modifier: Option<RankModifier<'_>>,
+    ) -> Result<Vec<Bm25Result>> {
+        let source = StorageFtsSource::new(storage);
+        let mut buf = self.acquire_buffer();
+        execute_rank_by_with(
+            &source, schema, rank_by, top_k, doc_filter, lazy_filter, modifier, &mut buf,
+        )
+    }
+
     /// Evaluate a single FTS filter predicate into a `RoaringBitmap` of matching `FtsDocId`s.
     pub fn eval_fts_predicate(
         &self,
@@ -615,9 +634,35 @@ impl FtsIndex {
             return Ok(RoaringBitmap::new());
         }
         match expr {
-            RankBy::Product(w, inner) => {
-                self.rank_by_match(storage, source, schema, inner, weight * *w)
+            RankBy::Product(children) => {
+                let mut w = weight;
+                let mut lexical: Option<&RankBy> = None;
+                for child in children {
+                    match child {
+                        RankBy::Const(c) => w *= *c,
+                        other => {
+                            if lexical.replace(other).is_some() {
+                                return Err(TreeError::InvalidQuery(
+                                    "rank_by_match requires a pure lexical expression".into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                match lexical {
+                    Some(inner) => self.rank_by_match(storage, source, schema, inner, w),
+                    None => Err(TreeError::InvalidQuery(
+                        "rank_by_match requires a pure lexical expression".into(),
+                    )),
+                }
             }
+            RankBy::Const(_)
+            | RankBy::Filter(_)
+            | RankBy::Attribute { .. }
+            | RankBy::Saturate { .. }
+            | RankBy::Decay { .. } => Err(TreeError::InvalidQuery(
+                "rank_by_match requires a pure lexical expression".into(),
+            )),
             RankBy::Sum(children) | RankBy::Max(children) => {
                 let mut acc = RoaringBitmap::new();
                 for child in children {

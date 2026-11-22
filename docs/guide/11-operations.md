@@ -36,7 +36,7 @@ All APIs return `izzydb::Result<T>`; the error type is `TreeError` (implements `
 | `NonFiniteVector` | `NaN` or `±Inf` in a vector. | Sanitize inputs. |
 | `InvalidAttribute { name, reason }` | Undeclared attribute, wrong value type, `NaN` float. | Match the schema. |
 | `InvalidFilter(msg)` | Unknown/non-filterable attribute, wrong value type, `Eq` on an array, range on `Bool`, … | See [Filtering](05-filtering.md). |
-| `InvalidQuery(msg)` | Bad `RankBy`, hybrid options, or facet spec. | See [Full-Text](06-full-text-search.md), [Hybrid](07-hybrid-search.md), [Faceting](08-faceting.md). |
+| `InvalidQuery(msg)` | Bad `RankBy`, hybrid options, or facet spec. | See [Full-Text](06-full-text-search.md), [Hybrid](07-hybrid-search.md), [Ranking & Boosting](08-ranking-and-boosting.md), [Faceting](09-faceting.md). |
 | `DocumentNotFound(id)` | `patch` / `patch_batch` on a missing id. | `upsert` instead, or check first with `get`. |
 | `Storage(msg)` | RocksDB reported an I/O or lock error (disk full, permissions, DB already open elsewhere). | Check the message and the environment. |
 | `CorruptedData(msg)` | Unreadable stored data, or an interrupted bulk import. | For an interrupted import, delete the directory and re-run the import. Otherwise restore from backup. |
@@ -55,7 +55,7 @@ println!("{} docs in {} leaves", stats.num_docs, stats.tree.leaf_nodes);
 
 **Writes**
 
-- Use [bulk import](09-bulk-import.md) for the initial load.
+- Use [bulk import](10-bulk-import.md) for the initial load.
 - Index only what you query: each `filterable` and full-text attribute adds work to every write ([Collections & Schema](02-collections-and-schema.md#declaring-attributes)).
 - `patch` a few attributes instead of `upsert`ing a whole document.
 - Prefer `patch_batch` / `delete_batch` to loops of single calls.

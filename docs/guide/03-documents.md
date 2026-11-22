@@ -126,6 +126,6 @@ Returns every `DocId` matching a filter (attribute and/or full-text predicates),
 
 ## Batching advice
 
-- Each `upsert` is its own transaction. For **initial** loads of large datasets use [Bulk Import](09-bulk-import.md), which is dramatically faster.
+- Each `upsert` is its own transaction. For **initial** loads of large datasets use [Bulk Import](10-bulk-import.md), which is dramatically faster.
 - For ongoing changes of many documents, prefer `patch_batch` / `delete_batch` over loops of single calls.
-- There is no explicit `flush`/`commit`: a returned write has been applied to RocksDB and its write-ahead log (see [Durability](10-operations.md#durability) for what that does and does not guarantee).
+- There is no explicit `flush`/`commit`: a returned write has been applied to RocksDB and its write-ahead log (see [Durability](11-operations.md#durability) for what that does and does not guarantee).

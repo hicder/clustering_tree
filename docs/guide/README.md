@@ -8,7 +8,8 @@ IzzyDB is an **embedded** hybrid search engine for Rust. It runs inside your pro
 | Attribute filtering | "…but only `category = shoes AND price < 100`." | [Filtering](05-filtering.md) |
 | Full-text (BM25) | "Which documents best match these *words*?" | [Full-Text Search](06-full-text-search.md) |
 | Hybrid (RRF) | "Combine vector and keyword rankings." | [Hybrid Search](07-hybrid-search.md) |
-| Facets | "How many results per category / price range?" | [Faceting](08-faceting.md) |
+| Ranking & boosting | "Boost by filters, recency, popularity, or sort by attributes." | [Ranking, Boosting & Sorting](08-ranking-and-boosting.md) |
+| Facets | "How many results per category / price range?" | [Faceting](09-faceting.md) |
 
 ## Reading order
 
@@ -21,10 +22,10 @@ New to IzzyDB? Read 1 → 3, then jump to whichever search mode you need.
 5. [Filtering](05-filtering.md) — the `Filter` expression tree and its exact semantics (nulls, negation, ranges).
 6. [Full-Text Search](06-full-text-search.md) — analyzers, BM25, `RankBy` composition, prefix search.
 7. [Hybrid Search](07-hybrid-search.md) — Reciprocal Rank Fusion of vector + BM25.
-8. [Faceting](08-faceting.md) — `Terms`, `Ranges`, `Stats`, `Histogram`, multi-select facets.
-9. [Bulk Import](09-bulk-import.md) — loading millions of rows from Parquet with `izzydb-bulk`.
-10. [Operations & Troubleshooting](10-operations.md) — durability, reopening, concurrency, verification, errors, performance tips.
-11. [Ranking, Boosting & Sorting](11-ranking-and-boosting.md) — filter boosts, `Saturate` / `Decay` attribute scores, multiplicative boosts, `query_ordered`.
+8. [Ranking, Boosting & Sorting](08-ranking-and-boosting.md) — filter boosts, `Saturate` / `Decay` attribute scores, multiplicative boosts, `query_ordered`.
+9. [Faceting](09-faceting.md) — `Terms`, `Ranges`, `Stats`, `Histogram`, multi-select facets.
+10. [Bulk Import](10-bulk-import.md) — loading millions of rows from Parquet with `izzydb-bulk`.
+11. [Operations & Troubleshooting](11-operations.md) — durability, reopening, concurrency, verification, errors, performance tips.
 
 ## Mental model in 60 seconds
 

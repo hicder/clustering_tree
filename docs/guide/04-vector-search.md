@@ -27,7 +27,7 @@ Wider beams look at more clusters (higher recall, more latency). Reranking fixes
 |---|---|---|---|
 | `SearchOptions::new(k, beam_width)` | `k`, `beam_width` | — | Number of results; clusters kept per tree level. |
 | `.with_rerank(n)` | `rerank_candidates` | `None` (no rerank) | Take the best `n` candidates by quantized score and re-score them exactly. Reported distances are then computed from the full-precision vectors. |
-| `.with_exhaustive_cluster_threshold(t)` | `exhaustive_cluster_threshold` | 8 | If cluster pruning leaves ≤ `t` leaves, skip quantized scoring and compute exact distances directly. |
+| `.with_exact_scan_threshold(t)` | `exact_scan_threshold` | 4,096 | If an exact materialized filter produces ≤ `t` matching vector rows, skip ANN traversal and compute exact distances directly. |
 | `.with_max_expanded_leaves(m)` | `max_expanded_leaves` | `beam_width * 16` | Upper bound on leaves probed when a **filter** forces the search to keep expanding to find enough matches. |
 
 ### Choosing values

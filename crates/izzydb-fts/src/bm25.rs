@@ -44,6 +44,7 @@ pub struct Bm25TermScorer {
 }
 
 impl Bm25TermScorer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         weight: f32,
         doc_count: u64,

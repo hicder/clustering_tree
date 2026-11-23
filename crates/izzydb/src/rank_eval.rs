@@ -1,50 +1,49 @@
-//! Generalized [`RankBy`] execution.
+//! Generalized [`RankBy`] execution on v3 `RowId` / `RowSet` / [`FilterPlan`].
 //!
-//! The Block-Max MAXSCORE engine in `izzydb-fts` only understands *pure lexical* expressions
-//! (BM25 leaves combined with `Sum` / `Max` / constant weights). Everything else is routed here:
-//!
-//! | normalized shape                                   | strategy                                              |
-//! |----------------------------------------------------|-------------------------------------------------------|
-//! | pure lexical                                       | MAXSCORE unchanged                                    |
-//! | `L * m(doc)` (one lexical factor, others modifiers)| MAXSCORE on `L * UB(m)`, exact rescoring of survivors |
-//! | `L + a(doc)` (lexical terms plus modifier terms)   | MAXSCORE with a lowered threshold + exact backfill    |
-//! | no BM25 (`Filter` / `Attribute` / `Saturate` / ...)| index-order scan if monotone, else candidate scan     |
-//! | anything else (e.g. `BM25 x BM25`)                 | exact evaluation over the positive candidate universe |
+//! | normalized shape                                    | strategy                                              |
+//! |-----------------------------------------------------|-------------------------------------------------------|
+//! | pure lexical                                        | MAXSCORE with `LivenessMaskProvider`                  |
+//! | `L * m(row) + a(row)` (one lexical factor + mods)   | MAXSCORE on `L * UB(m)` + exact `RowView` rescoring   |
+//! | no BM25 (`Filter` / `Attribute` / `Saturate` / ...) | index-order `stream_value_groups` if monotone, else `RowSet` scan |
+//! | anything else (e.g. `BM25 * BM25`)                  | exact evaluation over the positive `RowSet` universe  |
 //!
 //! Every path returns the exact top-k under `score DESC, DocId ASC`; scores `<= 0` are excluded.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
-use roaring::RoaringBitmap;
-
-use crate::codec::{
-    DocView, decode_attributes, decode_scalar_val_bytes, encode_attr_prefix, ordered_type_tag,
-};
-use crate::collection::Collection;
-use crate::config::{AttrId, DocId};
-use crate::error::Result;
-use crate::filter::Filter;
-use crate::rank::{DecayMode, OrderBySpec, RankBy, eval_decay, eval_saturate};
-use crate::schema::{AttributeType, Attributes, CollectionSchema, ScalarValue};
+use izzydb_core::config::{AttrId, DocId, ROW_BLOCK_SIZE, RowId, SegmentId, for_each_set_bit_256};
+use izzydb_core::error::Result;
+use izzydb_core::filter::Filter;
+use izzydb_core::rank::{DecayMode, OrderBySpec, RankBy, eval_decay, eval_saturate};
+use izzydb_core::rowset::RowSet;
+use izzydb_core::schema::{AttributeType, CollectionSchema, ColumnStorage, ScalarValue};
+use izzydb_core::simd::{batch_eval_decay, batch_eval_saturate};
 use izzydb_fts::{Bm25Result, RankModifier};
+use izzydb_storage::SegmentTableSnapshot;
+use izzydb_storage::codec::{RowView, decode_scalar_val_bytes, ordered_type_tag};
+use izzydb_storage::column::ColumnBlockView;
+
+use crate::attr_reader::{AttrReader, ColumnReader, RowStoreReader};
+use crate::collection::Collection;
+use crate::filter_plan::{self, FilterPlan, FilterPlanTrace};
+use crate::fts_index::LivenessMaskProvider;
+use crate::order_by::OrderPopulation;
+use crate::segments::RowResolver;
 
 const SCAN_BATCH: usize = 1024;
 
 // ------------------------------------------------------------------------------------------
-// Compiled per-document evaluation tree
+// Compiled per-row evaluation tree
 // ------------------------------------------------------------------------------------------
 
-/// A [`RankBy`] resolved against the schema: attribute names become ids and every maximal pure
-/// lexical subtree becomes a `Lex(i)` slot filled from precomputed BM25 scores.
 #[derive(Debug, Clone)]
 pub(crate) enum Node {
     Const(f32),
     Lex(usize),
     Filter(Filter),
-    /// A filter resolved up-front to the exact set of matching documents.
-    DocSet(Arc<HashSet<DocId>>),
+    RowSet(Arc<RowSet>),
     Attr {
         id: AttrId,
         missing: f32,
@@ -120,8 +119,8 @@ impl Node {
         }
     }
 
-    /// Score of this node for one document. `lex` holds the BM25 score of each `Lex` slot.
-    pub(crate) fn eval(&self, ctx: &mut DocCtx<'_, '_>, lex: &[f32]) -> Result<f32> {
+    /// Score of this node for one row. `lex` holds the BM25 score of each `Lex` slot.
+    pub(crate) fn eval(&self, ctx: &RowCtx<'_, '_>, lex: &[f32]) -> Result<f32> {
         Ok(match self {
             Node::Const(c) => *c,
             Node::Lex(i) => lex.get(*i).copied().unwrap_or(0.0),
@@ -132,14 +131,14 @@ impl Node {
                     0.0
                 }
             }
-            Node::DocSet(set) => {
-                if set.contains(&ctx.doc_id) {
+            Node::RowSet(set) => {
+                if set.contains(ctx.row_id) {
                     1.0
                 } else {
                     0.0
                 }
             }
-            Node::Attr { id, missing } => match ctx.view.get_numeric_f64(*id)? {
+            Node::Attr { id, missing } => match ctx.get_numeric_f64(*id)? {
                 Some(v) => clamp_f32(v),
                 None => *missing,
             },
@@ -148,7 +147,7 @@ impl Node {
                 midpoint,
                 exponent,
                 missing,
-            } => match ctx.view.get_numeric_f64(*id)? {
+            } => match ctx.get_numeric_f64(*id)? {
                 Some(v) => eval_saturate(v, *midpoint, *exponent),
                 None => *missing,
             },
@@ -159,7 +158,7 @@ impl Node {
                 exponent,
                 mode,
                 missing,
-            } => match ctx.view.get_numeric_f64(*id)? {
+            } => match ctx.get_numeric_f64(*id)? {
                 Some(v) => eval_decay(v, *origin, *midpoint, *exponent, *mode),
                 None => *missing,
             },
@@ -190,12 +189,12 @@ impl Node {
         })
     }
 
-    /// Sound upper bound of this node over all documents; `f32::INFINITY` if none is known.
+    /// Sound upper bound of this node over all live rows; `f32::INFINITY` if none is known.
     pub(crate) fn upper_bound(&self, coll: &Collection) -> Result<f32> {
         Ok(match self {
             Node::Const(c) => *c,
             Node::Lex(_) => f32::INFINITY,
-            Node::Filter(_) | Node::DocSet(_) => 1.0,
+            Node::Filter(_) | Node::RowSet(_) => 1.0,
             Node::Sat { missing, .. } | Node::Decay { missing, .. } => missing.max(1.0),
             Node::Attr { id, missing } => match coll.attr_max_numeric(*id)? {
                 Some(m) => m.max(*missing),
@@ -229,31 +228,125 @@ impl Node {
         })
     }
 
-    /// Superset of `FtsDocId`s with score `> 0`, or `None` when it is not restricted to
-    /// documents reachable from the FTS index (i.e. "all documents").
-    fn positive_universe(&self, lex_bms: &[RoaringBitmap]) -> Option<RoaringBitmap> {
+    fn has_filter_node(&self) -> bool {
         match self {
-            Node::Const(c) => (*c <= 0.0).then(RoaringBitmap::new),
-            Node::Lex(i) => Some(lex_bms[*i].clone()),
-            Node::Filter(_) | Node::Attr { .. } | Node::Sat { .. } | Node::Decay { .. } => None,
-            Node::DocSet(_) => None,
-            Node::Sum(c) | Node::Max(c) => {
-                let mut acc = RoaringBitmap::new();
+            Node::Filter(_) => true,
+            Node::Sum(c) | Node::Max(c) | Node::Product(c) => {
+                c.iter().any(Node::has_filter_node)
+            }
+            _ => false,
+        }
+    }
+
+    fn collect_numeric_attrs(&self, out: &mut Vec<AttrId>) {
+        match self {
+            Node::Attr { id, .. } | Node::Sat { id, .. } | Node::Decay { id, .. } => {
+                if !out.contains(id) {
+                    out.push(*id);
+                }
+            }
+            Node::Sum(c) | Node::Max(c) | Node::Product(c) => {
                 for n in c {
-                    acc |= n.positive_universe(lex_bms)?;
+                    n.collect_numeric_attrs(out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn eval_from_cols(
+        &self,
+        row_idx: usize,
+        row_id: RowId,
+        attrs: &[AttrId],
+        cols: &[Vec<Option<f64>>],
+        lex: &[f32],
+    ) -> f32 {
+        let lookup = |id: AttrId| -> Option<f64> {
+            let pos = attrs.iter().position(|&a| a == id)?;
+            cols[pos][row_idx]
+        };
+        match self {
+            Node::Const(c) => *c,
+            Node::Lex(i) => lex.get(*i).copied().unwrap_or(0.0),
+            Node::Filter(_) => unreachable!("eval_from_cols called with Filter node"),
+            Node::RowSet(set) => {
+                if set.contains(row_id) {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            Node::Attr { id, missing } => match lookup(*id) {
+                Some(v) => clamp_f32(v),
+                None => *missing,
+            },
+            Node::Sat {
+                id,
+                midpoint,
+                exponent,
+                missing,
+            } => match lookup(*id) {
+                Some(v) => eval_saturate(v, *midpoint, *exponent),
+                None => *missing,
+            },
+            Node::Decay {
+                id,
+                origin,
+                midpoint,
+                exponent,
+                mode,
+                missing,
+            } => match lookup(*id) {
+                Some(v) => eval_decay(v, *origin, *midpoint, *exponent, *mode),
+                None => *missing,
+            },
+            Node::Sum(c) => c
+                .iter()
+                .map(|n| n.eval_from_cols(row_idx, row_id, attrs, cols, lex))
+                .sum(),
+            Node::Max(c) => c
+                .iter()
+                .map(|n| n.eval_from_cols(row_idx, row_id, attrs, cols, lex))
+                .fold(0.0f32, f32::max),
+            Node::Product(c) => {
+                let mut acc = 1.0f32;
+                for n in c {
+                    acc *= n.eval_from_cols(row_idx, row_id, attrs, cols, lex);
+                    if acc == 0.0 {
+                        break;
+                    }
+                }
+                acc
+            }
+        }
+    }
+
+    /// Superset [`RowSet`] of rows with score `> 0`, or `None` when not restricted to lexical matches.
+    fn positive_universe(&self, lex_sets: &[RowSet]) -> Option<RowSet> {
+        match self {
+            Node::Const(c) => (*c <= 0.0).then(RowSet::empty),
+            Node::Lex(i) => Some(lex_sets[*i].clone()),
+            Node::Filter(_)
+            | Node::RowSet(_)
+            | Node::Attr { .. }
+            | Node::Sat { .. }
+            | Node::Decay { .. } => None,
+            Node::Sum(c) | Node::Max(c) => {
+                let mut acc = RowSet::empty();
+                for n in c {
+                    let sub = n.positive_universe(lex_sets)?;
+                    acc = acc.or(&sub);
                 }
                 Some(acc)
             }
             Node::Product(c) => {
-                let mut acc: Option<RoaringBitmap> = None;
+                let mut acc: Option<RowSet> = None;
                 for n in c {
-                    if let Some(bm) = n.positive_universe(lex_bms) {
+                    if let Some(rs) = n.positive_universe(lex_sets) {
                         acc = Some(match acc {
-                            Some(mut cur) => {
-                                cur &= bm;
-                                cur
-                            }
-                            None => bm,
+                            Some(prev) => prev.and(&rs),
+                            None => rs,
                         });
                     }
                 }
@@ -282,45 +375,71 @@ fn round_up_f32(v: f64) -> f32 {
     }
 }
 
-/// Per-document evaluation context: zero-copy [`DocView`] plus lazily decoded attributes for
-/// FTS filter predicates.
-pub(crate) struct DocCtx<'c, 'b> {
+/// Per-row evaluation context wrapping zero-copy [`RowView`].
+pub(crate) struct RowCtx<'c, 'b> {
     coll: &'c Collection,
-    doc_id: DocId,
-    bytes: &'b [u8],
-    pub(crate) view: DocView<'b>,
-    attrs: Option<Attributes>,
+    row_id: RowId,
+    pub(crate) view: RowView<'b>,
 }
 
-impl<'c, 'b> DocCtx<'c, 'b> {
-    pub(crate) fn new(coll: &'c Collection, doc_id: DocId, bytes: &'b [u8]) -> Result<Self> {
-        Ok(Self {
-            coll,
-            doc_id,
-            bytes,
-            view: DocView::parse(bytes)?,
-            attrs: None,
-        })
+impl<'c, 'b> RowCtx<'c, 'b> {
+    #[inline]
+    pub(crate) fn new(coll: &'c Collection, row_id: RowId, view: RowView<'b>) -> Self {
+        Self { coll, row_id, view }
     }
 
-    pub(crate) fn filter_matches(&mut self, f: &Filter) -> Result<bool> {
-        if !f.has_fts() {
-            return self
-                .view
-                .matches_filter(&self.coll.schema, f, &mut |_, _, _, _, _| false);
+    pub(crate) fn filter_matches(&self, f: &Filter) -> Result<bool> {
+        if crate::detached::filter_mentions_detached(&self.coll.schema, f) {
+            return Ok(crate::detached::filter_rows_mixed_batch(
+                &self.coll.storage,
+                &self.coll.schema,
+                &self.coll.fts_index,
+                f,
+                &[self.row_id],
+            )?[0]);
         }
-        if self.attrs.is_none() {
-            self.attrs = Some(decode_attributes(&self.coll.schema, self.bytes)?);
-        }
-        Ok(self
+        self.view.matches_filter(
+            &self.coll.schema,
+            f,
+            &mut |kind, attr, query, last_as_prefix, val| {
+                self.coll.fts_index.matches_fts_attr(
+                    &self.coll.schema,
+                    kind,
+                    attr,
+                    query,
+                    last_as_prefix,
+                    val,
+                )
+            },
+        )
+    }
+
+    pub(crate) fn get_numeric_f64(&self, id: AttrId) -> Result<Option<f64>> {
+        if self
             .coll
-            .fts_index
-            .matches_filter(&self.coll.schema, f, self.attrs.as_ref().unwrap()))
+            .schema
+            .get_by_id(id)
+            .is_some_and(|e| e.storage == ColumnStorage::Detached)
+        {
+            let col_gen = crate::detached::current_detached_gen(&self.coll.storage, id)?;
+            let Some(slice) = self.coll.storage.get_detached_block_pinned(
+                id,
+                col_gen,
+                self.row_id.seg(),
+                self.row_id.block_idx(),
+            )?
+            else {
+                return Ok(None);
+            };
+            let blk = ColumnBlockView::parse(&slice)?;
+            return Ok(blk.get_numeric_f64(self.row_id.slot()));
+        }
+        self.view.get_numeric_f64(id)
     }
 }
 
 // ------------------------------------------------------------------------------------------
-// Top-k collection
+// Top-k collection (`score DESC, DocId ASC`)
 // ------------------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
@@ -377,7 +496,7 @@ impl TopK {
 
     fn into_sorted(self) -> Vec<Bm25Result> {
         let mut v = self.heap.into_vec();
-        v.sort_unstable(); // best first (`Ord` is "worse is greater")
+        v.sort_unstable();
         v.into_iter()
             .map(|r| Bm25Result {
                 id: r.id,
@@ -396,15 +515,12 @@ fn sort_results(v: &mut [Bm25Result]) {
 // ------------------------------------------------------------------------------------------
 
 enum Plan {
-    /// Pure lexical: plain MAXSCORE.
     Lexical,
-    /// `lex * prod(mult) + sum(add)` with a pure lexical `lex`.
     Rescored {
         lex: RankBy,
         mult: Vec<RankBy>,
         add: Vec<RankBy>,
     },
-    /// Exact evaluation over the positive candidate universe.
     General,
 }
 
@@ -451,8 +567,6 @@ fn classify(norm: &RankBy) -> Plan {
     }
 }
 
-/// A filter whose matches are a superset of the documents where the (normalized) non-lexical
-/// `expr` scores `> 0`, or `None` when no such restriction exists (e.g. `Decay`, `Const`).
 fn positive_support(expr: &RankBy) -> Option<Filter> {
     match expr {
         RankBy::Filter(f) => Some((**f).clone()),
@@ -462,7 +576,6 @@ fn positive_support(expr: &RankBy) -> Option<Filter> {
                 .filter(|c| !matches!(c, RankBy::Const(_)))
                 .filter_map(positive_support)
                 .collect();
-            // Any single factor that is zero outside its support zeroes the whole product.
             match parts.len() {
                 0 => None,
                 1 => parts.into_iter().next(),
@@ -471,14 +584,18 @@ fn positive_support(expr: &RankBy) -> Option<Filter> {
         }
         RankBy::Sum(children) | RankBy::Max(children) => {
             let parts: Option<Vec<Filter>> = children.iter().map(positive_support).collect();
-            parts.map(|p| if p.len() == 1 { p.into_iter().next().unwrap() } else { Filter::Or(p) })
+            parts.map(|p| {
+                if p.len() == 1 {
+                    p.into_iter().next().unwrap()
+                } else {
+                    Filter::Or(p)
+                }
+            })
         }
         _ => None,
     }
 }
 
-/// Exact per-document modifier around a pure lexical expression:
-/// `score = L * mult(doc) + add(doc)`.
 pub(crate) struct LexModifier {
     mult: Option<Node>,
     add: Option<Node>,
@@ -491,9 +608,7 @@ pub(crate) struct LexModifier {
 // ------------------------------------------------------------------------------------------
 
 impl Collection {
-    /// Largest value of a numeric `filterable` attribute according to `cf_attr_clusters`
-    /// (a sound upper bound: stale keys can only over-estimate), clamped to `>= 0`.
-    /// `None` when the attribute is not indexed or the bound is not representable.
+    /// Sound upper bound of a numeric `filterable` attribute using live counts in `default[0x06]`.
     fn attr_max_numeric(&self, attr_id: AttrId) -> Result<Option<f32>> {
         let Some(entry) = self.schema.get_by_id(attr_id) else {
             return Ok(None);
@@ -507,13 +622,15 @@ impl Collection {
             return Ok(None);
         }
         let tag = ordered_type_tag(entry.attr_type)?;
-        let mut it = self
-            .storage
-            .iter_attr_clusters_prefix(encode_attr_prefix(attr_id, tag), true)?;
-        let Some(first) = it.next() else {
+        let vbytes_opt = if entry.storage == ColumnStorage::Detached {
+            let col_gen = crate::detached::current_detached_gen(&self.storage, attr_id)?;
+            self.storage.max_detached_count_key(attr_id, col_gen, tag)?
+        } else {
+            self.storage.max_attr_count_key(attr_id, tag)?
+        };
+        let Some(vbytes) = vbytes_opt else {
             return Ok(Some(0.0));
         };
-        let (vbytes, _) = first?;
         let v = match decode_scalar_val_bytes(tag, &vbytes)? {
             ScalarValue::Int(v) => v as f64,
             ScalarValue::Uint(v) => v as f64,
@@ -524,25 +641,24 @@ impl Collection {
         Ok(ub.is_finite().then_some(ub))
     }
 
-    /// Replace `Filter` leaves that can be resolved exactly from the indexes (FTS predicates and
-    /// filters over few candidate clusters) with precomputed document sets, so per-document
-    /// scoring is a set lookup instead of re-evaluating (and re-analyzing) the filter.
     fn resolve_filter_sets(&self, node: &mut Node) -> Result<()> {
-        /// Do not materialize sets larger than this many documents.
-        const MAX_DOC_SET: u64 = 1 << 20;
+        const MAX_ROW_SET: u64 = 1 << 20;
         match node {
             Node::Filter(f) => {
-                if let crate::collection::FilterPushdown::Exact(bm) = self.try_pushdown_filter(f)?
-                    && bm.len() <= MAX_DOC_SET
-                {
-                    let fts_ids: Vec<_> = bm.iter().collect();
-                    let set: HashSet<DocId> = self
-                        .storage
-                        .multi_get_doc_ids_from_fts(&fts_ids)?
-                        .into_iter()
-                        .flatten()
-                        .collect();
-                    *node = Node::DocSet(Arc::new(set));
+                let mut trace = FilterPlanTrace::default();
+                match filter_plan::plan_filter_with_trace(
+                    &self.storage,
+                    &self.schema,
+                    f,
+                    &self.fts_index,
+                    &mut trace,
+                )? {
+                    FilterPlan::Empty => *node = Node::Const(0.0),
+                    FilterPlan::All => *node = Node::Const(1.0),
+                    FilterPlan::Materialized(rs) if rs.len() <= MAX_ROW_SET => {
+                        *node = Node::RowSet(Arc::new(rs));
+                    }
+                    _ => {}
                 }
             }
             Node::Sum(c) | Node::Max(c) | Node::Product(c) => {
@@ -586,34 +702,55 @@ impl Collection {
                     return Ok(res);
                 }
                 let mut topk = TopK::new(top_k);
-                self.general_eval(&norm, filter, &mut |id, s| topk.push(id, s))?;
+                self.general_eval(&norm, filter, &mut |_row, doc_id, s| topk.push(doc_id, s))?;
                 Ok(topk.into_sorted())
             }
         }
     }
 
-    /// Exact ids of all documents with score `> 0` that match `filter` (used for faceting).
-    pub(crate) fn rank_matching_doc_ids(
+    /// Exact [`RowSet`] of all live rows with score `> 0` that match `filter` (used for faceting).
+    pub(crate) fn rank_matching_rowset(
         &self,
         rank_by: &RankBy,
         filter: Option<&Filter>,
-    ) -> Result<Vec<DocId>> {
+    ) -> Result<RowSet> {
         rank_by.validate(&self.schema)?;
         if let Some(f) = filter {
             f.validate(&self.schema)?;
         }
         if self.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RowSet::empty());
         }
         let norm = rank_by.normalize();
-        let mut ids = Vec::new();
-        self.general_eval(&norm, filter, &mut |id, _| ids.push(id))?;
-        ids.sort_unstable();
-        Ok(ids)
+        if norm.is_pure_lexical() {
+            let lex_rs = self.fts_index.eval_rank_by_match_rowset(
+                &self.storage,
+                &self.schema,
+                &norm,
+            )?;
+            if lex_rs.is_empty() {
+                return Ok(RowSet::empty());
+            }
+            return match filter {
+                Some(f) => {
+                    let f_rs = filter_plan::materialize_filter(
+                        &self.storage,
+                        &self.schema,
+                        f,
+                        &self.fts_index,
+                    )?;
+                    Ok(lex_rs.and(&f_rs))
+                }
+                None => Ok(lex_rs),
+            };
+        }
+        let mut rows = Vec::new();
+        self.general_eval(&norm, filter, &mut |row, _doc_id, _s| rows.push(row))?;
+        Ok(RowSet::from_rows(rows))
     }
 
-    /// Run a pure lexical `rank_by` through MAXSCORE, pushing `filter` down where possible and
-    /// optionally applying an exact per-document [`LexModifier`].
+    /// Run a pure lexical `rank_by` through MAXSCORE using `LivenessMaskProvider` + optional
+    /// [`FilterPlan`] pushdown and [`LexModifier`].
     pub(crate) fn lexical_query(
         &self,
         rank_by: &RankBy,
@@ -621,31 +758,52 @@ impl Collection {
         top_k: usize,
         modifier: Option<&LexModifier>,
     ) -> Result<Vec<Bm25Result>> {
-        let Some(f) = filter else {
-            return self.run_lexical(rank_by, top_k, None, None, modifier);
-        };
-        let (pushdown_bm, is_exact) = match self.try_pushdown_filter(f)? {
-            crate::collection::FilterPushdown::None => (None, false),
-            crate::collection::FilterPushdown::Superset(bm) => (Some(bm), false),
-            crate::collection::FilterPushdown::Exact(bm) => (Some(bm), true),
-        };
-        if let Some(ref bm) = pushdown_bm
-            && bm.is_empty()
-        {
-            return Ok(Vec::new());
+        let snap = self.storage.segment_snapshot();
+        match filter {
+            None => self.run_lexical(rank_by, top_k, &snap, None, None, modifier),
+            Some(f) => {
+                let mut trace = FilterPlanTrace::default();
+                match filter_plan::plan_filter_with_trace(
+                    &self.storage,
+                    &self.schema,
+                    f,
+                    &self.fts_index,
+                    &mut trace,
+                )? {
+                    FilterPlan::Empty => Ok(Vec::new()),
+                    FilterPlan::All => self.run_lexical(rank_by, top_k, &snap, None, None, modifier),
+                    FilterPlan::Materialized(rs) => {
+                        if rs.is_empty() {
+                            return Ok(Vec::new());
+                        }
+                        self.run_lexical(rank_by, top_k, &snap, Some(&rs), None, modifier)
+                    }
+                    FilterPlan::Lazy { residual, seed } => self.run_lexical(
+                        rank_by,
+                        top_k,
+                        &snap,
+                        seed.as_ref(),
+                        Some(&residual),
+                        modifier,
+                    ),
+                }
+            }
         }
-        let post_filter = if is_exact { None } else { Some(f) };
-        self.run_lexical(rank_by, top_k, pushdown_bm.as_ref(), post_filter, modifier)
     }
 
     fn run_lexical(
         &self,
         rank_by: &RankBy,
         top_k: usize,
-        doc_filter: Option<&RoaringBitmap>,
+        snap: &SegmentTableSnapshot,
+        filter_rs: Option<&RowSet>,
         post_filter: Option<&Filter>,
         modifier: Option<&LexModifier>,
     ) -> Result<Vec<Bm25Result>> {
+        let mask = LivenessMaskProvider {
+            snap,
+            filter: filter_rs,
+        };
         let Some(m) = modifier else {
             return match post_filter {
                 None => self.fts_index.query_bm25(
@@ -653,44 +811,46 @@ impl Collection {
                     &self.schema,
                     rank_by,
                     top_k,
-                    doc_filter,
+                    Some(&mask),
                     None,
                 ),
                 Some(f) => {
-                    let mut lazy = |doc_id: DocId| -> Result<bool> {
-                        let Some(slice) = self.storage.get_doc_bytes_pinned(doc_id)? else {
+                    let mut lazy = |row: RowId| -> Result<bool> {
+                        let Some(slice) = self.storage.get_row_bytes_pinned(row)? else {
                             return Ok(false);
                         };
-                        DocCtx::new(self, doc_id, &slice)?.filter_matches(f)
+                        let view = RowView::parse(&slice)?;
+                        RowCtx::new(self, row, view).filter_matches(f)
                     };
                     self.fts_index.query_bm25(
                         &self.storage,
                         &self.schema,
                         rank_by,
                         top_k,
-                        doc_filter,
+                        Some(&mask),
                         Some(&mut lazy),
                     )
                 }
             };
         };
 
-        let mut rescore = |doc_id: DocId, s_ub: f32| -> Result<f32> {
-            let Some(slice) = self.storage.get_doc_bytes_pinned(doc_id)? else {
+        let mut rescore = |row: RowId, s_ub: f32| -> Result<f32> {
+            let Some(slice) = self.storage.get_row_bytes_pinned(row)? else {
                 return Ok(0.0);
             };
-            let mut ctx = DocCtx::new(self, doc_id, &slice)?;
+            let view = RowView::parse(&slice)?;
+            let ctx = RowCtx::new(self, row, view);
             if let Some(f) = post_filter
                 && !ctx.filter_matches(f)?
             {
                 return Ok(0.0);
             }
             let mv = match &m.mult {
-                Some(n) => n.eval(&mut ctx, &[])?,
+                Some(n) => n.eval(&ctx, &[])?,
                 None => m.mult_ub,
             };
             let av = match &m.add {
-                Some(n) => n.eval(&mut ctx, &[])?,
+                Some(n) => n.eval(&ctx, &[])?,
                 None => 0.0,
             };
             let lexical = if mv == m.mult_ub {
@@ -699,14 +859,18 @@ impl Collection {
                 s_ub * (mv / m.mult_ub)
             };
             let total = lexical + av;
-            Ok(if total.is_nan() { 0.0 } else { total.min(f32::MAX) })
+            Ok(if total.is_nan() {
+                0.0
+            } else {
+                total.min(f32::MAX)
+            })
         };
         self.fts_index.query_bm25_with(
             &self.storage,
             &self.schema,
             rank_by,
             top_k,
-            doc_filter,
+            Some(&mask),
             None,
             Some(RankModifier {
                 mult_ub: m.mult_ub,
@@ -726,13 +890,12 @@ impl Collection {
         top_k: usize,
     ) -> Result<Vec<Bm25Result>> {
         let mut no_lex = Vec::new();
-        let mult_node = (!mult.is_empty())
+        let mut mult_node = (!mult.is_empty())
             .then(|| Node::compile(&RankBy::Product(mult).normalize(), &self.schema, &mut no_lex));
         let add_expr = (!add.is_empty()).then(|| RankBy::Sum(add).normalize());
-        let add_node = add_expr
+        let mut add_node = add_expr
             .as_ref()
             .map(|e| Node::compile(e, &self.schema, &mut no_lex));
-        let (mut mult_node, mut add_node) = (mult_node, add_node);
         if let Some(n) = mult_node.as_mut() {
             self.resolve_filter_sets(n)?;
         }
@@ -747,10 +910,9 @@ impl Collection {
             Some(n) => n.upper_bound(self)?,
             None => 0.0,
         };
-        // Unbounded (or degenerate) modifiers cannot drive pruning: evaluate exactly instead.
         if !(mult_ub.is_finite() && mult_ub > 0.0 && add_ub.is_finite()) {
             let mut topk = TopK::new(top_k);
-            self.general_eval(norm, filter, &mut |id, s| topk.push(id, s))?;
+            self.general_eval(norm, filter, &mut |_row, doc_id, s| topk.push(doc_id, s))?;
             return Ok(topk.into_sorted());
         }
         let modifier = LexModifier {
@@ -761,28 +923,43 @@ impl Collection {
         };
         let mut results = self.lexical_query(&lex, filter, top_k, Some(&modifier))?;
 
-        // Documents without any lexical match score `add(doc)`; they can only matter if the
-        // lexical top-k is not full or its weakest score does not strictly exceed `add_ub`.
         if let Some(add_node) = modifier.add.as_ref()
             && add_ub > 0.0
         {
-            let covered = results.len() == top_k
-                && results.last().is_some_and(|r| r.score > add_ub);
+            let covered =
+                results.len() == top_k && results.last().is_some_and(|r| r.score > add_ub);
             if !covered {
-                let lex_bm = self.rank_match_bitmap(&lex)?;
-                // Restrict the backfill universe to the additive term's support when it has one
-                // (e.g. `w * Filter(..)` only scores on filter matches).
+                let lex_rs =
+                    self.fts_index
+                        .eval_rank_by_match_rowset(&self.storage, &self.schema, &lex)?;
                 let support = add_expr.as_ref().and_then(positive_support);
-                let docs = match (support, filter) {
-                    (Some(sup), Some(f)) => {
-                        self.resolve_filter_doc_ids(&Filter::And(vec![f.clone(), sup]))?
-                    }
-                    (Some(sup), None) => self.resolve_filter_doc_ids(&sup)?,
-                    (None, _) => self.universe_docs(filter)?,
-                };
+                let snap = self.storage.segment_snapshot();
+                let cand_rs = match (support, filter) {
+                    (Some(sup), Some(f)) => filter_plan::materialize_filter(
+                        &self.storage,
+                        &self.schema,
+                        &Filter::And(vec![f.clone(), sup]),
+                        &self.fts_index,
+                    )?,
+                    (Some(sup), None) => filter_plan::materialize_filter(
+                        &self.storage,
+                        &self.schema,
+                        &sup,
+                        &self.fts_index,
+                    )?,
+                    (None, Some(f)) => filter_plan::materialize_filter(
+                        &self.storage,
+                        &self.schema,
+                        f,
+                        &self.fts_index,
+                    )?,
+                    (None, None) => RowSet::from_all_live(&*snap),
+                }
+                .and_not(&lex_rs);
+
                 let mut topk = TopK::new(top_k);
-                self.scan_docs(add_node, &docs, &[], Some(&lex_bm), &mut |id, s| {
-                    topk.push(id, s)
+                self.scan_rowset(add_node, &cand_rs, &[], &mut |_row, doc_id, s| {
+                    topk.push(doc_id, s)
                 })?;
                 results.extend(topk.into_sorted());
                 sort_results(&mut results);
@@ -792,125 +969,404 @@ impl Collection {
         Ok(results)
     }
 
-    /// Sorted ids of all live documents matching `filter` (all documents when `None`).
-    fn universe_docs(&self, filter: Option<&Filter>) -> Result<Vec<DocId>> {
-        match filter {
-            Some(f) => self.resolve_filter_doc_ids(f),
-            None => self.storage.all_doc_ids(),
+    fn scan_rowset(
+        &self,
+        node: &Node,
+        rowset: &RowSet,
+        lex_maps: &[HashMap<DocId, f32>],
+        sink: &mut dyn FnMut(RowId, DocId, f32),
+    ) -> Result<()> {
+        if rowset.is_empty() {
+            return Ok(());
+        }
+        let col_reader = ColumnReader::new(&self.storage, &self.schema)?;
+        let row_reader = RowStoreReader::new(&self.storage);
+        let mut lex_scores = vec![0.0f32; lex_maps.len()];
+        let mut batch: Vec<RowId> = Vec::with_capacity(SCAN_BATCH);
+
+        let no_filter = !node.has_filter_node();
+        let mut ref_attrs = Vec::new();
+        if no_filter {
+            node.collect_numeric_attrs(&mut ref_attrs);
+        }
+
+        for &(seg, ref bm) in rowset.segments() {
+            let seg_columnar =
+                no_filter && ref_attrs.iter().all(|&a| col_reader.segment_has_columns(seg, a));
+            if seg_columnar
+                && lex_maps.is_empty()
+                && let Some(block_eval) = Self::as_single_block_simd_leaf(node)
+            {
+                self.scan_segment_simd_blocks(seg, bm, block_eval, sink)?;
+                continue;
+            }
+            if seg_columnar && !ref_attrs.is_empty() {
+                batch.clear();
+                let mut col_bufs: Vec<Vec<Option<f64>>> = vec![Vec::new(); ref_attrs.len()];
+                for local in bm.iter() {
+                    batch.push(RowId::new(seg, local));
+                    if batch.len() >= SCAN_BATCH {
+                        self.eval_batch_columnar(
+                            &col_reader,
+                            node,
+                            &ref_attrs,
+                            &mut col_bufs,
+                            &batch,
+                            lex_maps,
+                            &mut lex_scores,
+                            sink,
+                        )?;
+                        batch.clear();
+                    }
+                }
+                if !batch.is_empty() {
+                    self.eval_batch_columnar(
+                        &col_reader,
+                        node,
+                        &ref_attrs,
+                        &mut col_bufs,
+                        &batch,
+                        lex_maps,
+                        &mut lex_scores,
+                        sink,
+                    )?;
+                }
+                continue;
+            }
+
+            for local in bm.iter() {
+                batch.push(RowId::new(seg, local));
+                if batch.len() >= SCAN_BATCH {
+                    self.eval_batch(&row_reader, node, &batch, lex_maps, &mut lex_scores, sink)?;
+                    batch.clear();
+                }
+            }
+            if !batch.is_empty() {
+                self.eval_batch(&row_reader, node, &batch, lex_maps, &mut lex_scores, sink)?;
+                batch.clear();
+            }
+        }
+        Ok(())
+    }
+
+    fn as_single_block_simd_leaf(node: &Node) -> Option<(AttrId, SimdLeafOp)> {
+        match node {
+            Node::Sat {
+                id,
+                midpoint,
+                exponent,
+                missing,
+            } => Some((
+                *id,
+                SimdLeafOp::Saturate {
+                    weight: 1.0,
+                    midpoint: *midpoint,
+                    exponent: *exponent,
+                    missing: *missing,
+                },
+            )),
+            Node::Decay {
+                id,
+                origin,
+                midpoint,
+                exponent,
+                mode,
+                missing,
+            } => Some((
+                *id,
+                SimdLeafOp::Decay {
+                    weight: 1.0,
+                    origin: *origin,
+                    midpoint: *midpoint,
+                    exponent: *exponent,
+                    mode: *mode,
+                    missing: *missing,
+                },
+            )),
+            Node::Product(ch) if ch.len() == 2 => match (&ch[0], &ch[1]) {
+                (
+                    Node::Const(w),
+                    Node::Sat {
+                        id,
+                        midpoint,
+                        exponent,
+                        missing,
+                    },
+                ) => Some((
+                    *id,
+                    SimdLeafOp::Saturate {
+                        weight: *w,
+                        midpoint: *midpoint,
+                        exponent: *exponent,
+                        missing: *missing,
+                    },
+                )),
+                (
+                    Node::Const(w),
+                    Node::Decay {
+                        id,
+                        origin,
+                        midpoint,
+                        exponent,
+                        mode,
+                        missing,
+                    },
+                ) => Some((
+                    *id,
+                    SimdLeafOp::Decay {
+                        weight: *w,
+                        origin: *origin,
+                        midpoint: *midpoint,
+                        exponent: *exponent,
+                        mode: *mode,
+                        missing: *missing,
+                    },
+                )),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
-    /// Evaluate `node` over `docs` (sorted), skipping documents in the `exclude` FTS bitmap and
-    /// reporting every document with a finite score `> 0`.
-    fn scan_docs(
+    fn scan_segment_simd_blocks(
         &self,
-        node: &Node,
-        docs: &[DocId],
-        lex_maps: &[HashMap<DocId, f32>],
-        exclude: Option<&RoaringBitmap>,
-        sink: &mut dyn FnMut(DocId, f32),
+        seg: SegmentId,
+        bm: &roaring::RoaringBitmap,
+        (attr_id, op): (AttrId, SimdLeafOp),
+        sink: &mut dyn FnMut(RowId, DocId, f32),
     ) -> Result<()> {
-        let mut lex_scores = vec![0.0f32; lex_maps.len()];
-        for batch in docs.chunks(SCAN_BATCH) {
-            let skip: Vec<bool> = match exclude {
-                Some(bm) => self
-                    .storage
-                    .multi_get_fts_doc_ids(batch)?
-                    .into_iter()
-                    .map(|f| f.is_some_and(|f| bm.contains(f)))
-                    .collect(),
-                None => vec![false; batch.len()],
+        let mut by_block: Vec<(u32, [u64; 4])> = Vec::new();
+        for local in bm.iter() {
+            let blk = local >> 8;
+            let slot = (local & 0xFF) as usize;
+            if let Some(last) = by_block.last_mut()
+                && last.0 == blk
+            {
+                last.1[slot >> 6] |= 1u64 << (slot & 63);
+            } else {
+                let mut m = [0u64; 4];
+                m[slot >> 6] |= 1u64 << (slot & 63);
+                by_block.push((blk, m));
+            }
+        }
+        let slices = if self
+            .schema
+            .get_by_id(attr_id)
+            .is_some_and(|e| e.storage == ColumnStorage::Detached)
+        {
+            let col_gen = crate::detached::current_detached_gen(&self.storage, attr_id)?;
+            let det_keys: Vec<(AttrId, izzydb_core::config::ColumnGen, SegmentId, u32)> = by_block
+                .iter()
+                .map(|&(blk, _)| (attr_id, col_gen, seg, blk))
+                .collect();
+            self.storage
+                .multi_get_detached_blocks_pinned(&det_keys, true)?
+        } else {
+            let keys: Vec<(SegmentId, AttrId, u32)> = by_block
+                .iter()
+                .map(|&(blk, _)| (seg, attr_id, blk))
+                .collect();
+            self.storage.multi_get_column_blocks_pinned(&keys, true)?
+        };
+
+        let mut f64_buf = [0.0f64; ROW_BLOCK_SIZE];
+        let mut out_scores = [0.0f32; ROW_BLOCK_SIZE];
+        let mut pos_rows: Vec<RowId> = Vec::with_capacity(ROW_BLOCK_SIZE);
+        let mut pos_scores: Vec<f32> = Vec::with_capacity(ROW_BLOCK_SIZE);
+
+        for ((blk, req_mask), opt_slice) in by_block.into_iter().zip(slices.iter()) {
+            let present_mask = match opt_slice {
+                Some(slice) => ColumnBlockView::parse(slice)?.decode_numeric_f64_block(&mut f64_buf),
+                None => {
+                    f64_buf.fill(0.0);
+                    [0u64; 4]
+                }
             };
-            let slices = self.storage.multi_get_doc_bytes_pinned(batch)?;
-            for ((&doc_id, slice), skipped) in batch.iter().zip(slices).zip(skip) {
-                let Some(slice) = slice else { continue };
-                if skipped {
-                    continue;
+            let missing_val = match op {
+                SimdLeafOp::Saturate {
+                    midpoint,
+                    exponent,
+                    missing,
+                    ..
+                } => {
+                    batch_eval_saturate(
+                        &f64_buf,
+                        &present_mask,
+                        midpoint,
+                        exponent,
+                        missing,
+                        &mut out_scores,
+                    );
+                    missing
                 }
-                for (s, m) in lex_scores.iter_mut().zip(lex_maps) {
-                    *s = m.get(&doc_id).copied().unwrap_or(0.0);
+                SimdLeafOp::Decay {
+                    origin,
+                    midpoint,
+                    exponent,
+                    mode,
+                    missing,
+                    ..
+                } => {
+                    batch_eval_decay(
+                        &f64_buf,
+                        &present_mask,
+                        origin,
+                        midpoint,
+                        exponent,
+                        mode,
+                        missing,
+                        &mut out_scores,
+                    );
+                    missing
                 }
-                let mut ctx = DocCtx::new(self, doc_id, &slice)?;
-                let score = node.eval(&mut ctx, &lex_scores)?;
-                if score > 0.0 && !score.is_nan() {
-                    sink(doc_id, score.min(f32::MAX));
+            };
+            let _ = missing_val;
+            let weight = match op {
+                SimdLeafOp::Saturate { weight, .. } | SimdLeafOp::Decay { weight, .. } => weight,
+            };
+            pos_rows.clear();
+            pos_scores.clear();
+            for_each_set_bit_256(&req_mask, |slot| {
+                let s = out_scores[slot as usize] * weight;
+                if s > 0.0 && !s.is_nan() {
+                    pos_rows.push(RowId::new(seg, (blk << 8) | (slot as u32)));
+                    pos_scores.push(s.min(f32::MAX));
+                }
+            });
+            if !pos_rows.is_empty() {
+                let doc_ids = RowResolver::resolve_all(&self.storage, &pos_rows)?;
+                for ((&r, doc_id), &s) in pos_rows.iter().zip(doc_ids).zip(&pos_scores) {
+                    sink(r, doc_id, s);
                 }
             }
         }
         Ok(())
     }
 
-    /// Exact evaluation of an arbitrary normalized expression: derive a candidate universe from
-    /// the lexical leaves, fetch their BM25 scores, then evaluate every candidate.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_batch_columnar(
+        &self,
+        reader: &ColumnReader<'_>,
+        node: &Node,
+        attrs: &[AttrId],
+        col_bufs: &mut [Vec<Option<f64>>],
+        batch: &[RowId],
+        lex_maps: &[HashMap<DocId, f32>],
+        lex_scores: &mut [f32],
+        sink: &mut dyn FnMut(RowId, DocId, f32),
+    ) -> Result<()> {
+        for (&attr_id, buf) in attrs.iter().zip(col_bufs.iter_mut()) {
+            reader.read_numeric_batch(attr_id, batch, buf)?;
+        }
+        let doc_ids = RowResolver::resolve_all(&self.storage, batch)?;
+        for (idx, (&row, doc_id)) in batch.iter().zip(doc_ids).enumerate() {
+            for (s, m) in lex_scores.iter_mut().zip(lex_maps) {
+                *s = m.get(&doc_id).copied().unwrap_or(0.0);
+            }
+            let score = node.eval_from_cols(idx, row, attrs, col_bufs, lex_scores);
+            if score > 0.0 && !score.is_nan() {
+                sink(row, doc_id, score.min(f32::MAX));
+            }
+        }
+        Ok(())
+    }
+
+    fn eval_batch(
+        &self,
+        reader: &dyn AttrReader,
+        node: &Node,
+        batch: &[RowId],
+        lex_maps: &[HashMap<DocId, f32>],
+        lex_scores: &mut [f32],
+        sink: &mut dyn FnMut(RowId, DocId, f32),
+    ) -> Result<()> {
+        let doc_ids = RowResolver::resolve_all(&self.storage, batch)?;
+        let mut idx = 0usize;
+        reader.read_rows(batch, &mut |row, view| {
+            let doc_id = doc_ids[idx];
+            idx += 1;
+            for (s, m) in lex_scores.iter_mut().zip(lex_maps) {
+                *s = m.get(&doc_id).copied().unwrap_or(0.0);
+            }
+            let ctx = RowCtx::new(self, row, view);
+            let score = node.eval(&ctx, lex_scores)?;
+            if score > 0.0 && !score.is_nan() {
+                sink(row, doc_id, score.min(f32::MAX));
+            }
+            Ok(())
+        })
+    }
+
     fn general_eval(
         &self,
         norm: &RankBy,
         filter: Option<&Filter>,
-        sink: &mut dyn FnMut(DocId, f32),
+        sink: &mut dyn FnMut(RowId, DocId, f32),
     ) -> Result<()> {
         let mut lex = Vec::new();
         let mut node = Node::compile(norm, &self.schema, &mut lex);
         self.resolve_filter_sets(&mut node)?;
-        let lex_bms: Vec<RoaringBitmap> = lex
+        let lex_sets: Vec<RowSet> = lex
             .iter()
-            .map(|e| self.rank_match_bitmap(e))
+            .map(|e| {
+                self.fts_index
+                    .eval_rank_by_match_rowset(&self.storage, &self.schema, e)
+            })
             .collect::<Result<_>>()?;
 
-        let mut docs = match node.positive_universe(&lex_bms) {
-            Some(bm) => {
-                if bm.is_empty() {
+        let snap = self.storage.segment_snapshot();
+        let cand_rs = match node.positive_universe(&lex_sets) {
+            Some(mut rs) => {
+                if rs.is_empty() {
                     return Ok(());
                 }
-                let fts_ids: Vec<_> = bm.iter().collect();
-                let mut ids: Vec<DocId> = self
-                    .storage
-                    .multi_get_doc_ids_from_fts(&fts_ids)?
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                ids.sort_unstable();
-                ids.dedup();
                 if let Some(f) = filter {
-                    ids = intersect_sorted(&ids, &self.resolve_filter_doc_ids(f)?);
+                    let f_rs = filter_plan::materialize_filter(
+                        &self.storage,
+                        &self.schema,
+                        f,
+                        &self.fts_index,
+                    )?;
+                    rs = rs.and(&f_rs);
                 }
-                ids
+                rs
             }
-            None => self.universe_docs(filter)?,
+            None => match filter {
+                Some(f) => filter_plan::materialize_filter(
+                    &self.storage,
+                    &self.schema,
+                    f,
+                    &self.fts_index,
+                )?,
+                None => RowSet::from_all_live(&*snap),
+            },
         };
-        docs.dedup();
-        if docs.is_empty() {
+        if cand_rs.is_empty() {
             return Ok(());
         }
 
         let mut lex_maps = Vec::with_capacity(lex.len());
         if !lex.is_empty() {
-            let mut doc_fts = RoaringBitmap::new();
-            for fid in self.storage.multi_get_fts_doc_ids(&docs)?.into_iter().flatten() {
-                doc_fts.insert(fid);
-            }
+            let mask = LivenessMaskProvider {
+                snap: &snap,
+                filter: Some(&cand_rs),
+            };
+            let k = (cand_rs.len() as usize).max(1);
             for expr in &lex {
-                let hits = if doc_fts.is_empty() {
-                    Vec::new()
-                } else {
-                    self.fts_index.query_bm25(
-                        &self.storage,
-                        &self.schema,
-                        expr,
-                        (doc_fts.len() as usize).max(1),
-                        Some(&doc_fts),
-                        None,
-                    )?
-                };
+                let hits = self.fts_index.query_bm25(
+                    &self.storage,
+                    &self.schema,
+                    expr,
+                    k,
+                    Some(&mask),
+                    None,
+                )?;
                 lex_maps.push(hits.into_iter().map(|h| (h.id, h.score)).collect());
             }
         }
-        self.scan_docs(&node, &docs, &lex_maps, None, sink)
+        self.scan_rowset(&node, &cand_rs, &lex_maps, sink)
     }
 
-    /// Fast path for a monotone transform of a single `filterable` numeric attribute
-    /// (`Attribute` / `Saturate` / `Decay` with `Forward` or `Backward` mode, optionally scaled
-    /// by a constant): stream the attribute's index in score order and stop after the top-k
-    /// score tier instead of scanning every candidate.
     fn monotone_rank_query(
         &self,
         norm: &RankBy,
@@ -939,7 +1395,6 @@ impl Collection {
             },
             _ => return Ok(None),
         };
-        // Documents without the attribute must score 0 (so they never qualify).
         let Some(entry) = self.schema.get_by_name(attr) else {
             return Ok(None);
         };
@@ -950,21 +1405,29 @@ impl Collection {
         let mut no_lex = Vec::new();
         let node = Node::compile(norm, &self.schema, &mut no_lex);
         let leaf_node = Node::compile(leaf, &self.schema, &mut no_lex);
-        let prepared = match filter {
-            Some(f) => Some(self.attr_index.prepare_filter_with_fts(
-                &self.storage,
-                &self.schema,
-                f,
-                Some(&self.fts_index),
-            )?),
-            None => None,
+        let pop = match filter {
+            None => OrderPopulation::AllLive,
+            Some(f) => {
+                let mut trace = FilterPlanTrace::default();
+                match filter_plan::plan_filter_with_trace(
+                    &self.storage,
+                    &self.schema,
+                    f,
+                    &self.fts_index,
+                    &mut trace,
+                )? {
+                    FilterPlan::Empty => return Ok(Some(Vec::new())),
+                    FilterPlan::All => OrderPopulation::AllLive,
+                    FilterPlan::Materialized(rs) => {
+                        if rs.is_empty() {
+                            return Ok(Some(Vec::new()));
+                        }
+                        OrderPopulation::RowSet(rs)
+                    }
+                    FilterPlan::Lazy { residual, seed } => OrderPopulation::Lazy { seed, residual },
+                }
+            }
         };
-        if prepared
-            .as_ref()
-            .is_some_and(|p| p.cluster_candidates.is_empty())
-        {
-            return Ok(Some(Vec::new()));
-        }
 
         let spec = if descending {
             OrderBySpec::desc(attr.clone())
@@ -983,19 +1446,20 @@ impl Collection {
 
         let mut collected: Vec<Bm25Result> = Vec::new();
         let mut boundary: Option<f32> = None;
-        self.stream_value_groups(&spec, prepared.as_ref(), &mut |value, ids| {
+        self.stream_value_groups(&spec, &pop, &mut |value, group_rows| {
             let Some(score) = score_of(&value) else {
                 return Ok(true);
             };
             if score <= 0.0 || score.is_nan() {
-                return Ok(false); // monotone: nothing later can score > 0
+                return Ok(false);
             }
             if let Some(b) = boundary
                 && score < b
             {
                 return Ok(false);
             }
-            collected.extend(ids.into_iter().map(|id| Bm25Result { id, score }));
+            let doc_ids = RowResolver::resolve_all(&self.storage, &group_rows)?;
+            collected.extend(doc_ids.into_iter().map(|id| Bm25Result { id, score }));
             if boundary.is_none() && collected.len() >= top_k {
                 boundary = Some(score);
             }
@@ -1007,7 +1471,6 @@ impl Collection {
     }
 }
 
-/// Score of `node` (a `Product([Const, leaf])` or a bare `leaf`) for a single attribute value.
 fn eval_value(node: &Node, leaf: &Node, v: f64) -> f32 {
     let leaf_score = match leaf {
         Node::Attr { .. } => clamp_f32(v),
@@ -1038,19 +1501,20 @@ fn eval_value(node: &Node, leaf: &Node, v: f64) -> f32 {
     }
 }
 
-fn intersect_sorted(a: &[DocId], b: &[DocId]) -> Vec<DocId> {
-    let (mut i, mut j) = (0, 0);
-    let mut out = Vec::with_capacity(a.len().min(b.len()));
-    while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
-            Ordering::Less => i += 1,
-            Ordering::Greater => j += 1,
-            Ordering::Equal => {
-                out.push(a[i]);
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-    out
+#[derive(Clone, Copy)]
+enum SimdLeafOp {
+    Saturate {
+        weight: f32,
+        midpoint: f64,
+        exponent: f64,
+        missing: f32,
+    },
+    Decay {
+        weight: f32,
+        origin: f64,
+        midpoint: f64,
+        exponent: f64,
+        mode: DecayMode,
+        missing: f32,
+    },
 }

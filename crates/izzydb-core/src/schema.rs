@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::config::{AttrId, TreeConfig};
+use crate::config::{AttrId, SegmentConfig, TreeConfig};
 use crate::error::{Result, TreeError};
 
 /// Supported attribute column types in a [`CollectionSchema`].
@@ -393,6 +393,33 @@ fn decode_bool_byte(byte: u8, field: &str) -> Result<bool> {
     }
 }
 
+/// Where an attribute's values are physically stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum ColumnStorage {
+    /// Stored inline in the segment row store (`cf_rows`) and transposed into `cf_columns` on seal.
+    #[default]
+    Inline = 0,
+    /// Stored outside the row store in versioned `cf_detached` column blocks.
+    Detached = 1,
+}
+
+impl ColumnStorage {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(val: u8) -> Result<Self> {
+        match val {
+            0 => Ok(Self::Inline),
+            1 => Ok(Self::Detached),
+            other => Err(TreeError::CorruptedData(format!(
+                "unknown ColumnStorage byte: {other}"
+            ))),
+        }
+    }
+}
+
 /// Configuration for a single attribute column in a collection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttributeConfig {
@@ -400,16 +427,21 @@ pub struct AttributeConfig {
     pub attr_type: AttributeType,
     pub filterable: bool,
     pub full_text_search: Option<FullTextSearchConfig>,
+    pub storage: ColumnStorage,
+    /// Opt non-filterable inline strings / string arrays into sealed-segment `cf_columns`.
+    pub column: bool,
 }
 
 impl AttributeConfig {
-    /// Create a filterable attribute definition.
+    /// Create a filterable inline attribute definition.
     pub fn new(name: impl Into<String>, attr_type: AttributeType) -> Self {
         Self {
             name: name.into(),
             attr_type,
             filterable: true,
             full_text_search: None,
+            storage: ColumnStorage::Inline,
+            column: false,
         }
     }
 
@@ -424,21 +456,53 @@ impl AttributeConfig {
         self.full_text_search = Some(config);
         self
     }
+
+    /// Set whether this attribute is stored inline or as a detached column.
+    pub fn storage(mut self, storage: ColumnStorage) -> Self {
+        self.storage = storage;
+        self
+    }
+
+    /// Opt an inline attribute into sealed-segment columnar storage (`cf_columns`).
+    pub fn with_column(mut self, column: bool) -> Self {
+        self.column = column;
+        self
+    }
 }
 
 /// Top-level configuration for opening or creating a [`Collection`](crate::Collection) (in `izzydb`).
 #[derive(Debug, Clone)]
 pub struct CollectionConfig {
-    pub tree: TreeConfig,
+    pub vector: Option<TreeConfig>,
+    pub segment: SegmentConfig,
     pub attributes: Vec<AttributeConfig>,
 }
 
 impl CollectionConfig {
     pub fn new(tree: TreeConfig) -> Self {
         Self {
-            tree,
+            vector: Some(tree),
+            segment: SegmentConfig::default(),
             attributes: Vec::new(),
         }
+    }
+
+    pub fn without_vectors() -> Self {
+        Self {
+            vector: None,
+            segment: SegmentConfig::default(),
+            attributes: Vec::new(),
+        }
+    }
+
+    pub fn with_seal_rows(mut self, seal_rows: u32) -> Self {
+        self.segment.seal_rows = seal_rows;
+        self
+    }
+
+    pub fn with_segment_config(mut self, segment: SegmentConfig) -> Self {
+        self.segment = segment;
+        self
     }
 
     pub fn with_attribute(
@@ -452,6 +516,43 @@ impl CollectionConfig {
             attr_type,
             filterable,
             full_text_search: None,
+            storage: ColumnStorage::Inline,
+            column: false,
+        });
+        self
+    }
+
+    pub fn with_column_attribute(
+        mut self,
+        name: impl Into<String>,
+        attr_type: AttributeType,
+        filterable: bool,
+        column: bool,
+    ) -> Self {
+        self.attributes.push(AttributeConfig {
+            name: name.into(),
+            attr_type,
+            filterable,
+            full_text_search: None,
+            storage: ColumnStorage::Inline,
+            column,
+        });
+        self
+    }
+
+    pub fn with_detached_attribute(
+        mut self,
+        name: impl Into<String>,
+        attr_type: AttributeType,
+        filterable: bool,
+    ) -> Self {
+        self.attributes.push(AttributeConfig {
+            name: name.into(),
+            attr_type,
+            filterable,
+            full_text_search: None,
+            storage: ColumnStorage::Detached,
+            column: false,
         });
         self
     }
@@ -473,12 +574,17 @@ impl CollectionConfig {
             attr_type,
             filterable,
             full_text_search: Some(fts),
+            storage: ColumnStorage::Inline,
+            column: false,
         });
         self
     }
 
     pub fn validate(&self) -> Result<()> {
-        self.tree.validate()?;
+        if let Some(ref tree) = self.vector {
+            tree.validate()?;
+        }
+        self.segment.validate()?;
         let mut seen = HashSet::with_capacity(self.attributes.len());
         for attr in &self.attributes {
             if attr.name.is_empty() {
@@ -489,6 +595,12 @@ impl CollectionConfig {
             if !seen.insert(attr.name.as_str()) {
                 return Err(TreeError::InvalidSchema(format!(
                     "duplicate attribute name '{}'",
+                    attr.name
+                )));
+            }
+            if attr.storage == ColumnStorage::Detached && attr.full_text_search.is_some() {
+                return Err(TreeError::InvalidSchema(format!(
+                    "detached attribute '{}' cannot have full_text_search",
                     attr.name
                 )));
             }
@@ -652,11 +764,33 @@ pub struct SchemaEntry {
     pub attr_type: AttributeType,
     pub filterable: bool,
     pub full_text_search: Option<FullTextSearchConfig>,
+    pub storage: ColumnStorage,
+    pub column: bool,
+}
+
+impl SchemaEntry {
+    /// Returns `true` if this attribute is stored in `ColumnBlock`s (`cf_columns` for sealed
+    /// inline segments, or `cf_detached` for detached columns).
+    #[inline]
+    pub fn is_columnar(&self) -> bool {
+        self.storage == ColumnStorage::Detached
+            || (self.storage == ColumnStorage::Inline
+                && (self.filterable
+                    || self.column
+                    || matches!(
+                        self.attr_type,
+                        AttributeType::Bool
+                            | AttributeType::Int
+                            | AttributeType::Uint
+                            | AttributeType::Float
+                    )))
+    }
 }
 
 /// Persistent collection schema registry mapping attribute names to monotonic `AttrId`s.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CollectionSchema {
+    has_vectors: bool,
     entries: Vec<SchemaEntry>,
     by_name: HashMap<String, usize>,
     by_id: HashMap<AttrId, usize>,
@@ -668,6 +802,7 @@ impl CollectionSchema {
     pub fn from_config(config: &CollectionConfig) -> Result<Self> {
         config.validate()?;
         let mut schema = Self {
+            has_vectors: config.vector.is_some(),
             entries: Vec::with_capacity(config.attributes.len()),
             by_name: HashMap::with_capacity(config.attributes.len()),
             by_id: HashMap::with_capacity(config.attributes.len()),
@@ -677,6 +812,10 @@ impl CollectionSchema {
             schema.register(attr)?;
         }
         Ok(schema)
+    }
+
+    pub fn has_vectors(&self) -> bool {
+        self.has_vectors
     }
 
     fn register(&mut self, attr: &AttributeConfig) -> Result<AttrId> {
@@ -692,6 +831,8 @@ impl CollectionSchema {
             attr_type: attr.attr_type,
             filterable: attr.filterable,
             full_text_search: attr.full_text_search.clone(),
+            storage: attr.storage,
+            column: attr.column,
         });
         self.by_name.insert(attr.name.clone(), idx);
         self.by_id.insert(id, idx);
@@ -702,6 +843,14 @@ impl CollectionSchema {
     /// and registering any newly declared attributes. Returns `true` if new attributes were added.
     pub fn reconcile(&mut self, config: &CollectionConfig) -> Result<bool> {
         config.validate()?;
+        let cfg_has_vectors = config.vector.is_some();
+        if self.has_vectors != cfg_has_vectors {
+            return Err(TreeError::ConfigMismatch {
+                field: "has_vectors",
+                expected: self.has_vectors.to_string(),
+                actual: cfg_has_vectors.to_string(),
+            });
+        }
         let mut changed = false;
         for attr in &config.attributes {
             if let Some(existing) = self.get_by_name(&attr.name) {
@@ -717,6 +866,20 @@ impl CollectionSchema {
                         field: "attribute_filterable",
                         expected: format!("{}:{}", existing.name, existing.filterable),
                         actual: format!("{}:{}", attr.name, attr.filterable),
+                    });
+                }
+                if existing.storage != attr.storage {
+                    return Err(TreeError::ConfigMismatch {
+                        field: "attribute_storage",
+                        expected: format!("{}:{:?}", existing.name, existing.storage),
+                        actual: format!("{}:{:?}", attr.name, attr.storage),
+                    });
+                }
+                if existing.column != attr.column {
+                    return Err(TreeError::ConfigMismatch {
+                        field: "attribute_column",
+                        expected: format!("{}:{}", existing.name, existing.column),
+                        actual: format!("{}:{}", attr.name, attr.column),
                     });
                 }
                 if existing.full_text_search != attr.full_text_search {
@@ -818,16 +981,18 @@ impl CollectionSchema {
         Ok(())
     }
 
-    /// Encode schema for persistence in `cf_meta["schema"]` (version 3).
+    /// Encode schema for persistence in `default[\x01schema]` (version 4).
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.push(3u8); // version
+        buf.push(4u8); // version
+        buf.push(u8::from(self.has_vectors));
         buf.extend_from_slice(&self.next_attr_id.to_le_bytes());
         buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         for entry in &self.entries {
             buf.extend_from_slice(&entry.id.to_le_bytes());
             buf.push(entry.attr_type.as_u8());
-            buf.push(u8::from(entry.filterable));
+            buf.push(u8::from(entry.filterable) | (u8::from(entry.column) << 1));
+            buf.push(entry.storage.as_u8());
             match &entry.full_text_search {
                 Some(fts) => {
                     buf.push(1);
@@ -842,38 +1007,47 @@ impl CollectionSchema {
         buf
     }
 
-    /// Decode schema from `cf_meta["schema"]` (version 3).
+    /// Decode schema from `default[\x01schema]` (version 4).
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 7 {
+        if bytes.len() < 8 {
             return Err(TreeError::CorruptedData(
                 "CollectionSchema payload too short".into(),
             ));
         }
         let version = bytes[0];
-        if version != 3 {
+        if version != 4 {
             return Err(TreeError::CorruptedData(format!(
                 "unsupported CollectionSchema version: {version}"
             )));
         }
-        let next_attr_id = u16::from_le_bytes(bytes[1..3].try_into().unwrap());
-        let count = u32::from_le_bytes(bytes[3..7].try_into().unwrap()) as usize;
-        let mut off = 7;
+        let has_vectors = decode_bool_byte(bytes[1], "schema has_vectors")?;
+        let next_attr_id = u16::from_le_bytes(bytes[2..4].try_into().unwrap());
+        let count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let mut off = 8;
 
         let mut entries = Vec::with_capacity(count);
         let mut by_name = HashMap::with_capacity(count);
         let mut by_id = HashMap::with_capacity(count);
 
         for idx in 0..count {
-            if off + 5 > bytes.len() {
+            if off + 6 > bytes.len() {
                 return Err(TreeError::CorruptedData(
                     "CollectionSchema entry header truncated".into(),
                 ));
             }
             let id = u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap());
             let attr_type = AttributeType::from_u8(bytes[off + 2])?;
-            let filterable = decode_bool_byte(bytes[off + 3], "schema filterable")?;
-            let has_fts = decode_bool_byte(bytes[off + 4], "schema has_fts")?;
-            off += 5;
+            let flag_byte = bytes[off + 3];
+            if flag_byte > 3 {
+                return Err(TreeError::CorruptedData(format!(
+                    "invalid schema attribute flags: {flag_byte}"
+                )));
+            }
+            let filterable = (flag_byte & 1) != 0;
+            let column = (flag_byte & 2) != 0;
+            let storage = ColumnStorage::from_u8(bytes[off + 4])?;
+            let has_fts = decode_bool_byte(bytes[off + 5], "schema has_fts")?;
+            off += 6;
 
             let full_text_search = if has_fts {
                 let fts = FullTextSearchConfig::decode(bytes, &mut off)?;
@@ -912,6 +1086,8 @@ impl CollectionSchema {
                 attr_type,
                 filterable,
                 full_text_search,
+                storage,
+                column,
             });
         }
         if off != bytes.len() {
@@ -921,6 +1097,7 @@ impl CollectionSchema {
         }
 
         Ok(Self {
+            has_vectors,
             entries,
             by_name,
             by_id,

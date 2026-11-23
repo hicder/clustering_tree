@@ -1,77 +1,57 @@
-//! Inverted full-text index manager coordinating RocksDB writes, token/phrase filters,
-//! and Vectorized Block-Max MAXSCORE BM25 execution.
+//! Inverted full-text index on `RowId` / `RowBlock` coordinates with segment-aware
+//! liveness masks and Vectorized Block-Max MAXSCORE BM25 execution.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use roaring::RoaringBitmap;
 
-use izzydb_core::config::{
-    AttrId, DocId, FtsBlockId, FtsDocId, TermId, for_each_set_bit_256, fts_block_id,
-    fts_skip_chunk_id, fts_skip_slot, fts_slot, make_fts_doc_id,
-};
+use izzydb_core::config::{AttrId, DocId, RowBlock, RowId, SegmentId, TermId, for_each_set_bit_256};
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::filter::{Filter, FtsPredicateKind, TokenQuery};
 use izzydb_core::rank::RankBy;
-use izzydb_core::schema::{AttributeValue, Attributes, CollectionSchema};
+use izzydb_core::rowset::{Liveness, RowSet};
+use izzydb_core::schema::{AttributeValue, Attributes, CollectionSchema, ColumnStorage};
 use izzydb_fts::{
-    AnalyzedDoc, QueryToken, Bm25Result, DEFAULT_MAX_PREFIX_EXPANSIONS, DocLenBlock,
+    BlockMaskProvider, Bm25Result, DEFAULT_MAX_PREFIX_EXPANSIONS, DocLenBlock, DocLenBlockView,
     FtsAnalyzer, FtsDocLenCursor, FtsMeta, FtsPostingSource, FtsSkipCursor, INLINE_TERM_MAX_DF,
     PackedPositionBlock, PackedPostingBlock, PositionBlockView, PostingBlockHeader,
-    PostingBlockView, ReusableBuffer, SkipBlock, SkipBlockView, TermRecord, TermStats,
-    RankModifier, dl_over_tf_lower_bound, execute_rank_by, execute_rank_by_with,
+    PostingBlockView, QueryToken, RankModifier, ReusableBuffer, SkipBlock, TermRecord,
+    dl_over_tf_lower_bound, execute_rank_by_with,
 };
 use izzydb_storage::codec::{
-    decode_fts_term_key, encode_fts_doc_len_key, encode_fts_term_id_key, encode_fts_term_key,
+    RowView, decode_fts_term_key, encode_fts_term_key, fts_block_key_coord,
 };
-use izzydb_storage::{DBPinnableSlice, RocksDocLenCursor, RocksSkipCursor, Storage, TxContext};
+use izzydb_storage::{
+    DBPinnableSlice, RocksDocLenCursor, RocksSkipCursor, SegmentTableSnapshot, Storage, TxContext,
+};
 
-/// Maximum posting blocks per term for which `TermStats` (`max_tf`, `min_dl_over_tf`)
-/// are recomputed inline on deletes or frequency decreases.
-pub(crate) const INLINE_TERM_STATS_RECOMPUTE_MAX_BLOCKS: usize = 64;
+use crate::segments::RowIndexHook;
 
-#[inline]
-pub(crate) fn normalize_opt_attr_val(v: Option<&AttributeValue>) -> Option<&AttributeValue> {
-    match v {
-        None | Some(AttributeValue::Null) => None,
-        Some(other) => Some(other),
-    }
+/// Combines segment-level liveness (`SegmentTableSnapshot`) with an optional pushed-down
+/// filter [`RowSet`] for Block-Max MAXSCORE block masking.
+pub struct LivenessMaskProvider<'a> {
+    pub snap: &'a SegmentTableSnapshot,
+    pub filter: Option<&'a RowSet>,
 }
 
-/// Returns `true` if any FTS-enabled attribute differs between `old_entries` and `new_attrs`.
-pub(crate) fn has_fts_attr_changes(
-    schema: &CollectionSchema,
-    old_entries: &[(AttrId, AttributeValue)],
-    new_attrs: &Attributes,
-) -> bool {
-    if !schema.has_fts() {
-        return false;
+impl BlockMaskProvider for LivenessMaskProvider<'_> {
+    #[inline]
+    fn mask(&self, block: RowBlock) -> Option<[u64; 4]> {
+        let live = self.snap.block_live_mask(block.seg(), block.block());
+        match (live, self.filter) {
+            (None, None) => None,
+            (Some(m), None) => Some(m),
+            (None, Some(rs)) => Some(rs.block_mask(block.seg(), block.block())),
+            (Some(mut m), Some(rs)) => {
+                let fm = rs.block_mask(block.seg(), block.block());
+                for i in 0..4 {
+                    m[i] &= fm[i];
+                }
+                Some(m)
+            }
+        }
     }
-    let old_map: HashMap<AttrId, &AttributeValue> =
-        old_entries.iter().map(|(id, v)| (*id, v)).collect();
-    schema.fts_entries().any(|entry| {
-        normalize_opt_attr_val(old_map.get(&entry.id).copied())
-            != normalize_opt_attr_val(new_attrs.get(&entry.name))
-    })
-}
-
-/// Returns `true` if any FTS-enabled attribute present in `patch_attrs` differs from `old_entries`.
-pub(crate) fn has_fts_patch_changes(
-    schema: &CollectionSchema,
-    old_entries: &[(AttrId, AttributeValue)],
-    patch_attrs: &Attributes,
-) -> bool {
-    if !schema.has_fts() || patch_attrs.is_empty() {
-        return false;
-    }
-    let old_map: HashMap<AttrId, &AttributeValue> =
-        old_entries.iter().map(|(id, v)| (*id, v)).collect();
-    schema.fts_entries().any(|entry| {
-        patch_attrs.get(&entry.name).is_some_and(|new_val| {
-            normalize_opt_attr_val(old_map.get(&entry.id).copied())
-                != normalize_opt_attr_val(Some(new_val))
-        })
-    })
 }
 
 /// RocksDB-backed [`FtsPostingSource`] adapter over [`Storage`].
@@ -89,7 +69,7 @@ pub struct StorageSkipCursor<'a>(RocksSkipCursor<'a>);
 
 impl FtsSkipCursor for StorageSkipCursor<'_> {
     #[inline]
-    fn current_block_id(&self) -> Option<FtsBlockId> {
+    fn current_block_id(&self) -> Option<RowBlock> {
         self.0.current_block_id()
     }
 
@@ -114,7 +94,7 @@ impl FtsSkipCursor for StorageSkipCursor<'_> {
     }
 
     #[inline]
-    fn seek_block(&mut self, target: FtsBlockId) -> Result<()> {
+    fn seek_block(&mut self, target: RowBlock) -> Result<()> {
         self.0.seek_block(target)
     }
 }
@@ -123,7 +103,7 @@ pub struct StorageDocLenCursor(RocksDocLenCursor);
 
 impl FtsDocLenCursor for StorageDocLenCursor {
     #[inline]
-    fn seek_block_bytes(&mut self, block_id: FtsBlockId) -> Result<Option<&[u8]>> {
+    fn seek_block_bytes(&mut self, block_id: RowBlock) -> Result<Option<&[u8]>> {
         self.0.seek_block_bytes(block_id)
     }
 }
@@ -189,7 +169,6 @@ impl FtsPostingSource for StorageFtsSource<'_> {
             let record = TermRecord::decode(&v)?;
             matches.push((token, record));
         }
-        // Ensure exact match is present even if prefix has > scan_limit terms.
         if !matches.iter().any(|(t, _)| t == prefix)
             && let Some(raw) = self.storage.get_fts_term_bytes(&prefix_key)?
         {
@@ -226,7 +205,7 @@ impl FtsPostingSource for StorageFtsSource<'_> {
     fn get_posting_block<'a>(
         &'a self,
         term_id: TermId,
-        block_id: FtsBlockId,
+        block_id: RowBlock,
     ) -> Result<Option<Self::PostingGuard<'a>>> {
         self.storage.get_fts_posting_pinned(term_id, block_id)
     }
@@ -237,13 +216,12 @@ impl FtsPostingSource for StorageFtsSource<'_> {
         ))
     }
 
-    fn multi_get_doc_ids(&self, fts_doc_ids: &[FtsDocId]) -> Result<Vec<Option<DocId>>> {
-        self.storage.multi_get_doc_ids_from_fts(fts_doc_ids)
+    fn multi_get_doc_ids(&self, row_ids: &[RowId]) -> Result<Vec<Option<DocId>>> {
+        self.storage.resolve_doc_ids(row_ids)
     }
 }
 
-/// Inverted full-text index manager coordinating atomic RocksDB writes, token/phrase filters,
-/// and Vectorized Block-Max MAXSCORE BM25 execution.
+/// Inverted full-text index manager operating directly on [`RowId`] / [`RowBlock`] coordinates.
 pub struct FtsIndex {
     buffers: Mutex<Vec<ReusableBuffer>>,
 }
@@ -304,205 +282,72 @@ impl FtsIndex {
         }
     }
 
-    /// Analyze and update all FTS-enabled attributes for `doc_id` inside `tx`.
-    pub fn upsert_doc(
-        &self,
-        tx: &mut TxContext<'_>,
-        schema: &CollectionSchema,
-        doc_id: DocId,
-        old_entries: Option<&[(AttrId, AttributeValue)]>,
-        new_attrs: &Attributes,
-    ) -> Result<()> {
-        if !schema.has_fts() {
-            return Ok(());
-        }
-
-        let mut meta = match tx.get_fts_meta_bytes()? {
-            Some(bytes) => FtsMeta::decode(&bytes)?,
-            None => FtsMeta::default(),
-        };
-
-        let fts_doc_id = match tx.get_fts_doc_id(doc_id)? {
-            Some(existing) => existing,
-            None => {
-                let allocated = if let Some(min_free) = tx.get_fts_free_ids()?.min() {
-                    tx.get_fts_free_ids_mut()?.remove(min_free);
-                    min_free
-                } else {
-                    meta.alloc_doc_id()?
-                };
-                tx.put_fts_doc_mapping(doc_id, allocated);
-                allocated
-            }
-        };
-        let block_id = fts_block_id(fts_doc_id);
-        let slot = fts_slot(fts_doc_id);
-
-        let old_map: HashMap<AttrId, &AttributeValue> = match old_entries {
-            Some(entries) => entries.iter().map(|(id, v)| (*id, v)).collect(),
-            None => HashMap::new(),
-        };
-
-        let mut buf = self.acquire_buffer();
-        for entry in schema.fts_entries() {
-            let old_val = old_map.get(&entry.id).copied();
-            let new_val = new_attrs.get(&entry.name);
-            if old_entries.is_some()
-                && normalize_opt_attr_val(old_val) == normalize_opt_attr_val(new_val)
-            {
-                continue;
-            }
-
-            let fts_cfg = entry.full_text_search.as_ref().unwrap();
-            let analyzer = FtsAnalyzer::new(fts_cfg.clone());
-
-            let old_analyzed = match old_val {
-                Some(val) => analyzer.analyze_attribute_value(val, &mut buf)?,
-                None => None,
-            };
-            let new_analyzed = match new_val {
-                Some(val) => analyzer.analyze_attribute_value(val, &mut buf)?,
-                None => None,
-            };
-
-            {
-                let stats = meta.per_attr_stats.entry(entry.id).or_default();
-                match (&old_analyzed, &new_analyzed) {
-                    (None, None) => continue,
-                    (None, Some(n)) => {
-                        stats.doc_count = stats.doc_count.saturating_add(1);
-                        stats.total_tokens = stats.total_tokens.saturating_add(n.doc_len as u64);
-                    }
-                    (Some(o), None) => {
-                        stats.doc_count = stats.doc_count.saturating_sub(1);
-                        stats.total_tokens = stats.total_tokens.saturating_sub(o.doc_len as u64);
-                    }
-                    (Some(o), Some(n)) => {
-                        stats.total_tokens = stats
-                            .total_tokens
-                            .saturating_sub(o.doc_len as u64)
-                            .saturating_add(n.doc_len as u64);
-                    }
-                }
-            }
-
-            apply_attr_token_diff(
-                tx,
-                &mut meta,
-                FtsDocSlot {
-                    attr_id: entry.id,
-                    block_id,
-                    slot,
-                    index_positions: fts_cfg.index_positions,
-                },
-                old_analyzed.as_ref(),
-                new_analyzed.as_ref(),
-            )?;
-        }
-
-        tx.put_fts_meta_bytes(meta.encode());
-        Ok(())
-    }
-
-    /// Remove all FTS postings and document mappings for `doc_id` inside `tx`.
-    pub fn remove_doc(
-        &self,
-        tx: &mut TxContext<'_>,
-        schema: &CollectionSchema,
-        doc_id: DocId,
-        old_entries: &[(AttrId, AttributeValue)],
-    ) -> Result<()> {
-        if !schema.has_fts() {
-            return Ok(());
-        }
-        let Some(fts_doc_id) = tx.get_fts_doc_id(doc_id)? else {
-            return Ok(());
-        };
-        let mut meta = match tx.get_fts_meta_bytes()? {
-            Some(bytes) => FtsMeta::decode(&bytes)?,
-            None => FtsMeta::default(),
-        };
-        let block_id = fts_block_id(fts_doc_id);
-        let slot = fts_slot(fts_doc_id);
-
-        let old_map: HashMap<AttrId, &AttributeValue> =
-            old_entries.iter().map(|(id, v)| (*id, v)).collect();
-
-        let mut buf = self.acquire_buffer();
-        for entry in schema.fts_entries() {
-            let fts_cfg = entry.full_text_search.as_ref().unwrap();
-            let analyzer = FtsAnalyzer::new(fts_cfg.clone());
-            let Some(val) = old_map.get(&entry.id) else {
-                continue;
-            };
-            let Some(old_analyzed) = analyzer.analyze_attribute_value(val, &mut buf)? else {
-                continue;
-            };
-            if let Some(stats) = meta.per_attr_stats.get_mut(&entry.id) {
-                stats.doc_count = stats.doc_count.saturating_sub(1);
-                stats.total_tokens = stats
-                    .total_tokens
-                    .saturating_sub(old_analyzed.doc_len as u64);
-            }
-            apply_attr_token_diff(
-                tx,
-                &mut meta,
-                FtsDocSlot {
-                    attr_id: entry.id,
-                    block_id,
-                    slot,
-                    index_positions: fts_cfg.index_positions,
-                },
-                Some(&old_analyzed),
-                None,
-            )?;
-        }
-
-        tx.delete_fts_doc_mapping(doc_id, fts_doc_id);
-        let free_ids = tx.get_fts_free_ids_mut()?;
-        free_ids.insert(fts_doc_id);
-        while meta.next_fts_doc_id > 0 && free_ids.remove(meta.next_fts_doc_id - 1) {
-            meta.next_fts_doc_id -= 1;
-        }
-        tx.put_fts_meta_bytes(meta.encode());
-        Ok(())
-    }
-
-    /// Recompute exact `TermStats` (`max_tf`, `min_dl_over_tf`) across all FTS terms by scanning
-    /// posting block headers, tightening any high-DF terms excluded from inline recomputation.
+    /// Recompute exact live `TermStats` (`doc_freq`, `max_tf`, `min_dl_over_tf`) across all FTS
+    /// terms by scanning live posting slots against `SegmentTableSnapshot`.
     pub fn compact_term_stats(&self, storage: &Storage, tx: &mut TxContext<'_>) -> Result<usize> {
+        let snap = storage.segment_snapshot();
         let terms = storage.all_fts_terms()?;
+        let mut dl_cursors: HashMap<AttrId, RocksDocLenCursor> = HashMap::new();
         let mut updated = 0usize;
+
         for (key, bytes) in terms {
+            let (attr_id, _) = decode_fts_term_key(&key)?;
             let mut rec = TermRecord::decode(&bytes)?;
-            let mut doc_freq = 0u64;
+            let dl_cursor = match dl_cursors.entry(attr_id) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(storage.open_fts_doc_len_cursor(attr_id)?)
+                }
+            };
+
+            let mut live_df = 0u64;
             let mut max_tf = 0u32;
             let mut min_ratio = f32::INFINITY;
-            if let Some((_, ref ib_bytes)) = rec.inline_block {
-                let header = PostingBlockHeader::parse(ib_bytes)?;
-                doc_freq = header.count as u64;
-                max_tf = header.max_tf;
-                min_ratio = header.min_dl_over_tf;
+
+            let mut accumulate_block = |block_id: RowBlock, pbytes: &[u8]| -> Result<()> {
+                let pblk = PackedPostingBlock::decode(pbytes)?;
+                let mask = snap.block_live_mask(block_id.seg(), block_id.block());
+                if mask == Some([0u64; 4]) {
+                    return Ok(());
+                }
+                let dl_view = dl_cursor
+                    .seek_block_bytes(block_id)?
+                    .map(DocLenBlockView::parse)
+                    .transpose()?;
+                for (&slot, &tf) in pblk.slots.iter().zip(pblk.tfs.iter()) {
+                    if let Some(m) = mask
+                        && ((m[(slot as usize) >> 6] >> (slot & 63)) & 1) == 0
+                    {
+                        continue;
+                    }
+                    live_df += 1;
+                    max_tf = max_tf.max(tf);
+                    let dl = dl_view.as_ref().map_or(tf, |dv| dv.dl(slot));
+                    min_ratio = min_ratio.min(dl_over_tf_lower_bound(dl, tf));
+                }
+                Ok(())
+            };
+
+            if let Some((ib_id, ref ib_bytes)) = rec.inline_block {
+                accumulate_block(ib_id, ib_bytes)?;
             } else {
                 let mut cursor = storage.open_fts_skip_cursor(rec.clone())?;
                 while let Some(bid) = cursor.current_block_id() {
                     if let Some(slice) = storage.get_fts_posting_pinned(rec.term_id, bid)? {
-                        let header = PostingBlockHeader::parse(&slice)?;
-                        doc_freq = doc_freq.saturating_add(header.count as u64);
-                        max_tf = max_tf.max(header.max_tf);
-                        min_ratio = min_ratio.min(header.min_dl_over_tf);
+                        accumulate_block(bid, &slice)?;
                     }
                     cursor.next_block()?;
                 }
             }
-            if doc_freq == 0 {
+
+            if live_df == 0 {
                 tx.delete_fts_term(key);
                 updated += 1;
-            } else if rec.stats.doc_freq != doc_freq
+            } else if rec.stats.doc_freq != live_df
                 || rec.stats.max_tf != max_tf
                 || rec.stats.min_dl_over_tf.to_bits() != min_ratio.to_bits()
             {
-                rec.stats.doc_freq = doc_freq;
+                rec.stats.doc_freq = live_df;
                 rec.stats.max_tf = max_tf;
                 rec.stats.min_dl_over_tf = min_ratio;
                 tx.put_fts_term_bytes(key, rec.encode());
@@ -512,30 +357,30 @@ impl FtsIndex {
         Ok(updated)
     }
 
-    /// Execute a [`RankBy`] BM25 query with optional pushdown `doc_filter` and `lazy_filter`.
+    /// Execute a [`RankBy`] BM25 query with combined liveness + optional pushed-down [`RowSet`] mask
+    /// and optional lazy filter callback.
+    #[allow(clippy::too_many_arguments)]
     pub fn query_bm25(
         &self,
         storage: &Storage,
         schema: &CollectionSchema,
         rank_by: &RankBy,
         top_k: usize,
-        doc_filter: Option<&RoaringBitmap>,
-        lazy_filter: Option<&mut dyn FnMut(DocId) -> Result<bool>>,
+        block_mask: Option<&dyn BlockMaskProvider>,
+        lazy_filter: Option<&mut dyn FnMut(RowId) -> Result<bool>>,
     ) -> Result<Vec<Bm25Result>> {
-        let source = StorageFtsSource::new(storage);
-        let mut buf = self.acquire_buffer();
-        execute_rank_by(
-            &source,
+        self.query_bm25_with(
+            storage,
             schema,
             rank_by,
             top_k,
-            doc_filter,
+            block_mask,
             lazy_filter,
-            &mut buf,
+            None,
         )
     }
 
-    /// [`FtsIndex::query_bm25`] with an optional per-document [`RankModifier`].
+    /// [`FtsIndex::query_bm25`] with an optional [`RankModifier`].
     #[allow(clippy::too_many_arguments)]
     pub fn query_bm25_with(
         &self,
@@ -543,19 +388,27 @@ impl FtsIndex {
         schema: &CollectionSchema,
         rank_by: &RankBy,
         top_k: usize,
-        doc_filter: Option<&RoaringBitmap>,
-        lazy_filter: Option<&mut dyn FnMut(DocId) -> Result<bool>>,
+        block_mask: Option<&dyn BlockMaskProvider>,
+        lazy_filter: Option<&mut dyn FnMut(RowId) -> Result<bool>>,
         modifier: Option<RankModifier<'_>>,
     ) -> Result<Vec<Bm25Result>> {
         let source = StorageFtsSource::new(storage);
         let mut buf = self.acquire_buffer();
         execute_rank_by_with(
-            &source, schema, rank_by, top_k, doc_filter, lazy_filter, modifier, &mut buf,
+            &source,
+            schema,
+            rank_by,
+            top_k,
+            block_mask,
+            lazy_filter,
+            modifier,
+            &mut buf,
         )
     }
 
-    /// Evaluate a single FTS filter predicate into a `RoaringBitmap` of matching `FtsDocId`s.
-    pub fn eval_fts_predicate(
+    /// Estimate live cardinality of an FTS predicate from `TermRecord.stats.doc_freq`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn estimate_fts_predicate(
         &self,
         storage: &Storage,
         schema: &CollectionSchema,
@@ -563,7 +416,8 @@ impl FtsIndex {
         attr: &str,
         query: &TokenQuery,
         last_as_prefix: bool,
-    ) -> Result<RoaringBitmap> {
+        live_rows: u64,
+    ) -> Result<u64> {
         let entry = schema
             .get_by_name(attr)
             .ok_or_else(|| TreeError::InvalidFilter(format!("unknown attribute '{attr}'")))?;
@@ -577,9 +431,91 @@ impl FtsIndex {
             FtsAnalyzer::new(fts_cfg.clone()).analyze_query(query, &mut buf)?
         };
         if qtokens.is_empty() {
-            return Ok(RoaringBitmap::new());
+            return Ok(0);
         }
 
+        let source = StorageFtsSource::new(storage);
+        let mut exact_tokens = exact_query_tokens(&qtokens, last_as_prefix);
+        exact_tokens.sort_unstable();
+        exact_tokens.dedup();
+        let exact_recs = source.multi_get_term_records(entry.id, &exact_tokens)?;
+        let prefix_recs: Vec<TermRecord> = if last_as_prefix {
+            let prefix = &qtokens.last().unwrap().text;
+            source
+                .scan_prefix_terms(entry.id, prefix, DEFAULT_MAX_PREFIX_EXPANSIONS)?
+                .into_iter()
+                .map(|(_, r)| r)
+                .filter(|r| r.stats.doc_freq > 0)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let est = match kind {
+            FtsPredicateKind::AnyToken => {
+                let exact_sum: u64 = exact_recs
+                    .iter()
+                    .flatten()
+                    .map(|r| r.stats.doc_freq)
+                    .fold(0u64, u64::saturating_add);
+                let pref_sum: u64 = prefix_recs
+                    .iter()
+                    .map(|r| r.stats.doc_freq)
+                    .fold(0u64, u64::saturating_add);
+                exact_sum.saturating_add(pref_sum)
+            }
+            FtsPredicateKind::AllTokens | FtsPredicateKind::TokenSequence => {
+                let mut min_df = u64::MAX;
+                for rec_opt in &exact_recs {
+                    let df = rec_opt.as_ref().map_or(0, |r| r.stats.doc_freq);
+                    if df == 0 {
+                        return Ok(0);
+                    }
+                    min_df = min_df.min(df);
+                }
+                if last_as_prefix {
+                    let pref_sum: u64 = prefix_recs
+                        .iter()
+                        .map(|r| r.stats.doc_freq)
+                        .fold(0u64, u64::saturating_add);
+                    if pref_sum == 0 {
+                        return Ok(0);
+                    }
+                    min_df = min_df.min(pref_sum);
+                }
+                if min_df == u64::MAX { 0 } else { min_df }
+            }
+        };
+        Ok(est.min(live_rows))
+    }
+
+    /// Evaluate a single FTS filter predicate directly into a live [`RowSet`].
+    pub fn eval_fts_predicate(
+        &self,
+        storage: &Storage,
+        schema: &CollectionSchema,
+        kind: FtsPredicateKind,
+        attr: &str,
+        query: &TokenQuery,
+        last_as_prefix: bool,
+    ) -> Result<RowSet> {
+        let entry = schema
+            .get_by_name(attr)
+            .ok_or_else(|| TreeError::InvalidFilter(format!("unknown attribute '{attr}'")))?;
+        let fts_cfg = entry.full_text_search.as_ref().ok_or_else(|| {
+            TreeError::InvalidFilter(format!(
+                "attribute '{attr}' does not have full_text_search enabled"
+            ))
+        })?;
+        let qtokens = {
+            let mut buf = self.acquire_buffer();
+            FtsAnalyzer::new(fts_cfg.clone()).analyze_query(query, &mut buf)?
+        };
+        if qtokens.is_empty() {
+            return Ok(RowSet::empty());
+        }
+
+        let snap = storage.segment_snapshot();
         let source = StorageFtsSource::new(storage);
         let prefix_expansions = if last_as_prefix {
             let prefix = &qtokens.last().unwrap().text;
@@ -589,14 +525,25 @@ impl FtsIndex {
         };
 
         match kind {
-            FtsPredicateKind::AnyToken => {
-                eval_any_token_predicate(storage, &source, entry.id, &qtokens, prefix_expansions)
-            }
-            FtsPredicateKind::AllTokens => {
-                eval_all_tokens_predicate(storage, &source, entry.id, &qtokens, prefix_expansions)
-            }
+            FtsPredicateKind::AnyToken => eval_any_token_predicate(
+                storage,
+                &snap,
+                &source,
+                entry.id,
+                &qtokens,
+                prefix_expansions,
+            ),
+            FtsPredicateKind::AllTokens => eval_all_tokens_predicate(
+                storage,
+                &snap,
+                &source,
+                entry.id,
+                &qtokens,
+                prefix_expansions,
+            ),
             FtsPredicateKind::TokenSequence => eval_token_sequence_predicate(
                 storage,
+                &snap,
                 &source,
                 entry.id,
                 &qtokens,
@@ -605,33 +552,29 @@ impl FtsIndex {
         }
     }
 
-    /// Exact set of `FtsDocId`s whose BM25 score under `rank_by` is `> 0`.
-    ///
-    /// BM25 IDF is strictly positive whenever `df > 0`, so a document scores `> 0` iff it contains
-    /// at least one resolved term reachable through a positive-weight path of the `RankBy` AST
-    /// (`Sum` / `Max` = union, `Product(w, e)` = `e` when the accumulated weight is `> 0`).
-    /// Term resolution mirrors MAXSCORE compilation (query analysis, `last_as_prefix`, and
-    /// `max_prefix_expansions`) but needs no float math or doc-length reads.
-    pub fn eval_rank_by_match_bitmap(
+    /// Exact live [`RowSet`] of documents whose BM25 score under pure-lexical `rank_by` is `> 0`.
+    pub fn eval_rank_by_match_rowset(
         &self,
         storage: &Storage,
         schema: &CollectionSchema,
         rank_by: &RankBy,
-    ) -> Result<RoaringBitmap> {
+    ) -> Result<RowSet> {
+        let snap = storage.segment_snapshot();
         let source = StorageFtsSource::new(storage);
-        self.rank_by_match(storage, &source, schema, rank_by, 1.0)
+        self.rank_by_match(storage, &snap, &source, schema, rank_by, 1.0)
     }
 
     fn rank_by_match(
         &self,
         storage: &Storage,
+        snap: &SegmentTableSnapshot,
         source: &StorageFtsSource<'_>,
         schema: &CollectionSchema,
         expr: &RankBy,
         weight: f32,
-    ) -> Result<RoaringBitmap> {
+    ) -> Result<RowSet> {
         if weight <= 0.0 {
-            return Ok(RoaringBitmap::new());
+            return Ok(RowSet::empty());
         }
         match expr {
             RankBy::Product(children) => {
@@ -650,7 +593,7 @@ impl FtsIndex {
                     }
                 }
                 match lexical {
-                    Some(inner) => self.rank_by_match(storage, source, schema, inner, w),
+                    Some(inner) => self.rank_by_match(storage, snap, source, schema, inner, w),
                     None => Err(TreeError::InvalidQuery(
                         "rank_by_match requires a pure lexical expression".into(),
                     )),
@@ -664,9 +607,10 @@ impl FtsIndex {
                 "rank_by_match requires a pure lexical expression".into(),
             )),
             RankBy::Sum(children) | RankBy::Max(children) => {
-                let mut acc = RoaringBitmap::new();
+                let mut acc = RowSet::empty();
                 for child in children {
-                    acc |= self.rank_by_match(storage, source, schema, child, weight)?;
+                    let sub = self.rank_by_match(storage, snap, source, schema, child, weight)?;
+                    acc = acc.or(&sub);
                 }
                 Ok(acc)
             }
@@ -688,7 +632,7 @@ impl FtsIndex {
                     FtsAnalyzer::new(fts_cfg.clone()).analyze_query(query, &mut buf)?
                 };
                 if qtokens.is_empty() {
-                    return Ok(RoaringBitmap::new());
+                    return Ok(RowSet::empty());
                 }
                 let last_as_prefix = params
                     .as_ref()
@@ -717,7 +661,98 @@ impl FtsIndex {
                     );
                 }
                 records.retain(|r| r.stats.doc_freq > 0);
-                eval_any_token_records(storage, &records)
+                eval_any_token_records(storage, snap, &records)
+            }
+        }
+    }
+
+    /// Evaluate a single FTS predicate against a decoded attribute value (used for lazy filters).
+    pub fn matches_fts_attr(
+        &self,
+        schema: &CollectionSchema,
+        kind: FtsPredicateKind,
+        attr: &str,
+        query: &TokenQuery,
+        last_as_prefix: bool,
+        val_opt: Option<&AttributeValue>,
+    ) -> bool {
+        let Some(entry) = schema.get_by_name(attr) else {
+            return false;
+        };
+        let Some(fts_cfg) = entry.full_text_search.as_ref() else {
+            return false;
+        };
+        let Some(val) = val_opt else {
+            return false;
+        };
+        let mut buf = self.acquire_buffer();
+        let analyzer = FtsAnalyzer::new(fts_cfg.clone());
+        let Ok(Some(doc)) = analyzer.analyze_attribute_value(val, &mut buf) else {
+            return false;
+        };
+        let Ok(qtokens) = analyzer.analyze_query(query, &mut buf) else {
+            return false;
+        };
+        if qtokens.is_empty() {
+            return false;
+        }
+        match kind {
+            FtsPredicateKind::AnyToken => qtokens.iter().enumerate().any(|(i, qt)| {
+                if last_as_prefix && i == qtokens.len() - 1 {
+                    doc.terms.keys().any(|t| t.starts_with(&qt.text))
+                } else {
+                    doc.terms.contains_key(&qt.text)
+                }
+            }),
+            FtsPredicateKind::AllTokens => qtokens.iter().enumerate().all(|(i, qt)| {
+                if last_as_prefix && i == qtokens.len() - 1 {
+                    doc.terms.keys().any(|t| t.starts_with(&qt.text))
+                } else {
+                    doc.terms.contains_key(&qt.text)
+                }
+            }),
+            FtsPredicateKind::TokenSequence => {
+                let base = qtokens[0].position;
+                let rel: Vec<u32> = qtokens.iter().map(|t| t.position - base).collect();
+                if qtokens.len() == 1 {
+                    let qt = &qtokens[0];
+                    return if last_as_prefix {
+                        doc.terms.keys().any(|t| t.starts_with(&qt.text))
+                    } else {
+                        doc.terms.contains_key(&qt.text)
+                    };
+                }
+                let Some(first_term) = doc.terms.get(&qtokens[0].text) else {
+                    return false;
+                };
+                'outer: for &p0 in &first_term.positions {
+                    let exact_end = if last_as_prefix {
+                        qtokens.len() - 1
+                    } else {
+                        qtokens.len()
+                    };
+                    for i in 1..exact_end {
+                        let target = p0 + rel[i];
+                        let Some(t) = doc.terms.get(&qtokens[i].text) else {
+                            continue 'outer;
+                        };
+                        if t.positions.binary_search(&target).is_err() {
+                            continue 'outer;
+                        }
+                    }
+                    if last_as_prefix {
+                        let target = p0 + rel[qtokens.len() - 1];
+                        let prefix = &qtokens[qtokens.len() - 1].text;
+                        let ok = doc.terms.iter().any(|(tok, term)| {
+                            tok.starts_with(prefix) && term.positions.binary_search(&target).is_ok()
+                        });
+                        if !ok {
+                            continue 'outer;
+                        }
+                    }
+                    return true;
+                }
+                false
             }
         }
     }
@@ -730,89 +765,258 @@ impl FtsIndex {
         filter: &Filter,
         attrs: &Attributes,
     ) -> bool {
-        let mut buf = self.acquire_buffer();
         filter.matches_with_fts(attrs, &mut |kind, attr, query, last_as_prefix| {
-            let Some(entry) = schema.get_by_name(attr) else {
-                return false;
-            };
-            let Some(fts_cfg) = entry.full_text_search.as_ref() else {
-                return false;
-            };
-            let Some(val) = attrs.get(attr) else {
-                return false;
-            };
-            let analyzer = FtsAnalyzer::new(fts_cfg.clone());
-            let Ok(Some(doc)) = analyzer.analyze_attribute_value(val, &mut buf) else {
-                return false;
-            };
-            let Ok(qtokens) = analyzer.analyze_query(query, &mut buf) else {
-                return false;
-            };
-            if qtokens.is_empty() {
-                return false;
-            }
-            match kind {
-                FtsPredicateKind::AnyToken => qtokens.iter().enumerate().any(|(i, qt)| {
-                    if last_as_prefix && i == qtokens.len() - 1 {
-                        doc.terms.keys().any(|t| t.starts_with(&qt.text))
-                    } else {
-                        doc.terms.contains_key(&qt.text)
-                    }
-                }),
-                FtsPredicateKind::AllTokens => qtokens.iter().enumerate().all(|(i, qt)| {
-                    if last_as_prefix && i == qtokens.len() - 1 {
-                        doc.terms.keys().any(|t| t.starts_with(&qt.text))
-                    } else {
-                        doc.terms.contains_key(&qt.text)
-                    }
-                }),
-                FtsPredicateKind::TokenSequence => {
-                    let base = qtokens[0].position;
-                    let rel: Vec<u32> = qtokens.iter().map(|t| t.position - base).collect();
-                    if qtokens.len() == 1 {
-                        let qt = &qtokens[0];
-                        return if last_as_prefix {
-                            doc.terms.keys().any(|t| t.starts_with(&qt.text))
-                        } else {
-                            doc.terms.contains_key(&qt.text)
-                        };
-                    }
-                    let Some(first_term) = doc.terms.get(&qtokens[0].text) else {
-                        return false;
-                    };
-                    'outer: for &p0 in &first_term.positions {
-                        let exact_end = if last_as_prefix {
-                            qtokens.len() - 1
-                        } else {
-                            qtokens.len()
-                        };
-                        for i in 1..exact_end {
-                            let target = p0 + rel[i];
-                            let Some(t) = doc.terms.get(&qtokens[i].text) else {
-                                continue 'outer;
-                            };
-                            if t.positions.binary_search(&target).is_err() {
-                                continue 'outer;
-                            }
-                        }
-                        if last_as_prefix {
-                            let target = p0 + rel[qtokens.len() - 1];
-                            let prefix = &qtokens[qtokens.len() - 1].text;
-                            let ok = doc.terms.iter().any(|(tok, term)| {
-                                tok.starts_with(prefix) && term.positions.binary_search(&target).is_ok()
-                            });
-                            if !ok {
-                                continue 'outer;
-                            }
-                        }
-                        return true;
-                    }
-                    false
-                }
-            }
+            self.matches_fts_attr(schema, kind, attr, query, last_as_prefix, attrs.get(attr))
         })
     }
 }
+
+impl RowIndexHook for FtsIndex {
+    fn on_insert(
+        &self,
+        tx: &mut TxContext<'_>,
+        schema: &CollectionSchema,
+        row: RowId,
+        view: &RowView<'_>,
+        _vector: Option<&[f32]>,
+        _prev_row: Option<RowId>,
+    ) -> Result<()> {
+        if !schema.has_fts() {
+            return Ok(());
+        }
+
+        let mut meta = match tx.get_fts_meta_bytes()? {
+            Some(bytes) => FtsMeta::decode(&bytes)?,
+            None => FtsMeta::default(),
+        };
+        let block_id = row.block();
+        let slot = row.slot();
+        let mut buf = self.acquire_buffer();
+        let mut modified = false;
+
+        for entry in schema.fts_entries() {
+            if entry.storage != ColumnStorage::Inline {
+                continue;
+            }
+            let Some(val) = view.decode_field(entry.id)? else {
+                continue;
+            };
+            let fts_cfg = entry.full_text_search.as_ref().unwrap();
+            let analyzer = FtsAnalyzer::new(fts_cfg.clone());
+            let Some(analyzed) = analyzer.analyze_attribute_value(&val, &mut buf)? else {
+                continue;
+            };
+            modified = true;
+            {
+                let stats = meta.per_attr_stats.entry(entry.id).or_default();
+                stats.doc_count = stats.doc_count.saturating_add(1);
+                stats.total_tokens = stats.total_tokens.saturating_add(analyzed.doc_len as u64);
+            }
+
+            let mut dl_blk = match tx.get_fts_doc_len_bytes(entry.id, block_id)? {
+                Some(bytes) => DocLenBlock::decode(&bytes)?,
+                None => DocLenBlock::default(),
+            };
+            dl_blk.set(slot, analyzed.doc_len);
+            tx.put_fts_doc_len_bytes(entry.id, block_id, dl_blk.encode());
+
+            for (tok, term) in &analyzed.terms {
+                let term_key = encode_fts_term_key(entry.id, tok);
+                insert_new_term_posting(
+                    tx,
+                    &mut meta,
+                    FtsDocSlot {
+                        block_id,
+                        slot,
+                        index_positions: fts_cfg.index_positions,
+                    },
+                    term_key,
+                    term.tf,
+                    analyzed.doc_len,
+                    &term.positions,
+                    &dl_blk,
+                )?;
+            }
+        }
+
+        if modified {
+            tx.put_fts_meta_bytes(meta.encode());
+        }
+        Ok(())
+    }
+
+    fn on_delete(
+        &self,
+        tx: &mut TxContext<'_>,
+        schema: &CollectionSchema,
+        _row: RowId,
+        view: &RowView<'_>,
+        _had_vector: bool,
+    ) -> Result<()> {
+        if !schema.has_fts() {
+            return Ok(());
+        }
+        let Some(meta_bytes) = tx.get_fts_meta_bytes()? else {
+            return Ok(());
+        };
+        let mut meta = FtsMeta::decode(&meta_bytes)?;
+        let mut buf = self.acquire_buffer();
+        let mut modified = false;
+
+        for entry in schema.fts_entries() {
+            if entry.storage != ColumnStorage::Inline {
+                continue;
+            }
+            let Some(val) = view.decode_field(entry.id)? else {
+                continue;
+            };
+            let fts_cfg = entry.full_text_search.as_ref().unwrap();
+            let analyzer = FtsAnalyzer::new(fts_cfg.clone());
+            let Some(analyzed) = analyzer.analyze_attribute_value(&val, &mut buf)? else {
+                continue;
+            };
+            modified = true;
+            if let Some(stats) = meta.per_attr_stats.get_mut(&entry.id) {
+                stats.doc_count = stats.doc_count.saturating_sub(1);
+                stats.total_tokens = stats
+                    .total_tokens
+                    .saturating_sub(analyzed.doc_len as u64);
+            }
+            for tok in analyzed.terms.keys() {
+                let term_key = encode_fts_term_key(entry.id, tok);
+                if let Some(tbytes) = tx.get_fts_term_bytes(&term_key)? {
+                    let mut rec = TermRecord::decode(&tbytes)?;
+                    rec.stats.doc_freq = rec.stats.doc_freq.saturating_sub(1);
+                    tx.put_fts_term_bytes(term_key, rec.encode());
+                }
+            }
+        }
+
+        if modified {
+            tx.put_fts_meta_bytes(meta.encode());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FtsDocSlot {
+    block_id: RowBlock,
+    slot: u8,
+    index_positions: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_new_term_posting(
+    tx: &mut TxContext<'_>,
+    meta: &mut FtsMeta,
+    loc: FtsDocSlot,
+    term_key: Vec<u8>,
+    new_tf: u32,
+    new_dl: u32,
+    new_positions: &[u32],
+    doc_lens: &DocLenBlock,
+) -> Result<()> {
+    let (mut rec, is_brand_new) = match tx.get_fts_term_bytes(&term_key)? {
+        Some(b) => (TermRecord::decode(&b)?, false),
+        None => (TermRecord::new(meta.alloc_term_id()?), true),
+    };
+    rec.stats.doc_freq = rec.stats.doc_freq.saturating_add(1);
+    rec.stats.observe(new_tf, new_dl);
+
+    match rec.inline_block.take() {
+        None if is_brand_new => {
+            let mut blk = PackedPostingBlock::default();
+            blk.upsert(loc.slot, new_tf, doc_lens);
+            rec.inline_block = Some((loc.block_id, blk.encode()));
+        }
+        Some((ib_id, ib_bytes)) => {
+            let hdr = PostingBlockHeader::parse(&ib_bytes)?;
+            if ib_id == loc.block_id && (hdr.count as usize) < INLINE_TERM_MAX_DF {
+                let mut blk = PackedPostingBlock::decode(&ib_bytes)?;
+                blk.upsert(loc.slot, new_tf, doc_lens);
+                rec.inline_block = Some((loc.block_id, blk.encode()));
+            } else {
+                materialize_inline_block(tx, rec.term_id, ib_id, &ib_bytes)?;
+                upsert_posting_and_skip(tx, rec.term_id, loc.block_id, loc.slot, new_tf, doc_lens)?;
+            }
+        }
+        None => {
+            upsert_posting_and_skip(tx, rec.term_id, loc.block_id, loc.slot, new_tf, doc_lens)?;
+        }
+    }
+    tx.put_fts_term_bytes(term_key, rec.encode());
+    if loc.index_positions {
+        upsert_position_block(tx, rec.term_id, loc.block_id, loc.slot, new_positions.to_vec())?;
+    }
+    Ok(())
+}
+
+fn materialize_inline_block(
+    tx: &mut TxContext<'_>,
+    term_id: TermId,
+    block_id: RowBlock,
+    encoded: &[u8],
+) -> Result<()> {
+    let hdr = PostingBlockHeader::parse(encoded)?;
+    tx.put_fts_posting_bytes(term_id, block_id, encoded.to_vec());
+
+    let chunk = block_id.chunk();
+    let mut skip_blk = match tx.get_fts_skip_bytes(term_id, chunk)? {
+        Some(sb) => SkipBlock::decode(&sb)?,
+        None => SkipBlock::default(),
+    };
+    skip_blk.upsert(block_id.rel_block(), hdr.max_tf, hdr.min_dl_over_tf);
+    tx.put_fts_skip_bytes(term_id, chunk, skip_blk.encode());
+    Ok(())
+}
+
+fn upsert_posting_and_skip(
+    tx: &mut TxContext<'_>,
+    term_id: TermId,
+    block_id: RowBlock,
+    slot: u8,
+    tf: u32,
+    doc_lens: &DocLenBlock,
+) -> Result<()> {
+    let mut blk = match tx.get_fts_posting_bytes(term_id, block_id)? {
+        Some(bytes) => PackedPostingBlock::decode(&bytes)?,
+        None => PackedPostingBlock::default(),
+    };
+    blk.upsert(slot, tf, doc_lens);
+    let encoded = blk.encode();
+    let hdr = PostingBlockHeader::parse(&encoded)?;
+    tx.put_fts_posting_bytes(term_id, block_id, encoded);
+
+    let chunk = block_id.chunk();
+    let mut skip_blk = match tx.get_fts_skip_bytes(term_id, chunk)? {
+        Some(sb) => SkipBlock::decode(&sb)?,
+        None => SkipBlock::default(),
+    };
+    skip_blk.upsert(block_id.rel_block(), hdr.max_tf, hdr.min_dl_over_tf);
+    tx.put_fts_skip_bytes(term_id, chunk, skip_blk.encode());
+    Ok(())
+}
+
+fn upsert_position_block(
+    tx: &mut TxContext<'_>,
+    term_id: TermId,
+    block_id: RowBlock,
+    slot: u8,
+    positions: Vec<u32>,
+) -> Result<()> {
+    let mut pblk = match tx.get_fts_position_bytes(term_id, block_id)? {
+        Some(bytes) => PackedPositionBlock::decode(&bytes)?,
+        None => PackedPositionBlock::default(),
+    };
+    pblk.upsert(slot, positions);
+    tx.put_fts_position_bytes(term_id, block_id, pblk.encode());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Token & phrase predicates -> RowSet
+// ---------------------------------------------------------------------------
 
 fn exact_query_tokens(qtokens: &[QueryToken], last_as_prefix: bool) -> Vec<String> {
     let slice = if last_as_prefix {
@@ -825,11 +1029,12 @@ fn exact_query_tokens(qtokens: &[QueryToken], last_as_prefix: bool) -> Vec<Strin
 
 fn eval_any_token_predicate(
     storage: &Storage,
+    snap: &SegmentTableSnapshot,
     source: &StorageFtsSource<'_>,
     attr_id: AttrId,
     qtokens: &[QueryToken],
     prefix_expansions: Option<Vec<(String, TermRecord)>>,
-) -> Result<RoaringBitmap> {
+) -> Result<RowSet> {
     let mut exact_tokens = exact_query_tokens(qtokens, prefix_expansions.is_some());
     exact_tokens.sort_unstable();
     exact_tokens.dedup();
@@ -841,46 +1046,45 @@ fn eval_any_token_predicate(
     if let Some(exp) = prefix_expansions {
         records.extend(exp.into_iter().map(|(_, rec)| rec));
     }
-    eval_any_token_records(storage, &records)
+    eval_any_token_records(storage, snap, &records)
 }
 
 fn eval_all_tokens_predicate(
     storage: &Storage,
+    snap: &SegmentTableSnapshot,
     source: &StorageFtsSource<'_>,
     attr_id: AttrId,
     qtokens: &[QueryToken],
     prefix_expansions: Option<Vec<(String, TermRecord)>>,
-) -> Result<RoaringBitmap> {
+) -> Result<RowSet> {
     let last_as_prefix = prefix_expansions.is_some();
     let exact_tokens = exact_query_tokens(qtokens, last_as_prefix);
     let prefix_records = prefix_expansions.unwrap_or_default();
     if last_as_prefix && prefix_records.is_empty() {
-        return Ok(RoaringBitmap::new());
+        return Ok(RowSet::empty());
     }
     let Some(exact_map) = fetch_exact_term_map(source, attr_id, &exact_tokens)? else {
-        return Ok(RoaringBitmap::new());
+        return Ok(RowSet::empty());
     };
     let exact_recs: Vec<TermRecord> = exact_map.into_values().collect();
     let prefix_recs: Vec<TermRecord> = prefix_records.into_iter().map(|(_, r)| r).collect();
     let blocks = eval_all_tokens_blocks(
         storage,
+        snap,
         &exact_recs,
         last_as_prefix.then_some(prefix_recs.as_slice()),
     )?;
-    let mut bm = RoaringBitmap::new();
-    for (block_id, mask) in blocks {
-        insert_mask_into_bitmap(block_id, &mask, &mut bm);
-    }
-    Ok(bm)
+    Ok(blocks_to_rowset(&blocks))
 }
 
 fn eval_token_sequence_predicate(
     storage: &Storage,
+    snap: &SegmentTableSnapshot,
     source: &StorageFtsSource<'_>,
     attr_id: AttrId,
     qtokens: &[QueryToken],
     prefix_expansions: Option<Vec<(String, TermRecord)>>,
-) -> Result<RoaringBitmap> {
+) -> Result<RowSet> {
     if qtokens.len() == 1 {
         let records: Vec<TermRecord> = if let Some(exp) = prefix_expansions {
             exp.into_iter().map(|(_, r)| r).collect()
@@ -891,29 +1095,30 @@ fn eval_token_sequence_predicate(
                 .flatten()
                 .collect()
         };
-        return eval_any_token_records(storage, &records);
+        return eval_any_token_records(storage, snap, &records);
     }
 
     let last_as_prefix = prefix_expansions.is_some();
     let exact_tokens = exact_query_tokens(qtokens, last_as_prefix);
     let prefix_records = prefix_expansions.unwrap_or_default();
     if last_as_prefix && prefix_records.is_empty() {
-        return Ok(RoaringBitmap::new());
+        return Ok(RowSet::empty());
     }
 
     let Some(exact_map) = fetch_exact_term_map(source, attr_id, &exact_tokens)? else {
-        return Ok(RoaringBitmap::new());
+        return Ok(RowSet::empty());
     };
     let exact_recs: Vec<TermRecord> = exact_map.values().cloned().collect();
     let prefix_recs: Vec<TermRecord> = prefix_records.into_iter().map(|(_, r)| r).collect();
 
     let candidate_blocks = eval_all_tokens_blocks(
         storage,
+        snap,
         &exact_recs,
         last_as_prefix.then_some(prefix_recs.as_slice()),
     )?;
     if candidate_blocks.is_empty() {
-        return Ok(RoaringBitmap::new());
+        return Ok(RowSet::empty());
     }
 
     let base_pos = qtokens[0].position;
@@ -934,8 +1139,8 @@ fn eval_token_sequence_predicate(
     unique_term_ids.sort_unstable();
     unique_term_ids.dedup();
 
-    let mut pos_keys: Vec<[u8; 8]> = Vec::with_capacity(unique_term_ids.len());
-    let mut result = RoaringBitmap::new();
+    let mut pos_keys: Vec<[u8; 12]> = Vec::with_capacity(unique_term_ids.len());
+    let mut matched_rows: Vec<RowId> = Vec::new();
     for (block_id, cand_mask) in candidate_blocks {
         match_block_positions(
             storage,
@@ -947,28 +1152,28 @@ fn eval_token_sequence_predicate(
             &rel_positions,
             last_as_prefix,
             &mut pos_keys,
-            &mut result,
+            &mut matched_rows,
         )?;
     }
-    Ok(result)
+    Ok(RowSet::from_rows(matched_rows))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn match_block_positions(
     storage: &Storage,
-    block_id: FtsBlockId,
+    block_id: RowBlock,
     cand_mask: &[u64; 4],
     unique_term_ids: &[TermId],
     query_term_ids: &[TermId],
     prefix_recs: &[TermRecord],
     rel_positions: &[u32],
     last_as_prefix: bool,
-    pos_keys: &mut Vec<[u8; 8]>,
-    result: &mut RoaringBitmap,
+    pos_keys: &mut Vec<[u8; 12]>,
+    out_rows: &mut Vec<RowId>,
 ) -> Result<()> {
     pos_keys.clear();
     for &tid in unique_term_ids {
-        pos_keys.push(encode_fts_term_id_key(tid, block_id));
+        pos_keys.push(fts_block_key_coord(tid, block_id));
     }
     let pos_slices = storage.multi_get_fts_positions_pinned(pos_keys)?;
 
@@ -1057,7 +1262,7 @@ fn match_block_positions(
                     continue 'start;
                 }
             }
-            result.insert(make_fts_doc_id(block_id, slot));
+            out_rows.push(block_id.row(slot));
             return;
         }
     });
@@ -1068,69 +1273,70 @@ fn match_block_positions(
     Ok(())
 }
 
-fn insert_mask_into_bitmap(block_id: FtsBlockId, mask: &[u64; 4], out: &mut RoaringBitmap) {
-    for_each_set_bit_256(mask, |slot| {
-        out.insert(make_fts_doc_id(block_id, slot));
-    });
-}
-
-fn fetch_exact_term_map(
-    source: &StorageFtsSource<'_>,
-    attr_id: AttrId,
-    exact_tokens: &[String],
-) -> Result<Option<HashMap<String, TermRecord>>> {
-    let mut unique_exact: Vec<String> = exact_tokens.to_vec();
-    unique_exact.sort_unstable();
-    unique_exact.dedup();
-    if unique_exact.is_empty() {
-        return Ok(Some(HashMap::new()));
-    }
-    let recs = source.multi_get_term_records(attr_id, &unique_exact)?;
-    let mut map = HashMap::with_capacity(unique_exact.len());
-    for (tok, opt_rec) in unique_exact.into_iter().zip(recs) {
-        let Some(rec) = opt_rec else {
-            return Ok(None);
-        };
-        if rec.stats.doc_freq == 0 {
-            return Ok(None);
-        }
-        map.insert(tok, rec);
-    }
-    Ok(Some(map))
-}
-
-fn eval_any_token_records(storage: &Storage, records: &[TermRecord]) -> Result<RoaringBitmap> {
-    let mut out = RoaringBitmap::new();
-    for rec in records {
-        if let Some((block_id, ref ib_bytes)) = rec.inline_block {
-            let view = PostingBlockView::parse(ib_bytes)?;
+fn eval_any_token_records(
+    storage: &Storage,
+    snap: &SegmentTableSnapshot,
+    records: &[TermRecord],
+) -> Result<RowSet> {
+    let mut by_seg: BTreeMap<SegmentId, RoaringBitmap> = BTreeMap::new();
+    let mut add_block = |block_id: RowBlock, bytes: &[u8]| -> Result<()> {
+        let Some(live_mask) = snap.block_live_mask(block_id.seg(), block_id.block()) else {
+            let view = PostingBlockView::parse(bytes)?;
+            let bm = by_seg.entry(block_id.seg()).or_default();
+            let base = block_id.block() << 8;
             view.for_each_slot(|slot| {
-                out.insert(make_fts_doc_id(block_id, slot));
+                bm.insert(base | (slot as u32));
             });
+            return Ok(());
+        };
+        if live_mask == [0u64; 4] {
+            return Ok(());
+        }
+        let mut mask = [0u64; 4];
+        PostingBlockView::parse(bytes)?.or_slots_into_mask(&mut mask);
+        for w in 0..4 {
+            mask[w] &= live_mask[w];
+        }
+        if mask != [0u64; 4] {
+            let bm = by_seg.entry(block_id.seg()).or_default();
+            let base = block_id.block() << 8;
+            for_each_set_bit_256(&mask, |slot| {
+                bm.insert(base | (slot as u32));
+            });
+        }
+        Ok(())
+    };
+
+    for rec in records {
+        if rec.stats.doc_freq == 0 {
+            continue;
+        }
+        if let Some((block_id, ref ib_bytes)) = rec.inline_block {
+            add_block(block_id, ib_bytes)?;
         } else {
             storage.visit_fts_postings_for_term(rec.term_id, |block_id, bytes| {
-                let view = PostingBlockView::parse(bytes)?;
-                view.for_each_slot(|slot| {
-                    out.insert(make_fts_doc_id(block_id, slot));
-                });
-                Ok(())
+                add_block(block_id, bytes)
             })?;
         }
     }
-    Ok(out)
+    Ok(RowSet::from_sorted_segs(by_seg.into_iter().collect()))
 }
 
 fn eval_all_tokens_blocks(
     storage: &Storage,
+    snap: &SegmentTableSnapshot,
     exact_records: &[TermRecord],
     prefix_records: Option<&[TermRecord]>,
-) -> Result<Vec<(FtsBlockId, [u64; 4])>> {
+) -> Result<Vec<(RowBlock, [u64; 4])>> {
     if exact_records.is_empty() {
         let Some(precs) = prefix_records else {
             return Ok(Vec::new());
         };
-        let mut by_block: BTreeMap<FtsBlockId, [u64; 4]> = BTreeMap::new();
+        let mut by_block: BTreeMap<RowBlock, [u64; 4]> = BTreeMap::new();
         for rec in precs {
+            if rec.stats.doc_freq == 0 {
+                continue;
+            }
             if let Some((block_id, ref ib_bytes)) = rec.inline_block {
                 let view = PostingBlockView::parse(ib_bytes)?;
                 let mask = by_block.entry(block_id).or_insert([0u64; 4]);
@@ -1144,7 +1350,18 @@ fn eval_all_tokens_blocks(
                 })?;
             }
         }
-        return Ok(by_block.into_iter().collect());
+        let mut out = Vec::with_capacity(by_block.len());
+        for (bid, mut mask) in by_block {
+            if let Some(live) = snap.block_live_mask(bid.seg(), bid.block()) {
+                for w in 0..4 {
+                    mask[w] &= live[w];
+                }
+            }
+            if mask != [0u64; 4] {
+                out.push((bid, mask));
+            }
+        }
+        return Ok(out);
     }
 
     let mut ordered: Vec<TermRecord> = exact_records.to_vec();
@@ -1177,12 +1394,8 @@ fn eval_all_tokens_blocks(
     };
 
     let mut results = Vec::new();
-    'block_loop: loop {
-        let Some(mut target) = cursors[0].1.current_block_id() else {
-            break;
-        };
+    'block_loop: while let Some(mut target) = cursors[0].1.current_block_id() {
 
-        // Gallop / intersect block_ids using cf_fts_skips (and inline records) before touching cf_fts_postings.
         loop {
             let mut all_match = true;
             for (_, cur) in &mut cursors {
@@ -1211,18 +1424,21 @@ fn eval_all_tokens_blocks(
             }
         }
 
-        // Intersect intra-block slot bitmasks via lazy sequential posting iterators.
-        let mut mask = [u64::MAX; 4];
-        for (_, cur) in &mut cursors {
-            let mut cur_mask = [0u64; 4];
-            if let Some(bytes) = cur.current_posting_bytes()? {
-                PostingBlockView::parse(bytes)?.or_slots_into_mask(&mut cur_mask);
-            }
-            for w in 0..4 {
-                mask[w] &= cur_mask[w];
-            }
-            if mask == [0u64; 4] {
-                break;
+        let mut mask = snap
+            .block_live_mask(target.seg(), target.block())
+            .unwrap_or([u64::MAX; 4]);
+        if mask != [0u64; 4] {
+            for (_, cur) in &mut cursors {
+                let mut cur_mask = [0u64; 4];
+                if let Some(bytes) = cur.current_posting_bytes()? {
+                    PostingBlockView::parse(bytes)?.or_slots_into_mask(&mut cur_mask);
+                }
+                for w in 0..4 {
+                    mask[w] &= cur_mask[w];
+                }
+                if mask == [0u64; 4] {
+                    break;
+                }
             }
         }
 
@@ -1257,379 +1473,39 @@ fn eval_all_tokens_blocks(
     Ok(results)
 }
 
-#[derive(Clone, Copy)]
-struct FtsDocSlot {
+fn blocks_to_rowset(blocks: &[(RowBlock, [u64; 4])]) -> RowSet {
+    let mut by_seg: BTreeMap<SegmentId, RoaringBitmap> = BTreeMap::new();
+    for &(bid, ref mask) in blocks {
+        let bm = by_seg.entry(bid.seg()).or_default();
+        let base = bid.block() << 8;
+        for_each_set_bit_256(mask, |slot| {
+            bm.insert(base | (slot as u32));
+        });
+    }
+    RowSet::from_sorted_segs(by_seg.into_iter().collect())
+}
+
+fn fetch_exact_term_map(
+    source: &StorageFtsSource<'_>,
     attr_id: AttrId,
-    block_id: FtsBlockId,
-    slot: u8,
-    index_positions: bool,
-}
-
-fn apply_attr_token_diff(
-    tx: &mut TxContext<'_>,
-    meta: &mut FtsMeta,
-    loc: FtsDocSlot,
-    old_doc: Option<&AnalyzedDoc>,
-    new_doc: Option<&AnalyzedDoc>,
-) -> Result<()> {
-    let old_dl = old_doc.map_or(0, |d| d.doc_len);
-    let new_dl = new_doc.map_or(0, |d| d.doc_len);
-
-    let dl_key = encode_fts_doc_len_key(loc.attr_id, loc.block_id);
-    let mut doc_len_block = match tx.get_fts_doc_len_bytes(&dl_key)? {
-        Some(bytes) => DocLenBlock::decode(&bytes)?,
-        None => DocLenBlock::default(),
-    };
-    if old_dl != new_dl {
-        if new_dl > 0 {
-            doc_len_block.set(loc.slot, new_dl);
-        } else {
-            doc_len_block.remove(loc.slot);
-        }
-        if doc_len_block.is_empty() {
-            tx.delete_fts_doc_len(dl_key);
-        } else {
-            tx.put_fts_doc_len_bytes(dl_key, doc_len_block.encode());
-        }
+    exact_tokens: &[String],
+) -> Result<Option<HashMap<String, TermRecord>>> {
+    let mut unique_exact: Vec<String> = exact_tokens.to_vec();
+    unique_exact.sort_unstable();
+    unique_exact.dedup();
+    if unique_exact.is_empty() {
+        return Ok(Some(HashMap::new()));
     }
-
-    // 1. Removals
-    if let Some(old) = old_doc {
-        for (tok, old_term) in &old.terms {
-            if new_doc.is_some_and(|n| n.terms.contains_key(tok)) {
-                continue;
-            }
-            remove_token_posting(tx, loc, tok, old_term.tf, old_dl, &doc_len_block)?;
+    let recs = source.multi_get_term_records(attr_id, &unique_exact)?;
+    let mut map = HashMap::with_capacity(unique_exact.len());
+    for (tok, opt_rec) in unique_exact.into_iter().zip(recs) {
+        let Some(rec) = opt_rec else {
+            return Ok(None);
+        };
+        if rec.stats.doc_freq == 0 {
+            return Ok(None);
         }
+        map.insert(tok, rec);
     }
-
-    // 2. Additions and updates
-    if let Some(new) = new_doc {
-        for (tok, new_term) in &new.terms {
-            let term_key = encode_fts_term_key(loc.attr_id, tok);
-            if let Some(old_term) = old_doc.and_then(|o| o.terms.get(tok)) {
-                update_existing_term_posting(
-                    tx,
-                    meta,
-                    loc,
-                    term_key,
-                    old_term.tf,
-                    old_dl,
-                    new_term.tf,
-                    new_dl,
-                    &old_term.positions,
-                    &new_term.positions,
-                    &doc_len_block,
-                )?;
-            } else {
-                insert_new_term_posting(
-                    tx,
-                    meta,
-                    loc,
-                    term_key,
-                    new_term.tf,
-                    new_dl,
-                    &new_term.positions,
-                    &doc_len_block,
-                )?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn update_existing_term_posting(
-    tx: &mut TxContext<'_>,
-    meta: &mut FtsMeta,
-    loc: FtsDocSlot,
-    term_key: Vec<u8>,
-    old_tf: u32,
-    old_dl: u32,
-    new_tf: u32,
-    new_dl: u32,
-    old_positions: &[u32],
-    new_positions: &[u32],
-    doc_len_block: &DocLenBlock,
-) -> Result<()> {
-    let tf_or_dl_changed = old_tf != new_tf || old_dl != new_dl;
-    let pos_changed = loc.index_positions && old_positions != new_positions;
-    let mut rec = match tx.get_fts_term_bytes(&term_key)? {
-        Some(b) => TermRecord::decode(&b)?,
-        None => TermRecord::new(meta.alloc_term_id()?),
-    };
-    if tf_or_dl_changed {
-        let mut was_inline_same_block = false;
-        if let Some((ib_id, ref ib_bytes)) = rec.inline_block {
-            if ib_id == loc.block_id {
-                was_inline_same_block = true;
-                let mut blk = PackedPostingBlock::decode(ib_bytes)?;
-                blk.upsert(loc.slot, new_tf, doc_len_block);
-                let encoded = blk.encode();
-                let hdr = PostingBlockHeader::parse(&encoded)?;
-                rec.stats.doc_freq = hdr.count as u64;
-                rec.stats.max_tf = hdr.max_tf;
-                rec.stats.min_dl_over_tf = hdr.min_dl_over_tf;
-                rec.inline_block = Some((loc.block_id, encoded));
-            } else {
-                let (ib_id, ib_bytes) = rec.inline_block.take().unwrap();
-                materialize_inline_block(tx, rec.term_id, ib_id, &ib_bytes)?;
-                upsert_posting_and_skip(tx, rec.term_id, loc.block_id, loc.slot, new_tf, doc_len_block)?;
-            }
-        } else {
-            upsert_posting_and_skip(tx, rec.term_id, loc.block_id, loc.slot, new_tf, doc_len_block)?;
-        }
-
-        if !was_inline_same_block {
-            let lowered_max_tf = new_tf < old_tf && old_tf == rec.stats.max_tf;
-            let old_ratio = dl_over_tf_lower_bound(old_dl, old_tf);
-            let new_ratio = dl_over_tf_lower_bound(new_dl, new_tf);
-            let raised_min_ratio = new_ratio > old_ratio && old_ratio <= rec.stats.min_dl_over_tf;
-            rec.stats.observe(new_tf, new_dl);
-            if lowered_max_tf || raised_min_ratio {
-                maybe_recompute_term_stats_in_tx(tx, rec.term_id, &mut rec.stats)?;
-            }
-        }
-        tx.put_fts_term_bytes(term_key, rec.encode());
-    }
-    if pos_changed {
-        upsert_position_block(tx, rec.term_id, loc.block_id, loc.slot, new_positions.to_vec())?;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn insert_new_term_posting(
-    tx: &mut TxContext<'_>,
-    meta: &mut FtsMeta,
-    loc: FtsDocSlot,
-    term_key: Vec<u8>,
-    new_tf: u32,
-    new_dl: u32,
-    new_positions: &[u32],
-    doc_len_block: &DocLenBlock,
-) -> Result<()> {
-    let mut rec = match tx.get_fts_term_bytes(&term_key)? {
-        Some(b) => TermRecord::decode(&b)?,
-        None => TermRecord::new(meta.alloc_term_id()?),
-    };
-    rec.stats.doc_freq = rec.stats.doc_freq.saturating_add(1);
-    rec.stats.observe(new_tf, new_dl);
-
-    match rec.inline_block.take() {
-        None if rec.stats.doc_freq == 1 => {
-            let mut blk = PackedPostingBlock::default();
-            blk.upsert(loc.slot, new_tf, doc_len_block);
-            rec.inline_block = Some((loc.block_id, blk.encode()));
-        }
-        Some((ib_id, ib_bytes)) => {
-            if ib_id == loc.block_id && rec.stats.doc_freq <= INLINE_TERM_MAX_DF as u64 {
-                let mut blk = PackedPostingBlock::decode(&ib_bytes)?;
-                blk.upsert(loc.slot, new_tf, doc_len_block);
-                rec.inline_block = Some((loc.block_id, blk.encode()));
-            } else {
-                materialize_inline_block(tx, rec.term_id, ib_id, &ib_bytes)?;
-                upsert_posting_and_skip(tx, rec.term_id, loc.block_id, loc.slot, new_tf, doc_len_block)?;
-            }
-        }
-        None => {
-            upsert_posting_and_skip(tx, rec.term_id, loc.block_id, loc.slot, new_tf, doc_len_block)?;
-        }
-    }
-    tx.put_fts_term_bytes(term_key, rec.encode());
-    if loc.index_positions {
-        upsert_position_block(tx, rec.term_id, loc.block_id, loc.slot, new_positions.to_vec())?;
-    }
-    Ok(())
-}
-
-fn remove_token_posting(
-    tx: &mut TxContext<'_>,
-    loc: FtsDocSlot,
-    token: &str,
-    old_tf: u32,
-    old_dl: u32,
-    doc_lens: &DocLenBlock,
-) -> Result<()> {
-    let term_key = encode_fts_term_key(loc.attr_id, token);
-    let Some(bytes) = tx.get_fts_term_bytes(&term_key)? else {
-        return Ok(());
-    };
-    let mut rec = TermRecord::decode(&bytes)?;
-    let term_id = rec.term_id;
-
-    if loc.index_positions {
-        let pos_key = encode_fts_term_id_key(term_id, loc.block_id);
-        if let Some(pbytes) = tx.get_fts_position_bytes(&pos_key)? {
-            let mut pblk = PackedPositionBlock::decode(&pbytes)?;
-            if pblk.remove(loc.slot) {
-                if pblk.is_empty() {
-                    tx.delete_fts_position(pos_key);
-                } else {
-                    tx.put_fts_position_bytes(pos_key, pblk.encode());
-                }
-            }
-        }
-    }
-
-    if let Some((ib_id, ib_bytes)) = rec.inline_block.take() {
-        if ib_id == loc.block_id {
-            let mut blk = PackedPostingBlock::decode(&ib_bytes)?;
-            let _ = blk.remove(loc.slot, doc_lens);
-            if blk.is_empty() {
-                tx.delete_fts_term(term_key);
-            } else {
-                let encoded = blk.encode();
-                let hdr = PostingBlockHeader::parse(&encoded)?;
-                rec.stats.doc_freq = hdr.count as u64;
-                rec.stats.max_tf = hdr.max_tf;
-                rec.stats.min_dl_over_tf = hdr.min_dl_over_tf;
-                rec.inline_block = Some((ib_id, encoded));
-                tx.put_fts_term_bytes(term_key, rec.encode());
-            }
-        } else {
-            rec.inline_block = Some((ib_id, ib_bytes));
-            tx.put_fts_term_bytes(term_key, rec.encode());
-        }
-        return Ok(());
-    }
-
-    let pkey = encode_fts_term_id_key(term_id, loc.block_id);
-    if let Some(pbytes) = tx.get_fts_posting_bytes(&pkey)? {
-        let mut blk = PackedPostingBlock::decode(&pbytes)?;
-        if blk.remove(loc.slot, doc_lens) {
-            let skey = encode_fts_term_id_key(term_id, fts_skip_chunk_id(loc.block_id));
-            let rel_slot = fts_skip_slot(loc.block_id);
-            let mut skip_blk = match tx.get_fts_skip_bytes(&skey)? {
-                Some(sb) => SkipBlock::decode(&sb)?,
-                None => SkipBlock::default(),
-            };
-            if blk.is_empty() {
-                tx.delete_fts_posting(pkey);
-                skip_blk.remove(rel_slot);
-            } else {
-                let encoded = blk.encode();
-                let hdr = PostingBlockHeader::parse(&encoded)?;
-                tx.put_fts_posting_bytes(pkey, encoded);
-                skip_blk.upsert(rel_slot, hdr.max_tf, hdr.min_dl_over_tf);
-            }
-            if skip_blk.is_empty() {
-                tx.delete_fts_skip(skey);
-            } else {
-                tx.put_fts_skip_bytes(skey, skip_blk.encode());
-            }
-        }
-    }
-
-    rec.stats.doc_freq = rec.stats.doc_freq.saturating_sub(1);
-    if rec.stats.doc_freq == 0 {
-        tx.delete_fts_term(term_key);
-    } else {
-        let hit_max_tf = old_tf == rec.stats.max_tf;
-        let hit_min_ratio = dl_over_tf_lower_bound(old_dl, old_tf) <= rec.stats.min_dl_over_tf;
-        if hit_max_tf || hit_min_ratio {
-            maybe_recompute_term_stats_in_tx(tx, term_id, &mut rec.stats)?;
-        }
-        tx.put_fts_term_bytes(term_key, rec.encode());
-    }
-    Ok(())
-}
-
-fn maybe_recompute_term_stats_in_tx(
-    tx: &TxContext<'_>,
-    term_id: TermId,
-    ts: &mut TermStats,
-) -> Result<bool> {
-    let mut block_count = 0usize;
-    let mut max_tf = 0u32;
-    let mut min_ratio = f32::INFINITY;
-    let mut aborted = false;
-
-    tx.visit_fts_skip_blocks(term_id, |_chunk_id, bytes| {
-        let view = SkipBlockView::parse(bytes)?;
-        block_count += view.count;
-        if block_count > INLINE_TERM_STATS_RECOMPUTE_MAX_BLOCKS {
-            aborted = true;
-            return Ok(false);
-        }
-        for i in 0..view.count {
-            max_tf = max_tf.max(view.max_tf(i));
-            min_ratio = min_ratio.min(view.min_dl_over_tf(i));
-        }
-        Ok(true)
-    })?;
-
-    if !aborted && block_count > 0 {
-        ts.max_tf = max_tf;
-        ts.min_dl_over_tf = min_ratio;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
-fn materialize_inline_block(
-    tx: &mut TxContext<'_>,
-    term_id: TermId,
-    block_id: FtsBlockId,
-    encoded: &[u8],
-) -> Result<()> {
-    let hdr = PostingBlockHeader::parse(encoded)?;
-    let pkey = encode_fts_term_id_key(term_id, block_id);
-    tx.put_fts_posting_bytes(pkey, encoded.to_vec());
-
-    let skey = encode_fts_term_id_key(term_id, fts_skip_chunk_id(block_id));
-    let mut skip_blk = match tx.get_fts_skip_bytes(&skey)? {
-        Some(sb) => SkipBlock::decode(&sb)?,
-        None => SkipBlock::default(),
-    };
-    skip_blk.upsert(fts_skip_slot(block_id), hdr.max_tf, hdr.min_dl_over_tf);
-    tx.put_fts_skip_bytes(skey, skip_blk.encode());
-    Ok(())
-}
-
-fn upsert_posting_and_skip(
-    tx: &mut TxContext<'_>,
-    term_id: TermId,
-    block_id: FtsBlockId,
-    slot: u8,
-    tf: u32,
-    doc_lens: &DocLenBlock,
-) -> Result<()> {
-    let pkey = encode_fts_term_id_key(term_id, block_id);
-    let mut blk = match tx.get_fts_posting_bytes(&pkey)? {
-        Some(bytes) => PackedPostingBlock::decode(&bytes)?,
-        None => PackedPostingBlock::default(),
-    };
-    blk.upsert(slot, tf, doc_lens);
-    let encoded = blk.encode();
-    let hdr = PostingBlockHeader::parse(&encoded)?;
-    tx.put_fts_posting_bytes(pkey, encoded);
-
-    let skey = encode_fts_term_id_key(term_id, fts_skip_chunk_id(block_id));
-    let mut skip_blk = match tx.get_fts_skip_bytes(&skey)? {
-        Some(sb) => SkipBlock::decode(&sb)?,
-        None => SkipBlock::default(),
-    };
-    skip_blk.upsert(fts_skip_slot(block_id), hdr.max_tf, hdr.min_dl_over_tf);
-    tx.put_fts_skip_bytes(skey, skip_blk.encode());
-    Ok(())
-}
-
-fn upsert_position_block(
-    tx: &mut TxContext<'_>,
-    term_id: TermId,
-    block_id: FtsBlockId,
-    slot: u8,
-    positions: Vec<u32>,
-) -> Result<()> {
-    let pkey = encode_fts_term_id_key(term_id, block_id);
-    let mut pblk = match tx.get_fts_position_bytes(&pkey)? {
-        Some(bytes) => PackedPositionBlock::decode(&bytes)?,
-        None => PackedPositionBlock::default(),
-    };
-    pblk.upsert(slot, positions);
-    tx.put_fts_position_bytes(pkey, pblk.encode());
-    Ok(())
+    Ok(Some(map))
 }

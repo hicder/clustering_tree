@@ -228,7 +228,7 @@ fn run_suite(name: &str, n: usize, dim: usize, with_fts: bool, compare_upsert_n:
             if with_fts {
                 attrs.insert("text".into(), format!("vector search index doc{i}").into());
             }
-            up_col.upsert(i as DocId, v, attrs).unwrap();
+            up_col.upsert(i as DocId, Some(v), attrs).unwrap();
         }
         let up_s = t_up.elapsed().as_secs_f64();
         let up_bytes = dir_size_bytes(&up_dir);

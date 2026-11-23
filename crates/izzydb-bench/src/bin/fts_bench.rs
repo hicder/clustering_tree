@@ -44,7 +44,7 @@ fn run_suite(n: usize, vocab_size: usize) {
             .join(" ");
         let mut attrs = Attributes::new();
         attrs.insert("body".into(), text.clone().into());
-        col.upsert(id, &vec, attrs).unwrap();
+        col.upsert(id, Some(&vec), attrs).unwrap();
         raw_texts.push((id, text));
     }
     println!(

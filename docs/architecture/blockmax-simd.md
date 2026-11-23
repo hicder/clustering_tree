@@ -3,22 +3,23 @@
 This document describes the on-disk/in-memory data layout for full-text search (FTS) blocks and how the Block-Max MAXSCORE query engine executes vectorized BM25 scoring over them using runtime-dispatched SIMD kernels.
 
 Implementation sources:
-- Block ID / slot / skip-chunk bit-splitting (`FTS_BLOCK_SIZE = 256`, `FTS_SKIP_CHUNK_SIZE = 256`): [`crates/izzydb-core/src/config.rs`](../../crates/izzydb-core/src/config.rs)
-- `FtsMeta`, `TermRecord`, `SkipBlock`/`SkipBlockView`/`SkipBlockLayout`, `DocLenBlock`, v3 `PackedPostingBlock`, `IntWidth`, and `dl_over_tf_lower_bound`: [`crates/izzydb-fts/src/block.rs`](../../crates/izzydb-fts/src/block.rs)
+- `RowId` / `RowBlock` / `SkipChunk` bit-splitting (`ROW_BLOCK_SIZE = 256`, `FTS_SKIP_CHUNK_SIZE = 256`): [`crates/izzydb-core/src/config.rs`](../../crates/izzydb-core/src/config.rs)
+- `FtsMeta` v4, `TermRecord` v4, `SkipBlock`, `DocLenBlock`, v3 `PackedPostingBlock`, `IntWidth`, and `dl_over_tf_lower_bound`: [`crates/izzydb-fts/src/block.rs`](../../crates/izzydb-fts/src/block.rs)
 - BM25 scoring parameters, upper-bound formula, and SIMD dispatch wrappers: [`crates/izzydb-fts/src/bm25.rs`](../../crates/izzydb-fts/src/bm25.rs)
 - Runtime-dispatched SIMD kernels (`Avx512`, `Avx2`, `Neon`, `Scalar`): [`crates/izzydb-fts/src/simd.rs`](../../crates/izzydb-fts/src/simd.rs)
-- MAXSCORE execution loop, `DlNormCache`, `BlockFilterMask`, `FtsSkipCursor`, and `Clause` evaluation: [`crates/izzydb-fts/src/maxscore.rs`](../../crates/izzydb-fts/src/maxscore.rs)
-- RocksDB column families, `FtsRevBlock`, `RocksSkipCursor`, and cached `RocksDocLenCursor`: [`crates/izzydb-storage/src/storage.rs`](../../crates/izzydb-storage/src/storage.rs), [`crates/izzydb-storage/src/codec.rs`](../../crates/izzydb-storage/src/codec.rs)
+- MAXSCORE execution loop, `DlNormCache`, `BlockMaskProvider`, `FtsSkipCursor`, and `Clause` evaluation: [`crates/izzydb-fts/src/maxscore.rs`](../../crates/izzydb-fts/src/maxscore.rs)
+- RocksDB column families, `cf_row_doc_ids`, `RocksSkipCursor`, and cached `RocksDocLenCursor`: [`crates/izzydb-storage/src/storage/mod.rs`](../../crates/izzydb-storage/src/storage/mod.rs), [`crates/izzydb-storage/src/codec.rs`](../../crates/izzydb-storage/src/codec.rs)
 
 ---
 
 ## 1. Design Overview: Why 256-Document Blocks?
 
-Rather than storing variable-length posting lists keyed by arbitrary document IDs, `FtsIndex` assigns each FTS document a dense monotonic `FtsDocId: u32` (`< FtsDocId::MAX`) and partitions the `u32` ID space into fixed-size blocks of **`FTS_BLOCK_SIZE = 256`** documents:
+Rather than storing variable-length posting lists keyed by arbitrary document IDs, `FtsIndex` keys postings directly on v3 **`RowId = (SegmentId, LocalId)`** coordinates and partitions each segment into fixed-size blocks of **`ROW_BLOCK_SIZE = 256`** rows:
 
 ```text
-FtsDocId (u32):  [ block_id: 24 bits (fts_doc_id >> 8) | slot: 8 bits (fts_doc_id & 0xFF) ]
-Skip chunking:   [ chunk_id: 24 bits (block_id >> 8)   | rel:  8 bits (block_id & 0xFF)   ]
+RowId (u64):     [ seg: 32 bits | local: 32 bits ]
+RowBlock:        (seg, block = local >> 8)   slot = (local & 0xFF) as u8
+SkipChunk:       (seg, chunk = block >> 8)   rel  = (block & 0xFF) as u8
 ```
 
 A fixed 256-slot block geometry aligns storage, caching, and SIMD execution around four hardware-friendly primitives:
@@ -34,15 +35,15 @@ A fixed 256-slot block geometry aligns storage, caching, and SIMD execution arou
 
 ### 2.1 RocksDB Column Families & Keys
 
-Block-Max MAXSCORE reads from `cf_fts_terms`, `cf_fts_skips`, FTS document lengths in `default`, and lazily from `cf_fts_postings` (plus `default[b"\x01fts_meta"]` for `doc_count`/`total_tokens` and FTS reverse-map blocks in `default` to resolve top-$k$ `FtsDocId -> DocId`):
+Block-Max MAXSCORE reads from `cf_fts_terms`, `cf_fts_skips`, FTS document lengths in `default`, and lazily from `cf_fts_postings` (plus `default[b"\x01fts_meta"]` for `doc_count`/`total_tokens`, `SegmentTableSnapshot` for liveness masking, and `cf_row_doc_ids` to resolve top-$k$ `RowId -> DocId`):
 
 | Column Family | Key Format | Value Format | Access & Caching Pattern |
 |---|---|---|---|
-| `cf_fts_terms` | `attr_id` (`u16` BE) \|\| `token_utf8` | `TermRecord` (`term_id`, `TermStats`, optional inline v3 block) | Sorted `batched_multi_get_cf` (or 2-byte prefix scan for `last_as_prefix`) |
-| `cf_fts_skips` | `term_id` (`u32` BE) \|\| `chunk_id` (`u32` BE) (8 B) | `SkipBlock` (up to 256 blocks' bounds) | Uncompressed CF, 4 B prefix Bloom; batched `chunk 0` pin + lazy `skip_iter` |
-| FTS document lengths in `default` | `0x05` \|\| `attr_id` (`u16` BE) \|\| `block_id` (`u32` BE) (7 B) | `DocLenBlock` (260 / 516 / 1,028 B) | Lazily loaded into `Storage::fts_doc_lens_cache` per `attr_id` |
-| `cf_fts_postings` | `term_id` (`u32` BE) \|\| `block_id` (`u32` BE) (8 B) | v3 `PackedPostingBlock` (TF-only) | Uncompressed CF, 4 B prefix Bloom; lazy sequential `posting_iter` inside `RocksSkipCursor` |
-| FTS reverse-map blocks in `default` | `0x04` \|\| `block_id` (`u32` BE) (5 B) | `FtsRevBlock` (4,128 B) | Cached in `Storage::fts_rev_map_cache` |
+| `cf_fts_terms` | `attr_id` (`u16` BE) \|\| `token_utf8` | `TermRecord` v4 (`term_id`, `TermStats`, optional inline v3 block with `(seg, block)`) | Sorted `batched_multi_get_cf` (or 2-byte prefix scan for `last_as_prefix`) |
+| `cf_fts_skips` | `term_id` BE \|\| `seg` BE \|\| `chunk` BE (12 B) | `SkipBlock` (up to 256 blocks' bounds) | Uncompressed CF, 4 B prefix Bloom; `RocksSkipCursor` |
+| FTS document lengths in `default` | `0x05` \|\| `attr_id` BE \|\| `seg` BE \|\| `block` BE (11 B) | `DocLenBlock` (260 / 516 / 1,028 B) | Lazily loaded into `Storage::fts_doc_lens_cache` per `(attr_id, seg, block)` |
+| `cf_fts_postings` | `term_id` BE \|\| `seg` BE \|\| `block` BE (12 B) | v3 `PackedPostingBlock` (TF-only) | Uncompressed CF, 4 B prefix Bloom; lazy sequential `posting_iter` inside `RocksSkipCursor` |
+| `cf_row_doc_ids` | `seg` BE \|\| `block` BE (8 B) | `[u64; 256]` LE `DocId`s (2,048 B) | LRU cached in `Storage::doc_id_block_cache` (32 MiB) |
 
 ### 2.2 Adaptive Integer Width (`IntWidth`)
 
@@ -58,15 +59,15 @@ All multi-byte integers inside packed blocks are **little-endian**, matching `x8
 
 ### 2.3 `TermRecord` (`cf_fts_terms`)
 
-21-byte fixed header (`TERM_RECORD_HEADER_LEN = 21`) with optional inline v3 posting block for single-block rare terms (`doc_freq <= INLINE_TERM_MAX_DF = 8`):
+21-byte fixed header (`TERM_RECORD_HEADER_LEN = 21`) with optional inline v3 posting block for single-`(seg, block)` rare terms (`doc_freq <= INLINE_TERM_MAX_DF = 8`):
 
 | Offset | Size | Field | Type | Meaning |
 |---:|---:|---|---|---|
 | `0` | 4 | `term_id` | `u32` LE | Monotonic numeric `TermId` indexing `cf_fts_skips`/`cf_fts_postings`/`cf_fts_positions` |
-| `4` | 8 | `stats.doc_freq` | `u64` LE | Number of documents containing this term |
+| `4` | 8 | `stats.doc_freq` | `u64` LE | Live documents containing this term |
 | `12` | 4 | `stats.max_tf` | `u32` LE | Maximum term frequency across all postings of this term |
 | `16` | 4 | `stats.min_dl_over_tf` | `f32` LE | Sound lower bound on `dl / tf` across all postings (`>= 0.0`, non-NaN; `f32::INFINITY` when empty) |
-| `20` | 1 | `flags` | `u8` | `0x00`: out-of-line in `cf_fts_postings` + `cf_fts_skips`; `0x01`: inline `block_id: u32 LE \|\| v3 PackedPostingBlock` follows byte `20` |
+| `20` | 1 | `flags` | `u8` | `0x00`: out-of-line in `cf_fts_postings` + `cf_fts_skips`; `0x01`: inline `seg: u32 LE \|\| block: u32 LE \|\| v3 PackedPostingBlock` follows byte `20` |
 
 ### 2.4 `SkipBlock` (`cf_fts_skips`)
 
@@ -207,17 +208,17 @@ All 256-slot kernels live in [`crates/izzydb-fts/src/simd.rs`](../../crates/izzy
     • multi_get_term_records (cf_fts_terms) + batched open_skip_cursors (cf_fts_skips chunk 0 / inline)
         │
         ▼
-  Next block_id = min(essential cursors [essential_start..])
+  Next RowBlock = (seg, block) = min(essential cursors [essential_start..])
         │
-        ├──[BlockFilterMask misses block_id]──────────────────────────► advance essential, skip
+        ├──[BlockMaskProvider misses (seg, block)]────────────────────► advance essential, skip
         │
         ├──[theta > 0 && ess_block_ub + non_ess_ub + eps < theta]─────► advance essential, skip
         │   (reads only in-memory SkipBlock bounds / inline header — 0 cf_fts_postings reads)
         ▼
   Essential SIMD Accumulation (scores[256] = 0, touched = 0)
-    • For each essential clause at block_id:
-      lazy current_posting_bytes() (cf_fts_postings) ─► accumulate_block_simd + advance_past(block_id)
-    • active_mask = touched & allowed_mask
+    • For each essential clause at (seg, block):
+      lazy current_posting_bytes() (cf_fts_postings) ─► accumulate_block_simd + advance_past
+    • active_mask = touched & allowed_mask (liveness & pushed-down filter RowSet)
     • max_ess = max_score_256(scores, active_mask)
         │
         ├──[max_ess + non_ess_ub + eps < theta]───────────────────────► prune all non-essential
@@ -233,8 +234,8 @@ All 256-slot kernels live in [`crates/izzydb-fts/src/simd.rs`](../../crates/izzy
         ▼
   Top-k Candidate Extraction & Dynamic Partitioning
     • hit_mask = filter_ge_256(scores, active_mask, cand_thresh)
-    • Extract (score, make_fts_doc_id(block_id, slot)) via trailing_zeros
-    • Update min-heap & theta (resolving DocIds via cached FtsRevBlock on ties/lazy filter)
+    • Extract (score, RowId::new(seg, (block << 8) | slot)) via trailing_zeros
+    • Update min-heap & theta (resolving DocIds via cf_row_doc_ids on ties/lazy filter)
     • Advance essential_start while prefix_max_sum[essential_start] + eps < theta
 ```
 

@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use izzydb::{
     AttributeType, AttributeValue, Attributes, Collection, CollectionConfig, DistanceMetric, DocId,
-    DocumentPatch, Filter, SearchOptions, TreeConfig, TreeError,
+    DocumentPatch, Filter, FilterPlanTrace, FilteredSearchRegime, SearchOptions, TreeConfig,
+    TreeError, VacuumBudget,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -73,7 +74,7 @@ fn test_schema_validation_and_reopen_reconcile() {
         let mut bad_attrs = Attributes::new();
         bad_attrs.insert("unknown".into(), "x".into());
         assert!(matches!(
-            col.upsert(1, &[0.0; 8], bad_attrs),
+            col.upsert(1, Some(&[0.0; 8]), bad_attrs),
             Err(TreeError::InvalidAttribute { .. })
         ));
 
@@ -81,14 +82,14 @@ fn test_schema_validation_and_reopen_reconcile() {
         let mut bad_type = Attributes::new();
         bad_type.insert("rank".into(), "not_an_int".into());
         assert!(matches!(
-            col.upsert(1, &[0.0; 8], bad_type),
+            col.upsert(1, Some(&[0.0; 8]), bad_type),
             Err(TreeError::InvalidAttribute { .. })
         ));
 
         // Non-filterable attribute rejected in Filter, allowed in upsert/get
         let mut attrs = Attributes::new();
         attrs.insert("note".into(), "secret_payload".into());
-        col.upsert(1, &[1.0; 8], attrs).unwrap();
+        col.upsert(1, Some(&[1.0; 8]), attrs).unwrap();
         assert_eq!(
             col.get(1).unwrap().unwrap().attributes.get("note"),
             Some(&AttributeValue::String("secret_payload".into()))
@@ -102,7 +103,7 @@ fn test_schema_validation_and_reopen_reconcile() {
             Err(TreeError::InvalidFilter(_))
         ));
 
-        col.verify_invariants().unwrap();
+        col.verify_ann_invariants().unwrap();
     }
 
     // Reopen with mismatched attribute type fails
@@ -141,7 +142,7 @@ fn test_schema_validation_and_reopen_reconcile() {
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, 1);
-    col.verify_invariants().unwrap();
+    col.verify_ann_invariants().unwrap();
 }
 
 #[test]
@@ -155,21 +156,21 @@ fn test_upsert_delete_reopen_and_get() {
         attrs1.insert("category".into(), "books".into());
         attrs1.insert("rank".into(), 10i64.into());
         attrs1.insert("note".into(), "v1".into());
-        col.upsert(42, &[1.0; 8], attrs1.clone()).unwrap();
+        col.upsert(42, Some(&[1.0; 8]), attrs1.clone()).unwrap();
 
         let doc = col.get(42).unwrap().unwrap();
         assert_eq!(doc.id, 42);
-        assert_eq!(doc.embedding, vec![1.0; 8]);
+        assert_eq!(doc.embedding, Some(vec![1.0; 8]));
         assert_eq!(doc.attributes, attrs1);
 
         // Upsert same id with updated embedding and attributes
         let mut attrs2 = Attributes::new();
         attrs2.insert("category".into(), "games".into());
         attrs2.insert("rank".into(), 20i64.into());
-        col.upsert(42, &[2.0; 8], attrs2.clone()).unwrap();
+        col.upsert(42, Some(&[2.0; 8]), attrs2.clone()).unwrap();
 
         let doc2 = col.get(42).unwrap().unwrap();
-        assert_eq!(doc2.embedding, vec![2.0; 8]);
+        assert_eq!(doc2.embedding, Some(vec![2.0; 8]));
         assert_eq!(doc2.attributes, attrs2);
 
         // Old attribute value must no longer match
@@ -191,13 +192,13 @@ fn test_upsert_delete_reopen_and_get() {
             .unwrap();
         assert_eq!(new_hits.len(), 1);
         assert_eq!(new_hits[0].id, 42);
-        col.verify_invariants().unwrap();
+        col.verify_ann_invariants().unwrap();
     }
 
     // Reopen, delete, verify gone
     {
         let mut col = Collection::open(dir.path(), cfg).unwrap();
-        col.verify_invariants().unwrap();
+        col.verify_ann_invariants().unwrap();
         assert!(col.get(42).unwrap().is_some());
         col.delete(42).unwrap();
         assert!(col.get(42).unwrap().is_none());
@@ -211,7 +212,7 @@ fn test_upsert_delete_reopen_and_get() {
             .unwrap()
             .is_empty()
         );
-        col.verify_invariants().unwrap();
+        col.verify_ann_invariants().unwrap();
     }
 }
 
@@ -251,7 +252,7 @@ fn test_heavy_churn_splits_merges_lire_and_invariants() {
                         .into(),
                     );
                 }
-                col.upsert(id, &vec, attrs.clone()).unwrap();
+                col.upsert(id, Some(&vec), attrs.clone()).unwrap();
                 oracle.insert(id, (vec, attrs));
             } else if op < 90 {
                 let id = rng.random_range(0..160u64);
@@ -263,13 +264,13 @@ fn test_heavy_churn_splits_merges_lire_and_invariants() {
             }
 
             if step % 25 == 24 {
-                let stats = col.verify_invariants().unwrap();
-                assert_eq!(stats.tree.num_vectors, oracle.len() as u64);
+                let tstats = col.verify_ann_invariants().unwrap().unwrap();
+                assert_eq!(tstats.num_vectors, oracle.len() as u64);
             }
         }
 
-        let stats = col.verify_invariants().unwrap();
-        assert_eq!(stats.tree.num_vectors, oracle.len() as u64);
+        let tstats = col.verify_ann_invariants().unwrap().unwrap();
+        assert_eq!(tstats.num_vectors, oracle.len() as u64);
 
         // Verify filtered queries match brute force with high recall under churned tree
         let filters = vec![
@@ -347,25 +348,25 @@ fn test_false_positive_cluster_pruning_and_dynamic_expansion() {
         let mut attrs = Attributes::new();
         attrs.insert("x".into(), 1i64.into());
         attrs.insert("y".into(), 0i64.into());
-        col.upsert(id, &v, attrs).unwrap();
+        col.upsert(id, Some(&v), attrs).unwrap();
     }
     for id in 4..8u64 {
         let v: Vec<f32> = (0..8).map(|_| rng.random_range(-0.05..0.05)).collect();
         let mut attrs = Attributes::new();
         attrs.insert("x".into(), 0i64.into());
         attrs.insert("y".into(), 2i64.into());
-        col.upsert(id, &v, attrs).unwrap();
+        col.upsert(id, Some(&v), attrs).unwrap();
     }
     for id in 100..106u64 {
         let v: Vec<f32> = (0..8).map(|_| 5.0 + rng.random_range(-0.05..0.05)).collect();
         let mut attrs = Attributes::new();
         attrs.insert("x".into(), 1i64.into());
         attrs.insert("y".into(), 2i64.into());
-        col.upsert(id, &v, attrs).unwrap();
+        col.upsert(id, Some(&v), attrs).unwrap();
     }
 
-    let stats = col.verify_invariants().unwrap();
-    assert!(stats.tree.leaf_nodes >= 2);
+    let tstats = col.verify_ann_invariants().unwrap().unwrap();
+    assert!(tstats.leaf_nodes >= 2);
 
     let filter = Filter::And(vec![
         Filter::Eq("x".into(), 1i64.into()),
@@ -375,7 +376,7 @@ fn test_false_positive_cluster_pruning_and_dynamic_expansion() {
     // to force best-first traversal + dynamic expansion past the false-positive cluster!
     let opts = SearchOptions::new(4, 1)
         .with_rerank(10)
-        .with_exhaustive_cluster_threshold(0);
+        .with_exact_scan_threshold(0);
     let hits = col.search(&[0.0; 8], opts, Some(&filter)).unwrap();
     assert_eq!(hits.len(), 4);
     for hit in &hits {
@@ -445,13 +446,13 @@ fn test_all_filter_operators_and_selectivities_recall() {
         if id % 10 != 0 {
             attrs.insert("optional_rank".into(), ((id as i64) - 1000).into());
         }
-        col.upsert(id, &vec, attrs.clone()).unwrap();
+        col.upsert(id, Some(&vec), attrs.clone()).unwrap();
         oracle.insert(id, (vec, attrs));
     }
 
-    let stats = col.verify_invariants().unwrap();
-    assert_eq!(stats.tree.num_vectors, n as u64);
-    assert!(stats.tree.leaf_nodes > 20);
+    let tstats = col.verify_ann_invariants().unwrap().unwrap();
+    assert_eq!(tstats.num_vectors, n as u64);
+    assert!(tstats.leaf_nodes > 20);
 
     let test_cases: Vec<(&str, Filter, usize, f64)> = vec![
         // ~0.1% selectivity (2 docs in 2000 -> exhaustive crossover or tiny subset)
@@ -631,9 +632,9 @@ fn test_patch_and_patch_batch_semantics_and_atomicity() {
     let dir = TempDir::new().unwrap();
     let cfg = small_collection_config(4, DistanceMetric::L2Squared, true);
 
-    // Seed two well-separated clusters so we can test same-leaf vs cross-leaf vector patches.
-    let loc1_before;
-    let loc2_before;
+    // Seed two well-separated clusters so we can test CoW row allocation and search correctness.
+    let row1_before;
+    let row2_before;
     {
         let mut col = Collection::open(dir.path(), cfg.clone()).unwrap();
         for id in 1..=4u64 {
@@ -642,22 +643,19 @@ fn test_patch_and_patch_batch_semantics_and_atomicity() {
             attrs.insert("rank".into(), (id as i64).into());
             attrs.insert("tags".into(), vec!["t1".to_string(), "t2".to_string()].into());
             attrs.insert("note".into(), format!("note_{id}").into());
-            col.upsert(id, &[0.0 + (id as f32) * 0.01, 0.0, 0.0, 0.0], attrs)
+            col.upsert(id, Some(&[0.0 + (id as f32) * 0.01, 0.0, 0.0, 0.0]), attrs)
                 .unwrap();
         }
         for id in 101..=104u64 {
             let mut attrs = Attributes::new();
             attrs.insert("category".into(), "far".into());
             attrs.insert("rank".into(), (id as i64).into());
-            col.upsert(id, &[50.0 + ((id - 100) as f32) * 0.01, 0.0, 0.0, 0.0], attrs)
+            col.upsert(id, Some(&[50.0 + ((id - 100) as f32) * 0.01, 0.0, 0.0, 0.0]), attrs)
                 .unwrap();
         }
-        col.verify_invariants().unwrap();
-    }
-    {
-        let (storage, _) = izzydb::storage::Storage::open(dir.path(), &cfg.tree).unwrap();
-        loc1_before = storage.get_doc_loc(1).unwrap().unwrap();
-        loc2_before = storage.get_doc_loc(2).unwrap().unwrap();
+        col.verify_ann_invariants().unwrap();
+        row1_before = col.storage().get_id_map(1).unwrap().unwrap();
+        row2_before = col.storage().get_id_map(2).unwrap().unwrap();
     }
 
     {
@@ -673,7 +671,7 @@ fn test_patch_and_patch_batch_semantics_and_atomicity() {
         )
         .unwrap();
         let d1 = col.get(1).unwrap().unwrap();
-        assert_eq!(d1.embedding, vec![0.01, 0.0, 0.0, 0.0]);
+        assert_eq!(d1.embedding, Some(vec![0.01, 0.0, 0.0, 0.0]));
         assert_eq!(
             d1.attributes.get("category"),
             Some(&AttributeValue::String("updated".into()))
@@ -700,14 +698,14 @@ fn test_patch_and_patch_batch_semantics_and_atomicity() {
             .unwrap();
         assert_eq!(
             col.get(2).unwrap().unwrap().embedding,
-            vec![0.025, 0.0, 0.0, 0.0]
+            Some(vec![0.025, 0.0, 0.0, 0.0])
         );
 
         // 3. Vector-only cross-leaf patch moves doc 3 to far cluster and preserves attributes.
         col.patch(3, DocumentPatch::new().with_embedding(vec![50.05, 0.0, 0.0, 0.0]))
             .unwrap();
         let d3 = col.get(3).unwrap().unwrap();
-        assert_eq!(d3.embedding, vec![50.05, 0.0, 0.0, 0.0]);
+        assert_eq!(d3.embedding, Some(vec![50.05, 0.0, 0.0, 0.0]));
         assert_eq!(
             d3.attributes.get("category"),
             Some(&AttributeValue::String("near".into()))
@@ -759,18 +757,20 @@ fn test_patch_and_patch_batch_semantics_and_atomicity() {
             Some(&AttributeValue::Int(222))
         );
 
-        col.verify_invariants().unwrap();
+        col.verify_ann_invariants().unwrap();
     }
 
     {
-        let (storage, _) = izzydb::storage::Storage::open(dir.path(), &cfg.tree).unwrap();
-        let loc1_after = storage.get_doc_loc(1).unwrap().unwrap();
-        let loc2_after = storage.get_doc_loc(2).unwrap().unwrap();
-        let loc3_after = storage.get_doc_loc(3).unwrap().unwrap();
-        let loc101 = storage.get_doc_loc(101).unwrap().unwrap();
-        assert_eq!(loc1_after, loc1_before);
-        assert_eq!(loc2_after, loc2_before);
-        assert_eq!(loc3_after.leaf_id, loc101.leaf_id);
+        let (storage, _, _) = izzydb::storage::Storage::open(dir.path(), &cfg).unwrap();
+        let snap = storage.segment_snapshot();
+        let row1_after = storage.get_id_map(1).unwrap().unwrap();
+        let row2_after = storage.get_id_map(2).unwrap().unwrap();
+        assert_ne!(row1_after, row1_before);
+        assert_ne!(row2_after, row2_before);
+        assert_eq!(snap.resolve_row(row1_before), None);
+        assert_eq!(snap.resolve_row(row2_before), None);
+        assert_eq!(snap.resolve_row(row1_after), Some(row1_after));
+        assert_eq!(snap.resolve_row(row2_after), Some(row2_after));
     }
 }
 
@@ -797,10 +797,10 @@ fn test_delete_batch_delete_by_filter_and_update_by_filter() {
         if id % 5 == 0 {
             attrs.insert("tags".into(), vec!["special".to_string()].into());
         }
-        col.upsert(id, &[((id % 20) as f32) * 0.5, (id as f32) * 0.01, 0.0, 0.0], attrs)
+        col.upsert(id, Some(&[((id % 20) as f32) * 0.5, (id as f32) * 0.01, 0.0, 0.0]), attrs)
             .unwrap();
     }
-    col.verify_invariants().unwrap();
+    col.verify_ann_invariants().unwrap();
 
     // delete returns false for missing, true for existing
     assert!(!col.delete(999_999).unwrap());
@@ -810,7 +810,7 @@ fn test_delete_batch_delete_by_filter_and_update_by_filter() {
     // delete_batch deduplicates and ignores missing IDs
     let deleted = col.delete_batch(&[595, 596, 595, 999_998, 597]).unwrap();
     assert_eq!(deleted, 3);
-    col.verify_invariants().unwrap();
+    col.verify_ann_invariants().unwrap();
 
     // 0-match filter is a no-op
     let zero_upd = col
@@ -844,28 +844,30 @@ fn test_delete_batch_delete_by_filter_and_update_by_filter() {
             Some(&AttributeValue::String("promoted".into()))
         );
     }
-    col.verify_invariants().unwrap();
+    col.verify_ann_invariants().unwrap();
 
     // delete_by_filter on IsNull
     let null_tags_filter = Filter::IsNull("tags".into());
     let expected_nulls = col.resolve_filter_doc_ids(&null_tags_filter).unwrap();
     let del_nulls = col.delete_by_filter(&null_tags_filter).unwrap();
     assert_eq!(del_nulls as usize, expected_nulls.len());
-    col.verify_invariants().unwrap();
+    col.verify_ann_invariants().unwrap();
 
     // Drain everything with empty And(vec![]) and verify clean empty root leaf, then re-insert.
     let remaining = col.len();
     let drained = col.delete_by_filter(&Filter::And(vec![])).unwrap();
     assert_eq!(drained, remaining);
-    let stats = col.verify_invariants().unwrap();
-    assert_eq!(stats.tree.num_vectors, 0);
-    assert_eq!(stats.tree.root_level, 0);
-    assert_eq!(stats.tree.total_nodes, 1);
+    col.vacuum_ann(VacuumBudget::unlimited()).unwrap();
+    let tstats = col.verify_ann_invariants().unwrap().unwrap();
+    assert_eq!(tstats.num_vectors, 0);
+    assert_eq!(tstats.root_level, 0);
+    assert_eq!(tstats.total_nodes, 1);
 
     let mut fresh = Attributes::new();
     fresh.insert("category".into(), "reborn".into());
-    col.upsert(1, &[1.0, 2.0, 3.0, 4.0], fresh).unwrap();
-    assert_eq!(col.verify_invariants().unwrap().num_docs, 1);
+    col.upsert(1, Some(&[1.0, 2.0, 3.0, 4.0]), fresh).unwrap();
+    col.verify_ann_invariants().unwrap();
+    assert_eq!(col.len(), 1);
 }
 
 #[test]
@@ -896,7 +898,7 @@ fn test_long_horizon_mutation_churn_with_patch_and_filter_ops() {
                     vec![format!("t{}", rng.random_range(0..4))].into(),
                 );
             }
-            col.upsert(id, &vec, attrs.clone()).unwrap();
+            col.upsert(id, Some(&vec), attrs.clone()).unwrap();
             oracle.insert(id, (vec, attrs));
         } else if op < 55 {
             // Single patch (attribute-only, vector-only, or both)
@@ -972,13 +974,13 @@ fn test_long_horizon_mutation_churn_with_patch_and_filter_ops() {
         }
 
         if step % 40 == 39 {
-            let stats = col.verify_invariants().unwrap();
-            assert_eq!(stats.num_docs, oracle.len());
+            col.verify_ann_invariants().unwrap();
+            assert_eq!(col.len(), oracle.len() as u64);
         }
     }
 
-    let stats = col.verify_invariants().unwrap();
-    assert_eq!(stats.num_docs, oracle.len());
+    col.verify_ann_invariants().unwrap();
+    assert_eq!(col.len(), oracle.len() as u64);
 
     let q = random_vec(&mut rng, 10);
     let filter = Filter::And(vec![
@@ -999,5 +1001,281 @@ fn test_long_horizon_mutation_churn_with_patch_and_filter_ops() {
         let exact_ids: HashSet<DocId> = exact.iter().map(|&(id, _)| id).collect();
         let hits = got.iter().filter(|r| exact_ids.contains(&r.id)).count();
         assert!(hits * 2 >= exact_ids.len());
+    }
+}
+
+#[test]
+fn test_filter_variants_null_nan_neg_zero_match_brute_force() {
+    let dir = TempDir::new().unwrap();
+    let cfg = small_collection_config(4, DistanceMetric::L2Squared, false).with_seal_rows(50);
+    let mut col = Collection::open(dir.path(), cfg).unwrap();
+
+    let mut oracle: HashMap<DocId, Attributes> = HashMap::new();
+    for id in 0..120u64 {
+        let mut attrs = Attributes::new();
+        attrs.insert("category".into(), format!("cat_{}", id % 5).into());
+        if id % 6 == 0 {
+            attrs.insert("score".into(), (-0.0f64).into());
+        } else if id % 7 != 0 {
+            attrs.insert("score".into(), ((id as f64) * 0.5 - 10.0).into());
+        }
+        if id % 4 != 0 {
+            attrs.insert("rank".into(), ((id as i64) - 50).into());
+        }
+        attrs.insert("active".into(), (id % 2 == 0).into());
+        if id % 3 == 0 {
+            attrs.insert("tags".into(), vec![format!("t{}", id % 4), "common".into()].into());
+        }
+        col.upsert(id, Some(&[id as f32 * 0.01, 0.0, 0.0, 0.0]), attrs.clone())
+            .unwrap();
+        oracle.insert(id, attrs);
+    }
+
+    // Non-finite NaN floats are rejected by Filter::validate.
+    for nan_f in [
+        Filter::Eq("score".into(), f64::NAN.into()),
+        Filter::NotEq("score".into(), f64::NAN.into()),
+        Filter::Lt("score".into(), f64::NAN.into()),
+    ] {
+        assert!(matches!(
+            col.resolve_filter_doc_ids(&nan_f),
+            Err(TreeError::InvalidFilter(_))
+        ));
+    }
+
+    let filters = vec![
+        Filter::Eq("score".into(), 0.0f64.into()),
+        Filter::Eq("score".into(), (-0.0f64).into()),
+        Filter::Eq("rank".into(), izzydb::ScalarValue::Null),
+        Filter::NotEq("rank".into(), izzydb::ScalarValue::Null),
+        Filter::In(
+            "rank".into(),
+            vec![izzydb::ScalarValue::Null, (-10i64).into(), 10i64.into()],
+        ),
+        Filter::NotIn(
+            "rank".into(),
+            vec![izzydb::ScalarValue::Null, (-10i64).into()],
+        ),
+        Filter::IsNull("tags".into()),
+        Filter::IsNotNull("tags".into()),
+        Filter::Contains("tags".into(), "common".into()),
+        Filter::And(vec![
+            Filter::Gte("score".into(), 0.0f64.into()),
+            Filter::Lt("score".into(), 12.5f64.into()),
+            Filter::Not(Box::new(Filter::Eq("active".into(), false.into()))),
+        ]),
+        Filter::Or(vec![
+            Filter::Eq("category".into(), "cat_0".into()),
+            Filter::IsNull("score".into()),
+        ]),
+    ];
+
+    for f in filters {
+        let got = col.resolve_filter_doc_ids(&f).unwrap();
+        let mut expected: Vec<DocId> = oracle
+            .iter()
+            .filter(|(_, attrs)| f.matches(attrs))
+            .map(|(&id, _)| id)
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(got, expected, "mismatch for filter {f:?}");
+    }
+}
+
+#[test]
+fn test_planner_regimes_exact_masked_and_post_filter() {
+    let dir = TempDir::new().unwrap();
+    let dim = 8;
+    let mut tree = TreeConfig::new(dim, DistanceMetric::L2Squared);
+    tree.min_leaf_size = 4;
+    tree.max_leaf_size = 16;
+    let cfg = CollectionConfig::new(tree)
+        .with_seal_rows(200)
+        .with_attribute("bucket", AttributeType::Uint, true);
+
+    let mut col = Collection::open(dir.path(), cfg).unwrap();
+    let mut rng = SmallRng::seed_from_u64(7070);
+    let mut docs = Vec::with_capacity(600);
+    for id in 0..600u64 {
+        let mut attrs = Attributes::new();
+        attrs.insert("bucket".into(), (id % 10).into());
+        docs.push(izzydb::Document {
+            id,
+            embedding: Some(random_vec(&mut rng, dim)),
+            attributes: attrs,
+        });
+    }
+    col.upsert_batch(&docs).unwrap();
+    let q = random_vec(&mut rng, dim);
+
+    // 1. Default exact_scan_threshold = 4096 -> materialized 60 rows uses ExactScan.
+    let mut trace = FilterPlanTrace::default();
+    let hits = col
+        .search_with_trace(
+            &q,
+            SearchOptions::new(5, 4),
+            Some(&Filter::Eq("bucket".into(), 3u64.into())),
+            &mut trace,
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 5);
+    assert_eq!(trace.regime, Some(FilteredSearchRegime::ExactScan));
+
+    // 2. With exact_scan_threshold = 10, 10% selectivity (60 rows <= 0.5) uses MaskedTraversal.
+    let mut trace = FilterPlanTrace::default();
+    let hits = col
+        .search_with_trace(
+            &q,
+            SearchOptions::new(5, 4)
+                .with_exact_scan_threshold(10)
+                .with_rerank(20),
+            Some(&Filter::Eq("bucket".into(), 3u64.into())),
+            &mut trace,
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 5);
+    assert_eq!(trace.regime, Some(FilteredSearchRegime::MaskedTraversal));
+
+    // 3. With exact_scan_threshold = 10, 90% selectivity (s = 0.9 > 0.5) uses PostFilter.
+    let mut trace = FilterPlanTrace::default();
+    let hits = col
+        .search_with_trace(
+            &q,
+            SearchOptions::new(5, 4)
+                .with_exact_scan_threshold(10)
+                .with_rerank(20),
+            Some(&Filter::NotEq("bucket".into(), 3u64.into())),
+            &mut trace,
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 5);
+    assert_eq!(trace.regime, Some(FilteredSearchRegime::PostFilter));
+}
+
+#[test]
+fn test_tombstone_heavy_postings_and_counts_exact() {
+    let dir = TempDir::new().unwrap();
+    let cfg = small_collection_config(4, DistanceMetric::L2Squared, false).with_seal_rows(50);
+    let mut col = Collection::open(dir.path(), cfg).unwrap();
+
+    for id in 0..200u64 {
+        let mut attrs = Attributes::new();
+        attrs.insert("category".into(), if id % 2 == 0 { "even" } else { "odd" }.into());
+        attrs.insert("rank".into(), (id as i64).into());
+        col.upsert(id, Some(&[id as f32, 0.0, 0.0, 0.0]), attrs)
+            .unwrap();
+    }
+
+    // Overwrite 50% of docs (all evens) with "changed" -> old postings keep dead locals.
+    for id in (0..200u64).step_by(2) {
+        let mut attrs = Attributes::new();
+        attrs.insert("category".into(), "changed".into());
+        attrs.insert("rank".into(), (id as i64 + 1000).into());
+        col.upsert(id, Some(&[id as f32, 1.0, 0.0, 0.0]), attrs)
+            .unwrap();
+    }
+
+    assert!(col.resolve_filter_doc_ids(&Filter::Eq("category".into(), "even".into())).unwrap().is_empty());
+    let changed = col
+        .resolve_filter_doc_ids(&Filter::Eq("category".into(), "changed".into()))
+        .unwrap();
+    assert_eq!(changed.len(), 100);
+    let odds = col
+        .resolve_filter_doc_ids(&Filter::Eq("category".into(), "odd".into()))
+        .unwrap();
+    assert_eq!(odds.len(), 100);
+
+    // Search for old "even" returns empty even with tombstones in postings.
+    let hits = col
+        .search(
+            &[0.0; 4],
+            SearchOptions::new(10, 4).with_exact_scan_threshold(0),
+            Some(&Filter::Eq("category".into(), "even".into())),
+        )
+        .unwrap();
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn test_multi_segment_range_zone_pruning() {
+    let dir = TempDir::new().unwrap();
+    let cfg = small_collection_config(4, DistanceMetric::L2Squared, false).with_seal_rows(40);
+    let mut col = Collection::open(dir.path(), cfg).unwrap();
+
+    // Insert 4 segments of 40 docs each with strictly disjoint score bands.
+    for seg in 0..4u64 {
+        let docs: Vec<izzydb::Document> = (0..40u64)
+            .map(|i| {
+                let id = seg * 40 + i;
+                let mut attrs = Attributes::new();
+                attrs.insert("score".into(), ((seg * 100 + i) as f64).into());
+                izzydb::Document {
+                    id,
+                    embedding: Some(vec![id as f32, 0.0, 0.0, 0.0]),
+                    attributes: attrs,
+                }
+            })
+            .collect();
+        col.upsert_batch(&docs).unwrap();
+    }
+
+    let filter = Filter::And(vec![
+        Filter::Gte("score".into(), 110.0f64.into()),
+        Filter::Lt("score".into(), 125.0f64.into()),
+    ]);
+    let mut trace = FilterPlanTrace::default();
+    let hits = col
+        .search_with_trace(&[115.0, 0.0, 0.0, 0.0], SearchOptions::new(5, 4), Some(&filter), &mut trace)
+        .unwrap();
+    assert_eq!(hits.len(), 5);
+    assert!(
+        trace.range_segments_pruned >= 3,
+        "expected >= 3 segments pruned, got {:?}",
+        trace
+    );
+    assert_eq!(trace.range_segments_visited, 1);
+
+    let matched = col.resolve_filter_doc_ids(&filter).unwrap();
+    let expected: Vec<DocId> = (50..65).collect();
+    assert_eq!(matched, expected);
+}
+
+#[test]
+fn test_update_by_filter_no_halloween_double_update() {
+    let dir = TempDir::new().unwrap();
+    let cfg = small_collection_config(4, DistanceMetric::L2Squared, false).with_seal_rows(15);
+    let mut col = Collection::open(dir.path(), cfg).unwrap();
+
+    for id in 0..30u64 {
+        let mut attrs = Attributes::new();
+        attrs.insert("active".into(), (id < 20).into());
+        attrs.insert("rank".into(), 0i64.into());
+        col.upsert(id, Some(&[id as f32, 0.0, 0.0, 0.0]), attrs)
+            .unwrap();
+    }
+
+    // Patch keeps "active": true so updated rows still match the filter!
+    let updated = col
+        .update_by_filter(
+            &Filter::Eq("active".into(), true.into()),
+            &DocumentPatch::new()
+                .with_attribute("active", true.into())
+                .with_attribute("rank", 99i64.into()),
+        )
+        .unwrap();
+    assert_eq!(updated, 20);
+    assert_eq!(col.len(), 30);
+
+    for id in 0..20u64 {
+        assert_eq!(
+            col.get(id).unwrap().unwrap().attributes.get("rank"),
+            Some(&AttributeValue::Int(99))
+        );
+    }
+    for id in 20..30u64 {
+        assert_eq!(
+            col.get(id).unwrap().unwrap().attributes.get("rank"),
+            Some(&AttributeValue::Int(0))
+        );
     }
 }

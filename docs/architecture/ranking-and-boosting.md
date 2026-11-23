@@ -2,7 +2,7 @@
 
 This document describes how `izzydb` executes the generalized `RankBy` AST (BM25, filter boosts, attribute scores, multiplicative products) and attribute-ordered queries (`OrderBy`). Implementation: [`rank.rs`](../../crates/izzydb-core/src/rank.rs) (AST, math, normalization), [`maxscore.rs`](../../crates/izzydb-fts/src/maxscore.rs) (pruned lexical execution), [`rank_eval.rs`](../../crates/izzydb/src/rank_eval.rs) (planner and exact executors), [`order_by.rs`](../../crates/izzydb/src/order_by.rs) (index-order scan).
 
-No storage format changed: attribute scores read the forward store (`cf_docs`) through zero-copy `DocView`; filter boosts reuse the filter machinery; `OrderBy` streams the existing order-preserving `cf_attr_clusters` keys.
+Attribute scores read through `AttrReader` (`cf_columns` on sealed segments, `cf_detached` on detached columns, and zero-copy `RowView` in `cf_rows` on open segments); filter boosts reuse `FilterPlan`; `OrderBy` streams value-major `cf_attr_postings` / `cf_detached_postings` keys.
 
 ## 1. The AST and its invariants
 
@@ -30,7 +30,7 @@ RankBy = Const(f32) | Bm25{..} | Filter(Filter)
 | Normalized shape | Plan | Cost model |
 |---|---|---|
 | **Pure lexical**: BM25 leaves under `Sum` / `Max` / constant-weight `Product` | Block-Max MAXSCORE, unchanged | identical to plain BM25 |
-| **`L * m(doc)`**: one pure-lexical factor `L`, other factors have no BM25 (`Saturate`, `Decay`, `Filter`, `1 + w*Decay(..)`, ...) | MAXSCORE on `L * UB(m)`; survivors rescored exactly | `cf_docs` read only for candidates with `L * UB(m) > theta` |
+| **`L * m(doc)`**: one pure-lexical factor `L`, other factors have no BM25 (`Saturate`, `Decay`, `Filter`, `1 + w*Decay(..)`, ...) | MAXSCORE on `L * UB(m)`; survivors rescored exactly | forward attribute read only for candidates with `L * UB(m) > theta` |
 | **`L + a(doc)`**: lexical terms plus non-lexical additive terms | MAXSCORE with threshold `theta - UB(a)`; exact backfill of non-lexical docs when needed | backfill skipped when the lexical top-k is full and its weakest score `> UB(a)` |
 | **No BM25** | single monotone `filterable` attribute: index-order scan; otherwise candidate scan | `O(k)` index entries (monotone) / `O(candidates)` |
 | **Anything else** (e.g. `BM25 x BM25`) | exact evaluation over the positive candidate universe | unpruned over candidates |
@@ -47,7 +47,7 @@ score(doc) = L(doc) * m(doc) + a(doc),   0 <= m <= mult_ub,   0 <= a <= add_ub
 - Every pruning decision (block skipping, essential/non-essential partitioning, the candidate threshold) uses `prune_theta = max(theta - add_ub, 0)`. A document can only enter the top-k if `L * mult_ub + add_ub > theta`, so no qualifying document is pruned.
 - Candidates that survive reach `rescore(doc_id, L * mult_ub)`, which reads the document once, evaluates `m` and `a`, and returns the exact final score. The heap and `theta` hold exact scores.
 
-Upper bounds: `Const(c) = c`, `Filter = 1`, `Saturate`/`Decay = max(1, missing)`, `Sum = sum`, `Max = max`, `Product = product`. `Attribute` is unbounded by definition; its bound is the largest key in `cf_attr_clusters` for a `filterable` attribute (stale keys only over-estimate, which is sound). A modifier with no finite bound (e.g. `Attribute` on a non-filterable attribute) falls back to the exact plan.
+Upper bounds: `Const(c) = c`, `Filter = 1`, `Saturate`/`Decay = max(1, missing)`, `Sum = sum`, `Max = max`, `Product = product`. `Attribute` is unbounded by definition; its bound is read from per-segment `0x12` zone maps (or largest key in `cf_attr_postings` / `cf_detached_postings`) for a `filterable` attribute. A modifier with no finite bound (e.g. `Attribute` on a non-filterable attribute) falls back to the exact plan.
 
 ### 2.2 Additive backfill
 
@@ -55,7 +55,7 @@ Upper bounds: `Const(c) = c`, `Filter = 1`, `Saturate`/`Decay = max(1, missing)`
 
 ### 2.3 Filter leaves
 
-`RankBy::Filter` leaves whose predicate is exactly resolvable from the indexes (FTS token/phrase predicates, filters over few candidate clusters) are resolved once per query into a document set, making per-document scoring a hash lookup instead of re-analyzing text. Other filters are evaluated per document with `DocView::matches_filter` (or attribute decoding when they contain FTS predicates).
+`RankBy::Filter` leaves whose predicate is exactly resolvable from the indexes (FTS token/phrase predicates, selective filters) are resolved once per query into a `RowSet`, making per-document scoring a bitmap/set lookup instead of re-analyzing text. Other filters are evaluated per row via `RowView::matches_filter` (plus `cf_detached` / attribute decoding when detached or FTS predicates are present).
 
 ### 2.4 Exact fallback
 
@@ -78,10 +78,10 @@ Pure lexical expressions keep the posting-union bitmap population, so per-facet 
 
 ## 4. Attribute sorting (`OrderBy`)
 
-`Collection::query_ordered(&[OrderBySpec], filter, top_k)` returns the top-k documents by one or more ordered scalar attributes (`Int`, `Uint`, `Float`, `String`), `Asc` / `Desc`, `NullsFirst` / `NullsLast` per key. The primary key must be `filterable`; secondary keys are read from `cf_docs`.
+`Collection::order_by(&[OrderBySpec], filter, top_k)` returns the top-k documents by one or more ordered scalar attributes (`Int`, `Uint`, `Float`, `String`), `Asc` / `Desc`, `NullsFirst` / `NullsLast` per key. The primary key must be `filterable` (inline or detached); secondary keys are read via `AttrReader`.
 
-- **Streaming path (default).** `Storage::iter_attr_clusters_prefix` walks `cf_attr_clusters` for the primary `(attr_id, type_tag)` prefix, forward for `Asc` and reverse for `Desc`; keys are already in value order. For each value, the leaf bitmap is intersected with the filter's candidate leaves and the matching `DocId`s are resolved by restricting the prepared filter to that exact cluster key. With one sort key a value group is appended in ascending `DocId` order; with several keys the group is ordered by the remaining keys (and `DocId`), and only the boundary group is partially taken. The scan **stops as soon as `top_k` rows exist**.
-- **Selective-filter crossover.** When the filter prunes to at most 8 candidate leaves (matching `SearchOptions::exhaustive_cluster_threshold`), the matches are resolved and sorted in memory.
+- **Streaming path (default).** Walks value-major `cf_attr_postings` (or `cf_detached_postings`, merging with `0x14` overwritten sets) for the primary `(attr_id, type_tag)` prefix, forward for `Asc` and reverse for `Desc`; keys are grouped by `(encoded_val, seg)` in sorted value order. For each value group, segment `SegPosting`s are merged into a `RowSet`, ANDed with `SegmentTableSnapshot` liveness and the filter, resolved to `DocId`s via `RowResolver`, and ordered by any secondary keys (`DocId` tie-breaker). The scan **stops as soon as `top_k` rows exist** at a value boundary.
+- **Selective-filter crossover.** When the filter materializes to at most `8,192` rows, matches are fetched via `AttrReader` and sorted in memory.
 - **Nulls.** Documents with an absent/`Null` primary key (`IsNull`) are emitted before the scan for `NullsFirst`, or appended after it (only if rows remain) for `NullsLast`.
 - **Float ordering.** `-0.0` and `0.0` share one key (the index normalizes them), so they tie and break by `DocId`; NaN is rejected at write time.
 
@@ -103,7 +103,7 @@ Pure lexical expressions keep the posting-union bitmap population, so per-facet 
 | `BM25 x BM25` (exact fallback) | ~6 ms |
 | `Sum(Saturate, Filter)` (candidate scan, no BM25) | ~12 ms |
 
-Modifier queries cost more than plain BM25 because each surviving candidate needs a `cf_docs` read; a strong modifier bound (e.g. a large additive weight) weakens pruning because `theta - add_ub` stays small.
+Modifier queries cost more than plain BM25 because surviving candidates read attributes via `AttrReader` / `cf_rows`; a strong modifier bound (e.g. a large additive weight) weakens pruning because `theta - add_ub` stays small.
 
 ## 6. Testing
 

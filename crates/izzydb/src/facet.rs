@@ -1,32 +1,28 @@
-//! Exact faceting engine: adaptive strategy dispatch over global counts (`default[0x06]`),
-//! forward `cf_docs` passes, and inverted per-leaf mask intersections (`cf_attr_postings`).
-//!
-//! Every facet kind (`Terms`, scalar `Ranges`, `Stats`, `Histogram`) is finalized from a sorted
-//! `(encoded_value, doc_count)` list, so all strategies only need to produce per-value document
-//! counts. Array-attribute `Ranges` are the exception: a document with several elements inside
-//! one bucket must count once, so they accumulate per-bucket document counts directly.
+//! Exact faceting engine on v3 segments: adaptive strategy dispatch over live global counts
+//! (`default[0x06]`), forward [`AttrReader`] passes (`"docs"`), and inverted per-segment posting
+//! intersections (`cf_attr_postings`).
 
 use std::collections::{BTreeMap, HashMap};
 
 use roaring::RoaringBitmap;
 
-use izzydb_core::config::{AttrId, DocId, NodeId, TreeConfig};
+use izzydb_core::config::{AttrId, DocId, RowId, SegmentId};
 use izzydb_core::error::{Result, TreeError};
 pub use izzydb_core::facet::*;
 use izzydb_core::filter::Filter;
-use izzydb_core::schema::{AttributeType, CollectionSchema, ScalarValue};
+use izzydb_core::rowset::{Liveness, RowSet};
+use izzydb_core::schema::{AttributeType, CollectionSchema, ColumnStorage, ScalarValue};
 use izzydb_storage::codec::{
-    DocView, LeafPostingView, TAG_PRESENT, attr_type_value_tag, decode_f64_ordered,
-    decode_i64_ordered, decode_scalar_val_bytes, encode_present_cluster_key,
-    encode_scalar_val_bytes, encode_str_prefix_ordered,
+    RowFieldRef, SegPostingView, attr_type_value_tag, decode_f64_ordered, decode_i64_ordered,
+    decode_scalar_val_bytes, encode_present_attr_key, encode_scalar_val_bytes,
+    encode_str_prefix_ordered,
 };
-use izzydb_storage::node::TreeMeta;
+use izzydb_storage::column::ColumnBlockView;
 use izzydb_storage::Storage;
 
-use crate::attr_index::{AttributeIndex, ClusterCandidates, LeafMask, PreparedFilter};
+use crate::attr_reader::{AttrReader, ColumnReader, RowStoreReader};
+use crate::filter_plan::{self, FilterPlan, FilterPlanTrace, total_live_rows};
 use crate::fts_index::FtsIndex;
-use crate::rabitq::RabitqQuantizer;
-use crate::search::{collect_matching_doc_ids_in_leaves, parse_leaf_views};
 
 thread_local! {
     static STRATEGY_TRACE: std::cell::RefCell<Vec<&'static str>> =
@@ -37,60 +33,39 @@ fn trace_strategy(name: &'static str) {
     STRATEGY_TRACE.with(|t| t.borrow_mut().push(name));
 }
 
-/// Drain the strategies chosen by facet evaluation on this thread (one entry per evaluated
-/// `FacetGroup`): `"global"`, `"complement"`, `"docs"`, `"leaf_masks_no_views"`,
-/// `"leaf_masks_views"`. Intended for tests and diagnostics.
+/// Drain the strategies chosen by facet evaluation on this thread.
 #[doc(hidden)]
 pub fn take_strategy_trace() -> Vec<&'static str> {
     STRATEGY_TRACE.with(|t| std::mem::take(&mut *t.borrow_mut()))
 }
 
-/// Maximum number of documents for the forward `cf_docs` pass to be preferred.
+/// Maximum number of rows for the forward `AttrReader` pass to be preferred.
 pub const FORWARD_PASS_MAX_DOCS: usize = 2048;
-/// Maximum number of candidate leaves resolved eagerly to decide between strategies 3 and 4.
-const SMALL_CANDIDATE_LEAVES: usize = 16;
-const DOC_CHUNK: usize = 512;
-const LEAF_CHUNK: usize = 256;
 
-/// Everything the engine needs from a [`Collection`](crate::Collection).
 pub(crate) struct FacetEnv<'a> {
     pub storage: &'a Storage,
     pub schema: &'a CollectionSchema,
-    pub attr_index: &'a AttributeIndex,
     pub fts_index: &'a FtsIndex,
-    pub config: &'a TreeConfig,
-    pub quantizer: &'a RabitqQuantizer,
-    pub meta: &'a TreeMeta,
-    pub leaf_parent: &'a HashMap<NodeId, NodeId>,
 }
 
 impl FacetEnv<'_> {
-    fn num_vectors(&self) -> u64 {
-        self.meta.num_vectors
-    }
-
-    fn all_leaf_ids(&self) -> Vec<NodeId> {
-        if self.meta.root_level == 0 {
-            vec![self.meta.root_id]
-        } else {
-            let mut ids: Vec<NodeId> = self.leaf_parent.keys().copied().collect();
-            ids.sort_unstable();
-            ids
-        }
+    fn total_live_rows(&self) -> u64 {
+        total_live_rows(&self.storage.segment_snapshot())
     }
 }
 
 /// The set of documents facets are computed over.
 pub(crate) enum Population<'a> {
-    /// Documents matching `filter` (each facet may rewrite it via its `FacetFilterMode`) and,
-    /// when `rank_bm` is set, having BM25 score `> 0` (a set of `FtsDocId`s).
+    /// Rows matching `filter` (each facet may rewrite it via its `FacetFilterMode`) and, when
+    /// `rank_bm` is set, also present in `rank_bm`.
     Query {
         filter: Option<&'a Filter>,
-        rank_bm: Option<&'a RoaringBitmap>,
-        /// Pre-built plan for `filter` (shared with the primary search) when `rank_bm` is `None`.
-        prepared: Option<&'a PreparedFilter>,
+        rank_bm: Option<&'a RowSet>,
     },
-    /// An explicit document set (filter modes are ignored).
+    /// An explicit live [`RowSet`] (filter modes are ignored).
+    RowSet(&'a RowSet),
+    /// Explicit `DocId`s (filter modes are ignored; resolved via `cf_id_map`).
+    #[allow(dead_code)]
     Docs(&'a [DocId]),
 }
 
@@ -104,23 +79,42 @@ pub(crate) fn compute_facets(
     let mut out: Vec<Option<FacetResult>> = vec![None; specs.len()];
 
     let total = match pop {
-        Population::Docs(docs) => {
-            let mut docs = docs.to_vec();
-            docs.sort_unstable();
-            docs.dedup();
+        Population::RowSet(rs) => {
             let idx: Vec<usize> = (0..specs.len()).collect();
             let mut accs = AttrAccs::build(env, specs, &idx)?;
-            accs.accumulate_docs(env, &docs)?;
-            accs.finalize_into(specs, docs.len() as u64, &mut out)?;
-            docs.len() as u64
+            let count = rs.len();
+            if count > 0 {
+                if count as usize <= FORWARD_PASS_MAX_DOCS {
+                    let rows: Vec<RowId> = rs.iter().collect();
+                    trace_strategy("docs");
+                    accs.accumulate_rows(env, &rows)?;
+                } else {
+                    trace_strategy("leaf_masks_no_views");
+                    accs.accumulate_rowset_postings(env, rs)?;
+                }
+            }
+            accs.finalize_into(specs, count, &mut out)?;
+            count
         }
-        Population::Query {
-            filter,
-            rank_bm,
-            prepared,
-        } => {
-            // Groups share one population evaluation per distinct effective filter. The primary
-            // group (effective filter == query filter) always exists so `total` is known.
+        Population::Docs(docs) => {
+            let mut ids = docs.to_vec();
+            ids.sort_unstable();
+            ids.dedup();
+            let raw_rows = env.storage.multi_get_id_map(&ids)?;
+            let snap = env.storage.segment_snapshot();
+            let mut rows: Vec<RowId> = raw_rows
+                .into_iter()
+                .flatten()
+                .filter(|&r| snap.is_live(r))
+                .collect();
+            rows.sort_unstable();
+            let idx: Vec<usize> = (0..specs.len()).collect();
+            let mut accs = AttrAccs::build(env, specs, &idx)?;
+            accs.accumulate_rows(env, &rows)?;
+            accs.finalize_into(specs, rows.len() as u64, &mut out)?;
+            rows.len() as u64
+        }
+        Population::Query { filter, rank_bm } => {
             let mut groups: Vec<(Option<Filter>, Vec<usize>)> = vec![(filter.cloned(), Vec::new())];
             for (i, spec) in specs.iter().enumerate() {
                 let eff = spec.effective_filter(filter);
@@ -131,8 +125,7 @@ pub(crate) fn compute_facets(
             }
             let mut primary_total = 0;
             for (gi, (gfilter, idxs)) in groups.iter().enumerate() {
-                let shared = (gi == 0 && rank_bm.is_none()).then_some(prepared).flatten();
-                let g_total = eval_group(env, specs, idxs, gfilter.as_ref(), rank_bm, shared, &mut out)?;
+                let g_total = eval_group(env, specs, idxs, gfilter.as_ref(), rank_bm, &mut out)?;
                 if gi == 0 {
                     primary_total = g_total;
                 }
@@ -155,7 +148,6 @@ pub(crate) fn compute_facets(
 // Accumulators
 // ---------------------------------------------------------------------------------------------
 
-/// Which part of an attribute's value space a scan must cover.
 #[derive(Debug, Clone, PartialEq)]
 enum ScanSel {
     Full,
@@ -175,7 +167,6 @@ impl ScanSel {
         }
     }
 
-    /// Whether `val` (visited in ascending order from `start`) is beyond the selection.
     fn past_end(&self, val: &[u8]) -> bool {
         match self {
             ScanSel::Full => false,
@@ -239,15 +230,13 @@ impl EncRange {
     }
 }
 
-/// Per-bucket document counts for `Ranges` over array attributes (documents counted once).
 struct ArrayRangeAcc {
     ranges: Vec<EncRange>,
     counts: Vec<u64>,
-    /// Per-leaf scratch masks (strategy 4).
-    scratch: Vec<LeafMask>,
+    /// Per-segment union of matching local ids (`seg_idx -> bucket_idx -> bitmap`).
+    scratch: BTreeMap<SegmentId, Vec<RoaringBitmap>>,
 }
 
-/// Accumulated per-attribute state shared by every facet on that attribute.
 struct AttrAcc {
     attr_id: AttrId,
     type_tag: u8,
@@ -259,17 +248,14 @@ struct AttrAcc {
     array_ranges: Vec<ArrayRangeAcc>,
 }
 
-/// Per-facet binding into [`AttrAccs`].
 struct FacetPlan {
     acc_idx: usize,
-    /// Index into `AttrAcc::array_ranges` for array-attribute `Ranges`.
     array_range: Option<usize>,
     attr_type: AttributeType,
 }
 
 struct AttrAccs {
     accs: Vec<AttrAcc>,
-    /// Plans aligned with `spec_idxs`.
     plans: Vec<FacetPlan>,
     spec_idxs: Vec<usize>,
 }
@@ -321,7 +307,7 @@ impl AttrAccs {
                         acc.array_ranges.push(ArrayRangeAcc {
                             ranges: enc,
                             counts: vec![0; n],
-                            scratch: Vec::new(),
+                            scratch: BTreeMap::new(),
                         });
                         array_range = Some(acc.array_ranges.len() - 1);
                     } else {
@@ -360,155 +346,415 @@ impl AttrAccs {
         self.plans.iter().any(|p| p.array_range.is_some())
     }
 
-    // ---- Strategy 1: global counts -------------------------------------------------------
+    // ---- Strategy 1: global counts (`default[0x06]`) -------------------------------------
 
     fn load_global_counts(&mut self, env: &FacetEnv<'_>) -> Result<()> {
         for acc in &mut self.accs {
+            let is_detached = env
+                .schema
+                .get_by_id(acc.attr_id)
+                .is_some_and(|e| e.storage == ColumnStorage::Detached);
+            let col_gen = if is_detached {
+                crate::detached::current_detached_gen(env.storage, acc.attr_id)?
+            } else {
+                0
+            };
             if acc.need_values {
                 let sel = acc.sel.clone();
                 let values = &mut acc.values;
-                env.storage
-                    .visit_attr_counts(acc.attr_id, acc.type_tag, sel.start(), |val, c| {
-                        if sel.past_end(val) {
-                            return Ok(false);
-                        }
+                let cb = |val: &[u8], c: u64| -> Result<bool> {
+                    if sel.past_end(val) {
+                        return Ok(false);
+                    }
+                    if c > 0 {
                         values.insert(val.to_vec(), c);
-                        Ok(true)
-                    })?;
+                    }
+                    Ok(true)
+                };
+                if is_detached {
+                    env.storage.visit_detached_counts(
+                        acc.attr_id,
+                        col_gen,
+                        acc.type_tag,
+                        sel.start(),
+                        cb,
+                    )?;
+                } else {
+                    env.storage
+                        .visit_attr_counts(acc.attr_id, acc.type_tag, sel.start(), cb)?;
+                }
             }
             if acc.need_present {
-                acc.present = env
-                    .storage
-                    .get_attr_count(&encode_present_cluster_key(acc.attr_id))?;
+                let key = encode_present_attr_key(acc.attr_id);
+                acc.present = if is_detached {
+                    env.storage.get_detached_count(col_gen, &key)?
+                } else {
+                    env.storage.get_attr_count(&key)?
+                };
             }
         }
         Ok(())
     }
 
-    // ---- Strategy 3: forward DocView pass ------------------------------------------------
+    // ---- Strategy 3: forward `ColumnReader` (sealed) + `RowStoreReader` fallback pass ----
 
-    fn accumulate_docs(&mut self, env: &FacetEnv<'_>, sorted_docs: &[DocId]) -> Result<()> {
-        if self.accs.is_empty() {
+    fn accumulate_rows(&mut self, env: &FacetEnv<'_>, sorted_rows: &[RowId]) -> Result<()> {
+        if self.accs.is_empty() || sorted_rows.is_empty() {
             return Ok(());
         }
+        let col_reader = ColumnReader::new(env.storage, env.schema)?;
         let mut key_buf: Vec<u8> = Vec::with_capacity(32);
         let mut elems: Vec<Vec<u8>> = Vec::new();
-        for chunk in sorted_docs.chunks(DOC_CHUNK) {
-            let slices = env.storage.multi_get_doc_bytes_pinned(chunk)?;
-            for (&doc_id, slice) in chunk.iter().zip(slices.iter()) {
-                let slice = slice.as_ref().ok_or_else(|| {
-                    TreeError::InvariantViolation(format!("facet doc {doc_id} missing in cf_docs"))
-                })?;
-                let view = DocView::parse(slice)?;
-                for acc in &mut self.accs {
-                    let Some(field) = view.get_raw_field(acc.attr_id)? else {
-                        continue;
-                    };
-                    if field.is_null() {
-                        continue;
+        let mut need_row_store = vec![false; sorted_rows.len()];
+        let mut row_store_attrs = vec![false; self.accs.len()];
+
+        for (ai, acc) in self.accs.iter_mut().enumerate() {
+            let mut col_rows: Vec<usize> = Vec::new();
+            let mut block_coords: Vec<(SegmentId, u32)> = Vec::new();
+            for (ri, &row) in sorted_rows.iter().enumerate() {
+                if col_reader.segment_has_columns(row.seg(), acc.attr_id) {
+                    col_rows.push(ri);
+                    let k = (row.seg(), row.block_idx());
+                    if block_coords.last().copied() != Some(k) {
+                        block_coords.push(k);
                     }
-                    acc.present += 1;
-                    let is_array = !matches!(field, izzydb_storage::codec::DocFieldRef::Scalar(_));
-                    if !is_array {
-                        if acc.need_values {
-                            field.for_each_scalar(|v| {
-                                key_buf.clear();
-                                v.encode_into(&mut key_buf);
-                                bump(&mut acc.values, &key_buf, 1);
-                            })?;
-                        }
-                        continue;
-                    }
-                    elems.clear();
-                    field.for_each_scalar(|v| {
-                        let mut k = Vec::with_capacity(16);
-                        v.encode_into(&mut k);
-                        elems.push(k);
-                    })?;
-                    for ar in &mut acc.array_ranges {
-                        for (b, r) in ar.ranges.iter().enumerate() {
-                            if elems.iter().any(|e| r.contains(e)) {
-                                ar.counts[b] += 1;
-                            }
-                        }
-                    }
+                } else {
+                    need_row_store[ri] = true;
+                    row_store_attrs[ai] = true;
+                }
+            }
+            if col_rows.is_empty() {
+                continue;
+            }
+            let block_slices = col_reader.fetch_column_slices(acc.attr_id, &block_coords)?;
+            let mut block_views: HashMap<(SegmentId, u32), Option<ColumnBlockView<'_>>> =
+                HashMap::with_capacity(block_coords.len());
+            for (&(seg, block), opt_slice) in block_coords.iter().zip(block_slices.iter()) {
+                let parsed = opt_slice
+                    .as_ref()
+                    .map(|s| ColumnBlockView::parse(s))
+                    .transpose()?;
+                block_views.insert((seg, block), parsed);
+            }
+
+            let is_array = acc.array_ranges.is_empty()
+                && matches!(
+                    env.schema.get_by_id(acc.attr_id).map(|e| e.attr_type),
+                    Some(
+                        AttributeType::IntArray
+                            | AttributeType::UintArray
+                            | AttributeType::StringArray
+                    )
+                );
+            let collect_elems = !acc.array_ranges.is_empty() || is_array;
+
+            for ri in col_rows {
+                let row = sorted_rows[ri];
+                let Some(Some(view)) = block_views.get(&(row.seg(), row.block_idx())) else {
+                    continue;
+                };
+                let slot = row.slot();
+                if !view.is_present(slot) {
+                    continue;
+                }
+                acc.present += 1;
+                if !collect_elems {
                     if acc.need_values {
-                        elems.sort_unstable();
-                        elems.dedup();
-                        for e in &elems {
-                            bump(&mut acc.values, e, 1);
+                        view.for_each_encoded_value(slot, &mut key_buf, |enc| {
+                            bump(&mut acc.values, enc, 1);
+                        })?;
+                    }
+                    continue;
+                }
+                elems.clear();
+                view.for_each_encoded_value(slot, &mut key_buf, |enc| {
+                    elems.push(enc.to_vec());
+                })?;
+                for ar in &mut acc.array_ranges {
+                    for (b, r) in ar.ranges.iter().enumerate() {
+                        if elems.iter().any(|e| r.contains(e)) {
+                            ar.counts[b] += 1;
                         }
+                    }
+                }
+                if acc.need_values {
+                    elems.sort_unstable();
+                    elems.dedup();
+                    for e in &elems {
+                        bump(&mut acc.values, e, 1);
                     }
                 }
             }
         }
-        Ok(())
+
+        let fallback_rows: Vec<RowId> = sorted_rows
+            .iter()
+            .zip(need_row_store.iter())
+            .filter_map(|(&r, &need)| need.then_some(r))
+            .collect();
+        if fallback_rows.is_empty() {
+            return Ok(());
+        }
+
+        let reader = RowStoreReader::new(env.storage);
+        reader.read_rows(&fallback_rows, &mut |row, view| {
+            for (ai, acc) in self.accs.iter_mut().enumerate() {
+                if !row_store_attrs[ai] || col_reader.segment_has_columns(row.seg(), acc.attr_id) {
+                    continue;
+                }
+                let Some(field) = view.get_raw_field(acc.attr_id)? else {
+                    continue;
+                };
+                if field.is_null() {
+                    continue;
+                }
+                acc.present += 1;
+                let is_array = !matches!(field, RowFieldRef::Scalar(_));
+                if !is_array {
+                    if acc.need_values {
+                        field.for_each_scalar(|v| {
+                            key_buf.clear();
+                            v.encode_into(&mut key_buf);
+                            bump(&mut acc.values, &key_buf, 1);
+                        })?;
+                    }
+                    continue;
+                }
+                elems.clear();
+                field.for_each_scalar(|v| {
+                    let mut k = Vec::with_capacity(16);
+                    v.encode_into(&mut k);
+                    elems.push(k);
+                })?;
+                for ar in &mut acc.array_ranges {
+                    for (b, r) in ar.ranges.iter().enumerate() {
+                        if elems.iter().any(|e| r.contains(e)) {
+                            ar.counts[b] += 1;
+                        }
+                    }
+                }
+                if acc.need_values {
+                    elems.sort_unstable();
+                    elems.dedup();
+                    for e in &elems {
+                        bump(&mut acc.values, e, 1);
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
-    // ---- Strategy 4: inverted per-leaf mask intersection ---------------------------------
+    // ---- Strategy 4: per-segment posting intersection over `RowSet` ----------------------
 
-    fn accumulate_leaf(
-        &mut self,
-        env: &FacetEnv<'_>,
-        leaf_id: NodeId,
-        mask: &LeafMask,
-    ) -> Result<()> {
-        let words = mask.as_slice().len();
+    fn accumulate_rowset_postings(&mut self, env: &FacetEnv<'_>, pop: &RowSet) -> Result<()> {
+        if self.accs.is_empty() || pop.is_empty() {
+            return Ok(());
+        }
+        let mut key_buf: Vec<u8> = Vec::with_capacity(32);
+        let mut elems: Vec<Vec<u8>> = Vec::new();
         for acc in &mut self.accs {
+            let is_detached = env
+                .schema
+                .get_by_id(acc.attr_id)
+                .is_some_and(|e| e.storage == ColumnStorage::Detached);
+            let col_gen = if is_detached {
+                crate::detached::current_detached_gen(env.storage, acc.attr_id)?
+            } else {
+                0
+            };
+
+            let mut ow_pop_by_seg: HashMap<SegmentId, RoaringBitmap> = HashMap::new();
+            let mut clean_pop_by_seg: HashMap<SegmentId, RoaringBitmap> = HashMap::new();
+            if is_detached {
+                for (seg, ow_bm) in env.storage.all_detached_overwritten(acc.attr_id, col_gen)? {
+                    if let Some(pop_bm) = pop.segment(seg) {
+                        let ow_in_pop = &ow_bm & pop_bm;
+                        if !ow_in_pop.is_empty() {
+                            clean_pop_by_seg.insert(seg, pop_bm - &ow_in_pop);
+                            ow_pop_by_seg.insert(seg, ow_in_pop);
+                        }
+                    }
+                }
+            }
+            let effective_mask = |seg: SegmentId| -> Option<&RoaringBitmap> {
+                if let Some(clean) = clean_pop_by_seg.get(&seg) {
+                    Some(clean)
+                } else {
+                    pop.segment(seg)
+                }
+            };
+
             if acc.need_present {
-                env.storage.visit_leaf_attr_postings(
-                    acc.attr_id,
-                    TAG_PRESENT,
-                    leaf_id,
-                    &[],
-                    |_, posting| {
-                        acc.present +=
-                            LeafPostingView::parse(posting)?.count_and_mask(mask.as_slice())?;
-                        Ok(false)
-                    },
-                )?;
+                let key = encode_present_attr_key(acc.attr_id);
+                if is_detached {
+                    env.storage.visit_detached_postings_for_value(
+                        acc.attr_id,
+                        col_gen,
+                        key[2],
+                        &key[3..],
+                        |seg, bytes| {
+                            let Some(mask) = effective_mask(seg) else {
+                                return Ok(());
+                            };
+                            acc.present += SegPostingView::parse(bytes)?.and_count(mask)?;
+                            Ok(())
+                        },
+                    )?;
+                } else {
+                    env.storage
+                        .visit_attr_postings_for_value(&key, |seg, bytes| {
+                            let Some(pop_bm) = pop.segment(seg) else {
+                                return Ok(());
+                            };
+                            acc.present += SegPostingView::parse(bytes)?.and_count(pop_bm)?;
+                            Ok(())
+                        })?;
+                }
             }
-            if !acc.need_values && acc.array_ranges.is_empty() {
-                continue;
-            }
-            for ar in &mut acc.array_ranges {
-                ar.scratch.clear();
-                ar.scratch
-                    .resize_with(ar.ranges.len(), || LeafMask::empty(words));
-            }
-            let sel = acc.sel.clone();
-            let need_values = acc.need_values;
-            let AttrAcc {
-                values,
-                array_ranges,
-                attr_id,
-                type_tag,
-                ..
-            } = acc;
-            env.storage
-                .visit_leaf_attr_postings(*attr_id, *type_tag, leaf_id, sel.start(), |val, posting| {
+
+            if acc.need_values || !acc.array_ranges.is_empty() {
+                for ar in &mut acc.array_ranges {
+                    ar.scratch.clear();
+                }
+                let sel = acc.sel.clone();
+                let need_values = acc.need_values;
+                let AttrAcc {
+                    values,
+                    array_ranges,
+                    attr_id,
+                    type_tag,
+                    ..
+                } = acc;
+                let visit_posting = |val: &[u8], seg: SegmentId, bytes: &[u8]| -> Result<bool> {
                     if sel.past_end(val) {
                         return Ok(false);
                     }
-                    let view = LeafPostingView::parse(posting)?;
+                    let Some(mask) = effective_mask(seg) else {
+                        return Ok(true);
+                    };
+                    let view = SegPostingView::parse(bytes)?;
                     if need_values {
-                        let c = view.count_and_mask(mask.as_slice())?;
+                        let c = view.and_count(mask)?;
                         if c > 0 {
                             bump(values, val, c);
                         }
                     }
                     for ar in array_ranges.iter_mut() {
+                        let n_buckets = ar.ranges.len();
                         for (b, r) in ar.ranges.iter().enumerate() {
                             if r.contains(val) {
-                                view.or_into_words(ar.scratch[b].as_mut_slice())?;
+                                let sb = ar
+                                    .scratch
+                                    .entry(seg)
+                                    .or_insert_with(|| vec![RoaringBitmap::new(); n_buckets]);
+                                view.or_into_masked(mask, &mut sb[b])?;
                             }
                         }
                     }
                     Ok(true)
-                })?;
-            for ar in &mut acc.array_ranges {
-                for (b, scratch) in ar.scratch.iter().enumerate() {
-                    ar.counts[b] += scratch.and_count(mask);
+                };
+                if is_detached {
+                    env.storage.visit_detached_postings_range(
+                        *attr_id,
+                        col_gen,
+                        *type_tag,
+                        sel.start(),
+                        visit_posting,
+                    )?;
+                } else {
+                    env.storage.visit_attr_postings_range(
+                        *attr_id,
+                        *type_tag,
+                        sel.start(),
+                        visit_posting,
+                    )?;
+                }
+                for ar in &mut acc.array_ranges {
+                    for seg_buckets in ar.scratch.values() {
+                        for (b, bm) in seg_buckets.iter().enumerate() {
+                            ar.counts[b] += bm.len();
+                        }
+                    }
+                }
+            }
+
+            // Re-evaluate overwritten rows in `pop` directly from `cf_detached`.
+            if !ow_pop_by_seg.is_empty() {
+                let mut ow_keys: Vec<(AttrId, u32, SegmentId, u32)> = Vec::new();
+                let mut seg_blocks: Vec<(SegmentId, u32, Vec<u8>)> = Vec::new();
+                let mut seg_list: Vec<(SegmentId, RoaringBitmap)> = ow_pop_by_seg.into_iter().collect();
+                seg_list.sort_unstable_by_key(|(s, _)| *s);
+                for (seg, bm) in seg_list {
+                    for local in bm.iter() {
+                        let blk = local >> 8;
+                        let slot = (local & 0xFF) as u8;
+                        if let Some(last) = seg_blocks.last_mut()
+                            && last.0 == seg
+                            && last.1 == blk
+                        {
+                            last.2.push(slot);
+                        } else {
+                            seg_blocks.push((seg, blk, vec![slot]));
+                            ow_keys.push((acc.attr_id, col_gen, seg, blk));
+                        }
+                    }
+                }
+                let slices = env
+                    .storage
+                    .multi_get_detached_blocks_pinned(&ow_keys, true)?;
+                let is_array = acc.array_ranges.is_empty()
+                    && matches!(
+                        env.schema.get_by_id(acc.attr_id).map(|e| e.attr_type),
+                        Some(
+                            AttributeType::IntArray
+                                | AttributeType::UintArray
+                                | AttributeType::StringArray
+                        )
+                    );
+                let collect_elems = !acc.array_ranges.is_empty() || is_array;
+                for ((_, _, slots), opt_slice) in seg_blocks.iter().zip(slices.iter()) {
+                    let Some(slice) = opt_slice.as_ref() else {
+                        continue;
+                    };
+                    let view = ColumnBlockView::parse(slice)?;
+                    for &slot in slots {
+                        if !view.is_present(slot) {
+                            continue;
+                        }
+                        if acc.need_present {
+                            acc.present += 1;
+                        }
+                        if !acc.need_values && acc.array_ranges.is_empty() {
+                            continue;
+                        }
+                        if !collect_elems {
+                            if acc.need_values {
+                                view.for_each_encoded_value(slot, &mut key_buf, |enc| {
+                                    bump(&mut acc.values, enc, 1);
+                                })?;
+                            }
+                            continue;
+                        }
+                        elems.clear();
+                        view.for_each_encoded_value(slot, &mut key_buf, |enc| {
+                            elems.push(enc.to_vec());
+                        })?;
+                        for ar in &mut acc.array_ranges {
+                            for (b, r) in ar.ranges.iter().enumerate() {
+                                if elems.iter().any(|e| r.contains(e)) {
+                                    ar.counts[b] += 1;
+                                }
+                            }
+                        }
+                        if acc.need_values {
+                            elems.sort_unstable();
+                            elems.dedup();
+                            for e in &elems {
+                                bump(&mut acc.values, e, 1);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -523,7 +769,6 @@ impl AttrAccs {
         total: u64,
         out: &mut [Option<FacetResult>],
     ) -> Result<()> {
-        // Sorted (encoded_value, count) lists, built once per attribute.
         let sorted: Vec<Vec<(&[u8], u64)>> = self
             .accs
             .iter()
@@ -567,7 +812,7 @@ fn bump(map: &mut HashMap<Vec<u8>, u64>, key: &[u8], by: u64) {
     }
 }
 
-fn encode_ranges(ranges: &[izzydb_core::facet::FacetRange]) -> Result<Vec<EncRange>> {
+fn encode_ranges(ranges: &[FacetRange]) -> Result<Vec<EncRange>> {
     ranges
         .iter()
         .map(|r| {
@@ -646,7 +891,6 @@ fn finalize_facet(
                 .collect();
             let total_values = kept.len() as u64;
             match sort {
-                // `kept` is already ascending by encoded value (== value order).
                 FacetSort::ValueAsc => {}
                 FacetSort::ValueDesc => kept.reverse(),
                 FacetSort::CountDesc => kept.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0))),
@@ -756,7 +1000,6 @@ fn finalize_facet(
 // Strategy dispatch
 // ---------------------------------------------------------------------------------------------
 
-/// If `filter` is a pure complement `Not(inner)` / `NotEq` / `NotIn`, return the positive `inner`.
 fn complement_inner(filter: &Filter) -> Option<Filter> {
     match filter {
         Filter::Not(inner) => Some((**inner).clone()),
@@ -767,15 +1010,20 @@ fn complement_inner(filter: &Filter) -> Option<Filter> {
     }
 }
 
-/// Evaluate one `FacetGroup` (all `idxs` share `filter`) writing results into `out`.
-/// Returns the group's population size.
+fn filter_has_complement_or_null(filter: &Filter) -> bool {
+    match filter {
+        Filter::Not(_) | Filter::NotEq(_, _) | Filter::NotIn(_, _) | Filter::IsNull(_) => true,
+        Filter::And(ch) | Filter::Or(ch) => ch.iter().any(filter_has_complement_or_null),
+        _ => false,
+    }
+}
+
 fn eval_group(
     env: &FacetEnv<'_>,
     specs: &[FacetSpec],
     idxs: &[usize],
     filter: Option<&Filter>,
-    rank_bm: Option<&RoaringBitmap>,
-    shared_prepared: Option<&PreparedFilter>,
+    rank_bm: Option<&RowSet>,
     out: &mut [Option<FacetResult>],
 ) -> Result<u64> {
     let mut accs = AttrAccs::build(env, specs, idxs)?;
@@ -784,11 +1032,12 @@ fn eval_group(
         Ok(total)
     };
 
-    if env.num_vectors() == 0 {
+    let live_rows = env.total_live_rows();
+    if live_rows == 0 {
         return finish(&mut accs, 0, out);
     }
-    if let Some(bm) = rank_bm
-        && bm.is_empty()
+    if let Some(rs) = rank_bm
+        && rs.is_empty()
     {
         return finish(&mut accs, 0, out);
     }
@@ -797,191 +1046,116 @@ fn eval_group(
     if filter.is_none() && rank_bm.is_none() && !accs.has_array_ranges() {
         trace_strategy("global");
         accs.load_global_counts(env)?;
-        return finish(&mut accs, env.num_vectors(), out);
+        return finish(&mut accs, live_rows, out);
     }
 
-    // Shortcut: a small BM25 match set with no attribute filter resolves straight to doc ids.
+    // Shortcut: small BM25 match set with no attribute filter.
     if filter.is_none()
-        && let Some(bm) = rank_bm
-        && bm.len() as usize <= FORWARD_PASS_MAX_DOCS
+        && let Some(rs) = rank_bm
+        && rs.len() as usize <= FORWARD_PASS_MAX_DOCS
     {
-        let fts_ids: Vec<_> = bm.iter().collect();
-        let mut docs: Vec<DocId> = env
-            .storage
-            .multi_get_doc_ids_from_fts(&fts_ids)?
-            .into_iter()
-            .flatten()
-            .collect();
-        docs.sort_unstable();
-        docs.dedup();
+        let rows: Vec<RowId> = rs.iter().collect();
         trace_strategy("docs");
-        accs.accumulate_docs(env, &docs)?;
-        return finish(&mut accs, docs.len() as u64, out);
+        accs.accumulate_rows(env, &rows)?;
+        return finish(&mut accs, rows.len() as u64, out);
     }
 
     // Strategy 2: complement of a selective positive filter against global counts.
     if rank_bm.is_none()
         && !accs.has_array_ranges()
         && let Some(inner) = filter.and_then(complement_inner)
-        && let Some(inner_docs) = resolve_small_docs(env, &inner)?
     {
-        trace_strategy("complement");
-        let mut inner_accs = AttrAccs::build(env, specs, idxs)?;
-        inner_accs.accumulate_docs(env, &inner_docs)?;
-        accs.load_global_counts(env)?;
-        for (acc, sub) in accs.accs.iter_mut().zip(&inner_accs.accs) {
-            for (k, &c) in &sub.values {
-                let slot = acc.values.get_mut(k.as_slice()).ok_or_else(|| {
-                    TreeError::InvariantViolation(format!(
-                        "complement facet: value {k:?} missing from global counts"
-                    ))
-                })?;
-                *slot = slot.checked_sub(c).ok_or_else(|| {
-                    TreeError::InvariantViolation(
-                        "complement facet: inner count exceeds global count".into(),
-                    )
-                })?;
-            }
-            // Global presence is only loaded when some facet needs `missing_count`.
-            if acc.need_present {
-                acc.present = acc.present.checked_sub(sub.present).ok_or_else(|| {
-                    TreeError::InvariantViolation(
-                        "complement facet: inner presence exceeds global presence".into(),
-                    )
-                })?;
-            }
-        }
-        let total = env.num_vectors().saturating_sub(inner_docs.len() as u64);
-        return finish(&mut accs, total, out);
-    }
-
-    // General path: resolve the population via a prepared filter.
-    let owned;
-    let prepared: &PreparedFilter = match shared_prepared {
-        Some(p) => p,
-        None => {
-            owned = env.attr_index.prepare_filter_with_fts_and_rank_bm(
-                env.storage,
-                env.schema,
-                filter,
-                Some(env.fts_index),
-                rank_bm,
-            )?;
-            &owned
-        }
-    };
-    if prepared.cluster_candidates.is_empty() {
-        return finish(&mut accs, 0, out);
-    }
-    let leaf_ids: Vec<NodeId> = match &prepared.cluster_candidates {
-        ClusterCandidates::Subset(bm) => bm.iter().collect(),
-        ClusterCandidates::All => env.all_leaf_ids(),
-    };
-
-    // Strategy 3 when the population is small and cheap to resolve.
-    if matches!(prepared.cluster_candidates, ClusterCandidates::Subset(_))
-        && leaf_ids.len() <= SMALL_CANDIDATE_LEAVES
-    {
-        let mut docs = Vec::new();
-        collect_matching_doc_ids_in_leaves(
+        let mut trace = FilterPlanTrace::default();
+        let inner_plan = filter_plan::plan_filter_with_trace(
             env.storage,
-            env.attr_index,
-            prepared,
-            &leaf_ids,
-            env.config,
-            env.quantizer,
-            &mut docs,
+            env.schema,
+            &inner,
+            env.fts_index,
+            &mut trace,
         )?;
-        docs.sort_unstable();
-        docs.dedup();
-        if docs.len() <= FORWARD_PASS_MAX_DOCS {
-            trace_strategy("docs");
-            accs.accumulate_docs(env, &docs)?;
-            return finish(&mut accs, docs.len() as u64, out);
-        }
-    }
-
-    // Strategy 4: per-leaf mask intersection over inverted postings.
-    let total = run_leaf_masks(env, prepared, &leaf_ids, &mut accs)?;
-    finish(&mut accs, total, out)
-}
-
-/// Resolve `inner`'s matching docs when it is cheap (few candidate leaves, few docs).
-fn resolve_small_docs(env: &FacetEnv<'_>, inner: &Filter) -> Result<Option<Vec<DocId>>> {
-    let prepared = env.attr_index.prepare_filter_with_fts(
-        env.storage,
-        env.schema,
-        inner,
-        Some(env.fts_index),
-    )?;
-    let leaf_ids: Vec<NodeId> = match &prepared.cluster_candidates {
-        ClusterCandidates::Subset(bm) if bm.is_empty() => return Ok(Some(Vec::new())),
-        ClusterCandidates::Subset(bm) if bm.len() as usize <= SMALL_CANDIDATE_LEAVES => {
-            bm.iter().collect()
-        }
-        _ => return Ok(None),
-    };
-    let mut docs = Vec::new();
-    collect_matching_doc_ids_in_leaves(
-        env.storage,
-        env.attr_index,
-        &prepared,
-        &leaf_ids,
-        env.config,
-        env.quantizer,
-        &mut docs,
-    )?;
-    docs.sort_unstable();
-    docs.dedup();
-    Ok((docs.len() <= FORWARD_PASS_MAX_DOCS).then_some(docs))
-}
-
-/// Strategy 4: evaluate per-leaf masks once and fold every facet attribute through them.
-fn run_leaf_masks(
-    env: &FacetEnv<'_>,
-    prepared: &PreparedFilter,
-    leaf_ids: &[NodeId],
-    accs: &mut AttrAccs,
-) -> Result<u64> {
-    let mut total = 0u64;
-    let no_views = !prepared.needs_live_mask();
-    trace_strategy(if no_views {
-        "leaf_masks_no_views"
-    } else {
-        "leaf_masks_views"
-    });
-    let word_count = env.config.max_leaf_size.div_ceil(64);
-    for chunk in leaf_ids.chunks(LEAF_CHUNK) {
-        let masks: Vec<LeafMask> = if no_views {
-            env.attr_index
-                .eval_leaves_masks_no_views(env.storage, prepared, chunk, word_count)?
-        } else {
-            let slices = env.storage.multi_get_leaf_nodes_pinned(chunk)?;
-            let views = parse_leaf_views(chunk, &slices, env.config, env.quantizer)?;
-            let pairs: Vec<_> = chunk
-                .iter()
-                .copied()
-                .zip(views.iter().map(|v| v.as_ref()))
-                .collect();
-            let mut masks = env
-                .attr_index
-                .eval_leaves_masks(env.storage, prepared, &pairs)?;
-            for (view, mask) in views.iter().zip(masks.iter_mut()) {
-                if let Some(view) = view
-                    && view.has_tombstones()
-                {
-                    mask.and_live_mask_bytes(view.live_mask_bytes);
+        let small_inner = match inner_plan {
+            FilterPlan::Empty => Some(RowSet::empty()),
+            FilterPlan::Materialized(rs) if rs.len() as usize <= FORWARD_PASS_MAX_DOCS => Some(rs),
+            FilterPlan::Lazy {
+                residual,
+                seed: Some(s),
+            } if s.len() as usize <= FORWARD_PASS_MAX_DOCS => {
+                let snap = env.storage.segment_snapshot();
+                let rs = filter_plan::materialize_lazy(
+                    env.storage,
+                    env.schema,
+                    env.fts_index,
+                    &snap,
+                    &residual,
+                    Some(&s),
+                )?;
+                (rs.len() as usize <= FORWARD_PASS_MAX_DOCS).then_some(rs)
+            }
+            _ => None,
+        };
+        if let Some(inner_rs) = small_inner {
+            let inner_rows: Vec<RowId> = inner_rs.iter().collect();
+            trace_strategy("complement");
+            let mut inner_accs = AttrAccs::build(env, specs, idxs)?;
+            inner_accs.accumulate_rows(env, &inner_rows)?;
+            accs.load_global_counts(env)?;
+            for (acc, sub) in accs.accs.iter_mut().zip(&inner_accs.accs) {
+                for (k, &c) in &sub.values {
+                    let slot = acc.values.get_mut(k.as_slice()).ok_or_else(|| {
+                        TreeError::InvariantViolation(format!(
+                            "complement facet: value {k:?} missing from global counts"
+                        ))
+                    })?;
+                    *slot = slot.checked_sub(c).ok_or_else(|| {
+                        TreeError::InvariantViolation(
+                            "complement facet: inner count exceeds global count".into(),
+                        )
+                    })?;
+                }
+                if acc.need_present {
+                    acc.present = acc.present.checked_sub(sub.present).ok_or_else(|| {
+                        TreeError::InvariantViolation(
+                            "complement facet: inner presence exceeds global presence".into(),
+                        )
+                    })?;
                 }
             }
-            masks
-        };
-        for (&leaf_id, mask) in chunk.iter().zip(masks.iter()) {
-            if mask.is_empty() {
-                continue;
-            }
-            total += mask.count_ones();
-            accs.accumulate_leaf(env, leaf_id, mask)?;
+            let total = live_rows.saturating_sub(inner_rows.len() as u64);
+            return finish(&mut accs, total, out);
         }
     }
-    Ok(total)
+
+    // General path: materialize the group's exact live `RowSet`.
+    let snap = env.storage.segment_snapshot();
+    let pop_rs = match (filter, rank_bm) {
+        (Some(f), Some(bm)) => {
+            let f_rs =
+                filter_plan::materialize_filter(env.storage, env.schema, f, env.fts_index)?;
+            f_rs.and(bm)
+        }
+        (Some(f), None) => {
+            filter_plan::materialize_filter(env.storage, env.schema, f, env.fts_index)?
+        }
+        (None, Some(bm)) => bm.clone().and_live(&*snap),
+        (None, None) => RowSet::from_all_live(&*snap),
+    };
+
+    if pop_rs.is_empty() {
+        return finish(&mut accs, 0, out);
+    }
+
+    if pop_rs.len() as usize <= FORWARD_PASS_MAX_DOCS {
+        let rows: Vec<RowId> = pop_rs.iter().collect();
+        trace_strategy("docs");
+        accs.accumulate_rows(env, &rows)?;
+        return finish(&mut accs, rows.len() as u64, out);
+    }
+
+    if filter.is_some_and(filter_has_complement_or_null) {
+        trace_strategy("leaf_masks_views");
+    } else {
+        trace_strategy("leaf_masks_no_views");
+    }
+    accs.accumulate_rowset_postings(env, &pop_rs)?;
+    finish(&mut accs, pop_rs.len(), out)
 }

@@ -1,51 +1,54 @@
 # Index Path
 
-This document describes how `Collection` coordinates `ClusteringTree`, the forward document store (`cf_docs` + `cf_vectors`), and `AttributeIndex` (`cf_attr_clusters` + `cf_attr_postings` + attribute zones in `default`) on upserts, deletes, splits, merges, and SPFresh LIRE rounds.
+This document describes how `Collection` coordinates `SegmentStore`, `AnnIndex`, `AttributeIndex`, `FtsIndex`, and detached columns during live mutations (`upsert`, `patch`, `delete`) and background maintenance (`seal`, `compact`, `vacuum_ann`).
 
-## 1. Architecture & Shared RocksDB Layout
+Implementation sources:
+- Top-level write coordinator: [`crates/izzydb/src/collection.rs`](../../crates/izzydb/src/collection.rs)
+- Append-only segment allocator & `RowIndexHook`: [`crates/izzydb/src/segments.rs`](../../crates/izzydb/src/segments.rs)
+- Global ANN tree over `RowId`s: [`crates/izzydb/src/tree.rs`](../../crates/izzydb/src/tree.rs)
+- Value-major segment attribute index: [`crates/izzydb/src/attr_index.rs`](../../crates/izzydb/src/attr_index.rs)
+- Segment-scoped FTS index: [`crates/izzydb/src/fts_index.rs`](../../crates/izzydb/src/fts_index.rs)
 
-`Collection` ([`crates/izzydb/src/collection.rs`](../../crates/izzydb/src/collection.rs)) owns a shared `Arc<Storage>` ([`crates/izzydb-storage/src/storage.rs`](../../crates/izzydb-storage/src/storage.rs)) and coordinates:
+*(For offline compaction and forwarding details, see [`segments-and-compaction.md`](segments-and-compaction.md); for detached columns, see [`detached-columns.md`](detached-columns.md).)*
 
-1. **Document Store:** `cf_docs` (v2 offset-indexed forward `Attributes`) and `cf_vectors` (`[f32; dim]` LE).
-2. **`ClusteringTree`** ([`crates/izzydb/src/tree.rs`](../../crates/izzydb/src/tree.rs)): manages internal nodes in `default`, `cf_leaf_entries` (slot-indexed `PackedLeafNode` with `live_mask`, precomputed `code_popcounts`, and 8-wide SIMD-tiled RaBitQ codes), `cf_doc_loc` (`leaf_id || local_id || fts_doc_id` — 12 B), and in-memory `internal_cache` + `leaf_parent` maps.
-3. **`AttributeIndex`** ([`crates/izzydb/src/attr_index.rs`](../../crates/izzydb/src/attr_index.rs)): maintains cluster-level `RoaringBitmap<NodeId>`s in `cf_attr_clusters`, cluster-first `LeafPosting` slot sets in `cf_attr_postings`, and cached per-leaf `(min, max)` bounds (`AttrZoneMap`) in `default`.
+---
 
-All mutations in an operation execute inside a single `TxContext` overlay (`dirty_internal`, `dirty_leaf`, `dirty_vectors`, `dirty_doc_pos`, `dirty_fts_doc_map`, `dirty_docs`, `dirty_attr_clusters`, `dirty_attr_postings`, and dirty FTS maps) and commit atomically in one `rocksdb::WriteBatch`.
+## 1. Architecture & Write Hooks
 
-## 2. Slot-Indexed Per-Leaf `LocalId` Lifecycle
+`Collection` owns `Arc<Storage>` and executes every mutation inside a single `TxContext` committed as one atomic `rocksdb::WriteBatch`:
 
-Because `PackedLeafNode` is **slot-indexed (`local_id == slot`)** and tracks occupancy via `live_mask: Vec<u64>`, entries keep their slot across normal inserts and deletes without a separate `local_ids` array:
+1. **`SegmentStore`:** Appends new rows to `Manifest.open_segment` (`RowId = (seg, local)`), writes `cf_rows` (`RowView` v3), `cf_id_map[doc_id] = row_id`, `cf_row_doc_ids`, and optional `cf_vectors[row_id]`. Seals segments at `SegmentConfig.seal_rows` (building `cf_columns` unless `defer_column_build = true`).
+2. **`AttributeIndex`** (`RowIndexHook`): Inserts segment-scoped `SegPosting` entries (`cf_attr_postings`), updates live `default[0x06]` counts, and widens `default[0x12]` per-segment zone maps. On delete/replace, decrements `0x06` only (`cf_attr_postings` and zones are never shrunk in place).
+3. **`FtsIndex`** (`RowIndexHook`): Analyzes FTS-enabled attributes directly into `(seg, block)`-keyed `cf_fts_postings` / `cf_fts_skips` / `cf_fts_positions` / `default[0x05]` doc lens. On delete/replace, decrements `TermRecord.doc_freq` and `FtsMeta` stats without touching sealed posting blocks.
+4. **`AnnIndex` (`ClusteringTree`, when `has_vectors`):** Inserts new `(RowId, quantized_code)` entries into `cf_leaf_entries` and updates internal nodes (`default[0x02]`). Stale entries left behind by deleted/replaced rows increment `AnnMeta.stale_rows` and are cleaned up opportunistically on leaf split/re-encode or incrementally via `vacuum_ann`.
 
-- **Normal leaf insert:** `alloc_slot` reuses the lowest dead `0` bit in `live_mask` when `live_count < slot_cap`, or appends at `slot_cap` (`slot_cap += 1`). Existing live slots do not move, so only the newly inserted document updates `AttributeIndex` and `FtsRevBlock`.
-- **Normal leaf delete:** clears the bit in `live_mask` and trims any trailing dead slots (`slot_cap`), leaving all lower surviving slots unchanged.
-- **Leaf compaction (`needs_leaf_compaction`):** triggers when `slot_cap > max_leaf_size` or sparse deletes leave `slot_cap > 32 && live_count * 2 <= slot_cap`, re-packing surviving slots to `0..n` and updating `AttributeIndex` + `FtsRevBlock` via `ClusterDelta`.
-- **Split, merge, redistribution, and LIRE:** re-pack surviving entries compactly to `0..n` via `PackedLeafNode::reset_and_encode` (preserving `fts_doc_id` in `cf_doc_loc` via `tx.put_doc_pos`) and emit `ClusterDelta { removed, added }` so `AttributeIndex::apply_cluster_delta` atomically updates affected postings in `cf_attr_postings`, cluster summaries in `cf_attr_clusters`, and attribute zones in `default`.
+---
 
-## 3. Upsert & Patch Flows (`Collection::upsert`, `patch`, `patch_batch`, `update_by_filter`)
+## 2. Copy-on-Write (`upsert`, `patch`, `delete`)
 
-1. **Validation & encoding:**
-   - Validates `attributes` (or `DocumentPatch::attributes`) against `CollectionSchema` (`self.schema.validate_attributes`).
-   - Validates and prepares `embedding` (when provided) via `prepare_vector` (L2-normalizing when `metric == Cosine`).
-   - Merges patched attributes (`AttributeValue::Null` clears an attribute; omitted attributes are preserved) and encodes v2 forward attributes with an `AttrId`-sorted offset directory into `cf_docs` (`encode_attributes`).
-2. **Existing document fast paths (when `id` already exists):**
-   - **Zero-touch vector fast path (`patch.embedding` is `None`, or `upsert` vector is bit-identical to `cf_vectors`):** skips loading or writing `PackedLeafNode`, centroids, RaBitQ codes, and `cf_vectors`, and diffs `AttributeIndex` in place at `(old_loc.leaf_id, old_loc.local_id)` via `diff_doc_in_place` / `diff_patched_in_place`.
-   - **In-place same-leaf vector update (`update_vector_in_tx` Case A):** when the new vector routes back to `old_loc.leaf_id`, updates `cf_vectors`, recomputes centroid / RaBitQ codes (`encode_into_with_popcnt` on the fast path) while preserving `old_loc.local_id`, propagates centroid upward if drifted, and diffs `AttributeIndex` in place—avoiding spurious `handle_underflow` merges.
-   - **Cross-leaf vector move (`update_vector_in_tx` Case B):** runs `remove_existing_in_tx` then `insert_in_tx` in the same `TxContext` (preserving any existing `fts_doc_id` across `cf_doc_loc` reconciliation), removing old `AttributeIndex` keys and applying `rem_delta` before updating `cf_docs`, applying `ins_delta`, and inserting new keys at `new_loc`, followed by LIRE if splits occurred.
-3. **New document insert & route (`insert_in_tx`):**
-   - Routes via `search::route_to_leaf_in_tx` (reading through `tx` overlay).
-   - **Non-overflow (`new_count <= max_leaf_size`):** updates centroid (incremental mean or exact mean on `% 16 == 0`), re-encodes live slots in place when `new_count <= 16 || new_count % 16 == 0 || drifted` (or encodes just the new slot via `encode_into_with_popcnt`), and propagates centroid upward when drift exceeds `centroid_drift_eps`.
-   - **Overflow (`new_count > max_leaf_size`):** calls `split_node` (partitioning via `balanced_two_means`, cascading internal splits upward as needed), returning `(new_loc, ins_delta, Some(split_pair))`.
-4. **Attribute, Zone Map & FTS index update & atomic commit:**
-   - Skips `FtsIndex` completely when no FTS-enabled attribute changed on an existing document.
-   - Applies coalesced `ClusterDelta` (`net_changes`, removals before additions) to `AttributeIndex` via `tx.mutate_attr_posting`, which maintains `cf_attr_clusters` on `empty <-> non-empty` transitions.
-   - `TxContext::commit` atomically updates attribute zones in `default` (recomputing only when a leaf's min/max posting key is deleted; skipping re-writes when bounds did not change) and reconciles `cf_doc_loc` + `FtsRevBlock` in `default`.
-   - Commits `tx` in one `WriteBatch`, then writes through to in-memory `internal_cache`, `leaf_parent`, `attr_zones_cache`, `fts_rev_map_cache`, and `fts_doc_lens_cache`.
-   - `update_by_filter` resolves matching `DocId`s via `Collection::resolve_filter_doc_ids` and applies patches in bounded chunks (`512` docs per `TxContext` commit).
-5. **SPFresh LIRE (`lire::run_lire_with_hook`):**
-   - When split(s) occurred and `enable_lire && root_level > 0`, runs bounded LIRE (`MAX_LIRE_ROUNDS = 4`) and any maintenance splits/underflows. Each step runs inside a `TxContext` with an `on_delta` hook calling `AttributeIndex::apply_cluster_delta` before `tx.commit()`.
+### `upsert(id, embedding, attributes)`
+1. Validates vector (`Some` required when `has_vectors`, rejected or ignored cleanly when vectorless) and `Inline` vs `Detached` attributes against `CollectionSchema`.
+2. Allocates a fresh `new_row` via `SegmentStore::alloc_row`.
+3. If `id` already exists at `old_row`:
+   - Reads `old_row` from `cf_rows` (`RowView`) and runs delete hooks (tombstoning `old_row` in `default[0x10 || old_seg]`, decrementing `0x06` and FTS `doc_freq`, decrementing `0x07` detached counts, incrementing `AnnMeta.stale_rows` if `old_row` had a vector).
+   - `upsert` replaces the whole document (`carry_over = false`): any unmentioned detached column resets to `Null` at `new_row` unless provided in `attributes`.
+4. Writes `cf_rows[new_row]` (`Inline` attrs), `cf_id_map[id] = new_row`, `cf_row_doc_ids`, optional `cf_vectors`, runs `AttributeIndex::on_insert` + `FtsIndex::on_insert`, writes any detached values in `attributes` to `cf_detached` / `cf_detached_postings` / `0x07`, and inserts `new_row` into `AnnIndex` (running SPFresh LIRE rounds if splits occur).
 
-## 4. Delete Flows (`Collection::delete`, `delete_batch`, `delete_by_filter`)
+### `patch(id, patch)` / `patch_batch`
+1. Looks up existing `old_row` via `cf_id_map` (`DocumentNotFound` if missing).
+2. Reads `old_row`'s `RowView` (and old vector from `cf_vectors` when `patch.embedding` is `None` and `has_vectors`).
+3. Merges `patch.attributes` onto old `Inline` attributes, allocates `new_row`, and tombstones `old_row` as above (`carry_over = true`, preserving unmodified detached columns on `new_row`).
+4. **FTS diffing:** if FTS attributes are unchanged, raw FTS token analysis can still follow standard segment row hooks cleanly while inline/vector state moves atomically in `TxContext`.
+5. `patch_batch` validates and applies all patches inside one `TxContext`; `update_by_filter` resolves matching `DocId`s first and applies patches in bounded atomic chunks (`512` docs/commit).
 
-1. **`Collection::delete(id) -> Result<bool>`:** calls `tree::remove_existing_in_tx`, removes `id` from `AttributeIndex` and `FtsIndex`, stages `tx.delete_doc(id)`, applies any underflow/compaction `ClusterDelta`, and commits `tx` atomically. Returns `false` if `id` was absent. (Standalone `ClusteringTree::remove(id) -> Result<bool>` provides vector-only deletion by `DocId`.)
-2. **`Collection::delete_batch(ids) -> Result<u64>`:** deduplicates `ids`, calls `tree::remove_many_in_tx` (updating each affected leaf once before running `handle_underflow` and `needs_leaf_compaction`), batch-fetches `cf_docs` via `multi_get_doc_bytes`, purges `AttributeIndex` and `FtsIndex` before applying `ClusterDelta`, and commits atomically.
-3. **`Collection::delete_by_filter(filter) -> Result<u64>`:** resolves matching `DocId`s via `resolve_filter_doc_ids` and deletes in bounded chunks (`512` docs per `TxContext` commit).
+### `delete(id)` / `delete_batch` / `delete_by_filter`
+- Removes `id` from `cf_id_map`, adds `old_row.local()` to `default[0x10 || old_seg]`, decrements `0x06`, `0x07`, and FTS `doc_freq` / `FtsMeta`, increments `AnnMeta.stale_rows` (when `old_had_vector`), and updates `Manifest.live_rows`.
+- Returns `false` if absent (`delete`), total deleted count (`delete_batch` / `delete_by_filter`).
+
+---
+
+## 3. ANN Tree Maintenance & Forwarding Resolution
+
+- **Slot lifecycle in `PackedLeafNode` v3:** Leaf slots store `row_ids: [RowId; padded_slots]`. On `insert_vector`, any slot whose `RowId` is no longer live (after resolving `Forwarding` segments via `SegmentTableSnapshot::resolve_forwarding`) is immediately reusable before allocating a new slot.
+- **Splits & SPFresh LIRE (`lire::run_lire_with_hook`):** Re-pack surviving slots to `0..n` without touching `AttributeIndex` or `FtsIndex` (because `RowId`s live in segment space, NOT leaf space—eliminating v2's cross-leaf `ClusterDelta` cascade!).
+- **`vacuum_ann(VacuumBudget)`:** Incrementally scans `cf_leaf_entries` from `AnnMeta.vacuum_cursor`, drops stale slots, rewrites `Forwarding` `RowId`s to their compaction target `(T, new_local)`, merges underflowing leaves, and advances `AnnMeta.vacuum_epoch` upon full-pass completion so `Forwarding` segments can be retired.

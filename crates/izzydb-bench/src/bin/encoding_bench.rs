@@ -42,7 +42,8 @@ fn bench_high_dim_ann() {
     let mut tree = izzydb::ClusteringTree::open(dir.path(), tree_cfg).unwrap();
     let t0 = Instant::now();
     for (i, v) in data.iter().enumerate() {
-        tree.add_leaf(i as DocId, v).unwrap();
+        tree.insert_row(izzydb::RowId::new(0, i as izzydb::LocalId), v)
+            .unwrap();
     }
     let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -69,7 +70,7 @@ fn bench_high_dim_ann() {
             let res = tree.search(q, 10, beam).unwrap();
             q_hits += res
                 .iter()
-                .filter(|&&(id, _)| ground_truth[qi].contains(&id))
+                .filter(|&&(row, _)| ground_truth[qi].contains(&(row.local() as DocId)))
                 .count();
         }
         let q_us = sq.elapsed().as_secs_f64() * 1e6 / queries.len() as f64;
@@ -81,7 +82,7 @@ fn bench_high_dim_ann() {
             let res = tree.search_with_rerank(q, 10, beam, 100).unwrap();
             r_hits += res
                 .iter()
-                .filter(|&&(id, _)| ground_truth[qi].contains(&id))
+                .filter(|&&(row, _)| ground_truth[qi].contains(&(row.local() as DocId)))
                 .count();
         }
         let r_us = sr.elapsed().as_secs_f64() * 1e6 / queries.len() as f64;
@@ -128,7 +129,7 @@ fn bench_filtered_and_range() {
         // High-cardinality continuous float: 20,000 distinct values in [0, 1000)
         let cont = rng.random_range(0.0f64..1000.0);
         attrs.insert("cont_score".into(), cont.into());
-        col.upsert(i as DocId, &v, attrs).unwrap();
+        col.upsert(i as DocId, Some(&v), attrs).unwrap();
     }
     let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -243,7 +244,7 @@ fn bench_fts_and_hybrid() {
         attrs.insert("tag".into(), format!("tag_{}", id % 20).into());
         attrs.insert("title".into(), title.into());
         attrs.insert("body".into(), body.into());
-        col.upsert(id, &vec, attrs).unwrap();
+        col.upsert(id, Some(&vec), attrs).unwrap();
     }
     let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
     println!("\n=== 3. FTS, Lazy-Filter BM25, Phrase & Hybrid (n={n}, vocab={vocab_size}, build={build_ms:.1}ms) ===");

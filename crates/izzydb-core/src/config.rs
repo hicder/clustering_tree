@@ -1,69 +1,270 @@
+use std::fmt;
+
 use crate::error::{Result, TreeError};
 
-/// External document identifier.
+/// External document identifier (user primary key).
 pub type DocId = u64;
+
+/// Monotonic segment identifier (never reused).
+pub type SegmentId = u32;
+
+/// Dense, append-only local row identifier within a segment (`< MAX_SEGMENT_ROWS`).
+pub type LocalId = u32;
 
 /// Internal tree node identifier.
 pub type NodeId = u32;
 
-/// Dense per-leaf local identifier assigned to documents in a leaf.
-pub type LocalId = u32;
-
 /// Compact numeric identifier assigned to each attribute in a [`CollectionSchema`](crate::schema::CollectionSchema).
 pub type AttrId = u16;
-
-/// Dense monotonic document identifier used by the FTS inverted index (`block_id = fts_doc_id >> 8`).
-pub type FtsDocId = u32;
 
 /// Unique numeric identifier assigned to each `(AttrId, token)` term in the FTS inverted index.
 pub type TermId = u32;
 
-/// 256-document posting block identifier (`fts_doc_id >> 8`).
-pub type FtsBlockId = u32;
+/// Monotonic generation identifier for detached columns.
+pub type ColumnGen = u32;
 
-/// 256-block skip summary chunk identifier (`block_id >> 8`).
-pub type FtsSkipChunkId = u32;
+/// Universal 256-row block granularity (FTS posting blocks, doc lengths, column blocks, `RowId -> DocId` blocks).
+pub const ROW_BLOCK_SIZE: usize = 256;
 
-/// Number of documents per fixed FTS posting block.
-pub const FTS_BLOCK_SIZE: usize = 256;
+/// Alias for [`ROW_BLOCK_SIZE`] used by FTS block structures.
+pub const FTS_BLOCK_SIZE: usize = ROW_BLOCK_SIZE;
 
-/// Number of posting blocks per FTS skip summary chunk.
+/// Number of 256-row blocks per FTS skip summary chunk.
 pub const FTS_SKIP_CHUNK_SIZE: usize = 256;
 
-/// Extract the skip chunk ID for an [`FtsBlockId`].
-#[inline]
-pub const fn fts_skip_chunk_id(block_id: FtsBlockId) -> FtsSkipChunkId {
-    block_id >> 8
+/// Hard cap on rows per segment (`2^20 = 1,048,576`, at most 4,096 blocks).
+pub const MAX_SEGMENT_ROWS: u32 = 1 << 20;
+
+/// Default row count threshold at which an open segment is sealed (`256 * 256 = 65,536`).
+pub const DEFAULT_SEAL_ROWS: u32 = 65_536;
+
+/// Internal segment-addressed row coordinate: `(segment_id << 32) | local_id`.
+///
+/// Numeric ordering is segment-major (`(segment_id, local_id)` ascending).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct RowId(pub u64);
+
+impl RowId {
+    #[inline]
+    pub const fn new(seg: SegmentId, local: LocalId) -> Self {
+        Self(((seg as u64) << 32) | (local as u64))
+    }
+
+    #[inline]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn seg(self) -> SegmentId {
+        (self.0 >> 32) as SegmentId
+    }
+
+    #[inline]
+    pub const fn local(self) -> LocalId {
+        self.0 as LocalId
+    }
+
+    #[inline]
+    pub const fn block(self) -> RowBlock {
+        RowBlock::new(self.seg(), self.local() >> 8)
+    }
+
+    #[inline]
+    pub const fn block_idx(self) -> u32 {
+        self.local() >> 8
+    }
+
+    #[inline]
+    pub const fn slot(self) -> u8 {
+        (self.local() & 0xFF) as u8
+    }
+
+    #[inline]
+    pub const fn to_be_bytes(self) -> [u8; 8] {
+        self.0.to_be_bytes()
+    }
+
+    #[inline]
+    pub const fn from_be_bytes(bytes: [u8; 8]) -> Self {
+        Self(u64::from_be_bytes(bytes))
+    }
+
+    #[inline]
+    pub const fn to_le_bytes(self) -> [u8; 8] {
+        self.0.to_le_bytes()
+    }
+
+    #[inline]
+    pub const fn from_le_bytes(bytes: [u8; 8]) -> Self {
+        Self(u64::from_le_bytes(bytes))
+    }
 }
 
-/// Extract the intra-chunk block offset (`0..=255`) for an [`FtsBlockId`].
-#[inline]
-pub const fn fts_skip_slot(block_id: FtsBlockId) -> u8 {
-    (block_id & 0xFF) as u8
+impl fmt::Debug for RowId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RowId({}, {})", self.seg(), self.local())
+    }
 }
 
-/// Combine a skip chunk ID and intra-chunk offset into an [`FtsBlockId`].
-#[inline]
-pub const fn make_fts_block_id(chunk_id: FtsSkipChunkId, rel_slot: u8) -> FtsBlockId {
-    (chunk_id << 8) | (rel_slot as u32)
+impl fmt::Display for RowId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.seg(), self.local())
+    }
 }
 
-/// Extract the posting block ID for an [`FtsDocId`].
-#[inline]
-pub const fn fts_block_id(doc_id: FtsDocId) -> FtsBlockId {
-    doc_id >> 8
+/// 256-row block coordinate within a segment: `(segment_id << 32) | block_idx`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct RowBlock(pub u64);
+
+impl RowBlock {
+    #[inline]
+    pub const fn new(seg: SegmentId, block: u32) -> Self {
+        Self(((seg as u64) << 32) | (block as u64))
+    }
+
+    #[inline]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn seg(self) -> SegmentId {
+        (self.0 >> 32) as SegmentId
+    }
+
+    #[inline]
+    pub const fn block(self) -> u32 {
+        self.0 as u32
+    }
+
+    #[inline]
+    pub const fn chunk(self) -> SkipChunk {
+        SkipChunk::new(self.seg(), self.block() >> 8)
+    }
+
+    #[inline]
+    pub const fn chunk_idx(self) -> u32 {
+        self.block() >> 8
+    }
+
+    #[inline]
+    pub const fn rel_block(self) -> u8 {
+        (self.block() & 0xFF) as u8
+    }
+
+    #[inline]
+    pub const fn row(self, slot: u8) -> RowId {
+        RowId::new(self.seg(), (self.block() << 8) | (slot as u32))
+    }
+
+    #[inline]
+    pub const fn to_be_bytes(self) -> [u8; 8] {
+        self.0.to_be_bytes()
+    }
+
+    #[inline]
+    pub const fn from_be_bytes(bytes: [u8; 8]) -> Self {
+        Self(u64::from_be_bytes(bytes))
+    }
 }
 
-/// Extract the intra-block slot (`0..=255`) for an [`FtsDocId`].
-#[inline]
-pub const fn fts_slot(doc_id: FtsDocId) -> u8 {
-    (doc_id & 0xFF) as u8
+impl fmt::Debug for RowBlock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RowBlock({}, {})", self.seg(), self.block())
+    }
 }
 
-/// Combine a block ID and intra-block slot into an [`FtsDocId`].
-#[inline]
-pub const fn make_fts_doc_id(block_id: FtsBlockId, slot: u8) -> FtsDocId {
-    (block_id << 8) | (slot as u32)
+/// 256-block FTS skip chunk coordinate within a segment: `(segment_id << 32) | chunk_idx`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct SkipChunk(pub u64);
+
+impl SkipChunk {
+    #[inline]
+    pub const fn new(seg: SegmentId, chunk: u32) -> Self {
+        Self(((seg as u64) << 32) | (chunk as u64))
+    }
+
+    #[inline]
+    pub const fn seg(self) -> SegmentId {
+        (self.0 >> 32) as SegmentId
+    }
+
+    #[inline]
+    pub const fn chunk(self) -> u32 {
+        self.0 as u32
+    }
+
+    #[inline]
+    pub const fn block(self, rel_block: u8) -> RowBlock {
+        RowBlock::new(self.seg(), (self.chunk() << 8) | (rel_block as u32))
+    }
+
+    #[inline]
+    pub const fn to_be_bytes(self) -> [u8; 8] {
+        self.0.to_be_bytes()
+    }
+
+    #[inline]
+    pub const fn from_be_bytes(bytes: [u8; 8]) -> Self {
+        Self(u64::from_be_bytes(bytes))
+    }
+}
+
+impl fmt::Debug for SkipChunk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SkipChunk({}, {})", self.seg(), self.chunk())
+    }
+}
+
+/// Segment lifecycle configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentConfig {
+    /// Maximum rows appended to an open segment before it is sealed.
+    pub seal_rows: u32,
+    /// If `true`, sealing skips building `cf_columns` inline and defers it to `maintenance()`.
+    pub defer_column_build: bool,
+}
+
+impl Default for SegmentConfig {
+    fn default() -> Self {
+        Self {
+            seal_rows: DEFAULT_SEAL_ROWS,
+            defer_column_build: false,
+        }
+    }
+}
+
+impl SegmentConfig {
+    pub fn new(seal_rows: u32) -> Self {
+        Self {
+            seal_rows,
+            defer_column_build: false,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.seal_rows == 0 || self.seal_rows > MAX_SEGMENT_ROWS {
+            return Err(TreeError::InvalidConfig(format!(
+                "seal_rows must be in 1..={MAX_SEGMENT_ROWS}, got {}",
+                self.seal_rows
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Iterate over each set bit index (`0..=255`) in a 256-bit `[u64; 4]` block mask in ascending order.

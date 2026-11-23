@@ -543,6 +543,64 @@ unsafe fn neon_reduce_f32<const IS_L2: bool, const UNALIGNED_BYTES: bool>(
     sum
 }
 
+/// Evaluate `RankBy::Saturate` across up to 256 contiguous values (`present_mask` bit indicates
+/// whether each slot holds a finite numeric value; absent slots write `missing`).
+#[inline]
+pub fn batch_eval_saturate(
+    vals: &[f64],
+    present_mask: &[u64; 4],
+    midpoint: f64,
+    exponent: f64,
+    missing: f32,
+    out: &mut [f32],
+) {
+    let n = vals.len().min(out.len()).min(256);
+    if exponent == 1.0 {
+        for (i, (&x, dst)) in vals[..n].iter().zip(&mut out[..n]).enumerate() {
+            let present = ((present_mask[i >> 6] >> (i & 63)) & 1) != 0;
+            *dst = if !present {
+                missing
+            } else {
+                crate::rank::eval_saturate(x, midpoint, 1.0)
+            };
+        }
+    } else {
+        for (i, (&x, dst)) in vals[..n].iter().zip(&mut out[..n]).enumerate() {
+            let present = ((present_mask[i >> 6] >> (i & 63)) & 1) != 0;
+            *dst = if !present {
+                missing
+            } else {
+                crate::rank::eval_saturate(x, midpoint, exponent)
+            };
+        }
+    }
+}
+
+/// Evaluate `RankBy::Decay` across up to 256 contiguous values (`present_mask` bit indicates
+/// whether each slot holds a finite numeric value; absent slots write `missing`).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn batch_eval_decay(
+    vals: &[f64],
+    present_mask: &[u64; 4],
+    origin: f64,
+    midpoint: f64,
+    exponent: f64,
+    mode: crate::rank::DecayMode,
+    missing: f32,
+    out: &mut [f32],
+) {
+    let n = vals.len().min(out.len()).min(256);
+    for (i, (&x, dst)) in vals[..n].iter().zip(&mut out[..n]).enumerate() {
+        let present = ((present_mask[i >> 6] >> (i & 63)) & 1) != 0;
+        *dst = if !present {
+            missing
+        } else {
+            crate::rank::eval_decay(x, origin, midpoint, exponent, mode)
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

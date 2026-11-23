@@ -3,8 +3,8 @@
 A document is `(DocId, embedding, attributes)`:
 
 - `DocId` is a `u64` that **you** choose. It is the primary key.
-- `embedding` is `&[f32]` of exactly `dim` finite values (no `NaN`/`Inf`).
-- `attributes` is `Attributes = BTreeMap<String, AttributeValue>`. Every key must be declared in the schema.
+- `embedding` is `Option<&[f32]>` (`Some(&vec)` for vectored collections with `dim` finite values, or `None` for collections created with `CollectionConfig::without_vectors()`).
+- `attributes` is `Attributes = BTreeMap<String, AttributeValue>`. Every key must be declared in the schema (inline or detached).
 
 All write methods are on `Collection` and take `&mut self`. Each call is **atomic** across the vector index, attribute indexes, and full-text index; if it returns `Err`, nothing was written.
 
@@ -28,10 +28,12 @@ The value's variant must match the declared type (`Int` attribute ← `i64`, not
 ## `upsert` — insert or replace
 
 ```rust
-col.upsert(42, &embedding, attrs)?;
+col.upsert(42, Some(&embedding), attrs)?;
+// Vectorless collection:
+// col.upsert(42, None, attrs)?;
 ```
 
-If `42` exists, the document is **fully replaced**: any attribute you leave out of `attrs` becomes missing. Re-upserting an identical vector is cheap (IzzyDB detects that the vector is unchanged and skips re-indexing it).
+Documents append into the active segment (`RowId = (SegmentId, LocalId)`). If `42` already exists, its previous row is **tombstoned** and a new copy-on-write (CoW) row is appended: any inline or detached attribute you omit from `attrs` becomes missing (`Null`). Re-upserting an identical vector still updates the document by appending a new row and marking the old slot stale until `vacuum_ann` / `compact`.
 
 Errors: `DimensionMismatch`, `NonFiniteVector`, `InvalidAttribute`.
 
@@ -39,16 +41,16 @@ Errors: `DimensionMismatch`, `NonFiniteVector`, `InvalidAttribute`.
 
 ```rust
 match col.get(42)? {
-    Some(doc) => println!("{} {:?}", doc.embedding.len(), doc.attributes),
+    Some(doc) => println!("{:?} {:?}", doc.embedding.as_ref().map(|v| v.len()), doc.attributes),
     None => println!("not found"),
 }
 ```
 
-`Document { id, embedding, attributes }`. For `Cosine` collections the returned embedding is the L2-normalized form IzzyDB indexes, not necessarily the exact floats you supplied.
+`Document { id, embedding: Option<Vec<f32>>, attributes }`. For `Cosine` collections the returned embedding is the L2-normalized form IzzyDB indexes, not necessarily the exact floats you supplied.
 
 ## `patch` — partial update
 
-Use `DocumentPatch` when you only want to change some fields. Omitted attributes are preserved.
+Use `DocumentPatch` when you want to change some fields on an existing document. Omitted attributes (both inline and detached) and an omitted embedding (`None`) are **preserved**.
 
 ```rust
 use izzydb::DocumentPatch;
@@ -65,7 +67,7 @@ col.patch(42, DocumentPatch::new().with_embedding(new_embedding))?;
 ```
 
 - Returns `TreeError::DocumentNotFound(id)` if the document does not exist (unlike `upsert`, `patch` never creates).
-- Only the indexes touched by the change are updated, so patching one attribute is cheaper than a full `upsert`.
+- **Copy-on-write note:** Because sealed and open inline rows are append-only, `patch` tombstones the old `RowId` and appends a new CoW row carrying forward omitted fields. For attributes you mutate frequently (counters, popularity, moderation flags) without touching vectors or text, declare them as [Detached Columns](12-detached-columns.md) and update them in place with [`set_detached`](12-detached-columns.md#point-updates-with-set_detached).
 
 ### `patch_batch`
 

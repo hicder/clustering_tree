@@ -59,4 +59,8 @@ pub enum TreeError {
     /// Target document ID was not found in the collection.
     #[error("document {0} not found")]
     DocumentNotFound(DocId),
+
+    /// Operation is not yet supported in the current build phase.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
 }

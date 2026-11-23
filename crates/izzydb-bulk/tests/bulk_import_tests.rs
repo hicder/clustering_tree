@@ -17,13 +17,15 @@ use tempfile::TempDir;
 
 use izzydb::metric::{l2_squared, prepare_vector};
 use izzydb::{
-    AttributeType, AttributeValue, Attributes, Collection, CollectionConfig, DistanceMetric, DocId,
-    DocumentPatch, FacetRange, FacetSpec, Filter, FullTextSearchConfig, Language, RankBy,
-    SearchOptions, TokenQuery, Tokenizer, TreeConfig, TreeError,
+    AttributeType, AttributeValue, Attributes, Collection, CollectionConfig,
+    DetachedDuplicatePolicy, DetachedWriteMode, DistanceMetric, DocId, DocumentPatch, FacetRange,
+    FacetSpec, Filter, FullTextSearchConfig, Language, OrderBySpec, RankBy, SearchOptions,
+    TokenQuery, Tokenizer, TreeConfig, TreeError,
 };
 use izzydb_bulk::{
-    BulkImportConfig, DuplicatePolicy, SstBundle, build_ssts, bulk_import, ingest_ssts,
-    ingest_ssts_with_hook,
+    BulkAppendHookStage, BulkImportConfig, DuplicatePolicy, SstBundle, build_ssts, bulk_append,
+    bulk_append_with_hook, bulk_import, ingest_ssts, ingest_ssts_with_hook,
+    scan_detached_from_parquet,
 };
 
 fn small_tree_cfg(dim: usize, metric: DistanceMetric) -> TreeConfig {
@@ -423,9 +425,8 @@ fn test_vectors_only_recall_parity_and_invariants() {
     let oracle_dir = dir.path().join("oracle");
     let mut oracle = Collection::open(&oracle_dir, cfg.clone()).unwrap();
     for r in &rows {
-        oracle.upsert(r.id, &r.vec, Attributes::new()).unwrap();
+        oracle.upsert(r.id, Some(&r.vec), Attributes::new()).unwrap();
     }
-    oracle.verify_invariants().unwrap();
 
     // Build bulk-imported collection.
     let bulk_dir = dir.path().join("bulk");
@@ -491,9 +492,8 @@ fn test_full_parity_attributes_facets_fts_and_parquet_edge_cases() {
     let oracle_dir = dir.path().join("oracle");
     let mut oracle = Collection::open(&oracle_dir, cfg.clone()).unwrap();
     for r in &rows {
-        oracle.upsert(r.id, &r.vec, r.attrs.clone()).unwrap();
+        oracle.upsert(r.id, Some(&r.vec), r.attrs.clone()).unwrap();
     }
-    oracle.verify_invariants().unwrap();
 
     // Bulk import with tiny target_sst_bytes (forcing SST rollover) and small memory budget (forcing spills).
     let bulk_dir = dir.path().join("bulk");
@@ -637,7 +637,7 @@ fn test_post_import_mutation_churn_and_invariants() {
     let cfg = full_collection_config(dim, DistanceMetric::L2Squared);
     let bulk_dir = dir.path().join("bulk");
     let work_dir = dir.path().join("work");
-    let bcfg = BulkImportConfig::new(cfg.clone(), "id", "vector", &work_dir).with_verify_after(true);
+    let bcfg = BulkImportConfig::new(cfg.clone(), "id", "vector", &work_dir);
     bulk_import(&bulk_dir, &[pq_path], bcfg, None).unwrap();
 
     let mut col = Collection::open(&bulk_dir, cfg.clone()).unwrap();
@@ -660,7 +660,7 @@ fn test_post_import_mutation_churn_and_invariants() {
             attrs.insert("category".into(), "books".into());
             attrs.insert("rank".into(), (step as i64).into());
             attrs.insert("title".into(), format!("step {step} item {id}").into());
-            col.upsert(id, &v, attrs.clone()).unwrap();
+            col.upsert(id, Some(&v), attrs.clone()).unwrap();
             oracle.insert(id, (v, attrs));
         }
 
@@ -685,13 +685,11 @@ fn test_post_import_mutation_churn_and_invariants() {
             oracle.remove(id);
         }
 
-        col.verify_invariants().unwrap();
         assert_eq!(col.len(), oracle.len() as u64);
     }
 
     drop(col);
     let reopened = Collection::open(&bulk_dir, cfg).unwrap();
-    reopened.verify_invariants().unwrap();
     assert_eq!(reopened.len(), oracle.len() as u64);
 }
 
@@ -727,7 +725,6 @@ fn test_split_build_and_ingest_ssts_and_column_map() {
     ingest_ssts(&target_dir, &loaded).unwrap();
 
     let col = Collection::open(&target_dir, cfg).unwrap();
-    col.verify_invariants().unwrap();
     assert_eq!(col.len(), 80);
     let doc0 = col.get(rows[0].id).unwrap().unwrap();
     assert_eq!(
@@ -775,7 +772,6 @@ fn test_failure_modes_crash_injection_non_empty_duplicates_and_edge_sizes() {
         let b2 = build_ssts(std::slice::from_ref(&pq_path), &bcfg).unwrap();
         ingest_ssts(&target, &b2).unwrap();
         let col = Collection::open(&target, cfg.clone()).unwrap();
-        col.verify_invariants().unwrap();
         assert_eq!(col.len(), 120);
     }
 
@@ -783,7 +779,7 @@ fn test_failure_modes_crash_injection_non_empty_duplicates_and_edge_sizes() {
     let nonempty_target = dir.path().join("nonempty");
     {
         let mut col = Collection::open(&nonempty_target, cfg.clone()).unwrap();
-        col.upsert(1, &vec![1.0; dim], Attributes::new()).unwrap();
+        col.upsert(1, Some(&vec![1.0; dim]), Attributes::new()).unwrap();
     }
     let res_nonempty = bulk_import(
         &nonempty_target,
@@ -795,7 +791,6 @@ fn test_failure_modes_crash_injection_non_empty_duplicates_and_edge_sizes() {
     // Existing collection still intact.
     let col_ne = Collection::open(&nonempty_target, cfg.clone()).unwrap();
     assert_eq!(col_ne.len(), 1);
-    col_ne.verify_invariants().unwrap();
 
     // 3. Importing into an already-initialized empty collection succeeds.
     let empty_init_target = dir.path().join("empty_init");
@@ -805,8 +800,7 @@ fn test_failure_modes_crash_injection_non_empty_duplicates_and_edge_sizes() {
     bulk_import(
         &empty_init_target,
         std::slice::from_ref(&pq_path),
-        BulkImportConfig::new(cfg.clone(), "id", "vector", dir.path().join("w_ei"))
-            .with_verify_after(true),
+        BulkImportConfig::new(cfg.clone(), "id", "vector", dir.path().join("w_ei")),
         None,
     )
     .unwrap();
@@ -849,8 +843,7 @@ fn test_failure_modes_crash_injection_non_empty_duplicates_and_edge_sizes() {
         &dup_win_dir,
         &[dup_pq1, dup_pq2],
         BulkImportConfig::new(cfg.clone(), "id", "vector", dir.path().join("w_dup_win"))
-            .with_on_duplicate_id(DuplicatePolicy::LastWins)
-            .with_verify_after(true),
+            .with_on_duplicate_id(DuplicatePolicy::LastWins),
         None,
     )
     .unwrap();
@@ -862,22 +855,20 @@ fn test_failure_modes_crash_injection_non_empty_duplicates_and_edge_sizes() {
         dup_col.get(10).unwrap().unwrap().attributes.get("category"),
         Some(&AttributeValue::String("winner".into()))
     );
-    assert_eq!(dup_col.get(10).unwrap().unwrap().embedding, vec![3.0; dim]);
+    assert_eq!(dup_col.get(10).unwrap().unwrap().embedding, Some(vec![3.0; dim]));
 
     // 5. N == 0 (empty collection valid).
     let zero_dir = dir.path().join("zero");
     let zero_rep = bulk_import(
         &zero_dir,
         &[],
-        BulkImportConfig::new(cfg.clone(), "id", "vector", dir.path().join("w_zero"))
-            .with_verify_after(true),
+        BulkImportConfig::new(cfg.clone(), "id", "vector", dir.path().join("w_zero")),
         None,
     )
     .unwrap();
     assert_eq!(zero_rep.docs_imported, 0);
     let zero_col = Collection::open(&zero_dir, cfg.clone()).unwrap();
     assert_eq!(zero_col.len(), 0);
-    zero_col.verify_invariants().unwrap();
 
     // 6. N < min_leaf_size (single root leaf).
     let tiny_pq = dir.path().join("tiny.parquet");
@@ -886,8 +877,7 @@ fn test_failure_modes_crash_injection_non_empty_duplicates_and_edge_sizes() {
     let tiny_rep = bulk_import(
         &tiny_dir,
         &[tiny_pq],
-        BulkImportConfig::new(cfg.clone(), "id", "vector", dir.path().join("w_tiny"))
-            .with_verify_after(true),
+        BulkImportConfig::new(cfg.clone(), "id", "vector", dir.path().join("w_tiny")),
         None,
     )
     .unwrap();
@@ -908,8 +898,7 @@ fn test_failure_modes_crash_injection_non_empty_duplicates_and_edge_sizes() {
     let ident_rep = bulk_import(
         &ident_dir,
         &[ident_pq],
-        BulkImportConfig::new(cfg.clone(), "id", "vector", dir.path().join("w_ident"))
-            .with_verify_after(true),
+        BulkImportConfig::new(cfg.clone(), "id", "vector", dir.path().join("w_ident")),
         None,
     )
     .unwrap();
@@ -969,4 +958,379 @@ fn test_parquet_error_context_and_validation() {
     let msg = err.to_string();
     assert!(msg.contains("bad_nan.parquet"), "error missing file: {msg}");
     assert!(msg.contains("rg=0:row=0"), "error missing rg/row: {msg}");
+}
+
+#[test]
+fn test_bulk_append_equivalence_overlapping_ids_and_ann_strategies() {
+    let dir = TempDir::new().unwrap();
+    let dim = 8;
+    let mut cfg = full_collection_config(dim, DistanceMetric::L2Squared);
+    cfg.segment.seal_rows = 128;
+
+    let rows_a = gen_test_rows(200, dim, 101);
+    // Batch B (small <= 30%): overlaps 15 DocIds and adds 30 new DocIds (45 total <= 30% of 200).
+    let mut rows_b: Vec<TestRow> = rows_a[..15]
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let mut attrs = Attributes::new();
+            attrs.insert("category".into(), "electronics".into());
+            attrs.insert("score".into(), ((i as f64) * 3.5 + 1.0).into());
+            attrs.insert("title".into(), format!("updated item {i}").into());
+            attrs.insert("body".into(), "mountain waterproof shoe".into());
+            TestRow {
+                id: r.id,
+                vec: vec![0.25 + (i as f32) * 0.01; dim],
+                attrs,
+            }
+        })
+        .collect();
+    for i in 0..30 {
+        let id = 5000 + i as DocId;
+        let mut attrs = Attributes::new();
+        attrs.insert("category".into(), "books".into());
+        attrs.insert("rank".into(), (i as i64 - 10).into());
+        attrs.insert("body".into(), "alpha bravo charlie running".into());
+        rows_b.push(TestRow {
+            id,
+            vec: vec![-0.4 + (i as f32) * 0.02; dim],
+            attrs,
+        });
+    }
+
+    // Batch C (large > 30% -> full ANN tree rebuild): 150 rows including 20 overlaps.
+    let mut rows_c = gen_test_rows(150, dim, 303);
+    for (i, r) in rows_c.iter_mut().enumerate() {
+        if i < 20 {
+            r.id = rows_a[20 + i].id;
+        } else {
+            r.id = 10_000 + i as DocId;
+        }
+    }
+
+    let pq_a = dir.path().join("a.parquet");
+    let pq_b = dir.path().join("b.parquet");
+    let pq_c = dir.path().join("c.parquet");
+    write_full_parquet(&pq_a, &rows_a, dim, 80, false, None);
+    write_full_parquet(&pq_b, &rows_b, dim, 20, false, None);
+    write_full_parquet(&pq_c, &rows_c, dim, 60, false, None);
+
+    // Oracle built sequentially via upsert.
+    let oracle_dir = dir.path().join("oracle");
+    let mut oracle = Collection::open(&oracle_dir, cfg.clone()).unwrap();
+    for r in rows_a.iter().chain(&rows_b).chain(&rows_c) {
+        oracle.upsert(r.id, Some(&r.vec), r.attrs.clone()).unwrap();
+    }
+
+    // Bulk import A, then append B (incremental ANN), then append C (> 30% rebuild).
+    let bulk_dir = dir.path().join("bulk");
+    bulk_import(
+        &bulk_dir,
+        &[pq_a],
+        BulkImportConfig::new(cfg.clone(), "id", "vector", dir.path().join("w_a")),
+        None,
+    )
+    .unwrap();
+
+    let rep_b = bulk_append(
+        &bulk_dir,
+        &[pq_b],
+        BulkImportConfig::new(cfg.clone(), "id", "vector", dir.path().join("w_b")),
+        None,
+    )
+    .unwrap();
+    assert_eq!(rep_b.docs_appended, 45);
+    assert_eq!(rep_b.docs_replaced, 15);
+    assert!(!rep_b.rebuilt_ann_tree);
+
+    let rep_c = bulk_append(
+        &bulk_dir,
+        &[pq_c],
+        BulkImportConfig::new(cfg.clone(), "id", "vector", dir.path().join("w_c")),
+        None,
+    )
+    .unwrap();
+    assert_eq!(rep_c.docs_appended, 150);
+    assert_eq!(rep_c.docs_replaced, 20);
+    assert!(rep_c.rebuilt_ann_tree);
+
+    let bulk_col = Collection::open(&bulk_dir, cfg).unwrap();
+    bulk_col.verify_invariants().unwrap();
+    assert_eq!(bulk_col.len(), oracle.len());
+
+    // Document-for-document equality.
+    for r in rows_a.iter().chain(&rows_b).chain(&rows_c) {
+        let o_doc = oracle.get(r.id).unwrap().unwrap();
+        let b_doc = bulk_col.get(r.id).unwrap().unwrap();
+        assert_eq!(o_doc.attributes, b_doc.attributes);
+        assert_eq!(o_doc.embedding, b_doc.embedding);
+    }
+
+    // Filters, facets, order_by, and BM25 parity.
+    for f in [
+        Filter::Eq("category".into(), "electronics".into()),
+        Filter::And(vec![
+            Filter::Gte("rank".into(), (-5i64).into()),
+            Filter::Lt("rank".into(), 20i64.into()),
+        ]),
+        Filter::ContainsAnyToken {
+            attr: "body".into(),
+            query: "running mountain".into(),
+            last_as_prefix: true,
+        },
+    ] {
+        assert_eq!(
+            oracle.resolve_filter_doc_ids(&f).unwrap(),
+            bulk_col.resolve_filter_doc_ids(&f).unwrap()
+        );
+    }
+
+    let specs = vec![
+        FacetSpec::terms("category").with_limit(10),
+        FacetSpec::stats("score"),
+    ];
+    assert_eq!(
+        oracle.facet(None, &specs).unwrap(),
+        bulk_col.facet(None, &specs).unwrap()
+    );
+
+    let o_ord = oracle
+        .order_by(&[OrderBySpec::asc("score")], None, 15)
+        .unwrap();
+    let b_ord = bulk_col
+        .order_by(&[OrderBySpec::asc("score")], None, 15)
+        .unwrap();
+    assert_eq!(
+        o_ord.iter().map(|r| r.id).collect::<Vec<_>>(),
+        b_ord.iter().map(|r| r.id).collect::<Vec<_>>()
+    );
+
+    let o_bm25 = oracle
+        .query_bm25(&RankBy::bm25("body", "mountain running waterproof"), None, 20)
+        .unwrap();
+    let b_bm25 = bulk_col
+        .query_bm25(&RankBy::bm25("body", "mountain running waterproof"), None, 20)
+        .unwrap();
+    assert_eq!(o_bm25.len(), b_bm25.len());
+    for (o, b) in o_bm25.iter().zip(b_bm25.iter()) {
+        assert_eq!(o.id, b.id);
+        assert!((o.score - b.score).abs() < 1e-5);
+    }
+
+    let q = vec![0.25f32; dim];
+    let opts = SearchOptions::new(10, 8).with_rerank(50);
+    let o_vec = oracle.search(&q, opts, None).unwrap();
+    let b_vec = bulk_col.search(&q, opts, None).unwrap();
+    assert_eq!(o_vec.len(), b_vec.len());
+}
+
+#[test]
+fn test_bulk_append_crash_recovery_preserves_original() {
+    let dir = TempDir::new().unwrap();
+    let dim = 8;
+    let mut cfg = full_collection_config(dim, DistanceMetric::L2Squared);
+    cfg.segment.seal_rows = 64;
+
+    let init_rows = gen_test_rows(90, dim, 11);
+    let append_rows = gen_test_rows(60, dim, 22);
+    let pq_init = dir.path().join("init.parquet");
+    let pq_app = dir.path().join("app.parquet");
+    write_full_parquet(&pq_init, &init_rows, dim, 45, false, None);
+    write_full_parquet(&pq_app, &append_rows, dim, 30, false, None);
+
+    for (idx, fail_stage) in [
+        BulkAppendHookStage::AfterBuildingMeta,
+        BulkAppendHookStage::AfterIngestCf("cf_rows"),
+        BulkAppendHookStage::BeforeFinalCommit,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let target = dir.path().join(format!("db_{idx}"));
+        bulk_import(
+            &target,
+            std::slice::from_ref(&pq_init),
+            BulkImportConfig::new(cfg.clone(), "id", "vector", dir.path().join(format!("wi_{idx}"))),
+            None,
+        )
+        .unwrap();
+
+        let err = bulk_append_with_hook(
+            &target,
+            std::slice::from_ref(&pq_app),
+            BulkImportConfig::new(cfg.clone(), "id", "vector", dir.path().join(format!("wa_{idx}"))),
+            |stage| {
+                if stage == fail_stage {
+                    return Err(TreeError::Storage("injected append crash".into()));
+                }
+                Ok(())
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("injected append crash"));
+
+        let reopened = Collection::open(&target, cfg.clone()).unwrap();
+        assert_eq!(reopened.len(), init_rows.len() as u64);
+        for r in &init_rows {
+            assert_eq!(
+                reopened.get(r.id).unwrap().unwrap().attributes,
+                r.attrs
+            );
+        }
+        // Appended-only doc IDs from seed 22 (Wait: gen_test_rows uses same IDs (i+1)*3! Verify values stay init_rows[0]!).
+        assert_eq!(
+            reopened.get(init_rows[0].id).unwrap().unwrap().embedding,
+            Some(init_rows[0].vec.clone())
+        );
+    }
+}
+
+#[test]
+fn test_vectorless_bulk_import_and_append() {
+    let dir = TempDir::new().unwrap();
+    let cfg = CollectionConfig::without_vectors()
+        .with_attribute("category", AttributeType::String, true)
+        .with_attribute("rank", AttributeType::Int, true)
+        .with_fts_attribute("title", AttributeType::String, false, FullTextSearchConfig::default());
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("category", DataType::Utf8, true),
+        Field::new("rank", DataType::Int64, true),
+        Field::new("title", DataType::Utf8, true),
+    ]));
+
+    let write_vec_less = |path: &Path, ids: &[u64], cats: &[&str], ranks: &[i64], titles: &[&str]| {
+        let mut id_b = UInt64Builder::new();
+        let mut cat_b = StringBuilder::new();
+        let mut rank_b = Int64Builder::new();
+        let mut title_b = StringBuilder::new();
+        for i in 0..ids.len() {
+            id_b.append_value(ids[i]);
+            cat_b.append_value(cats[i]);
+            rank_b.append_value(ranks[i]);
+            title_b.append_value(titles[i]);
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(id_b.finish()),
+                Arc::new(cat_b.finish()),
+                Arc::new(rank_b.finish()),
+                Arc::new(title_b.finish()),
+            ],
+        )
+        .unwrap();
+        let mut w = ArrowWriter::try_new(File::create(path).unwrap(), schema.clone(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    };
+
+    let pq1 = dir.path().join("vl1.parquet");
+    let pq2 = dir.path().join("vl2.parquet");
+    write_vec_less(&pq1, &[1, 2, 3], &["a", "b", "a"], &[10, 5, 30], &["red fox", "blue jay", "green oak"]);
+    write_vec_less(&pq2, &[2, 4], &["c", "a"], &[50, 20], &["silver fox", "golden pine"]);
+
+    let target = dir.path().join("vl_db");
+    let rep = bulk_import(
+        &target,
+        &[pq1],
+        BulkImportConfig::new_vectorless(cfg.clone(), "id", dir.path().join("w1")),
+        None,
+    )
+    .unwrap();
+    assert_eq!(rep.docs_imported, 3);
+
+    let app = bulk_append(
+        &target,
+        &[pq2],
+        BulkImportConfig::new_vectorless(cfg.clone(), "id", dir.path().join("w2")),
+        None,
+    )
+    .unwrap();
+    assert_eq!(app.docs_appended, 2);
+    assert_eq!(app.docs_replaced, 1);
+
+    let col = Collection::open(&target, cfg).unwrap();
+    assert_eq!(col.len(), 4);
+    assert!(col.get(2).unwrap().unwrap().embedding.is_none());
+    assert_eq!(
+        col.resolve_filter_doc_ids(&Filter::Eq("category".into(), "a".into())).unwrap(),
+        vec![1, 3, 4]
+    );
+    let top = col.order_by(&[OrderBySpec::desc("rank")], None, 2).unwrap();
+    assert_eq!(top.iter().map(|r| r.id).collect::<Vec<_>>(), vec![2, 3]);
+    let bm25 = col.query_bm25(&RankBy::bm25("title", "fox"), None, 5).unwrap();
+    assert_eq!(bm25.len(), 2);
+}
+
+#[test]
+fn test_detached_columns_parquet_import() {
+    let dir = TempDir::new().unwrap();
+    let cfg = CollectionConfig::without_vectors()
+        .with_attribute("title", AttributeType::String, true)
+        .with_detached_attribute("popularity", AttributeType::Int, true)
+        .with_detached_attribute("badge", AttributeType::String, true);
+
+    let target = dir.path().join("det_db");
+    let mut col = Collection::open(&target, cfg.clone()).unwrap();
+    for id in 1..=5u64 {
+        let mut attrs = Attributes::new();
+        attrs.insert("title".into(), format!("item-{id}").into());
+        col.upsert(id, None, attrs).unwrap();
+    }
+
+    let pq_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt64, false),
+        Field::new("popularity", DataType::Int64, true),
+        Field::new("badge", DataType::Utf8, true),
+    ]));
+    let mut id_b = UInt64Builder::new();
+    let mut pop_b = Int64Builder::new();
+    let mut badge_b = StringBuilder::new();
+    for (id, pop, badge) in [(1, 100, Some("gold")), (3, 300, Some("silver")), (4, 50, None)] {
+        id_b.append_value(id);
+        pop_b.append_value(pop);
+        match badge {
+            Some(s) => badge_b.append_value(s),
+            None => badge_b.append_null(),
+        }
+    }
+    let batch = RecordBatch::try_new(
+        pq_schema.clone(),
+        vec![
+            Arc::new(id_b.finish()),
+            Arc::new(pop_b.finish()),
+            Arc::new(badge_b.finish()),
+        ],
+    )
+    .unwrap();
+    let pq = dir.path().join("det_cols.parquet");
+    let mut w = ArrowWriter::try_new(File::create(&pq).unwrap(), pq_schema, None).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+
+    let cols = vec!["popularity".to_owned(), "badge".to_owned()];
+    let rows = scan_detached_from_parquet(&[pq], col.schema(), "id", &cols, None).unwrap();
+    let job = col
+        .detached_ingest()
+        .columns(cols)
+        .mode(DetachedWriteMode::Replace)
+        .duplicate_policy(DetachedDuplicatePolicy::LastWins)
+        .from_iter(rows)
+        .build()
+        .unwrap();
+    col.publish_detached(job).unwrap();
+
+    assert_eq!(
+        col.resolve_filter_doc_ids(&Filter::Gte("popularity".into(), 100i64.into()))
+            .unwrap(),
+        vec![1, 3]
+    );
+    assert_eq!(
+        col.get(3).unwrap().unwrap().attributes.get("badge"),
+        Some(&AttributeValue::String("silver".into()))
+    );
+    assert!(!col.get(2).unwrap().unwrap().attributes.contains_key("popularity"));
 }

@@ -1,30 +1,69 @@
-//! Beam-search traversal, RaBitQ leaf scanning, filtered expansion, and exact reranking.
+//! Beam-search traversal, RaBitQ leaf scanning, effective-slot masking, and exact reranking.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
-use roaring::RoaringBitmap;
-
-use crate::attr_index::{AttributeIndex, ClusterCandidates, PreparedFilter};
-use crate::config::{DistanceMetric, DocId, NodeId, TreeConfig};
-use crate::error::{Result, TreeError};
-use crate::filter::Filter;
-use crate::fts_index::FtsIndex;
-use crate::metric::{cluster_distance, prepare_vector_cow, search_distance, search_distance_bytes};
-use crate::node::{LeafNodeView, PackedInternalNode, TreeMeta};
-use crate::rabitq::{
+use izzydb_core::config::{DistanceMetric, NodeId, RowId, TreeConfig};
+use izzydb_core::error::{Result, TreeError};
+use izzydb_core::filter::Filter;
+use izzydb_core::metric::{cluster_distance, prepare_vector_cow, search_distance, search_distance_bytes};
+use izzydb_core::rowset::RowSet;
+use izzydb_core::schema::CollectionSchema;
+use izzydb_rabitq::{
     QuantizedQueryMeta, QueryScratch, RabitqQuantizer, pack_query_bits_from_diff_bytes_into,
     pack_query_bits_into,
 };
-use crate::schema::CollectionSchema;
+use izzydb_storage::codec::RowView;
+use izzydb_storage::node::{AnnMeta, LeafNodeView, PackedInternalNode};
+use izzydb_storage::{DBPinnableSlice, SegmentTableSnapshot, Storage, TxContext};
+
+use crate::filter_plan::{self, FilterPlan, FilterPlanTrace, FilteredSearchRegime};
+use crate::fts_index::FtsIndex;
 use crate::simd::{self, LeafCandidate};
-use izzydb_storage::DBPinnableSlice;
-use crate::storage::{Storage, TxContext};
+
+/// Parameters controlling quantized vector search, optional full-vector reranking, and filtered expansion.
+#[derive(Debug, Clone, Copy)]
+pub struct SearchOptions {
+    pub k: usize,
+    pub beam_width: usize,
+    pub rerank_candidates: Option<usize>,
+    /// Materialized filtered sets with `<= exact_scan_threshold` vector rows use exact scan.
+    pub exact_scan_threshold: usize,
+    /// Maximum number of leaves probed during filtered dynamic expansion (defaults to `beam_width * 16`).
+    pub max_expanded_leaves: Option<usize>,
+}
+
+impl SearchOptions {
+    pub fn new(k: usize, beam_width: usize) -> Self {
+        Self {
+            k,
+            beam_width,
+            rerank_candidates: None,
+            exact_scan_threshold: 4_096,
+            max_expanded_leaves: None,
+        }
+    }
+
+    pub fn with_rerank(mut self, rerank_candidates: usize) -> Self {
+        self.rerank_candidates = Some(rerank_candidates);
+        self
+    }
+
+    pub fn with_exact_scan_threshold(mut self, threshold: usize) -> Self {
+        self.exact_scan_threshold = threshold;
+        self
+    }
+
+    pub fn with_max_expanded_leaves(mut self, max_leaves: usize) -> Self {
+        self.max_expanded_leaves = Some(max_leaves);
+        self
+    }
+}
 
 /// Route a prepared (validated and normalized if Cosine) vector to the single closest leaf.
 pub fn route_to_leaf(
     internal_cache: &HashMap<NodeId, PackedInternalNode>,
-    meta: &TreeMeta,
+    meta: &AnnMeta,
     prepared_vec: &[f32],
     beam_width: usize,
     config: &TreeConfig,
@@ -44,9 +83,12 @@ pub(crate) fn route_to_leaf_in_tx(
     beam_width: usize,
     config: &TreeConfig,
 ) -> Result<NodeId> {
+    let meta = tx
+        .ann_meta()
+        .ok_or_else(|| TreeError::InvalidConfig("collection has no vector index".into()))?;
     let leaves = search_leaves_with(
         |id| tx.get_internal_node_ref(id),
-        tx.meta(),
+        meta,
         prepared_vec,
         1,
         beam_width,
@@ -62,7 +104,7 @@ pub(crate) fn route_to_leaf_in_tx(
 /// Route a prepared vector to the single closest leaf via an arbitrary internal-node lookup closure.
 pub fn route_to_leaf_with<'a, F>(
     get_internal: F,
-    meta: &TreeMeta,
+    meta: &AnnMeta,
     prepared_vec: &[f32],
     beam_width: usize,
     config: &TreeConfig,
@@ -81,7 +123,7 @@ where
 /// Find the top `count` closest leaves to `prepared_vec` using in-memory `cluster_distance` beam search.
 pub fn search_leaves(
     internal_cache: &HashMap<NodeId, PackedInternalNode>,
-    meta: &TreeMeta,
+    meta: &AnnMeta,
     prepared_vec: &[f32],
     count: usize,
     beam_width: usize,
@@ -103,7 +145,7 @@ pub fn search_leaves(
 
 pub fn search_leaves_with<'a, F>(
     get_internal: F,
-    meta: &TreeMeta,
+    meta: &AnnMeta,
     prepared_vec: &[f32],
     count: usize,
     beam_width: usize,
@@ -143,57 +185,18 @@ where
     Ok(frontier)
 }
 
-/// Parameters controlling quantized search, optional full-vector reranking, and filtered expansion.
-#[derive(Debug, Clone, Copy)]
-pub struct SearchOptions {
-    pub k: usize,
-    pub beam_width: usize,
-    pub rerank_candidates: Option<usize>,
-    /// When cluster pruning yields `<= exhaustive_cluster_threshold` leaves, bypass tree traversal
-    /// and RaBitQ scoring and evaluate exact vectors directly.
-    pub exhaustive_cluster_threshold: usize,
-    /// Maximum number of leaves probed during filtered dynamic expansion (defaults to `beam_width * 16`).
-    pub max_expanded_leaves: Option<usize>,
-}
-
-impl SearchOptions {
-    pub fn new(k: usize, beam_width: usize) -> Self {
-        Self {
-            k,
-            beam_width,
-            rerank_candidates: None,
-            exhaustive_cluster_threshold: 8,
-            max_expanded_leaves: None,
-        }
-    }
-
-    pub fn with_rerank(mut self, rerank_candidates: usize) -> Self {
-        self.rerank_candidates = Some(rerank_candidates);
-        self
-    }
-
-    pub fn with_exhaustive_cluster_threshold(mut self, threshold: usize) -> Self {
-        self.exhaustive_cluster_threshold = threshold;
-        self
-    }
-
-    pub fn with_max_expanded_leaves(mut self, max_leaves: usize) -> Self {
-        self.max_expanded_leaves = Some(max_leaves);
-        self
-    }
-}
-
-/// Approximate nearest neighbor search using in-memory beam traversal,
-/// batched zero-copy RaBitQ leaf scanning, and optional batched full-vector reranking.
+/// Unfiltered approximate nearest neighbor search using in-memory beam traversal,
+/// batched zero-copy RaBitQ leaf scanning with effective-slot liveness masking,
+/// and optional batched full-vector reranking over `RowId`s.
 pub fn search(
     storage: &Storage,
     internal_cache: &HashMap<NodeId, PackedInternalNode>,
-    meta: &TreeMeta,
+    meta: &AnnMeta,
     quantizer: &RabitqQuantizer,
     query: &[f32],
     opts: SearchOptions,
     config: &TreeConfig,
-) -> Result<Vec<(DocId, f32)>> {
+) -> Result<Vec<(RowId, f32)>> {
     if opts.beam_width == 0 {
         return Err(TreeError::InvalidConfig(
             "beam_width must be >= 1".into(),
@@ -240,6 +243,9 @@ pub fn search(
     leaf_ids.dedup();
 
     let leaf_slices = storage.multi_get_leaf_nodes_pinned(&leaf_ids)?;
+    let seg_snap = storage.segment_snapshot();
+    let dropped = storage.dropped_segments_snapshot();
+    let need_liveness_mask = !seg_snap.has_deletes_or_forwarding.is_empty() || !dropped.is_empty();
 
     let mut scratch = QueryScratch::new(padded_dim, rabitq_words);
     quantizer.rotate_into(&q, &mut scratch.rot_q);
@@ -261,6 +267,7 @@ pub fn search(
     let mut candidates: Vec<LeafCandidate> =
         Vec::with_capacity(leaf_ids.len() * config.max_leaf_size);
     let mut live_mask_buf: Vec<u64> = Vec::new();
+    let mut any_forwarded = false;
 
     for (leaf_id, opt_slice) in leaf_ids.iter().copied().zip(leaf_slices.iter()) {
         let slice = opt_slice.as_ref().ok_or_else(|| {
@@ -270,13 +277,27 @@ pub fn search(
         if view.live_count == 0 {
             continue;
         }
-        let allowed_slots = if view.has_tombstones() {
-            view.copy_live_mask_into(&mut live_mask_buf);
-            Some(live_mask_buf.as_slice())
+        if !need_liveness_mask {
+            let allowed_slots = if view.has_tombstones() {
+                view.copy_live_mask_into(&mut live_mask_buf);
+                Some(live_mask_buf.as_slice())
+            } else {
+                None
+            };
+            score_leaf_view(&view, allowed_slots, &mut score_ctx, &mut candidates);
         } else {
-            None
-        };
-        score_leaf_view(&view, allowed_slots, &mut score_ctx, &mut candidates);
+            let (any_live, leaf_forwarded) =
+                build_effective_mask(&view, &seg_snap, &dropped, &mut live_mask_buf);
+            if !any_live {
+                continue;
+            }
+            any_forwarded |= leaf_forwarded;
+            score_leaf_view(&view, Some(&live_mask_buf), &mut score_ctx, &mut candidates);
+        }
+    }
+
+    if any_forwarded {
+        resolve_and_dedup_forwarded(&seg_snap, &dropped, &mut candidates);
     }
 
     finalize_candidates(
@@ -290,134 +311,254 @@ pub fn search(
     )
 }
 
-/// Filtered approximate nearest neighbor search with cluster-level pruning,
-/// exhaustive-scan crossover for highly selective filters, best-first dynamic expansion,
-/// and masked RaBitQ scoring.
+/// Filtered approximate nearest neighbor search using the v3 `RowSet` planner:
+/// - **Exact scan**: materialized sets with `<= exact_scan_threshold` rows
+/// - **Masked traversal**: materialized sets with selectivity `<= 0.5`
+/// - **Post-filter**: `Lazy` plans or high-selectivity (`> 0.5`) filters
 #[allow(clippy::too_many_arguments)]
 pub fn search_filtered(
     storage: &Storage,
     internal_cache: &HashMap<NodeId, PackedInternalNode>,
     leaf_parent: &HashMap<NodeId, NodeId>,
-    meta: &TreeMeta,
+    meta: &AnnMeta,
     quantizer: &RabitqQuantizer,
     schema: &CollectionSchema,
-    attr_index: &AttributeIndex,
-    fts_index: Option<&FtsIndex>,
+    fts_index: &FtsIndex,
     query: &[f32],
     opts: SearchOptions,
     filter: &Filter,
     config: &TreeConfig,
-) -> Result<Vec<(DocId, f32)>> {
+) -> Result<Vec<(RowId, f32)>> {
+    let mut trace = FilterPlanTrace::default();
+    search_filtered_with_trace(
+        storage,
+        internal_cache,
+        leaf_parent,
+        meta,
+        quantizer,
+        schema,
+        fts_index,
+        query,
+        opts,
+        filter,
+        config,
+        &mut trace,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn search_filtered_with_trace(
+    storage: &Storage,
+    internal_cache: &HashMap<NodeId, PackedInternalNode>,
+    leaf_parent: &HashMap<NodeId, NodeId>,
+    meta: &AnnMeta,
+    quantizer: &RabitqQuantizer,
+    schema: &CollectionSchema,
+    fts_index: &FtsIndex,
+    query: &[f32],
+    opts: SearchOptions,
+    filter: &Filter,
+    config: &TreeConfig,
+    trace: &mut FilterPlanTrace,
+) -> Result<Vec<(RowId, f32)>> {
     if opts.beam_width == 0 {
         return Err(TreeError::InvalidConfig(
             "beam_width must be >= 1".into(),
         ));
     }
     filter.validate(schema)?;
-    if opts.k == 0 || meta.num_vectors == 0 {
-        // Still validate the query vector for consistent error behavior.
-        prepare_vector_cow(query, config.dim, config.metric)?;
-        return Ok(Vec::new());
-    }
-
-    // Step 1: Cluster-level pruning via cf_attr_clusters (and FtsIndex for FTS predicates).
-    let prepared = attr_index.prepare_filter_with_fts(storage, schema, filter, fts_index)?;
-    search_filtered_prepared(
-        storage,
-        internal_cache,
-        leaf_parent,
-        meta,
-        quantizer,
-        attr_index,
-        query,
-        opts,
-        &prepared,
-        config,
-    )
-}
-
-/// [`search_filtered`] over an already-prepared (validated) filter, so callers that also need the
-/// filter's match set (e.g. faceting) can share one [`PreparedFilter`].
-#[allow(clippy::too_many_arguments)]
-pub fn search_filtered_prepared(
-    storage: &Storage,
-    internal_cache: &HashMap<NodeId, PackedInternalNode>,
-    leaf_parent: &HashMap<NodeId, NodeId>,
-    meta: &TreeMeta,
-    quantizer: &RabitqQuantizer,
-    attr_index: &AttributeIndex,
-    query: &[f32],
-    opts: SearchOptions,
-    prepared: &PreparedFilter,
-    config: &TreeConfig,
-) -> Result<Vec<(DocId, f32)>> {
-    if opts.beam_width == 0 {
-        return Err(TreeError::InvalidConfig(
-            "beam_width must be >= 1".into(),
-        ));
-    }
     let q = prepare_vector_cow(query, config.dim, config.metric)?;
     if opts.k == 0 || meta.num_vectors == 0 {
-        return Ok(Vec::new());
-    }
-    if prepared.cluster_candidates.is_empty() {
+        trace.regime = Some(FilteredSearchRegime::Empty);
         return Ok(Vec::new());
     }
 
+    let plan = filter_plan::plan_filter_with_trace(storage, schema, filter, fts_index, trace)?;
+    let total_leaves = leaf_parent.len().max(1);
+
+    match plan {
+        FilterPlan::All => {
+            trace.regime = Some(FilteredSearchRegime::Unfiltered);
+            search(storage, internal_cache, meta, quantizer, query, opts, config)
+        }
+        FilterPlan::Empty => {
+            trace.regime = Some(FilteredSearchRegime::Empty);
+            Ok(Vec::new())
+        }
+        FilterPlan::Materialized(rowset) => {
+            if rowset.is_empty() {
+                trace.regime = Some(FilteredSearchRegime::Empty);
+                return Ok(Vec::new());
+            }
+            if rowset.len() as usize <= opts.exact_scan_threshold {
+                trace.regime = Some(FilteredSearchRegime::ExactScan);
+                return search_exact_rowset(storage, &q, &rowset, opts.k, config.dim, config.metric);
+            }
+            let s = (rowset.len() as f64 / meta.num_vectors.max(1) as f64).clamp(1e-6, 1.0);
+            if s <= 0.5 {
+                trace.regime = Some(FilteredSearchRegime::MaskedTraversal);
+                search_masked_traversal(
+                    storage,
+                    internal_cache,
+                    meta,
+                    quantizer,
+                    &q,
+                    opts,
+                    &rowset,
+                    s,
+                    total_leaves,
+                    config,
+                )
+            } else {
+                trace.regime = Some(FilteredSearchRegime::PostFilter);
+                search_post_filter(
+                    storage,
+                    internal_cache,
+                    meta,
+                    quantizer,
+                    schema,
+                    fts_index,
+                    &q,
+                    opts,
+                    None,
+                    Some(&rowset),
+                    s,
+                    total_leaves,
+                    config,
+                )
+            }
+        }
+        FilterPlan::Lazy { residual, seed } => {
+            if let Some(ref seed_rs) = seed
+                && seed_rs.len() as usize <= opts.exact_scan_threshold
+            {
+                let snap = storage.segment_snapshot();
+                let exact_rs = filter_plan::materialize_lazy(
+                    storage,
+                    schema,
+                    fts_index,
+                    &snap,
+                    &residual,
+                    Some(seed_rs),
+                )?;
+                if exact_rs.is_empty() {
+                    trace.regime = Some(FilteredSearchRegime::Empty);
+                    return Ok(Vec::new());
+                }
+                trace.regime = Some(FilteredSearchRegime::ExactScan);
+                return search_exact_rowset(
+                    storage,
+                    &q,
+                    &exact_rs,
+                    opts.k,
+                    config.dim,
+                    config.metric,
+                );
+            }
+            let est = trace.estimated_cardinality.max(1) as f64;
+            let s = (est / meta.num_vectors.max(1) as f64).clamp(1e-4, 1.0);
+            trace.regime = Some(FilteredSearchRegime::PostFilter);
+            search_post_filter(
+                storage,
+                internal_cache,
+                meta,
+                quantizer,
+                schema,
+                fts_index,
+                &q,
+                opts,
+                Some(&residual),
+                seed.as_ref(),
+                s,
+                total_leaves,
+                config,
+            )
+        }
+    }
+}
+
+fn search_exact_rowset(
+    storage: &Storage,
+    q: &[f32],
+    rowset: &RowSet,
+    k: usize,
+    dim: usize,
+    metric: DistanceMetric,
+) -> Result<Vec<(RowId, f32)>> {
+    let sorted_rows: Vec<RowId> = rowset.iter().collect();
+    if sorted_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let vec_slices = storage.multi_get_vectors_pinned(&sorted_rows)?;
+    let expected_bytes = dim * 4;
+    let mut exact = Vec::with_capacity(sorted_rows.len());
+    let mut missing_rows: Vec<RowId> = Vec::new();
+    for (&row_id, opt_slice) in sorted_rows.iter().zip(vec_slices.iter()) {
+        match opt_slice.as_ref() {
+            Some(slice) => {
+                if slice.len() != expected_bytes {
+                    return Err(TreeError::CorruptedData(format!(
+                        "vector {row_id:?} expected {expected_bytes} bytes, got {}",
+                        slice.len()
+                    )));
+                }
+                exact.push((row_id, search_distance_bytes(metric, q, slice)));
+            }
+            None => missing_rows.push(row_id),
+        }
+    }
+    if !missing_rows.is_empty() {
+        let row_slices = storage.multi_get_row_bytes_pinned(&missing_rows)?;
+        for (&row_id, opt_row) in missing_rows.iter().zip(row_slices.iter()) {
+            let slice = opt_row.as_ref().ok_or_else(|| {
+                TreeError::InvariantViolation(format!("row {row_id:?} missing in cf_rows"))
+            })?;
+            let view = RowView::parse(slice)?;
+            if view.has_vector() {
+                return Err(TreeError::CorruptedData(format!(
+                    "missing vector {row_id:?} in cf_vectors"
+                )));
+            }
+        }
+    }
+    select_top_k(&mut exact, k, cmp_dist_row);
+    Ok(exact)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_masked_traversal(
+    storage: &Storage,
+    internal_cache: &HashMap<NodeId, PackedInternalNode>,
+    meta: &AnnMeta,
+    quantizer: &RabitqQuantizer,
+    q: &[f32],
+    opts: SearchOptions,
+    rowset: &RowSet,
+    selectivity: f64,
+    total_leaves: usize,
+    config: &TreeConfig,
+) -> Result<Vec<(RowId, f32)>> {
     let dim = config.dim;
     let padded_dim = quantizer.padded_dim();
     let rabitq_words = quantizer.num_words();
-
-    // Step 2: Exhaustive-scan crossover for highly selective filters.
-    if let ClusterCandidates::Subset(ref bm) = prepared.cluster_candidates
-        && bm.len() as usize <= opts.exhaustive_cluster_threshold
-    {
-        return search_filtered_exhaustive(
-            storage,
-            attr_index,
-            prepared,
-            bm,
-            &q,
-            opts.k,
-            config,
-            quantizer,
-        );
-    }
-
-    // Step 3: Pruned best-first traversal + dynamic cluster expansion.
-    let allowed_leaves: Option<&RoaringBitmap> = match prepared.cluster_candidates {
-        ClusterCandidates::All => None,
-        ClusterCandidates::Subset(ref bm) => Some(bm),
-    };
-    let allowed_internal =
-        build_allowed_internal_bitmap(allowed_leaves, leaf_parent, internal_cache, meta);
+    let inv_sqrt_padded_dim = quantizer.inv_sqrt_padded_dim();
 
     let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
-    let root_allowed = if meta.root_level == 0 {
-        allowed_leaves.is_none_or(|bm| bm.contains(meta.root_id))
-    } else {
-        allowed_internal
-            .as_ref()
-            .is_none_or(|bm| bm.contains(meta.root_id))
-    };
-    if root_allowed {
-        heap.push(HeapEntry {
-            dist: 0.0,
-            node_id: meta.root_id,
-            level: meta.root_level,
-        });
-    }
+    heap.push(HeapEntry {
+        dist: 0.0,
+        node_id: meta.root_id,
+        level: meta.root_level,
+    });
 
-    let inv_sqrt_padded_dim = quantizer.inv_sqrt_padded_dim();
     let mut scratch = QueryScratch::new(padded_dim, rabitq_words);
-    quantizer.rotate_into(&q, &mut scratch.rot_q);
+    quantizer.rotate_into(q, &mut scratch.rot_q);
     let dot_q_meta = if config.metric == DistanceMetric::DotProduct {
         Some(pack_query_bits_into(&scratch.rot_q, &mut scratch.planes))
     } else {
         None
     };
     let mut score_ctx = LeafScoreContext {
-        q: &q,
+        q,
         scratch: &mut scratch,
         dot_q_meta,
         inv_sqrt_padded_dim,
@@ -426,15 +567,23 @@ pub fn search_filtered_prepared(
     };
 
     let target = opts.rerank_candidates.unwrap_or(opts.k).max(opts.k);
+    let default_max = ((opts.beam_width as f64 / selectivity * 1.5).ceil() as usize)
+        .clamp(opts.beam_width, total_leaves.max(opts.beam_width));
     let max_expanded = opts
         .max_expanded_leaves
-        .unwrap_or(opts.beam_width.saturating_mul(16))
+        .unwrap_or(default_max)
         .max(opts.beam_width);
+
+    let seg_snap = storage.segment_snapshot();
+    let dropped = storage.dropped_segments_snapshot();
+    let need_liveness_resolve = !seg_snap.has_deletes_or_forwarding.is_empty() || !dropped.is_empty();
 
     let mut probed_leaves = 0usize;
     let mut batch_target = opts.beam_width;
     let mut candidates: Vec<LeafCandidate> = Vec::with_capacity(target.max(opts.beam_width * 16));
     let mut batch_leaves: Vec<NodeId> = Vec::new();
+    let mut mask_buf: Vec<u64> = Vec::new();
+    let mut any_forwarded = false;
 
     while probed_leaves < max_expanded && !heap.is_empty() {
         let take_limit = batch_target.min(max_expanded - probed_leaves);
@@ -445,49 +594,38 @@ pub fn search_filtered_prepared(
             if item.level == 0 {
                 batch_leaves.push(item.node_id);
             } else {
-                expand_internal_node(
-                    internal_cache,
-                    &item,
-                    &q,
-                    dim,
-                    config.metric,
-                    allowed_leaves,
-                    allowed_internal.as_ref(),
-                    &mut heap,
-                )?;
+                expand_internal_node_unpruned(internal_cache, &item, q, dim, config.metric, &mut heap)?;
             }
         }
-
         if batch_leaves.is_empty() {
             break;
         }
         probed_leaves += batch_leaves.len();
-
         batch_leaves.sort_unstable();
         batch_leaves.dedup();
-        let leaf_slices = storage.multi_get_leaf_nodes_pinned(&batch_leaves)?;
-        let parsed_views = parse_leaf_views(&batch_leaves, &leaf_slices, config, quantizer)?;
-        let leaf_pairs: Vec<(NodeId, Option<&LeafNodeView<'_>>)> = batch_leaves
-            .iter()
-            .copied()
-            .zip(parsed_views.iter().map(|v| v.as_ref()))
-            .collect();
-        let masks = attr_index.eval_leaves_masks(storage, prepared, &leaf_pairs)?;
 
-        for (view_opt, mut mask) in parsed_views.iter().zip(masks) {
-            let Some(view) = view_opt else {
-                continue;
-            };
+        let leaf_slices = storage.multi_get_leaf_nodes_pinned(&batch_leaves)?;
+        for (leaf_id, opt_slice) in batch_leaves.iter().copied().zip(leaf_slices.iter()) {
+            let slice = opt_slice.as_ref().ok_or_else(|| {
+                TreeError::CorruptedData(format!("missing leaf blob for leaf {leaf_id}"))
+            })?;
+            let view = LeafNodeView::parse(slice, dim, padded_dim, rabitq_words)?;
             if view.live_count == 0 {
                 continue;
             }
-            if view.has_tombstones() {
-                mask.and_live_mask_bytes(view.live_mask_bytes);
-            }
-            if mask.is_empty() {
+            let (any_live, leaf_forwarded) = build_effective_mask_with_rowset(
+                &view,
+                &seg_snap,
+                &dropped,
+                need_liveness_resolve,
+                Some(rowset),
+                &mut mask_buf,
+            );
+            if !any_live {
                 continue;
             }
-            score_leaf_view(view, Some(mask.as_slice()), &mut score_ctx, &mut candidates);
+            any_forwarded |= leaf_forwarded;
+            score_leaf_view(&view, Some(&mask_buf), &mut score_ctx, &mut candidates);
         }
 
         if (candidates.len() >= target && probed_leaves >= opts.beam_width)
@@ -499,9 +637,12 @@ pub fn search_filtered_prepared(
         batch_target = batch_target.saturating_mul(2);
     }
 
+    if any_forwarded {
+        resolve_and_dedup_forwarded(&seg_snap, &dropped, &mut candidates);
+    }
     finalize_candidates(
         storage,
-        &q,
+        q,
         candidates,
         opts.k,
         opts.rerank_candidates,
@@ -511,74 +652,208 @@ pub fn search_filtered_prepared(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn search_filtered_exhaustive(
+fn search_post_filter(
     storage: &Storage,
-    attr_index: &AttributeIndex,
-    prepared: &PreparedFilter,
-    leaf_bitmap: &RoaringBitmap,
-    q: &[f32],
-    k: usize,
-    config: &TreeConfig,
-    quantizer: &RabitqQuantizer,
-) -> Result<Vec<(DocId, f32)>> {
-    let leaf_ids: Vec<NodeId> = leaf_bitmap.iter().collect();
-    let mut matching_doc_ids = Vec::new();
-    collect_matching_doc_ids_in_leaves(
-        storage,
-        attr_index,
-        prepared,
-        &leaf_ids,
-        config,
-        quantizer,
-        &mut matching_doc_ids,
-    )?;
-    if matching_doc_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    matching_doc_ids.sort_unstable();
-    matching_doc_ids.dedup();
-    score_exact_vectors(storage, q, &matching_doc_ids, k, config.dim, config.metric)
-}
-
-fn build_allowed_internal_bitmap(
-    allowed_leaves: Option<&RoaringBitmap>,
-    leaf_parent: &HashMap<NodeId, NodeId>,
     internal_cache: &HashMap<NodeId, PackedInternalNode>,
-    meta: &TreeMeta,
-) -> Option<RoaringBitmap> {
-    let total_leaves = leaf_parent.len().max(1);
-    let bm = allowed_leaves?;
-    if (bm.len() as usize) * 2 >= total_leaves || meta.root_level == 0 {
-        return None;
-    }
-    let mut internal_bm = RoaringBitmap::new();
-    for leaf_id in bm.iter() {
-        if let Some(&p1) = leaf_parent.get(&leaf_id)
-            && internal_bm.insert(p1)
+    meta: &AnnMeta,
+    quantizer: &RabitqQuantizer,
+    schema: &CollectionSchema,
+    fts_index: &FtsIndex,
+    q: &[f32],
+    opts: SearchOptions,
+    residual: Option<&Filter>,
+    seed: Option<&RowSet>,
+    selectivity: f64,
+    total_leaves: usize,
+    config: &TreeConfig,
+) -> Result<Vec<(RowId, f32)>> {
+    let dim = config.dim;
+    let padded_dim = quantizer.padded_dim();
+    let rabitq_words = quantizer.num_words();
+    let inv_sqrt_padded_dim = quantizer.inv_sqrt_padded_dim();
+
+    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+    heap.push(HeapEntry {
+        dist: 0.0,
+        node_id: meta.root_id,
+        level: meta.root_level,
+    });
+
+    let mut scratch = QueryScratch::new(padded_dim, rabitq_words);
+    quantizer.rotate_into(q, &mut scratch.rot_q);
+    let dot_q_meta = if config.metric == DistanceMetric::DotProduct {
+        Some(pack_query_bits_into(&scratch.rot_q, &mut scratch.planes))
+    } else {
+        None
+    };
+    let mut score_ctx = LeafScoreContext {
+        q,
+        scratch: &mut scratch,
+        dot_q_meta,
+        inv_sqrt_padded_dim,
+        rabitq_words,
+        metric: config.metric,
+    };
+
+    let target = opts.rerank_candidates.unwrap_or(opts.k).max(opts.k);
+    let default_max = ((opts.beam_width as f64 / selectivity * 1.5).ceil() as usize)
+        .clamp(opts.beam_width, total_leaves.max(opts.beam_width));
+    let max_expanded = opts
+        .max_expanded_leaves
+        .unwrap_or(default_max)
+        .max(opts.beam_width);
+
+    let seg_snap = storage.segment_snapshot();
+    let dropped = storage.dropped_segments_snapshot();
+    let need_liveness = !seg_snap.has_deletes_or_forwarding.is_empty() || !dropped.is_empty();
+
+    let mut probed_leaves = 0usize;
+    let mut batch_target = opts.beam_width;
+    let mut verified: Vec<LeafCandidate> = Vec::with_capacity(target.max(opts.beam_width * 16));
+    let mut batch_leaves: Vec<NodeId> = Vec::new();
+    let mut batch_cands: Vec<LeafCandidate> = Vec::new();
+    let mut mask_buf: Vec<u64> = Vec::new();
+
+    while probed_leaves < max_expanded && !heap.is_empty() {
+        let take_limit = batch_target.min(max_expanded - probed_leaves);
+        batch_leaves.clear();
+        while batch_leaves.len() < take_limit
+            && let Some(item) = heap.pop()
         {
-            let mut cur = p1;
-            while let Some(node) = internal_cache.get(&cur)
-                && let Some(pid) = node.parent_id
-            {
-                if !internal_bm.insert(pid) {
-                    break;
-                }
-                cur = pid;
+            if item.level == 0 {
+                batch_leaves.push(item.node_id);
+            } else {
+                expand_internal_node_unpruned(internal_cache, &item, q, dim, config.metric, &mut heap)?;
             }
         }
+        if batch_leaves.is_empty() {
+            break;
+        }
+        probed_leaves += batch_leaves.len();
+        batch_leaves.sort_unstable();
+        batch_leaves.dedup();
+
+        batch_cands.clear();
+        let leaf_slices = storage.multi_get_leaf_nodes_pinned(&batch_leaves)?;
+        let mut batch_forwarded = false;
+
+        for (leaf_id, opt_slice) in batch_leaves.iter().copied().zip(leaf_slices.iter()) {
+            let slice = opt_slice.as_ref().ok_or_else(|| {
+                TreeError::CorruptedData(format!("missing leaf blob for leaf {leaf_id}"))
+            })?;
+            let view = LeafNodeView::parse(slice, dim, padded_dim, rabitq_words)?;
+            if view.live_count == 0 {
+                continue;
+            }
+            if !need_liveness && seed.is_none() {
+                let allowed_slots = if view.has_tombstones() {
+                    view.copy_live_mask_into(&mut mask_buf);
+                    Some(mask_buf.as_slice())
+                } else {
+                    None
+                };
+                score_leaf_view(&view, allowed_slots, &mut score_ctx, &mut batch_cands);
+            } else {
+                let (any_live, leaf_forwarded) = build_effective_mask_with_rowset(
+                    &view,
+                    &seg_snap,
+                    &dropped,
+                    need_liveness,
+                    seed,
+                    &mut mask_buf,
+                );
+                if !any_live {
+                    continue;
+                }
+                batch_forwarded |= leaf_forwarded;
+                score_leaf_view(&view, Some(&mask_buf), &mut score_ctx, &mut batch_cands);
+            }
+        }
+
+        if batch_forwarded {
+            resolve_and_dedup_forwarded(&seg_snap, &dropped, &mut batch_cands);
+        }
+
+        if let Some(res_filter) = residual {
+            batch_cands.sort_unstable_by(cmp_cand_dist_id);
+            let kth_cutoff = if verified.len() >= target {
+                select_top_k(&mut verified, target, cmp_cand_dist_id);
+                Some(verified[target - 1].dist)
+            } else {
+                None
+            };
+            let check_limit = match kth_cutoff {
+                Some(cut) => batch_cands.partition_point(|c| c.dist <= cut),
+                None => batch_cands.len(),
+            };
+            let to_check = &batch_cands[..check_limit];
+            let mut row_pairs: Vec<(RowId, LeafCandidate)> =
+                to_check.iter().map(|&c| (RowId(c.doc_id), c)).collect();
+            row_pairs.sort_unstable_by_key(|&(r, _)| r);
+            row_pairs.dedup_by_key(|(r, _)| *r);
+            for chunk in row_pairs.chunks(128) {
+                let rows: Vec<RowId> = chunk.iter().map(|&(r, _)| r).collect();
+                if crate::detached::filter_mentions_detached(schema, res_filter) {
+                    let flags = crate::detached::filter_rows_mixed_batch(
+                        storage, schema, fts_index, res_filter, &rows,
+                    )?;
+                    for (&(_, cand), ok) in chunk.iter().zip(flags) {
+                        if ok {
+                            verified.push(cand);
+                        }
+                    }
+                } else {
+                    let slices = storage.multi_get_row_bytes_pinned(&rows)?;
+                    for (&(row, cand), opt_slice) in chunk.iter().zip(slices.iter()) {
+                        let slice = opt_slice.as_ref().ok_or_else(|| {
+                            TreeError::InvariantViolation(format!("row {row:?} missing in cf_rows"))
+                        })?;
+                        let view = RowView::parse(slice)?;
+                        if view.matches_filter(
+                            schema,
+                            res_filter,
+                            &mut |kind, attr, query, last_as_prefix, val| {
+                                fts_index
+                                    .matches_fts_attr(schema, kind, attr, query, last_as_prefix, val)
+                            },
+                        )? {
+                            verified.push(cand);
+                        }
+                    }
+                }
+            }
+        } else {
+            verified.extend_from_slice(&batch_cands);
+        }
+
+        if (verified.len() >= target && probed_leaves >= opts.beam_width)
+            || heap.is_empty()
+            || probed_leaves >= max_expanded
+        {
+            break;
+        }
+        batch_target = batch_target.saturating_mul(2);
     }
-    Some(internal_bm)
+
+    verified.sort_unstable_by(|a, b| a.doc_id.cmp(&b.doc_id).then_with(|| a.dist.total_cmp(&b.dist)));
+    verified.dedup_by_key(|c| c.doc_id);
+    finalize_candidates(
+        storage,
+        q,
+        verified,
+        opts.k,
+        opts.rerank_candidates,
+        dim,
+        config.metric,
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn expand_internal_node(
+fn expand_internal_node_unpruned(
     internal_cache: &HashMap<NodeId, PackedInternalNode>,
     item: &HeapEntry,
     q: &[f32],
     dim: usize,
     metric: DistanceMetric,
-    allowed_leaves: Option<&RoaringBitmap>,
-    allowed_internal: Option<&RoaringBitmap>,
     heap: &mut BinaryHeap<HeapEntry>,
 ) -> Result<()> {
     let node = internal_cache.get(&item.node_id).ok_or_else(|| {
@@ -589,23 +864,127 @@ fn expand_internal_node(
     })?;
     let child_level = item.level - 1;
     for (i, &child_id) in node.child_ids.iter().enumerate() {
-        let allowed = if child_level == 0 {
-            allowed_leaves.is_none_or(|bm| bm.contains(child_id))
-        } else {
-            allowed_internal.is_none_or(|bm| bm.contains(child_id))
-        };
-        if allowed {
-            let d = search_distance(metric, q, node.child_centroid(i, dim));
-            heap.push(HeapEntry {
-                dist: d,
-                node_id: child_id,
-                level: child_level,
-            });
-        }
+        let d = search_distance(metric, q, node.child_centroid(i, dim));
+        heap.push(HeapEntry {
+            dist: d,
+            node_id: child_id,
+            level: child_level,
+        });
     }
     Ok(())
 }
 
+#[inline]
+fn build_effective_mask_with_rowset(
+    view: &LeafNodeView<'_>,
+    seg_snap: &SegmentTableSnapshot,
+    dropped: &roaring::RoaringBitmap,
+    need_liveness_resolve: bool,
+    rowset: Option<&RowSet>,
+    mask_buf: &mut Vec<u64>,
+) -> (bool, bool) {
+    view.copy_live_mask_into(mask_buf);
+    let mut any_live = false;
+    let mut saw_forwarded = false;
+    for (w_idx, word_ref) in mask_buf.iter_mut().enumerate() {
+        let mut bits = *word_ref;
+        let mut out = bits;
+        while bits != 0 {
+            let b = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let slot = (w_idx << 6) | b;
+            if slot >= view.slot_cap {
+                out &= !(1u64 << b);
+                continue;
+            }
+            let row = view.row_id(slot);
+            let resolved_opt = if need_liveness_resolve {
+                seg_snap
+                    .resolve_row(row)
+                    .filter(|r| !dropped.contains(r.seg()))
+            } else {
+                Some(row)
+            };
+            match resolved_opt {
+                Some(resolved) if rowset.is_none_or(|rs| rs.contains(resolved)) => {
+                    any_live = true;
+                    if resolved != row {
+                        saw_forwarded = true;
+                    }
+                }
+                _ => {
+                    out &= !(1u64 << b);
+                }
+            }
+        }
+        *word_ref = out;
+    }
+    (any_live, saw_forwarded)
+}
+
+/// Build `live_mask & liveness_mask(row_ids)` for `view` against `seg_snap`.
+/// Returns `(any_live_slots, saw_forwarded_row)`.
+#[inline]
+pub(crate) fn build_effective_mask(
+    view: &LeafNodeView<'_>,
+    seg_snap: &SegmentTableSnapshot,
+    dropped: &roaring::RoaringBitmap,
+    mask_buf: &mut Vec<u64>,
+) -> (bool, bool) {
+    view.copy_live_mask_into(mask_buf);
+    let mut any_live = false;
+    let mut saw_forwarded = false;
+    for (w_idx, word_ref) in mask_buf.iter_mut().enumerate() {
+        let mut bits = *word_ref;
+        let mut out = bits;
+        while bits != 0 {
+            let b = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let slot = (w_idx << 6) | b;
+            if slot >= view.slot_cap {
+                out &= !(1u64 << b);
+                continue;
+            }
+            let row = view.row_id(slot);
+            match seg_snap.resolve_row(row) {
+                Some(resolved) if !dropped.contains(resolved.seg()) => {
+                    any_live = true;
+                    if resolved != row {
+                        saw_forwarded = true;
+                    }
+                }
+                _ => {
+                    out &= !(1u64 << b);
+                }
+            }
+        }
+        *word_ref = out;
+    }
+    (any_live, saw_forwarded)
+}
+
+fn resolve_and_dedup_forwarded(
+    seg_snap: &SegmentTableSnapshot,
+    dropped: &roaring::RoaringBitmap,
+    candidates: &mut Vec<LeafCandidate>,
+) {
+    let mut write = 0usize;
+    for read in 0..candidates.len() {
+        let mut c = candidates[read];
+        if let Some(resolved) = seg_snap.resolve_row(RowId(c.doc_id))
+            && !dropped.contains(resolved.seg())
+        {
+            c.doc_id = resolved.raw();
+            candidates[write] = c;
+            write += 1;
+        }
+    }
+    candidates.truncate(write);
+    candidates.sort_unstable_by(|a, b| a.doc_id.cmp(&b.doc_id).then_with(|| a.dist.total_cmp(&b.dist)));
+    candidates.dedup_by_key(|c| c.doc_id);
+}
+
+#[allow(dead_code)]
 pub(crate) fn parse_leaf_views<'a>(
     leaf_ids: &[NodeId],
     leaf_slices: &'a [Option<DBPinnableSlice<'a>>],
@@ -625,53 +1004,16 @@ pub(crate) fn parse_leaf_views<'a>(
     Ok(views)
 }
 
-/// Fetch `leaf_ids`, evaluate `prepared` per-leaf masks, and append all matching live `DocId`s to `out`.
-pub(crate) fn collect_matching_doc_ids_in_leaves(
-    storage: &Storage,
-    attr_index: &AttributeIndex,
-    prepared: &PreparedFilter,
-    leaf_ids: &[NodeId],
-    config: &TreeConfig,
-    quantizer: &RabitqQuantizer,
-    out: &mut Vec<DocId>,
-) -> Result<()> {
-    if leaf_ids.is_empty() {
-        return Ok(());
-    }
-    let leaf_slices = storage.multi_get_leaf_nodes_pinned(leaf_ids)?;
-    let views = parse_leaf_views(leaf_ids, &leaf_slices, config, quantizer)?;
-    let leaf_pairs: Vec<(NodeId, Option<&LeafNodeView<'_>>)> = leaf_ids
-        .iter()
-        .copied()
-        .zip(views.iter().map(|v| v.as_ref()))
-        .collect();
-    let masks = attr_index.eval_leaves_masks(storage, prepared, &leaf_pairs)?;
-
-    for (view_opt, mask) in views.iter().zip(masks.iter()) {
-        if mask.is_empty() {
-            continue;
-        }
-        if let Some(view) = view_opt {
-            mask.for_each_set_bit(view.slot_cap, |slot| {
-                if view.is_live(slot) {
-                    out.push(view.doc_id(slot));
-                }
-            });
-        }
-    }
-    Ok(())
+pub(crate) struct LeafScoreContext<'a> {
+    pub q: &'a [f32],
+    pub scratch: &'a mut QueryScratch,
+    pub dot_q_meta: Option<QuantizedQueryMeta>,
+    pub inv_sqrt_padded_dim: f32,
+    pub rabitq_words: usize,
+    pub metric: DistanceMetric,
 }
 
-struct LeafScoreContext<'a> {
-    q: &'a [f32],
-    scratch: &'a mut QueryScratch,
-    dot_q_meta: Option<QuantizedQueryMeta>,
-    inv_sqrt_padded_dim: f32,
-    rabitq_words: usize,
-    metric: DistanceMetric,
-}
-
-fn score_leaf_view(
+pub(crate) fn score_leaf_view(
     view: &LeafNodeView<'_>,
     allowed_slots: Option<&[u64]>,
     ctx: &mut LeafScoreContext<'_>,
@@ -710,7 +1052,7 @@ fn score_leaf_view(
             slot_cap: view.slot_cap,
             rabitq_words: ctx.rabitq_words,
             popcount_u32: view.popcount_u32,
-            doc_ids_bytes: view.doc_ids_bytes,
+            doc_ids_bytes: view.row_ids_bytes,
             codes_bytes: view.codes_bytes,
             code_popcounts_bytes: view.code_popcounts_bytes,
             res_norm_sqs_bytes: view.res_norm_sqs_bytes,
@@ -732,34 +1074,34 @@ fn score_leaf_view(
     );
 }
 
-fn score_exact_vectors(
+pub(crate) fn score_exact_vectors(
     storage: &Storage,
     q: &[f32],
-    sorted_doc_ids: &[DocId],
+    sorted_rows: &[RowId],
     k: usize,
     dim: usize,
     metric: DistanceMetric,
-) -> Result<Vec<(DocId, f32)>> {
-    let vec_slices = storage.multi_get_vectors_pinned(sorted_doc_ids)?;
+) -> Result<Vec<(RowId, f32)>> {
+    let vec_slices = storage.multi_get_vectors_pinned(sorted_rows)?;
     let expected_bytes = dim * 4;
-    let mut exact = Vec::with_capacity(sorted_doc_ids.len());
-    for (&doc_id, opt_slice) in sorted_doc_ids.iter().zip(vec_slices.iter()) {
+    let mut exact = Vec::with_capacity(sorted_rows.len());
+    for (&row_id, opt_slice) in sorted_rows.iter().zip(vec_slices.iter()) {
         let slice = opt_slice.as_ref().ok_or_else(|| {
-            TreeError::CorruptedData(format!("missing vector {doc_id} in cf_vectors"))
+            TreeError::CorruptedData(format!("missing vector {row_id:?} in cf_vectors"))
         })?;
         if slice.len() != expected_bytes {
             return Err(TreeError::CorruptedData(format!(
-                "vector {doc_id} expected {expected_bytes} bytes, got {}",
+                "vector {row_id:?} expected {expected_bytes} bytes, got {}",
                 slice.len()
             )));
         }
-        exact.push((doc_id, search_distance_bytes(metric, q, slice)));
+        exact.push((row_id, search_distance_bytes(metric, q, slice)));
     }
-    select_top_k(&mut exact, k, cmp_dist_id);
+    select_top_k(&mut exact, k, cmp_dist_row);
     Ok(exact)
 }
 
-fn finalize_candidates(
+pub(crate) fn finalize_candidates(
     storage: &Storage,
     q: &[f32],
     mut candidates: Vec<LeafCandidate>,
@@ -767,10 +1109,13 @@ fn finalize_candidates(
     rerank_candidates: Option<usize>,
     dim: usize,
     metric: DistanceMetric,
-) -> Result<Vec<(DocId, f32)>> {
+) -> Result<Vec<(RowId, f32)>> {
     let Some(rerank_k) = rerank_candidates else {
         select_top_k(&mut candidates, k, cmp_cand_dist_id);
-        return Ok(candidates.into_iter().map(|c| (c.doc_id, c.dist)).collect());
+        return Ok(candidates
+            .into_iter()
+            .map(|c| (RowId(c.doc_id), c.dist))
+            .collect());
     };
 
     let shortlist_len = rerank_k.max(k);
@@ -780,15 +1125,16 @@ fn finalize_candidates(
     }
 
     candidates.sort_unstable_by_key(|c| c.doc_id);
-    let sorted_doc_ids: Vec<DocId> = candidates.iter().map(|c| c.doc_id).collect();
-    score_exact_vectors(storage, q, &sorted_doc_ids, k, dim, metric)
+    let sorted_rows: Vec<RowId> = candidates.iter().map(|c| RowId(c.doc_id)).collect();
+    score_exact_vectors(storage, q, &sorted_rows, k, dim, metric)
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
-struct HeapEntry {
-    dist: f32,
-    node_id: NodeId,
-    level: u8,
+pub(crate) struct HeapEntry {
+    pub dist: f32,
+    pub node_id: NodeId,
+    pub level: u8,
 }
 
 impl PartialEq for HeapEntry {
@@ -815,8 +1161,14 @@ impl PartialOrd for HeapEntry {
     }
 }
 
+#[allow(dead_code)]
 #[inline]
-fn select_top_k<T, F>(items: &mut Vec<T>, limit: usize, cmp: F)
+pub(crate) fn make_min_heap() -> BinaryHeap<HeapEntry> {
+    BinaryHeap::new()
+}
+
+#[inline]
+pub(crate) fn select_top_k<T, F>(items: &mut Vec<T>, limit: usize, cmp: F)
 where
     F: Fn(&T, &T) -> Ordering,
 {
@@ -832,7 +1184,7 @@ where
 }
 
 #[inline]
-fn cmp_dist_id(a: &(DocId, f32), b: &(DocId, f32)) -> Ordering {
+fn cmp_dist_row(a: &(RowId, f32), b: &(RowId, f32)) -> Ordering {
     a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
 }
 

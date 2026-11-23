@@ -4,7 +4,7 @@ use izzydb::fts::{Bm25TermScorer, FtsAnalyzer, ReusableBuffer};
 use izzydb::{
     AttributeType, Attributes, Bm25Overrides, Bm25Result, Collection, CollectionConfig,
     DistanceMetric, DocId, DocumentPatch, Filter, FullTextSearchConfig, HybridSearchOptions,
-    Language, RankBy, SearchOptions, TokenQuery, Tokenizer, TreeConfig, TreeError,
+    Language, RankBy, SearchOptions, SegmentConfig, TokenQuery, Tokenizer, TreeConfig, TreeError,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -151,8 +151,8 @@ fn test_fts_schema_validation_and_reconcile() {
         let mut attrs = Attributes::new();
         attrs.insert("cat".into(), "db".into());
         attrs.insert("title".into(), "Running fast queries".into());
-        col.upsert(1, &[1.0; 4], attrs).unwrap();
-        col.verify_invariants().unwrap();
+        col.upsert(1, Some(&[1.0; 4]), attrs).unwrap();
+        col.verify_ann_invariants().unwrap();
     }
 
     let bad_cfg = CollectionConfig::new(base_tree.clone())
@@ -181,19 +181,19 @@ fn test_fts_schema_validation_and_reconcile() {
             .with_max_token_length(10),
     );
     let mut col = Collection::open(dir.path(), cfg2).unwrap();
-    let stats = col.verify_invariants().unwrap();
-    assert_eq!(stats.num_fts_docs, 1);
+    col.verify_ann_invariants().unwrap();
+    assert_eq!(col.len(), 1);
 
     let mut bad_kw = Attributes::new();
     bad_kw.insert("kw".into(), vec!["toolongtokenvalue".to_string()].into());
     assert!(matches!(
-        col.upsert(2, &[0.5; 4], bad_kw),
+        col.upsert(2, Some(&[0.5; 4]), bad_kw),
         Err(TreeError::InvalidAttribute { .. })
     ));
 
     let mut good_kw = Attributes::new();
     good_kw.insert("kw".into(), vec!["rust".to_string(), "bm25".to_string()].into());
-    col.upsert(2, &[0.5; 4], good_kw).unwrap();
+    col.upsert(2, Some(&[0.5; 4]), good_kw).unwrap();
 
     let hits = col
         .query_bm25(
@@ -204,7 +204,7 @@ fn test_fts_schema_validation_and_reconcile() {
         .unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, 2);
-    col.verify_invariants().unwrap();
+    col.verify_ann_invariants().unwrap();
 }
 
 #[test]
@@ -277,9 +277,9 @@ fn test_fts_phrase_array_gap_prefix_and_vector_filters() {
                 .into(),
         );
         attrs.insert("summary".into(), summary.into());
-        col.upsert(id, &vec, attrs).unwrap();
+        col.upsert(id, Some(&vec), attrs).unwrap();
     }
-    col.verify_invariants().unwrap();
+    col.verify_ann_invariants().unwrap();
 
     // ContainsTokenSequence rejected on index_positions = false
     assert!(matches!(
@@ -635,7 +635,7 @@ fn test_fts_churn_parity_filtered_bm25_and_hybrid_search() {
             attrs.insert("active".into(), (id % 2 == 0).into());
             attrs.insert("title".into(), title.into());
             attrs.insert("body".into(), body.into());
-            col.upsert(id, &vec, attrs.clone()).unwrap();
+            col.upsert(id, Some(&vec), attrs.clone()).unwrap();
             oracle.insert(id, (vec, attrs));
         } else if op < 92 {
             let id = rng.random_range(0..450u64);
@@ -646,14 +646,13 @@ fn test_fts_churn_parity_filtered_bm25_and_hybrid_search() {
             col = Collection::open(dir.path(), cfg.clone()).unwrap();
         }
         if step % 150 == 149 {
-            let stats = col.verify_invariants().unwrap();
-            assert_eq!(stats.num_docs, oracle.len());
-            assert_eq!(stats.num_fts_docs, oracle.len());
+            col.verify_ann_invariants().unwrap();
+            assert_eq!(col.len(), oracle.len() as u64);
         }
     }
 
-    let stats = col.verify_invariants().unwrap();
-    assert_eq!(stats.num_fts_docs, oracle.len());
+    col.verify_ann_invariants().unwrap();
+    assert_eq!(col.len(), oracle.len() as u64);
 
     let fts_helper = izzydb::FtsIndex::new();
     let schema = col.schema();
@@ -794,9 +793,9 @@ fn test_fts_recycling_term_stats_tightening_and_null_empty_transitions() {
                 "outlier common common alpha beta gamma"
             };
             attrs.insert("body".into(), body.into());
-            col.upsert(id, &[0.0, 0.0, 0.0, 0.0], attrs).unwrap();
+            col.upsert(id, Some(&[0.0, 0.0, 0.0, 0.0]), attrs).unwrap();
         }
-        col.verify_invariants().unwrap();
+        col.verify_ann_invariants().unwrap();
 
         // Non-FTS attribute patch + vector-only patch preserve FTS index and invariants.
         col.patch(
@@ -806,16 +805,16 @@ fn test_fts_recycling_term_stats_tightening_and_null_empty_transitions() {
                 .with_attribute("tag", "patched".into()),
         )
         .unwrap();
-        col.verify_invariants().unwrap();
+        col.verify_ann_invariants().unwrap();
 
-        // Edit outlier doc 50 down (tf=6 -> tf=1, dl=6 -> dl=7): inline TermStats tightening must fire!
+        // Edit outlier doc 50 down (tf=6 -> tf=1, dl=6 -> dl=7): compact_fts_stats tightens bounds.
         col.patch(
             50,
             DocumentPatch::new()
                 .with_attribute("body", "outlier alpha beta gamma delta epsilon zeta".into()),
         )
         .unwrap();
-        col.verify_invariants().unwrap();
+        col.verify_ann_invariants().unwrap();
 
         // Null / empty / stopword-only transitions on doc 250 (preserved past delete_batch(0..200))
         // non-empty -> stopword-only (doc_len = 0)
@@ -824,35 +823,35 @@ fn test_fts_recycling_term_stats_tightening_and_null_empty_transitions() {
             DocumentPatch::new().with_attribute("body", "the and of".into()),
         )
         .unwrap();
-        col.verify_invariants().unwrap();
+        col.verify_ann_invariants().unwrap();
         // stopword-only -> empty string
         col.patch(250, DocumentPatch::new().with_attribute("body", "".into()))
             .unwrap();
-        col.verify_invariants().unwrap();
+        col.verify_ann_invariants().unwrap();
         // empty string -> Null (cleared)
         col.patch(250, DocumentPatch::new().clear_attribute("body"))
             .unwrap();
-        col.verify_invariants().unwrap();
+        col.verify_ann_invariants().unwrap();
         // Null -> non-empty
         col.patch(
             250,
             DocumentPatch::new().with_attribute("body", "outlier reborn".into()),
         )
         .unwrap();
-        col.verify_invariants().unwrap();
+        col.verify_ann_invariants().unwrap();
 
-        // Delete 200 docs (0..200) to populate fts_free_ids, then re-insert 150 docs and verify FtsDocId recycling!
+        // Delete 200 docs (0..200) and insert 150 docs into the segmented row store.
         let ids_to_del: Vec<DocId> = (0..200u64).collect();
         assert_eq!(col.delete_batch(&ids_to_del).unwrap(), 200);
-        col.verify_invariants().unwrap();
+        col.verify_ann_invariants().unwrap();
 
         for id in 1000..1150u64 {
             let mut attrs = Attributes::new();
             attrs.insert("tag".into(), "recycled".into());
             attrs.insert("body".into(), "common recycled text".into());
-            col.upsert(id, &[1.0, 0.0, 0.0, 0.0], attrs).unwrap();
+            col.upsert(id, Some(&[1.0, 0.0, 0.0, 0.0]), attrs).unwrap();
         }
-        col.verify_invariants().unwrap();
+        col.verify_ann_invariants().unwrap();
 
         // delete_by_filter with pure FTS filter & mixed filter
         let fts_del = col
@@ -878,19 +877,18 @@ fn test_fts_recycling_term_stats_tightening_and_null_empty_transitions() {
             )
             .unwrap();
         assert!(mixed_upd > 0);
-        col.verify_invariants().unwrap();
+        col.compact_fts_stats().unwrap();
+        col.verify_ann_invariants().unwrap();
     }
 
-    // Check FtsMeta.next_fts_doc_id stayed bounded at 300 (didn't grow to 450!) and TermStats tightened.
+    // Check TermStats tightened after compact_fts_stats.
     {
-        let (storage, _) = izzydb::storage::Storage::open(dir.path(), &test_tree_cfg(4)).unwrap();
+        let (storage, _, _) =
+            izzydb::storage::Storage::open(dir.path(), &cfg).unwrap();
         let meta = izzydb::fts::FtsMeta::decode(&storage.get_fts_meta_bytes().unwrap().unwrap())
             .unwrap();
-        assert!(
-            meta.next_fts_doc_id <= 300,
-            "expected FtsDocId recycling to keep next_fts_doc_id <= 300, got {}",
-            meta.next_fts_doc_id
-        );
+        let body_stats = meta.per_attr_stats.get(&1).copied().unwrap_or_default();
+        assert!(body_stats.doc_count > 0 && body_stats.doc_count < 300);
         let outlier_key = izzydb::codec::encode_fts_term_key(1, "outlier");
         let rec = izzydb::fts::TermRecord::decode(
             &storage.get_fts_term_bytes(&outlier_key).unwrap().unwrap(),
@@ -900,19 +898,24 @@ fn test_fts_recycling_term_stats_tightening_and_null_empty_transitions() {
         assert_eq!(rec.stats.min_dl_over_tf, 6.0);
     }
 
-    // Drain all remaining docs and confirm next_fts_doc_id shrinks back to 0 and free list is empty.
+    // Drain all remaining docs and confirm compact_fts_stats removes dead TermRecords and zeros stats.
     {
-        let mut col = Collection::open(dir.path(), cfg).unwrap();
+        let mut col = Collection::open(dir.path(), cfg.clone()).unwrap();
         let all = col.len();
         assert_eq!(col.delete_by_filter(&Filter::And(vec![])).unwrap(), all);
-        col.verify_invariants().unwrap();
+        col.compact_fts_stats().unwrap();
+        col.verify_ann_invariants().unwrap();
+        assert_eq!(col.len(), 0);
     }
     {
-        let (storage, _) = izzydb::storage::Storage::open(dir.path(), &test_tree_cfg(4)).unwrap();
+        let (storage, _, _) = izzydb::storage::Storage::open(dir.path(), &cfg).unwrap();
         let meta = izzydb::fts::FtsMeta::decode(&storage.get_fts_meta_bytes().unwrap().unwrap())
             .unwrap();
-        assert_eq!(meta.next_fts_doc_id, 0);
-        assert!(storage.get_fts_free_ids().unwrap().is_empty());
+        let body_stats = meta.per_attr_stats.get(&1).copied().unwrap_or_default();
+        assert_eq!(body_stats.doc_count, 0);
+        assert_eq!(body_stats.total_tokens, 0);
+        let outlier_key = izzydb::codec::encode_fts_term_key(1, "outlier");
+        assert!(storage.get_fts_term_bytes(&outlier_key).unwrap().is_none());
     }
 }
 
@@ -939,11 +942,11 @@ fn test_fts_compact_fts_stats_high_df_term() {
             "body".into(),
             if id == 0 { "rare rare rare common" } else { "common text" }.into(),
         );
-        col.upsert(id, &[0.0; 4], attrs).unwrap();
+        col.upsert(id, Some(&[0.0; 4]), attrs).unwrap();
     }
     col.delete(0).unwrap();
     col.compact_fts_stats().unwrap();
-    col.verify_invariants().unwrap();
+    col.verify_ann_invariants().unwrap();
 }
 
 #[test]
@@ -992,7 +995,7 @@ fn test_fts_long_horizon_churn_with_patch_and_filter_mutations() {
             .join(" ");
         attrs.insert("title".into(), title.into());
         attrs.insert("body".into(), body.into());
-        col.upsert(id, &vec, attrs.clone()).unwrap();
+        col.upsert(id, Some(&vec), attrs.clone()).unwrap();
         oracle.insert(id, (vec, attrs));
     }
 
@@ -1014,7 +1017,7 @@ fn test_fts_long_horizon_churn_with_patch_and_filter_mutations() {
                 .join(" ");
             attrs.insert("title".into(), title.into());
             attrs.insert("body".into(), body.into());
-            col.upsert(id, &vec, attrs.clone()).unwrap();
+            col.upsert(id, Some(&vec), attrs.clone()).unwrap();
             oracle.insert(id, (vec, attrs));
         } else if op < 55 {
             if let Some(&id) = oracle.keys().nth(rng.random_range(0..oracle.len().max(1))) {
@@ -1094,13 +1097,12 @@ fn test_fts_long_horizon_churn_with_patch_and_filter_mutations() {
         }
 
         if step % 60 == 59 {
-            let stats = col.verify_invariants().unwrap();
-            assert_eq!(stats.num_docs, oracle.len());
-            assert_eq!(stats.num_fts_docs, oracle.len());
+            col.verify_ann_invariants().unwrap();
+            assert_eq!(col.len(), oracle.len() as u64);
         }
     }
 
-    col.verify_invariants().unwrap();
+    col.verify_ann_invariants().unwrap();
     let fts_helper = izzydb::FtsIndex::new();
     let rank_by = RankBy::Sum(vec![
         RankBy::product(2.0, RankBy::bm25("title", "vector database")),
@@ -1124,4 +1126,179 @@ fn test_fts_long_horizon_churn_with_patch_and_filter_mutations() {
         assert_eq!(g.id, e.id);
         assert!((g.score - e.score).abs() <= 1e-4);
     }
+}
+
+#[test]
+fn test_fts_delete_40_percent_bm25_parity_vs_fresh_survivor_collection() {
+    let dir_churn = TempDir::new().unwrap();
+    let dir_fresh = TempDir::new().unwrap();
+    let cfg = CollectionConfig::new(test_tree_cfg(4))
+        .with_segment_config(SegmentConfig {
+            seal_rows: 100,
+            ..SegmentConfig::default()
+        })
+        .with_attribute("group", AttributeType::Uint, true)
+        .with_fts_attribute(
+            "body",
+            AttributeType::String,
+            false,
+            FullTextSearchConfig::default().with_stemming(true),
+        );
+
+    let vocab = [
+        "vector", "segment", "rocksdb", "bm25", "maxscore", "rabitq", "cluster", "filter", "block",
+        "phrase", "prefix", "posting",
+    ];
+    let mut rng = SmallRng::seed_from_u64(0x5A17_F755);
+    let mut churn = Collection::open(dir_churn.path(), cfg.clone()).unwrap();
+    let mut oracle: HashMap<DocId, (Vec<f32>, Attributes)> = HashMap::new();
+
+    for id in 0..400u64 {
+        let vec = random_vec(&mut rng, 4);
+        let len = rng.random_range(4..=16);
+        let body = (0..len)
+            .map(|_| vocab[rng.random_range(0..vocab.len())])
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut attrs = Attributes::new();
+        attrs.insert("group".into(), (id % 4).into());
+        attrs.insert("body".into(), body.into());
+        churn.upsert(id, Some(&vec), attrs.clone()).unwrap();
+        oracle.insert(id, (vec, attrs));
+    }
+
+    // Delete 40% (160 docs) across multiple segments.
+    let to_delete: Vec<DocId> = (0..160u64).map(|i| (i * 5) % 400).collect();
+    for id in &to_delete {
+        oracle.remove(id);
+    }
+    churn.delete_batch(&to_delete).unwrap();
+
+    // Build a clean fresh collection containing only the exact surviving documents.
+    let mut fresh = Collection::open(dir_fresh.path(), cfg).unwrap();
+    let mut batch: Vec<izzydb::Document> = oracle
+        .iter()
+        .map(|(&id, (v, a))| izzydb::Document {
+            id,
+            embedding: Some(v.clone()),
+            attributes: a.clone(),
+        })
+        .collect();
+    batch.sort_by_key(|d| d.id);
+    fresh.upsert_batch(&batch).unwrap();
+
+    for (rank_by, filter) in [
+        (RankBy::bm25("body", "vector segment rocksdb"), None),
+        (
+            RankBy::bm25("body", "maxscore rabitq cluster"),
+            Some(Filter::Eq("group".into(), 2u64.into())),
+        ),
+        (
+            RankBy::product(1.75, RankBy::bm25("body", "posting block filter")),
+            None,
+        ),
+    ] {
+        let got = churn.query_bm25(&rank_by, filter.as_ref(), 20).unwrap();
+        let exp = fresh.query_bm25(&rank_by, filter.as_ref(), 20).unwrap();
+        assert_eq!(got.len(), exp.len());
+        for (g, e) in got.iter().zip(exp.iter()) {
+            assert_eq!(g.id, e.id);
+            assert!(
+                (g.score - e.score).abs() <= 1e-6,
+                "BM25 score drift for doc {}: churn={} vs fresh={}",
+                g.id,
+                g.score,
+                e.score
+            );
+        }
+    }
+}
+
+#[test]
+fn test_fts_multi_segment_phrase_query() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = CollectionConfig::new(test_tree_cfg(4))
+        .with_segment_config(SegmentConfig {
+            seal_rows: 300,
+            ..SegmentConfig::default()
+        })
+        .with_fts_attribute(
+            "body",
+            AttributeType::String,
+            false,
+            FullTextSearchConfig::default().with_index_positions(true),
+        );
+    cfg.vector = None;
+
+    let mut col = Collection::open(dir.path(), cfg).unwrap();
+    let mut expected_phrase_ids: Vec<DocId> = Vec::new();
+    for id in 0..950u64 {
+        let mut attrs = Attributes::new();
+        let body = if id % 97 == 0 {
+            expected_phrase_ids.push(id);
+            "distributed vector database engine with exact phrase match".to_string()
+        } else if id % 31 == 0 {
+            "vector distributed engine without adjacent order".to_string()
+        } else {
+            format!("document {id} indexing segment postings only")
+        };
+        attrs.insert("body".into(), body.into());
+        col.upsert(id, None, attrs).unwrap();
+    }
+
+    let filter = Filter::ContainsTokenSequence {
+        attr: "body".into(),
+        query: "distributed vector".into(),
+        last_as_prefix: false,
+    };
+    let mut got = col.resolve_filter_doc_ids(&filter).unwrap();
+    got.sort_unstable();
+    assert_eq!(got, expected_phrase_ids);
+
+    // Also verify BM25 query spans all 4 segments (>900 docs with seal_rows=300).
+    let hits = col
+        .query_bm25(&RankBy::bm25("body", "distributed vector"), Some(&filter), 20)
+        .unwrap();
+    let hit_ids: HashSet<DocId> = hits.iter().map(|h| h.id).collect();
+    assert_eq!(hit_ids, expected_phrase_ids.into_iter().collect());
+}
+
+#[test]
+fn test_fts_inline_term_promotion_across_segments() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = CollectionConfig::new(test_tree_cfg(4))
+        .with_segment_config(SegmentConfig {
+            seal_rows: 50,
+            ..SegmentConfig::default()
+        })
+        .with_fts_attribute("body", AttributeType::String, false, FullTextSearchConfig::default());
+    cfg.vector = None;
+
+    let mut col = Collection::open(dir.path(), cfg).unwrap();
+    let mut rare_ids: Vec<DocId> = Vec::new();
+    // 140 docs -> spans 3 segments (0, 1, 2); "quasar" appears in segment 0 (<= 8 inline),
+    // then in segments 1 and 2, forcing inline -> out-of-line promotion across segments.
+    for id in 0..140u64 {
+        let mut attrs = Attributes::new();
+        let body = if matches!(id, 5 | 12 | 55 | 60 | 70 | 80 | 90 | 105 | 115 | 125 | 135) {
+            rare_ids.push(id);
+            "quasar pulsar neutron"
+        } else {
+            "ordinary background filler text"
+        };
+        attrs.insert("body".into(), body.into());
+        col.upsert(id, None, attrs).unwrap();
+    }
+
+    let got = col
+        .resolve_filter_doc_ids(&Filter::ContainsAllTokens {
+            attr: "body".into(),
+            query: "quasar".into(),
+            last_as_prefix: false,
+        })
+        .unwrap();
+    assert_eq!(got, rare_ids);
+
+    let bm25 = col.query_bm25(&RankBy::bm25("body", "quasar"), None, 20).unwrap();
+    assert_eq!(bm25.len(), rare_ids.len());
 }

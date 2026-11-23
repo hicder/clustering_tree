@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use izzydb::{
     AttributeType, AttributeValue, Attributes, Collection, CollectionConfig, DistanceMetric,
     DocId, DocumentPatch, FacetSpec, Filter, NullsOrder, OrderBySpec, OrderedResult, ScalarValue,
-    SortDirection, TreeConfig, TreeError,
+    SegmentConfig, SortDirection, TreeConfig, TreeError,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -65,7 +65,7 @@ fn build(dir: &TempDir) -> (Collection, HashMap<DocId, Attributes>) {
         a.insert("g".into(), AttributeValue::Int(rng.random_range(0..4)));
         a.insert("cat".into(), ["x", "y", "z"][(id % 3) as usize].into());
         a.insert("plain".into(), AttributeValue::Int(id as i64));
-        col.upsert(id, &[0.0; 4], a.clone()).unwrap();
+        col.upsert(id, Some(&[0.0; 4]), a.clone()).unwrap();
         docs.insert(id, a);
     }
     (col, docs)
@@ -262,10 +262,11 @@ fn survives_updates_deletes_and_splits() {
         a.insert("g".into(), AttributeValue::Int(1));
         a.insert("cat".into(), "y".into());
         a.insert("plain".into(), AttributeValue::Int(id as i64));
-        col.upsert(id, &[0.0; 4], a.clone()).unwrap();
+        col.upsert(id, Some(&[0.0; 4]), a.clone()).unwrap();
         docs.insert(id, a);
     }
-    col.verify_invariants().unwrap();
+    col.verify_ann_invariants().unwrap();
+    assert_eq!(col.len(), docs.len() as u64);
     run(&col, &docs, &[OrderBySpec::desc("i")]);
     run(&col, &docs, &[OrderBySpec::asc("u").with_nulls(NullsOrder::First), OrderBySpec::asc("i")]);
 }
@@ -322,9 +323,62 @@ fn top_group_fills_result_with_docid_tiebreak() {
     for id in 0..200u64 {
         let mut a = Attributes::new();
         a.insert("u".into(), AttributeValue::Uint(id / 100));
-        col.upsert(id, &[0.0; 4], a).unwrap();
+        col.upsert(id, Some(&[0.0; 4]), a).unwrap();
     }
     let got = col.query_ordered(&[OrderBySpec::desc("u")], None, 3).unwrap();
     let ids: Vec<DocId> = got.iter().map(|r| r.id).collect();
     assert_eq!(ids, vec![100, 101, 102]);
+}
+
+#[test]
+fn multi_segment_and_tombstone_order_by_parity() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = config().with_segment_config(SegmentConfig {
+        seal_rows: 64,
+        ..SegmentConfig::default()
+    });
+    cfg.vector = None;
+
+    let mut col = Collection::open(dir.path(), cfg).unwrap();
+    let mut rng = SmallRng::seed_from_u64(0x600D_04D3);
+    let mut docs: HashMap<DocId, Attributes> = HashMap::new();
+
+    for id in 0..220u64 {
+        let mut a = Attributes::new();
+        if id % 5 != 0 {
+            a.insert("i".into(), AttributeValue::Int(rng.random_range(-30..30)));
+        }
+        a.insert("u".into(), AttributeValue::Uint(rng.random_range(0..15)));
+        a.insert("cat".into(), if id % 2 == 0 { "even" } else { "odd" }.into());
+        col.upsert(id, None, a.clone()).unwrap();
+        docs.insert(id, a);
+    }
+
+    // Mutate / delete 30% across sealed and open segments.
+    for id in (0..220u64).step_by(3) {
+        if id % 6 == 0 {
+            col.delete(id).unwrap();
+            docs.remove(&id);
+        } else {
+            let new_i = rng.random_range(-30..30);
+            col.patch(id, DocumentPatch::new().with_attribute("i", AttributeValue::Int(new_i)))
+                .unwrap();
+            docs.get_mut(&id).unwrap().insert("i".into(), AttributeValue::Int(new_i));
+        }
+    }
+
+    let filter = Filter::Eq("cat".into(), "even".into());
+    for specs in [
+        &[OrderBySpec::asc("i").with_nulls(NullsOrder::First)][..],
+        &[OrderBySpec::desc("i").with_nulls(NullsOrder::Last), OrderBySpec::asc("u")][..],
+        &[OrderBySpec::asc("u")][..],
+    ] {
+        for f in [None, Some(&filter)] {
+            for k in [1, 10, 40, 200] {
+                let got = col.query_ordered(specs, f, k).unwrap();
+                let exp = oracle(&col, &docs, specs, f, k);
+                assert_eq!(got, exp, "specs={specs:?}, filter={f:?}, k={k}");
+            }
+        }
+    }
 }

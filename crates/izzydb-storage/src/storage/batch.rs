@@ -1,20 +1,25 @@
 use rocksdb::WriteBatch;
 
-use izzydb_core::config::{DocId, FtsBlockId, NodeId};
+use izzydb_core::config::{AttrId, ColumnGen, DocId, NodeId, ROW_BLOCK_SIZE, RowBlock, RowId, SegmentId, SkipChunk, TermId};
 use izzydb_core::schema::CollectionSchema;
 
-use crate::codec::encode_fts_block_key;
-use crate::node::{PackedInternalNode, PackedLeafNode, TreeMeta, encode_f32_slice};
+use crate::codec::{
+    ATTR_COUNT_TAG, DETACHED_COUNT_TAG, DETACHED_META_TAG, DETACHED_OVERWRITTEN_TAG, DetachedMeta,
+    FTS_DOC_LEN_TAG, INTERNAL_NODE_TAG, Manifest, SEG_DELETES_TAG, SEG_META_TAG, SegmentMeta,
+    ZONE_TAG, ZoneEntry, detached_meta_key, detached_overwritten_key, doc_id_block_key,
+    doc_len_key_coord, encode_doc_id_block, fts_block_key_coord, fts_chunk_key_coord, row_key,
+    seg_deletes_key, seg_meta_key, zone_key,
+};
+use crate::node::{AnnMeta, PackedInternalNode, PackedLeafNode, encode_f32_slice};
 
-use super::types::{DocLoc, doc_key, node_key};
 use super::{
-    ATTR_COUNT_TAG, ATTR_COUNTS_VERSION_KEY, ATTR_ZONE_TAG, CF_ATTR_CLUSTERS, CF_ATTR_POSTINGS, CF_DOC_LOC, CF_DOCS, CF_FTS_POSITIONS,
-    CF_FTS_POSTINGS, CF_FTS_SKIPS, CF_FTS_TERMS, CF_LEAF_ENTRIES, CF_VECTORS, FTS_DOC_LEN_TAG,
-    FTS_FREE_IDS_KEY, FTS_META_KEY, FTS_REV_BLOCK_TAG, INTERNAL_NODE_TAG, META_KEY, SCHEMA_KEY,
-    Storage, tagged_key,
+    ANN_META_KEY, CF_ATTR_POSTINGS, CF_COLUMNS, CF_DETACHED, CF_DETACHED_POSTINGS,
+    CF_FTS_POSITIONS, CF_FTS_POSTINGS, CF_FTS_SKIPS, CF_FTS_TERMS, CF_ID_MAP, CF_LEAF_ENTRIES,
+    CF_ROW_DOC_IDS, CF_ROWS, CF_VECTORS, DROPPED_SEGMENTS_KEY, FTS_META_KEY, MANIFEST_KEY,
+    SCHEMA_KEY, Storage, doc_key, node_key, tagged_key,
 };
 
-/// Typed wrapper around `rocksdb::WriteBatch` for atomic tree and attribute index mutations.
+/// Typed wrapper around `rocksdb::WriteBatch` for atomic v3 storage mutations.
 pub struct StorageBatch<'a> {
     pub(super) storage: &'a Storage,
     pub(super) batch: WriteBatch,
@@ -31,12 +36,83 @@ impl<'a> StorageBatch<'a> {
         self.batch.delete_cf(cf, key);
     }
 
-    pub fn put_meta(&mut self, meta: &TreeMeta) {
-        self.batch.put(META_KEY, meta.encode());
+    pub fn delete_range_cf(&mut self, cf_name: &str, from: &[u8], to: &[u8]) {
+        let cf = self.storage.db.cf_handle(cf_name).unwrap();
+        self.batch.delete_range_cf(cf, from, to);
+    }
+
+    pub fn delete_range_default(&mut self, from: &[u8], to: &[u8]) {
+        self.batch.delete_range(from, to);
+    }
+
+    pub fn put_manifest(&mut self, manifest: &Manifest) {
+        self.batch.put(MANIFEST_KEY, manifest.encode());
+    }
+
+    pub fn put_ann_meta(&mut self, meta: &AnnMeta) {
+        self.batch.put(ANN_META_KEY, meta.encode());
     }
 
     pub fn put_schema(&mut self, schema: &CollectionSchema) {
         self.batch.put(SCHEMA_KEY, schema.encode());
+    }
+
+    pub fn put_dropped_segments(&mut self, bytes: &[u8]) {
+        self.batch.put(DROPPED_SEGMENTS_KEY, bytes);
+    }
+
+    pub fn put_seg_meta(&mut self, seg: SegmentId, meta: &SegmentMeta) {
+        self.batch.put(seg_meta_key(seg), meta.encode());
+    }
+
+    pub fn delete_seg_meta(&mut self, seg: SegmentId) {
+        let _ = SEG_META_TAG;
+        self.batch.delete(seg_meta_key(seg));
+    }
+
+    pub fn put_seg_deletes(&mut self, seg: SegmentId, bytes: &[u8]) {
+        self.batch.put(seg_deletes_key(seg), bytes);
+    }
+
+    pub fn delete_seg_deletes(&mut self, seg: SegmentId) {
+        let _ = SEG_DELETES_TAG;
+        self.batch.delete(seg_deletes_key(seg));
+    }
+
+    pub fn put_zone_entry(&mut self, seg: SegmentId, attr_id: AttrId, tag: u8, entry: &ZoneEntry) {
+        let _ = ZONE_TAG;
+        self.batch.put(zone_key(seg, attr_id, tag), entry.encode());
+    }
+
+    pub fn delete_zone_entry(&mut self, seg: SegmentId, attr_id: AttrId, tag: u8) {
+        self.batch.delete(zone_key(seg, attr_id, tag));
+    }
+
+    pub fn put_detached_meta(&mut self, attr_id: AttrId, meta: &DetachedMeta) {
+        let _ = DETACHED_META_TAG;
+        self.batch.put(detached_meta_key(attr_id), meta.encode());
+    }
+
+    pub fn put_detached_overwritten(
+        &mut self,
+        attr_id: AttrId,
+        col_gen: ColumnGen,
+        seg: SegmentId,
+        bytes: &[u8],
+    ) {
+        let _ = DETACHED_OVERWRITTEN_TAG;
+        self.batch
+            .put(detached_overwritten_key(attr_id, col_gen, seg), bytes);
+    }
+
+    pub fn delete_detached_overwritten(
+        &mut self,
+        attr_id: AttrId,
+        col_gen: ColumnGen,
+        seg: SegmentId,
+    ) {
+        self.batch
+            .delete(detached_overwritten_key(attr_id, col_gen, seg));
     }
 
     pub fn put_internal_node(&mut self, node_id: NodeId, node: &PackedInternalNode) {
@@ -62,36 +138,40 @@ impl<'a> StorageBatch<'a> {
         self.delete_cf(CF_LEAF_ENTRIES, &node_key(leaf_id));
     }
 
-    pub fn put_vector(&mut self, doc_id: DocId, vec: &[f32]) {
-        self.put_cf(CF_VECTORS, &doc_key(doc_id), &encode_f32_slice(vec));
+    pub fn put_id_map(&mut self, doc_id: DocId, row_id: RowId) {
+        self.put_cf(CF_ID_MAP, &doc_key(doc_id), &row_key(row_id));
     }
 
-    pub fn delete_vector(&mut self, doc_id: DocId) {
-        self.delete_cf(CF_VECTORS, &doc_key(doc_id));
+    pub fn delete_id_map(&mut self, doc_id: DocId) {
+        self.delete_cf(CF_ID_MAP, &doc_key(doc_id));
     }
 
-    pub fn put_doc_loc(&mut self, doc_id: DocId, loc: DocLoc) {
-        self.put_cf(CF_DOC_LOC, &doc_key(doc_id), &loc.encode());
+    pub fn put_row_bytes(&mut self, row: RowId, bytes: &[u8]) {
+        self.put_cf(CF_ROWS, &row_key(row), bytes);
     }
 
-    pub fn delete_doc_loc(&mut self, doc_id: DocId) {
-        self.delete_cf(CF_DOC_LOC, &doc_key(doc_id));
+    pub fn delete_row(&mut self, row: RowId) {
+        self.delete_cf(CF_ROWS, &row_key(row));
     }
 
-    pub fn put_doc_bytes(&mut self, doc_id: DocId, bytes: &[u8]) {
-        self.put_cf(CF_DOCS, &doc_key(doc_id), bytes);
+    pub fn put_doc_id_block(&mut self, seg: SegmentId, block: u32, ids: &[DocId; ROW_BLOCK_SIZE]) {
+        self.put_cf(
+            CF_ROW_DOC_IDS,
+            &doc_id_block_key(seg, block),
+            &encode_doc_id_block(ids),
+        );
     }
 
-    pub fn delete_doc(&mut self, doc_id: DocId) {
-        self.delete_cf(CF_DOCS, &doc_key(doc_id));
+    pub fn put_vector(&mut self, row: RowId, vec: &[f32]) {
+        self.put_cf(CF_VECTORS, &row_key(row), &encode_f32_slice(vec));
     }
 
-    pub fn put_attr_cluster(&mut self, key: &[u8], bytes: &[u8]) {
-        self.put_cf(CF_ATTR_CLUSTERS, key, bytes);
+    pub fn put_vector_bytes(&mut self, row: RowId, bytes: &[u8]) {
+        self.put_cf(CF_VECTORS, &row_key(row), bytes);
     }
 
-    pub fn delete_attr_cluster(&mut self, key: &[u8]) {
-        self.delete_cf(CF_ATTR_CLUSTERS, key);
+    pub fn delete_vector(&mut self, row: RowId) {
+        self.delete_cf(CF_VECTORS, &row_key(row));
     }
 
     pub fn put_attr_posting(&mut self, key: &[u8], bytes: &[u8]) {
@@ -102,58 +182,56 @@ impl<'a> StorageBatch<'a> {
         self.delete_cf(CF_ATTR_POSTINGS, key);
     }
 
-    /// Set `default[0x06 || cluster_key]` to `count` (callers delete the key instead of writing `0`).
-    pub fn put_attr_count(&mut self, cluster_key: &[u8], count: u64) {
-        let mut key = Vec::with_capacity(1 + cluster_key.len());
+    pub fn put_column_block(&mut self, key: &[u8; 10], bytes: &[u8]) {
+        self.put_cf(CF_COLUMNS, key, bytes);
+    }
+
+    pub fn put_detached_block(&mut self, key: &[u8; 14], bytes: &[u8]) {
+        self.put_cf(CF_DETACHED, key, bytes);
+    }
+
+    pub fn delete_detached_block(&mut self, key: &[u8; 14]) {
+        self.delete_cf(CF_DETACHED, key);
+    }
+
+    pub fn put_detached_posting(&mut self, key: &[u8], bytes: &[u8]) {
+        self.put_cf(CF_DETACHED_POSTINGS, key, bytes);
+    }
+
+    pub fn delete_detached_posting(&mut self, key: &[u8]) {
+        self.delete_cf(CF_DETACHED_POSTINGS, key);
+    }
+
+    pub fn put_attr_count(&mut self, attr_key: &[u8], count: u64) {
+        let mut key = Vec::with_capacity(1 + attr_key.len());
         key.push(ATTR_COUNT_TAG);
-        key.extend_from_slice(cluster_key);
+        key.extend_from_slice(attr_key);
         self.batch.put(key, count.to_le_bytes());
     }
 
-    pub fn delete_attr_count(&mut self, cluster_key: &[u8]) {
-        let mut key = Vec::with_capacity(1 + cluster_key.len());
+    pub fn delete_attr_count(&mut self, attr_key: &[u8]) {
+        let mut key = Vec::with_capacity(1 + attr_key.len());
         key.push(ATTR_COUNT_TAG);
-        key.extend_from_slice(cluster_key);
+        key.extend_from_slice(attr_key);
         self.batch.delete(key);
     }
 
-    /// Persist the marker declaring that `default[0x06]` counts are complete and maintained.
-    pub fn put_attr_counts_marker(&mut self) {
-        self.batch.put(ATTR_COUNTS_VERSION_KEY, [1u8]);
+    pub fn put_detached_count(&mut self, suffix: &[u8], count: u64) {
+        let mut key = Vec::with_capacity(1 + suffix.len());
+        key.push(DETACHED_COUNT_TAG);
+        key.extend_from_slice(suffix);
+        self.batch.put(key, count.to_le_bytes());
     }
 
-    pub fn delete_attr_counts_marker(&mut self) {
-        self.batch.delete(ATTR_COUNTS_VERSION_KEY);
-    }
-
-    pub fn put_attr_zone(&mut self, key: &[u8; 3], bytes: &[u8]) {
-        self.batch.put(tagged_key::<4>(ATTR_ZONE_TAG, key), bytes);
-    }
-
-    pub fn delete_attr_zone(&mut self, key: &[u8; 3]) {
-        self.batch.delete(tagged_key::<4>(ATTR_ZONE_TAG, key));
+    pub fn delete_detached_count(&mut self, suffix: &[u8]) {
+        let mut key = Vec::with_capacity(1 + suffix.len());
+        key.push(DETACHED_COUNT_TAG);
+        key.extend_from_slice(suffix);
+        self.batch.delete(key);
     }
 
     pub fn put_fts_meta_bytes(&mut self, bytes: &[u8]) {
         self.batch.put(FTS_META_KEY, bytes);
-    }
-
-    pub fn put_fts_free_ids(&mut self, bytes: &[u8]) {
-        self.batch.put(FTS_FREE_IDS_KEY, bytes);
-    }
-
-    pub fn delete_fts_free_ids(&mut self) {
-        self.batch.delete(FTS_FREE_IDS_KEY);
-    }
-
-    pub fn put_fts_rev_block(&mut self, block_id: FtsBlockId, bytes: &[u8]) {
-        let key = tagged_key::<5>(FTS_REV_BLOCK_TAG, &encode_fts_block_key(block_id));
-        self.batch.put(key, bytes);
-    }
-
-    pub fn delete_fts_rev_block(&mut self, block_id: FtsBlockId) {
-        let key = tagged_key::<5>(FTS_REV_BLOCK_TAG, &encode_fts_block_key(block_id));
-        self.batch.delete(key);
     }
 
     pub fn put_fts_term(&mut self, key: &[u8], bytes: &[u8]) {
@@ -164,35 +242,41 @@ impl<'a> StorageBatch<'a> {
         self.delete_cf(CF_FTS_TERMS, key);
     }
 
-    pub fn put_fts_skip(&mut self, key: &[u8; 8], bytes: &[u8]) {
-        self.put_cf(CF_FTS_SKIPS, key, bytes);
+    pub fn put_fts_skip(&mut self, term_id: TermId, chunk: SkipChunk, bytes: &[u8]) {
+        self.put_cf(CF_FTS_SKIPS, &fts_chunk_key_coord(term_id, chunk), bytes);
     }
 
-    pub fn delete_fts_skip(&mut self, key: &[u8; 8]) {
-        self.delete_cf(CF_FTS_SKIPS, key);
+    pub fn delete_fts_skip(&mut self, term_id: TermId, chunk: SkipChunk) {
+        self.delete_cf(CF_FTS_SKIPS, &fts_chunk_key_coord(term_id, chunk));
     }
 
-    pub fn put_fts_posting(&mut self, key: &[u8; 8], bytes: &[u8]) {
-        self.put_cf(CF_FTS_POSTINGS, key, bytes);
+    pub fn put_fts_posting(&mut self, term_id: TermId, block: RowBlock, bytes: &[u8]) {
+        self.put_cf(CF_FTS_POSTINGS, &fts_block_key_coord(term_id, block), bytes);
     }
 
-    pub fn delete_fts_posting(&mut self, key: &[u8; 8]) {
-        self.delete_cf(CF_FTS_POSTINGS, key);
+    pub fn delete_fts_posting(&mut self, term_id: TermId, block: RowBlock) {
+        self.delete_cf(CF_FTS_POSTINGS, &fts_block_key_coord(term_id, block));
     }
 
-    pub fn put_fts_position(&mut self, key: &[u8; 8], bytes: &[u8]) {
-        self.put_cf(CF_FTS_POSITIONS, key, bytes);
+    pub fn put_fts_position(&mut self, term_id: TermId, block: RowBlock, bytes: &[u8]) {
+        self.put_cf(
+            CF_FTS_POSITIONS,
+            &fts_block_key_coord(term_id, block),
+            bytes,
+        );
     }
 
-    pub fn delete_fts_position(&mut self, key: &[u8; 8]) {
-        self.delete_cf(CF_FTS_POSITIONS, key);
+    pub fn delete_fts_position(&mut self, term_id: TermId, block: RowBlock) {
+        self.delete_cf(CF_FTS_POSITIONS, &fts_block_key_coord(term_id, block));
     }
 
-    pub fn put_fts_doc_len(&mut self, key: &[u8; 6], bytes: &[u8]) {
-        self.batch.put(tagged_key::<7>(FTS_DOC_LEN_TAG, key), bytes);
+    pub fn put_fts_doc_len(&mut self, attr_id: AttrId, block: RowBlock, bytes: &[u8]) {
+        let k = doc_len_key_coord(attr_id, block);
+        self.batch.put(tagged_key::<11>(FTS_DOC_LEN_TAG, &k), bytes);
     }
 
-    pub fn delete_fts_doc_len(&mut self, key: &[u8; 6]) {
-        self.batch.delete(tagged_key::<7>(FTS_DOC_LEN_TAG, key));
+    pub fn delete_fts_doc_len(&mut self, attr_id: AttrId, block: RowBlock) {
+        let k = doc_len_key_coord(attr_id, block);
+        self.batch.delete(tagged_key::<11>(FTS_DOC_LEN_TAG, &k));
     }
 }

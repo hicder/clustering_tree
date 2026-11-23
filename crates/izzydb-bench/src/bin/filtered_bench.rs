@@ -56,16 +56,16 @@ fn main() {
     let mut col = Collection::open(dir.path(), cfg).unwrap();
     let t0 = Instant::now();
     for (id, (vec, attrs)) in data.iter().enumerate() {
-        col.upsert(id as DocId, vec, attrs.clone()).unwrap();
+        col.upsert(id as DocId, Some(vec), attrs.clone()).unwrap();
     }
     let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let stats = col.verify_invariants().unwrap();
     println!(
-        "Built Collection: n={}, dim={}, leaves={}, clusters={}, postings={}, build={build_ms:.1}ms",
+        "Built Collection: n={}, dim={}, leaves={}, segments={}, postings={}, build={build_ms:.1}ms",
         stats.num_docs,
         dim,
-        stats.tree.leaf_nodes,
-        stats.num_cluster_bitmaps,
+        stats.tree.unwrap().leaf_nodes,
+        stats.num_segments,
         stats.num_posting_bitmaps
     );
 

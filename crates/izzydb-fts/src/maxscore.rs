@@ -4,14 +4,13 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
 use alyze::analyze::ReusableBuffer;
-use roaring::RoaringBitmap;
 
 use izzydb_core::config::{
-    AttrId, DocId, FTS_BLOCK_SIZE, FtsBlockId, FtsDocId, TermId, for_each_set_bit_256,
-    fts_block_id, fts_slot, make_fts_doc_id,
+    AttrId, DocId, FTS_BLOCK_SIZE, RowBlock, RowId, TermId, for_each_set_bit_256,
 };
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::rank::{Bm25Overrides, RankBy};
+use izzydb_core::rowset::RowSet;
 use izzydb_core::schema::{CollectionSchema, FullTextSearchConfig};
 
 use crate::analyzer::FtsAnalyzer;
@@ -31,21 +30,21 @@ pub struct Bm25Result {
 }
 
 /// Cursor over a single term's Block-Max skip summary (`cf_fts_skips` or inline `TermRecord`)
-/// sorted by ascending `block_id`.
+/// sorted by ascending `RowBlock`.
 pub trait FtsSkipCursor {
-    fn current_block_id(&self) -> Option<FtsBlockId>;
+    fn current_block_id(&self) -> Option<RowBlock>;
     fn current_block_bounds(&self) -> (u32, f32);
     fn inline_posting_bytes(&self) -> Option<&[u8]>;
     fn current_posting_bytes(&mut self) -> Result<Option<&[u8]>> {
         Ok(None)
     }
     fn next_block(&mut self) -> Result<()>;
-    fn seek_block(&mut self, target: FtsBlockId) -> Result<()>;
+    fn seek_block(&mut self, target: RowBlock) -> Result<()>;
 }
 
-/// Cursor over document-length blocks (`cf_fts_doc_lens`) for a single `attr_id`.
+/// Cursor over document-length blocks (`default[0x05]`) for a single `attr_id`.
 pub trait FtsDocLenCursor {
-    fn seek_block_bytes(&mut self, block_id: FtsBlockId) -> Result<Option<&[u8]>>;
+    fn seek_block_bytes(&mut self, block_id: RowBlock) -> Result<Option<&[u8]>>;
 }
 
 /// Storage abstraction consumed by MAXSCORE and FTS filter evaluation.
@@ -87,17 +86,17 @@ pub trait FtsPostingSource {
     fn get_posting_block<'a>(
         &'a self,
         term_id: TermId,
-        block_id: FtsBlockId,
+        block_id: RowBlock,
     ) -> Result<Option<Self::PostingGuard<'a>>>;
     fn open_doc_len_cursor<'a>(&'a self, attr_id: AttrId) -> Result<Self::DocLenCursor<'a>>;
-    fn multi_get_doc_ids(&self, fts_doc_ids: &[FtsDocId]) -> Result<Vec<Option<DocId>>>;
+    fn multi_get_doc_ids(&self, row_ids: &[RowId]) -> Result<Vec<Option<DocId>>>;
 }
 
 struct DlNormGroup<'a, S: FtsPostingSource + 'a> {
     attr_id: AttrId,
     c1: f32,
     c2: f32,
-    cached_block_id: Option<FtsBlockId>,
+    cached_block_id: Option<RowBlock>,
     cursor: Option<S::DocLenCursor<'a>>,
     dl_norm: [f32; FTS_BLOCK_SIZE],
 }
@@ -137,7 +136,7 @@ impl<'a, S: FtsPostingSource + 'a> DlNormCache<'a, S> {
         source: &'a S,
         tier: SimdTier,
         group_id: usize,
-        block_id: FtsBlockId,
+        block_id: RowBlock,
     ) -> Result<&[f32; FTS_BLOCK_SIZE]> {
         let group = &mut self.groups[group_id];
         if group.cached_block_id != Some(block_id) {
@@ -148,7 +147,7 @@ impl<'a, S: FtsPostingSource + 'a> DlNormCache<'a, S> {
             let cursor = group.cursor.as_mut().unwrap();
             let Some(bytes) = cursor.seek_block_bytes(block_id)? else {
                 return Err(TreeError::CorruptedData(format!(
-                    "missing cf_fts_doc_lens block for attr {attr_id} block {block_id}"
+                    "missing cf_fts_doc_lens block for attr {attr_id} block {block_id:?}"
                 )));
             };
             let view = DocLenBlockView::parse(bytes)?;
@@ -175,7 +174,7 @@ struct TermStream<'a, S: FtsPostingSource + 'a> {
 
 impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
     #[inline]
-    fn current_block_id(&self) -> Option<FtsBlockId> {
+    fn current_block_id(&self) -> Option<RowBlock> {
         self.cursor.current_block_id()
     }
 
@@ -186,7 +185,7 @@ impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
     }
 
     #[inline]
-    fn seek(&mut self, target: FtsBlockId) -> Result<()> {
+    fn seek(&mut self, target: RowBlock) -> Result<()> {
         if let Some(cur) = self.cursor.current_block_id()
             && cur < target
         {
@@ -196,7 +195,7 @@ impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
     }
 
     #[inline]
-    fn advance_past(&mut self, block_id: FtsBlockId) -> Result<()> {
+    fn advance_past(&mut self, block_id: RowBlock) -> Result<()> {
         if self.cursor.current_block_id() == Some(block_id) {
             self.cursor.next_block()?;
         }
@@ -206,7 +205,7 @@ impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
     #[inline]
     fn accumulate_into(
         &mut self,
-        target: FtsBlockId,
+        target: RowBlock,
         mode: AccumMode<'_, '_>,
         scores: &mut [f32; FTS_BLOCK_SIZE],
         dl_cache: &mut DlNormCache<'a, S>,
@@ -221,7 +220,7 @@ impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
         }
         let Some(guard) = source.get_posting_block(self.term_id, target)? else {
             return Err(TreeError::CorruptedData(format!(
-                "missing posting block for term_id {} block {target}",
+                "missing posting block for term_id {} block {target:?}",
                 self.term_id
             )));
         };
@@ -269,7 +268,7 @@ struct Clause<'a, S: FtsPostingSource + 'a> {
 }
 
 impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
-    fn next_block_id(&self) -> Option<FtsBlockId> {
+    fn next_block_id(&self) -> Option<RowBlock> {
         match &self.kind {
             ClauseKind::Single(t) => t.current_block_id(),
             ClauseKind::PrefixMax(ts) => ts.iter().filter_map(|t| t.current_block_id()).min(),
@@ -281,7 +280,7 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
         }
     }
 
-    fn block_upper_bound(&self, target: FtsBlockId) -> f32 {
+    fn block_upper_bound(&self, target: RowBlock) -> f32 {
         match &self.kind {
             ClauseKind::Single(t) => {
                 if t.current_block_id() == Some(target) {
@@ -307,7 +306,7 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
         }
     }
 
-    fn seek_to(&mut self, target: FtsBlockId) -> Result<()> {
+    fn seek_to(&mut self, target: RowBlock) -> Result<()> {
         match &mut self.kind {
             ClauseKind::Single(t) => t.seek(target),
             ClauseKind::PrefixMax(ts) => {
@@ -327,7 +326,7 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
         }
     }
 
-    fn advance_past(&mut self, target: FtsBlockId) -> Result<()> {
+    fn advance_past(&mut self, target: RowBlock) -> Result<()> {
         match &mut self.kind {
             ClauseKind::Single(t) => t.advance_past(target),
             ClauseKind::PrefixMax(ts) => {
@@ -349,7 +348,7 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
 
     fn accumulate_block(
         &mut self,
-        target: FtsBlockId,
+        target: RowBlock,
         scores: &mut [f32; FTS_BLOCK_SIZE],
         touched: &mut [u64; 4],
         dl_cache: &mut DlNormCache<'a, S>,
@@ -361,7 +360,7 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
 
     fn accumulate_block_masked(
         &mut self,
-        target: FtsBlockId,
+        target: RowBlock,
         mask: &[u64; 4],
         scores: &mut [f32; FTS_BLOCK_SIZE],
         dl_cache: &mut DlNormCache<'a, S>,
@@ -374,7 +373,7 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
     #[allow(clippy::too_many_arguments)]
     fn accumulate_impl(
         &mut self,
-        target: FtsBlockId,
+        target: RowBlock,
         mask: Option<&[u64; 4]>,
         scores: &mut [f32; FTS_BLOCK_SIZE],
         touched: Option<&mut [u64; 4]>,
@@ -800,13 +799,13 @@ fn ub_below_threshold(ub: f32, theta: f32) -> bool {
 #[derive(Debug, Clone, Copy)]
 struct TopKEntry {
     score: f32,
-    fts_doc_id: FtsDocId,
+    row_id: RowId,
     doc_id: Option<DocId>,
 }
 
 impl PartialEq for TopKEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.score.to_bits() == other.score.to_bits() && self.fts_doc_id == other.fts_doc_id
+        self.score.to_bits() == other.score.to_bits() && self.row_id == other.row_id
     }
 }
 
@@ -819,7 +818,7 @@ impl Ord for TopKEntry {
             .total_cmp(&self.score)
             .then_with(|| match (self.doc_id, other.doc_id) {
                 (Some(a), Some(b)) => a.cmp(&b),
-                _ => self.fts_doc_id.cmp(&other.fts_doc_id),
+                _ => self.row_id.cmp(&other.row_id),
             })
     }
 }
@@ -830,46 +829,33 @@ impl PartialOrd for TopKEntry {
     }
 }
 
-/// Precomputed per-block bitmasks from a `RoaringBitmap<FtsDocId>` filter pushdown.
-pub struct BlockFilterMask {
-    blocks: HashMap<FtsBlockId, [u64; 4]>,
+/// Optional per-block slot mask combining segment liveness and pushed-down filter [`RowSet`]s.
+///
+/// Returning `None` means all 256 slots in the block are allowed (fast path for segments
+/// without tombstones when no filter is active). Returning `Some([0; 4])` skips the block.
+pub trait BlockMaskProvider {
+    fn mask(&self, block: RowBlock) -> Option<[u64; 4]>;
 }
 
-impl BlockFilterMask {
-    pub fn from_bitmap(bm: &RoaringBitmap) -> Self {
-        let mut blocks: HashMap<FtsBlockId, [u64; 4]> = HashMap::new();
-        for fts_doc_id in bm.iter() {
-            let block_id = fts_block_id(fts_doc_id);
-            let slot = fts_slot(fts_doc_id);
-            let entry = blocks.entry(block_id).or_insert([0u64; 4]);
-            entry[(slot >> 6) as usize] |= 1u64 << (slot & 63);
-        }
-        Self { blocks }
-    }
-
+impl BlockMaskProvider for RowSet {
     #[inline]
-    pub fn get(&self, block_id: FtsBlockId) -> Option<&[u64; 4]> {
-        self.blocks.get(&block_id)
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
+    fn mask(&self, block: RowBlock) -> Option<[u64; 4]> {
+        Some(self.block_mask(block.seg(), block.block()))
     }
 }
 
-/// Per-document score modifier applied on top of a pure lexical expression `L(doc)`:
-/// `score(doc) = L(doc) * m(doc) + a(doc)` with `0 <= m <= mult_ub` and `0 <= a <= add_ub`.
+/// Per-row score modifier applied on top of a pure lexical expression `L(row)`:
+/// `score(row) = L(row) * m(row) + a(row)` with `0 <= m <= mult_ub` and `0 <= a <= add_ub`.
 ///
 /// MAXSCORE runs on `L * mult_ub` (an upper bound of the lexical part of the true score) and
 /// prunes against `theta - add_ub`; only candidates that survive pruning reach `rescore`.
 pub struct RankModifier<'f> {
-    /// Finite upper bound `> 0` of the multiplicative factor `m(doc)`.
+    /// Finite upper bound `> 0` of the multiplicative factor `m(row)`.
     pub mult_ub: f32,
-    /// Finite upper bound `>= 0` of the additive term `a(doc)`.
+    /// Finite upper bound `>= 0` of the additive term `a(row)`.
     pub add_ub: f32,
-    /// Maps `(doc_id, L(doc) * mult_ub)` to the exact final score (`<= 0` drops the document).
-    pub rescore: &'f mut dyn FnMut(DocId, f32) -> Result<f32>,
+    /// Maps `(row_id, L(row) * mult_ub)` to the exact final score (`<= 0` drops the document).
+    pub rescore: &'f mut dyn FnMut(RowId, f32) -> Result<f32>,
 }
 
 /// Execute a validated pure-lexical [`RankBy`] query using SIMD Vectorized Block-Max MAXSCORE.
@@ -878,25 +864,32 @@ pub fn execute_rank_by<S: FtsPostingSource>(
     schema: &CollectionSchema,
     rank_by: &RankBy,
     top_k: usize,
-    doc_filter: Option<&RoaringBitmap>,
-    lazy_filter: Option<&mut dyn FnMut(DocId) -> Result<bool>>,
+    block_mask: Option<&dyn BlockMaskProvider>,
+    lazy_filter: Option<&mut dyn FnMut(RowId) -> Result<bool>>,
     buffer: &mut ReusableBuffer,
 ) -> Result<Vec<Bm25Result>> {
     execute_rank_by_with(
-        source, schema, rank_by, top_k, doc_filter, lazy_filter, None, buffer,
+        source,
+        schema,
+        rank_by,
+        top_k,
+        block_mask,
+        lazy_filter,
+        None,
+        buffer,
     )
 }
 
 /// [`execute_rank_by`] with an optional [`RankModifier`] (multiplicative and/or additive
-/// per-document factors evaluated lazily on surviving candidates).
+/// per-row factors evaluated lazily on surviving candidates).
 #[allow(clippy::too_many_arguments)]
 pub fn execute_rank_by_with<S: FtsPostingSource>(
     source: &S,
     schema: &CollectionSchema,
     rank_by: &RankBy,
     top_k: usize,
-    doc_filter: Option<&RoaringBitmap>,
-    mut lazy_filter: Option<&mut dyn FnMut(DocId) -> Result<bool>>,
+    block_mask: Option<&dyn BlockMaskProvider>,
+    mut lazy_filter: Option<&mut dyn FnMut(RowId) -> Result<bool>>,
     modifier: Option<RankModifier<'_>>,
     buffer: &mut ReusableBuffer,
 ) -> Result<Vec<Bm25Result>> {
@@ -924,12 +917,6 @@ pub fn execute_rank_by_with<S: FtsPostingSource>(
     let Some(meta) = source.get_fts_meta()? else {
         return Ok(Vec::new());
     };
-    let filter_mask = doc_filter.map(BlockFilterMask::from_bitmap);
-    if let Some(ref fm) = filter_mask
-        && fm.is_empty()
-    {
-        return Ok(Vec::new());
-    }
 
     let tier = SimdTier::detect();
     let mut dl_cache = DlNormCache::new();
@@ -964,17 +951,17 @@ pub fn execute_rank_by_with<S: FtsPostingSource>(
 
     let mut scores = [0.0f32; FTS_BLOCK_SIZE];
     let mut touched: [u64; 4];
-    let mut candidates: Vec<(f32, FtsDocId)> = Vec::with_capacity(32);
+    let mut candidates: Vec<(f32, RowId)> = Vec::with_capacity(32);
     let mut non_ess_ubs: Vec<f32> = Vec::with_capacity(n_clauses);
 
     while let Some(block_id) = next_essential_block(&clauses[essential_start..]) {
-        let allowed_mask = match filter_mask {
-            Some(ref fm) => match fm.get(block_id) {
-                Some(mask) => Some(*mask),
-                None => {
+        let allowed_mask = match block_mask {
+            Some(mp) => match mp.mask(block_id) {
+                Some([0, 0, 0, 0]) => {
                     advance_clauses_past(&mut clauses[essential_start..], block_id)?;
                     continue;
                 }
+                other => other,
             },
             None => None,
         };
@@ -1074,7 +1061,7 @@ pub fn execute_rank_by_with<S: FtsPostingSource>(
 #[inline]
 fn next_essential_block<'a, S: FtsPostingSource + 'a>(
     essential: &[Clause<'a, S>],
-) -> Option<FtsBlockId> {
+) -> Option<RowBlock> {
     essential
         .iter()
         .filter_map(Clause::next_block_id)
@@ -1084,7 +1071,7 @@ fn next_essential_block<'a, S: FtsPostingSource + 'a>(
 #[inline]
 fn advance_clauses_past<'a, S: FtsPostingSource + 'a>(
     clauses: &mut [Clause<'a, S>],
-    block_id: FtsBlockId,
+    block_id: RowBlock,
 ) -> Result<()> {
     for c in clauses {
         c.advance_past(block_id)?;
@@ -1095,7 +1082,7 @@ fn advance_clauses_past<'a, S: FtsPostingSource + 'a>(
 #[inline]
 fn essential_block_pruned<'a, S: FtsPostingSource + 'a>(
     essential: &[Clause<'a, S>],
-    block_id: FtsBlockId,
+    block_id: RowBlock,
     non_ess_ub: f32,
     theta: f32,
 ) -> bool {
@@ -1111,7 +1098,7 @@ fn essential_block_pruned<'a, S: FtsPostingSource + 'a>(
 fn eval_non_essential_clauses<'a, S: FtsPostingSource + 'a>(
     non_essential: &mut [Clause<'a, S>],
     prefix_max_sum: &[f32],
-    block_id: FtsBlockId,
+    block_id: RowBlock,
     mut active_mask: [u64; 4],
     non_ess_ub: f32,
     theta: f32,
@@ -1175,54 +1162,45 @@ fn eval_non_essential_clauses<'a, S: FtsPostingSource + 'a>(
 
 #[inline]
 fn collect_block_candidates(
-    block_id: FtsBlockId,
+    block_id: RowBlock,
     hit_mask: &[u64; 4],
     scores: &[f32; FTS_BLOCK_SIZE],
-    candidates: &mut Vec<(f32, FtsDocId)>,
+    candidates: &mut Vec<(f32, RowId)>,
 ) {
     candidates.clear();
     for_each_set_bit_256(hit_mask, |slot| {
-        candidates.push((scores[slot as usize], make_fts_doc_id(block_id, slot)));
+        candidates.push((scores[slot as usize], block_id.row(slot)));
     });
 }
 
 fn insert_candidates_into_heap<'r, S: FtsPostingSource>(
     source: &S,
-    candidates: &[(f32, FtsDocId)],
+    candidates: &[(f32, RowId)],
     top_k: usize,
     mut theta: f32,
     heap: &mut BinaryHeap<TopKEntry>,
-    lazy_filter: &mut Option<&mut dyn FnMut(DocId) -> Result<bool>>,
-    mut rescore: Option<&mut (dyn FnMut(DocId, f32) -> Result<f32> + 'r)>,
+    lazy_filter: &mut Option<&mut dyn FnMut(RowId) -> Result<bool>>,
+    mut rescore: Option<&mut (dyn FnMut(RowId, f32) -> Result<f32> + 'r)>,
 ) -> Result<f32> {
-    let needs_doc_ids = lazy_filter.is_some()
-        || rescore.is_some()
-        || (heap.len() == top_k && candidates.iter().any(|&(s, _)| s == theta));
+    let needs_tie_doc_ids =
+        heap.len() == top_k && candidates.iter().any(|&(s, _)| s == theta);
 
-    let resolved_ids: Vec<Option<DocId>> = if needs_doc_ids {
-        let fts_ids: Vec<FtsDocId> = candidates.iter().map(|&(_, id)| id).collect();
-        source.multi_get_doc_ids(&fts_ids)?
-    } else {
-        vec![None; candidates.len()]
-    };
+    let mut tie_doc_ids: Option<Vec<Option<DocId>>> = None;
 
-    for (&(s, fts_doc_id), &opt_doc_id) in candidates.iter().zip(resolved_ids.iter()) {
-        if let Some(pred) = lazy_filter {
-            let Some(doc_id) = opt_doc_id else {
-                continue;
-            };
-            if !pred(doc_id)? {
-                continue;
-            }
+    for (idx, &(s, row_id)) in candidates.iter().enumerate() {
+        if let Some(pred) = lazy_filter
+            && !pred(row_id)?
+        {
+            continue;
         }
         let s = match rescore.as_mut() {
             Some(f) => {
-                let Some(doc_id) = opt_doc_id else {
-                    continue;
-                };
-                let exact = f(doc_id, s)?;
-                // Heap entries hold exact scores; non-positive scores are excluded.
-                if exact.is_nan() || exact <= 0.0 || !exact.is_finite() || (heap.len() == top_k && exact < theta) {
+                let exact = f(row_id, s)?;
+                if exact.is_nan()
+                    || exact <= 0.0
+                    || !exact.is_finite()
+                    || (heap.len() == top_k && exact < theta)
+                {
                     continue;
                 }
                 exact
@@ -1233,8 +1211,8 @@ fn insert_candidates_into_heap<'r, S: FtsPostingSource>(
         if heap.len() < top_k {
             heap.push(TopKEntry {
                 score: s,
-                fts_doc_id,
-                doc_id: opt_doc_id,
+                row_id,
+                doc_id: None,
             });
             if heap.len() == top_k {
                 theta = heap.peek().unwrap().score;
@@ -1243,19 +1221,31 @@ fn insert_candidates_into_heap<'r, S: FtsPostingSource>(
             heap.pop();
             heap.push(TopKEntry {
                 score: s,
-                fts_doc_id,
-                doc_id: opt_doc_id,
+                row_id,
+                doc_id: None,
             });
             theta = heap.peek().unwrap().score;
         } else if s == theta {
-            let Some(new_doc_id) = opt_doc_id else {
-                continue;
+            let new_doc_id = if needs_tie_doc_ids {
+                let resolved = tie_doc_ids.get_or_insert_with(|| {
+                    let ids: Vec<RowId> = candidates.iter().map(|&(_, r)| r).collect();
+                    source.multi_get_doc_ids(&ids).unwrap_or_default()
+                });
+                match resolved.get(idx).copied().flatten() {
+                    Some(id) => id,
+                    None => continue,
+                }
+            } else {
+                match source.multi_get_doc_ids(&[row_id])?[0] {
+                    Some(id) => id,
+                    None => continue,
+                }
             };
             let mut root = heap.pop().unwrap();
             let root_doc_id = match root.doc_id {
                 Some(id) => id,
                 None => {
-                    let fetched = source.multi_get_doc_ids(&[root.fts_doc_id])?;
+                    let fetched = source.multi_get_doc_ids(&[root.row_id])?;
                     let id = fetched[0].unwrap_or(DocId::MAX);
                     root.doc_id = Some(id);
                     id
@@ -1264,7 +1254,7 @@ fn insert_candidates_into_heap<'r, S: FtsPostingSource>(
             if new_doc_id < root_doc_id {
                 heap.push(TopKEntry {
                     score: s,
-                    fts_doc_id,
+                    row_id,
                     doc_id: Some(new_doc_id),
                 });
                 theta = heap.peek().unwrap().score;
@@ -1285,21 +1275,21 @@ fn resolve_and_sort_results<S: FtsPostingSource>(
     }
 
     let mut entries: Vec<TopKEntry> = heap.into_vec();
-    let missing_fts: Vec<FtsDocId> = entries
+    let missing_rows: Vec<RowId> = entries
         .iter()
         .filter(|e| e.doc_id.is_none())
-        .map(|e| e.fts_doc_id)
+        .map(|e| e.row_id)
         .collect();
-    if !missing_fts.is_empty() {
-        let fetched = source.multi_get_doc_ids(&missing_fts)?;
-        let map: HashMap<FtsDocId, DocId> = missing_fts
+    if !missing_rows.is_empty() {
+        let fetched = source.multi_get_doc_ids(&missing_rows)?;
+        let map: HashMap<RowId, DocId> = missing_rows
             .into_iter()
             .zip(fetched)
-            .filter_map(|(fid, did)| did.map(|d| (fid, d)))
+            .filter_map(|(rid, did)| did.map(|d| (rid, d)))
             .collect();
         for e in &mut entries {
             if e.doc_id.is_none() {
-                e.doc_id = map.get(&e.fts_doc_id).copied();
+                e.doc_id = map.get(&e.row_id).copied();
             }
         }
     }
@@ -1321,27 +1311,27 @@ fn resolve_and_sort_results<S: FtsPostingSource>(
 mod tests {
     use super::*;
     use crate::block::{DocLenBlock, PackedPostingBlock, PostingBlockHeader};
-    use izzydb_core::config::{DistanceMetric, TreeConfig, fts_block_id, fts_slot};
+    use izzydb_core::config::{DistanceMetric, TreeConfig};
     use izzydb_core::schema::{AttributeType, CollectionConfig};
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 
     struct MemSource {
         meta: FtsMeta,
-        docs: HashMap<FtsDocId, DocId>,
+        docs: HashMap<RowId, DocId>,
         terms: HashMap<(AttrId, String), TermRecord>,
-        postings: HashMap<TermId, Vec<(FtsBlockId, Vec<u8>)>>,
-        doc_lens: HashMap<(AttrId, FtsBlockId), Vec<u8>>,
+        postings: HashMap<TermId, Vec<(RowBlock, Vec<u8>)>>,
+        doc_lens: HashMap<(AttrId, RowBlock), Vec<u8>>,
     }
 
     struct MemSkipCursor {
-        blocks: Vec<(FtsBlockId, u32, f32)>,
-        inline: Option<(FtsBlockId, Vec<u8>)>,
+        blocks: Vec<(RowBlock, u32, f32)>,
+        inline: Option<(RowBlock, Vec<u8>)>,
         idx: usize,
     }
 
     impl FtsSkipCursor for MemSkipCursor {
-        fn current_block_id(&self) -> Option<FtsBlockId> {
+        fn current_block_id(&self) -> Option<RowBlock> {
             if let Some((bid, _)) = &self.inline {
                 if self.idx == 0 {
                     return Some(*bid);
@@ -1382,7 +1372,7 @@ mod tests {
             Ok(())
         }
 
-        fn seek_block(&mut self, target: FtsBlockId) -> Result<()> {
+        fn seek_block(&mut self, target: RowBlock) -> Result<()> {
             if let Some((bid, _)) = &self.inline {
                 if *bid < target {
                     self.idx = 1;
@@ -1402,7 +1392,7 @@ mod tests {
     }
 
     impl FtsDocLenCursor for MemDocLenCursor<'_> {
-        fn seek_block_bytes(&mut self, block_id: FtsBlockId) -> Result<Option<&[u8]>> {
+        fn seek_block_bytes(&mut self, block_id: RowBlock) -> Result<Option<&[u8]>> {
             Ok(self
                 .source
                 .doc_lens
@@ -1490,7 +1480,7 @@ mod tests {
         fn get_posting_block<'a>(
             &'a self,
             term_id: TermId,
-            block_id: FtsBlockId,
+            block_id: RowBlock,
         ) -> Result<Option<Self::PostingGuard<'a>>> {
             let Some(v) = self.postings.get(&term_id) else {
                 return Ok(None);
@@ -1507,8 +1497,8 @@ mod tests {
             })
         }
 
-        fn multi_get_doc_ids(&self, fts_doc_ids: &[FtsDocId]) -> Result<Vec<Option<DocId>>> {
-            Ok(fts_doc_ids
+        fn multi_get_doc_ids(&self, row_ids: &[RowId]) -> Result<Vec<Option<DocId>>> {
+            Ok(row_ids
                 .iter()
                 .map(|id| self.docs.get(id).copied())
                 .collect())
@@ -1530,8 +1520,8 @@ mod tests {
         let mut raw_docs: Vec<(DocId, String, String)> = Vec::new();
         let mut meta = FtsMeta::default();
         let mut docs_map = HashMap::new();
-        let mut dl_acc: HashMap<(AttrId, FtsBlockId), DocLenBlock> = HashMap::new();
-        let mut block_acc: HashMap<(AttrId, String, FtsBlockId), PackedPostingBlock> =
+        let mut dl_acc: HashMap<(AttrId, RowBlock), DocLenBlock> = HashMap::new();
+        let mut block_acc: HashMap<(AttrId, String, RowBlock), PackedPostingBlock> =
             HashMap::new();
         let mut term_records: HashMap<(AttrId, String), TermRecord> = HashMap::new();
 
@@ -1540,8 +1530,8 @@ mod tests {
 
         for i in 0..n_docs {
             let doc_id = (n_docs - i) as DocId * 3;
-            let fts_id = meta.alloc_doc_id().unwrap();
-            docs_map.insert(fts_id, doc_id);
+            let row_id = RowId::new((i / 300) as u32, (i % 300) as u32);
+            docs_map.insert(row_id, doc_id);
 
             let title = if i < 20 {
                 "w0 w1".to_string()
@@ -1564,8 +1554,8 @@ mod tests {
 
             let td = title_analyzer.analyze_str(&title, &mut buf).unwrap();
             let bd = body_analyzer.analyze_str(&body, &mut buf).unwrap();
-            let bid = fts_block_id(fts_id);
-            let slot = fts_slot(fts_id);
+            let bid = row_id.block();
+            let slot = row_id.slot();
 
             for (attr_id, ad) in [(0u16, &td), (1u16, &bd)] {
                 let s = meta.per_attr_stats.entry(attr_id).or_default();
@@ -1588,7 +1578,7 @@ mod tests {
             raw_docs.push((doc_id, title, body));
         }
 
-        let mut postings: HashMap<TermId, Vec<(FtsBlockId, Vec<u8>)>> = HashMap::new();
+        let mut postings: HashMap<TermId, Vec<(RowBlock, Vec<u8>)>> = HashMap::new();
         for ((aid, tok, bid), mut blk) in block_acc {
             blk.recompute_bounds(&dl_acc[&(aid, bid)]);
             let tid = term_records[&(aid, tok)].term_id;
@@ -1597,7 +1587,7 @@ mod tests {
         for blocks in postings.values_mut() {
             blocks.sort_by_key(|(bid, _)| *bid);
         }
-        let doc_lens: HashMap<(AttrId, FtsBlockId), Vec<u8>> = dl_acc
+        let doc_lens: HashMap<(AttrId, RowBlock), Vec<u8>> = dl_acc
             .into_iter()
             .filter(|(_, d)| !d.is_empty())
             .map(|(k, d)| (k, d.encode()))

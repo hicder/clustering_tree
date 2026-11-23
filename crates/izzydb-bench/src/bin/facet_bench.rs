@@ -73,7 +73,7 @@ fn main() {
         );
         let title: Vec<&str> = (0..6).map(|_| WORDS[rng.random_range(0..WORDS.len())]).collect();
         a.insert("title".into(), title.join(" ").into());
-        col.upsert(i as DocId, &v, a).unwrap();
+        col.upsert(i as DocId, Some(&v), a).unwrap();
     }
     println!("indexed {n} docs in {:?}\n", t0.elapsed());
 

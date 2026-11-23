@@ -10,4 +10,8 @@ fts-cjk = []
 
 [dependencies]
 bytemuck.workspace = true
+roaring.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

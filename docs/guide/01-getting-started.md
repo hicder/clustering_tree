@@ -54,10 +54,10 @@ attrs.insert("category".into(), "shoes".into());
 attrs.insert("price".into(), 79.99_f64.into());
 attrs.insert("title".into(), "Trail Runner Pro".into());
 
-col.upsert(1, &[0.1, 0.2, 0.3, 0.4], attrs)?;
+col.upsert(1, Some(&[0.1, 0.2, 0.3, 0.4]), attrs)?;
 ```
 
-`upsert(id, embedding, attributes)` inserts a new document or fully replaces the document with the same `id`. Attribute values convert with `.into()` from `&str`, `String`, `i32`/`i64`, `u32`/`u64`, `f64`, `bool`, `Vec<String>`, `Vec<i64>`, and `Vec<u64>`.
+`upsert(id, embedding, attributes)` inserts a new document or replaces the document with the same `id` (`Some(&vec)` for vectored collections, or `None` for vectorless collections). Attribute values convert with `.into()` from `&str`, `String`, `i32`/`i64`, `u32`/`u64`, `f64`, `bool`, `Vec<String>`, `Vec<i64>`, and `Vec<u64>`.
 
 ## 4. Query
 
@@ -131,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut a = Attributes::new();
         a.insert("category".into(), cat.into());
         a.insert("title".into(), title.into());
-        col.upsert(id, &vec, a)?;
+        col.upsert(id, Some(&vec), a)?;
     }
 
     let only_shoes = Filter::Eq("category".into(), "shoes".into());

@@ -1,54 +1,125 @@
-//! A mutable, RocksDB-backed hierarchical clustering tree (~100x fanout)
-//! with native cluster-aware attribute filtering and Block-Max MAXSCORE full-text search.
+//! Segmented storage engine with global ANN, inverted attribute filters, and Block-Max MAXSCORE FTS.
 
-pub use izzydb_core::{config, error, filter, kmeans, metric, rank, schema};
+pub use izzydb_core::{config, error, facet as facet_types, filter, kmeans, metric, rank, rowset, schema};
+pub use izzydb_core::facet;
 pub use izzydb_fts as fts;
 pub use izzydb_rabitq as rabitq;
 pub use izzydb_storage::{codec, node, storage};
 
-/// Cluster-aware inverted attribute index and two-phase filter evaluator.
-pub mod attr_index;
-/// High-level `Collection` coordinating vector, attribute, and full-text indexes.
+/// High-level `Collection` coordinating segments and secondary indexes.
 pub mod collection;
-/// Exact faceting engine (global counts, forward doc passes, inverted leaf-mask intersection).
-pub mod facet;
-/// Inverted full-text index manager and BM25 query execution.
+/// Segment store, row allocation, sealing, and `RowId -> DocId` resolution.
+pub mod segments;
+
+// Legacy/unported v2 modules compiled out progressively as Phases 3-11 land.
+#[cfg(any())]
+pub mod attr_index;
+#[cfg(any())]
 pub mod fts_index;
-/// SPFresh LIRE boundary reassignment after leaf splits.
+#[cfg(any())]
 pub mod lire;
-/// Attribute-ordered top-k queries over the order-preserving attribute indexes.
+#[cfg(any())]
 pub mod order_by;
-/// Generalized `RankBy` execution (filter boosts, attribute scores, products).
+#[cfg(any())]
 pub mod rank_eval;
-/// Beam-search tree traversal, RaBitQ leaf scanning, and exact reranking.
+#[cfg(any())]
 pub mod search;
-/// Re-exported RaBitQ SIMD leaf-scoring kernels.
+#[cfg(any())]
 pub mod simd;
-/// Mutable hierarchical clustering tree (`ClusteringTree`) and split/merge maintenance.
+#[cfg(any())]
 pub mod tree;
-/// Exhaustive structural, attribute-index, and FTS invariant verification.
+#[cfg(any())]
 pub mod verify;
 
 pub use collection::{
     Collection, Document, DocumentPatch, HybridSearchOptions, HybridSearchResult, SearchResult,
 };
+pub use config::{
+    AttrId, ColumnGen, DEFAULT_SEAL_ROWS, DistanceMetric, DocId, LocalId, MAX_SEGMENT_ROWS,
+    NodeId, ROW_BLOCK_SIZE, RowBlock, RowId, SegmentConfig, SegmentId, SkipChunk, TermId,
+    TreeConfig,
+};
+pub use error::{Result, TreeError};
 pub use facet::{
     FacetBucket, FacetFilterMode, FacetKind, FacetRange, FacetResult, FacetResults, FacetSort,
     FacetSpec, FacetedSearchResponse, HistogramBucket, HistogramFacetResult, HybridFacetScope,
     RangeBucket, RangeFacetResult, StatsFacetResult, TermFacetResult, VectorFacetScope,
 };
-pub use config::{AttrId, DistanceMetric, DocId, FtsBlockId, FtsDocId, LocalId, NodeId, TreeConfig};
-pub use error::{Result, TreeError};
 pub use filter::{Filter, FtsPredicateKind, TokenQuery};
-pub use fts_index::FtsIndex;
 pub use izzydb_fts::Bm25Result;
 pub use rank::{
     Bm25Overrides, DecayMode, NullsOrder, OrderBySpec, OrderedResult, RankBy, SortDirection,
 };
+pub use rowset::{Liveness, RowSet};
 pub use schema::{
     AttributeConfig, AttributeType, AttributeValue, Attributes, CollectionConfig, CollectionSchema,
-    FullTextSearchConfig, Language, ScalarValue, Tokenizer,
+    ColumnStorage, FullTextSearchConfig, Language, ScalarValue, Tokenizer,
 };
-pub use search::SearchOptions;
-pub use tree::ClusteringTree;
-pub use verify::{CollectionStats, TreeStats};
+
+/// Parameters controlling quantized vector search and exact reranking.
+#[derive(Debug, Clone, Copy)]
+pub struct SearchOptions {
+    pub k: usize,
+    pub beam_width: usize,
+    pub rerank_candidates: Option<usize>,
+    /// Materialized filtered sets with `<= exact_scan_threshold` vector rows use exact scan.
+    pub exact_scan_threshold: usize,
+    /// Maximum number of leaves probed during filtered dynamic expansion.
+    pub max_expanded_leaves: Option<usize>,
+}
+
+impl SearchOptions {
+    pub fn new(k: usize, beam_width: usize) -> Self {
+        Self {
+            k,
+            beam_width,
+            rerank_candidates: None,
+            exact_scan_threshold: 4_096,
+            max_expanded_leaves: None,
+        }
+    }
+
+    pub fn with_rerank(mut self, rerank_candidates: usize) -> Self {
+        self.rerank_candidates = Some(rerank_candidates);
+        self
+    }
+
+    pub fn with_exact_scan_threshold(mut self, threshold: usize) -> Self {
+        self.exact_scan_threshold = threshold;
+        self
+    }
+
+    pub fn with_max_expanded_leaves(mut self, max_leaves: usize) -> Self {
+        self.max_expanded_leaves = Some(max_leaves);
+        self
+    }
+}
+
+/// Summary statistics for the ANN clustering tree (Phase 3 / 11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeStats {
+    pub num_vectors: u64,
+    pub stale_rows: u64,
+    pub root_id: NodeId,
+    pub root_level: u8,
+    pub total_nodes: usize,
+    pub internal_nodes: usize,
+    pub leaf_nodes: usize,
+    pub min_leaf_entries: usize,
+    pub max_leaf_entries: usize,
+    pub min_internal_fanout: usize,
+    pub max_internal_fanout: usize,
+}
+
+/// Summary statistics collected by [`Collection::verify_invariants`] (Phase 11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionStats {
+    pub tree: Option<TreeStats>,
+    pub num_docs: usize,
+    pub num_segments: usize,
+    pub num_posting_bitmaps: usize,
+    pub num_fts_docs: usize,
+    pub num_fts_terms: usize,
+    pub num_fts_postings: usize,
+    pub num_fts_positions: usize,
+}

@@ -1,5 +1,6 @@
 //! Attribute-ordered top-k (`query_ordered`) against a brute-force in-memory sort.
 
+#![cfg(any())] // v3: phase 6
 use std::cmp::Ordering;
 use std::collections::HashMap;
 

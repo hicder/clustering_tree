@@ -1,3 +1,4 @@
+#![cfg(any())] // v3: phase 6
 //! Exact-parity tests for faceting against a brute-force oracle over the in-memory document model.
 
 use std::collections::{BTreeMap, HashMap, HashSet};

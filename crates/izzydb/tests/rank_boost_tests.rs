@@ -1,3 +1,4 @@
+#![cfg(any())] // v3: phase 6
 //! Exactness tests for filter boosts, attribute scoring, and general `Product` ranking against a
 //! brute-force reference evaluator.
 

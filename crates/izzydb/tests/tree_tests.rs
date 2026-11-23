@@ -1,3 +1,4 @@
+#![cfg(any())] // v3: phase 3
 use std::collections::{HashMap, HashSet};
 
 use izzydb::{ClusteringTree, DistanceMetric, DocId, TreeConfig, TreeError};

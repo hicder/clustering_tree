@@ -1,3 +1,4 @@
+#![cfg(any())] // v3: phase 4
 use std::collections::{HashMap, HashSet};
 
 use izzydb::{

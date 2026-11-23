@@ -1,3 +1,4 @@
+#![cfg(any())] // v3: phase 5
 use std::collections::{HashMap, HashSet};
 
 use izzydb::fts::{Bm25TermScorer, FtsAnalyzer, ReusableBuffer};

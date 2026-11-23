@@ -16,7 +16,7 @@ Before these changes, running `cargo run --release -p izzydb-bench --bin recall_
 
 ## Changes Implemented
 
-### 1. Packed Node Blobs & Leaf-Grouped Full Vectors ([`crates/izzydb-storage/src/node/mod.rs`](../../crates/izzydb-storage/src/node/mod.rs), [`crates/izzydb-storage/src/storage.rs`](../../crates/izzydb-storage/src/storage.rs))
+### 1. Packed Node Blobs & Leaf-Grouped Full Vectors ([`crates/izzydb-storage/src/node/mod.rs`](../../crates/izzydb-storage/src/node/mod.rs), [`crates/izzydb-storage/src/storage/mod.rs`](../../crates/izzydb-storage/src/storage/mod.rs))
 
 Replaced per-entry column families (`cf_node_header`, `cf_internal_entries`, `cf_leaf_entries`, `cf_vectors`) with one packed blob per node:
 
@@ -25,7 +25,7 @@ Replaced per-entry column families (`cf_node_header`, `cf_internal_entries`, `cf
 - **`cf_leaf_vectors` (`leaf_id -> PackedLeafVectors`):** Co-locates full-precision `f32` vectors by `leaf_id` in the exact same sorted `doc_ids` slot order as `cf_leaf_entries`. `search_with_rerank` now fetches at most `beam_width` (4) blobs instead of 100 individual `doc_id` lookups, and `get_vector(doc_id)` resolves via `cf_doc_loc` + binary search inside [`LeafVectorsView`](../../crates/izzydb-storage/src/node/mod.rs).
 - **RocksDB tuning & zero-copy reads:** Switched batched leaf and vector reads to `batched_multi_get_cf` (`sorted_input = true`) and `get_pinned_cf`, added a shared 128 MiB LRU block cache, pinned L0 index/filter blocks in cache, enabled memtable whole-key filtering, and disabled compression on node/vector CFs.
 
-### 2. In-Memory Internal Node Cache ([`crates/izzydb/src/tree/mod.rs`](../../crates/izzydb/src/tree/mod.rs), [`crates/izzydb-storage/src/storage.rs`](../../crates/izzydb-storage/src/storage.rs), [`crates/izzydb/src/lire.rs`](../../crates/izzydb/src/lire.rs), [`crates/izzydb/src/verify/mod.rs`](../../crates/izzydb/src/verify/mod.rs))
+### 2. In-Memory Internal Node Cache ([`crates/izzydb/src/tree/mod.rs`](../../crates/izzydb/src/tree/mod.rs), [`crates/izzydb-storage/src/storage/mod.rs`](../../crates/izzydb-storage/src/storage/mod.rs), [`crates/izzydb/src/lire.rs`](../../crates/izzydb/src/lire.rs), [`crates/izzydb/src/verify/mod.rs`](../../crates/izzydb/src/verify/mod.rs))
 
 - `ClusteringTree` loads all `cf_internal_nodes` entries into `internal_cache: HashMap<NodeId, PackedInternalNode>` on `open()`.
 - `TxContext::commit` writes the RocksDB `WriteBatch` first and updates `internal_cache` only after persistence succeeds.
@@ -37,7 +37,7 @@ Replaced per-entry column families (`cf_node_header`, `cf_internal_entries`, `cf
 - **Precomputed RaBitQ scalars:** `res_norm_sq` and `scale = norm / o_bar_dot_o` are computed at encode time, removing a per-candidate float division and square in the hot scan loop.
 - **Reduced allocations & partial sorting:** `prepare_vector_cow` borrows non-`Cosine` queries without copying, and `select_top_k` uses `select_nth_unstable_by` + `sort_unstable_by` on only the truncated top elements.
 
-### 4. Runtime-Dispatched SIMD Kernels ([`crates/izzydb-core/src/simd.rs`](../../crates/izzydb-core/src/simd.rs), [`crates/izzydb-rabitq/src/simd.rs`](../../crates/izzydb-rabitq/src/simd.rs))
+### 4. Runtime-Dispatched SIMD Kernels ([`crates/izzydb-core/src/simd.rs`](../../crates/izzydb-core/src/simd.rs), [`crates/izzydb-rabitq/src/simd/mod.rs`](../../crates/izzydb-rabitq/src/simd/mod.rs))
 
 Added runtime feature detection (`is_x86_feature_detected!`) with scalar fallbacks so standard `cargo build --release` binaries use native vector instructions automatically:
 

@@ -6,7 +6,7 @@ Implementation sources:
 - `RowId` / `RowBlock` / `SkipChunk` bit-splitting (`ROW_BLOCK_SIZE = 256`, `FTS_SKIP_CHUNK_SIZE = 256`): [`crates/izzydb-core/src/config.rs`](../../crates/izzydb-core/src/config.rs)
 - `FtsMeta` v4, `TermRecord` v4, `SkipBlock`, `DocLenBlock`, v3 `PackedPostingBlock`, `IntWidth`, and `dl_over_tf_lower_bound`: [`crates/izzydb-fts/src/block/mod.rs`](../../crates/izzydb-fts/src/block/mod.rs)
 - BM25 scoring parameters, upper-bound formula, and SIMD dispatch wrappers: [`crates/izzydb-fts/src/bm25.rs`](../../crates/izzydb-fts/src/bm25.rs)
-- Runtime-dispatched SIMD kernels (`Avx512`, `Avx2`, `Neon`, `Scalar`): [`crates/izzydb-fts/src/simd.rs`](../../crates/izzydb-fts/src/simd.rs)
+- Runtime-dispatched SIMD kernels (`Avx512`, `Avx2`, `Neon`, `Scalar`): [`crates/izzydb-fts/src/simd/mod.rs`](../../crates/izzydb-fts/src/simd/mod.rs)
 - MAXSCORE execution loop, `DlNormCache`, `BlockMaskProvider`, `FtsSkipCursor`, and `Clause` evaluation: [`crates/izzydb-fts/src/maxscore/mod.rs`](../../crates/izzydb-fts/src/maxscore/mod.rs)
 - RocksDB column families, `cf_row_doc_ids`, `RocksSkipCursor`, and cached `RocksDocLenCursor`: [`crates/izzydb-storage/src/storage/`](../../crates/izzydb-storage/src/storage/), [`crates/izzydb-codec/src/lib.rs`](../../crates/izzydb-codec/src/lib.rs)
 
@@ -172,7 +172,7 @@ At query startup (`execute_rank_by`), `SimdTier::detect()` selects the widest su
 | `Neon` | `aarch64`, `neon` | 4 lanes (128-bit) | Native `vcvtq_f32_u32`, `vfmaq_f32`, `vbslq_f32`, `vmaxvq_f32` |
 | `Scalar` | Portable fallback | 1 lane | Bit-twiddling (`trailing_zeros`) loops |
 
-*(Every SIMD kernel in `crates/izzydb-fts/src/simd.rs` is cross-checked in unit tests against `SimdTier::Scalar` across `U8`/`U16`/`U32` widths, sparse/dense layouts, and arbitrary masks.)*
+*(Every SIMD kernel in `crates/izzydb-fts/src/simd/mod.rs` is cross-checked in unit tests against `SimdTier::Scalar` across `U8`/`U16`/`U32` widths, sparse/dense layouts, and arbitrary masks.)*
 
 ### 4.2 Shared `DlNormCache` & `prepare_dl_norm_256`
 
@@ -188,7 +188,7 @@ is identical for every query term targeting the same `(attr_id, c1, c2)`.
 
 ### 4.3 SIMD Kernels Reference
 
-All 256-slot kernels live in [`crates/izzydb-fts/src/simd.rs`](../../crates/izzydb-fts/src/simd.rs):
+All 256-slot kernels live in [`crates/izzydb-fts/src/simd/mod.rs`](../../crates/izzydb-fts/src/simd/mod.rs):
 
 | Kernel | Input Layout | Operation & Vectorization Strategy |
 |---|---|---|

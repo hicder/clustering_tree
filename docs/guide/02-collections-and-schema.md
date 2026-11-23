@@ -123,5 +123,5 @@ col.config();         // &TreeConfig
 col.schema();         // &CollectionSchema: iterate col.schema().entries()
 ```
 
-[`CollectionConfig`]: ../../crates/izzydb-core/src/schema.rs
+[`CollectionConfig`]: ../../crates/izzydb-core/src/schema/mod.rs
 [`TreeConfig`]: ../../crates/izzydb-core/src/config.rs

@@ -4,11 +4,11 @@ This document describes the on-disk/in-memory data layout for full-text search (
 
 Implementation sources:
 - `RowId` / `RowBlock` / `SkipChunk` bit-splitting (`ROW_BLOCK_SIZE = 256`, `FTS_SKIP_CHUNK_SIZE = 256`): [`crates/izzydb-core/src/config.rs`](../../crates/izzydb-core/src/config.rs)
-- `FtsMeta` v4, `TermRecord` v4, `SkipBlock`, `DocLenBlock`, v3 `PackedPostingBlock`, `IntWidth`, and `dl_over_tf_lower_bound`: [`crates/izzydb-fts/src/block.rs`](../../crates/izzydb-fts/src/block.rs)
+- `FtsMeta` v4, `TermRecord` v4, `SkipBlock`, `DocLenBlock`, v3 `PackedPostingBlock`, `IntWidth`, and `dl_over_tf_lower_bound`: [`crates/izzydb-fts/src/block/mod.rs`](../../crates/izzydb-fts/src/block/mod.rs)
 - BM25 scoring parameters, upper-bound formula, and SIMD dispatch wrappers: [`crates/izzydb-fts/src/bm25.rs`](../../crates/izzydb-fts/src/bm25.rs)
 - Runtime-dispatched SIMD kernels (`Avx512`, `Avx2`, `Neon`, `Scalar`): [`crates/izzydb-fts/src/simd.rs`](../../crates/izzydb-fts/src/simd.rs)
-- MAXSCORE execution loop, `DlNormCache`, `BlockMaskProvider`, `FtsSkipCursor`, and `Clause` evaluation: [`crates/izzydb-fts/src/maxscore.rs`](../../crates/izzydb-fts/src/maxscore.rs)
-- RocksDB column families, `cf_row_doc_ids`, `RocksSkipCursor`, and cached `RocksDocLenCursor`: [`crates/izzydb-storage/src/storage/mod.rs`](../../crates/izzydb-storage/src/storage/mod.rs), [`crates/izzydb-storage/src/codec.rs`](../../crates/izzydb-storage/src/codec.rs)
+- MAXSCORE execution loop, `DlNormCache`, `BlockMaskProvider`, `FtsSkipCursor`, and `Clause` evaluation: [`crates/izzydb-fts/src/maxscore/mod.rs`](../../crates/izzydb-fts/src/maxscore/mod.rs)
+- RocksDB column families, `cf_row_doc_ids`, `RocksSkipCursor`, and cached `RocksDocLenCursor`: [`crates/izzydb-storage/src/storage/`](../../crates/izzydb-storage/src/storage/), [`crates/izzydb-codec/src/lib.rs`](../../crates/izzydb-codec/src/lib.rs)
 
 ---
 

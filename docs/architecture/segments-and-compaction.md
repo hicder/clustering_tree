@@ -4,9 +4,9 @@ This document specifies IzzyDB v3's append-only segment store, copy-on-write (Co
 
 Implementation sources:
 - Write-path segment store & hooks: [`crates/izzydb/src/segments.rs`](../../crates/izzydb/src/segments.rs)
-- Segment table & compaction filter: [`crates/izzydb-storage/src/storage/mod.rs`](../../crates/izzydb-storage/src/storage/mod.rs)
+- Segment table & compaction filter: [`crates/izzydb-storage/src/storage/`](../../crates/izzydb-storage/src/storage/)
 - Segment compaction & RowId forwarding: [`crates/izzydb/src/compaction.rs`](../../crates/izzydb/src/compaction.rs)
-- ANN vacuum & forwarding retire coordination: [`crates/izzydb/src/tree.rs`](../../crates/izzydb/src/tree.rs)
+- ANN vacuum & forwarding retire coordination: [`crates/izzydb/src/tree/mod.rs`](../../crates/izzydb/src/tree/mod.rs)
 - Sealed-segment columnar builder: [`crates/izzydb/src/columns.rs`](../../crates/izzydb/src/columns.rs)
 
 ---

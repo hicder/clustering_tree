@@ -15,7 +15,8 @@ An embedded, RocksDB-backed hybrid search engine in Rust for vector, full-text, 
 - [`izzydb-core`](crates/izzydb-core) — configuration, error types, schema & filter AST, `RankBy` AST, distance metrics, SIMD vector kernels, and balanced 2-means clustering.
 - [`izzydb-fts`](crates/izzydb-fts) — text analyzer, 256-doc SoA posting/position blocks, and Block-Max MAXSCORE BM25 execution.
 - [`izzydb-rabitq`](crates/izzydb-rabitq) — 1-bit RaBitQ quantization, randomized FWHT rotation, and SIMD popcount leaf scoring.
-- [`izzydb-storage`](crates/izzydb-storage) — packed node/metadata codecs and RocksDB storage/transaction layer.
+- [`izzydb-codec`](crates/izzydb-codec) — keyspace layout and binary codecs: key builders, order-preserving scalar encodings, posting lists, segment metadata, and the packed row format.
+- [`izzydb-storage`](crates/izzydb-storage) — packed ANN node/column block formats and the RocksDB storage/transaction layer (re-exports `izzydb-codec` as `codec`).
 - [`izzydb`](crates/izzydb) — `Collection` (segments, compaction, detached columns, filtered & unfiltered vector search, BM25 & hybrid search, SPFresh LIRE reassignment, and structural invariant verification).
 - [`izzydb-bulk`](crates/izzydb-bulk) — parallel offline Parquet bulk importer and appender (`bulk_import`, `bulk_append`, `build_ssts`, `ingest_ssts`, and the `izzydb-import` CLI with `import`, `append`, and `columns`) building sorted external SSTs.
 

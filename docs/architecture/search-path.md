@@ -3,9 +3,9 @@
 This document specifies how IzzyDB v3 executes vector search (`Collection::search`), filtered vector search (five-regime planner), BM25/boosted ranking (`query`, `query_bm25`, `order_by`), hybrid RRF search, and faceted search over segmented storage.
 
 Implementation sources:
-- Entry points: [`crates/izzydb/src/collection.rs`](../../crates/izzydb/src/collection.rs)
-- Filter planner (`FilterPlan`, cardinality estimation, zone pruning): [`crates/izzydb/src/filter_plan.rs`](../../crates/izzydb/src/filter_plan.rs)
-- ANN search, exact scan, masked traversal & post-filter: [`crates/izzydb/src/search.rs`](../../crates/izzydb/src/search.rs)
+- Entry points: [`crates/izzydb/src/collection/mod.rs`](../../crates/izzydb/src/collection/mod.rs)
+- Filter planner (`FilterPlan`, cardinality estimation, zone pruning): [`crates/izzydb/src/filter_plan/mod.rs`](../../crates/izzydb/src/filter_plan/mod.rs)
+- ANN search, exact scan, masked traversal & post-filter: [`crates/izzydb/src/search/mod.rs`](../../crates/izzydb/src/search/mod.rs)
 - Segment/block row resolution (`RowId -> DocId`): [`crates/izzydb/src/segments.rs`](../../crates/izzydb/src/segments.rs)
 
 ---

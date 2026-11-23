@@ -49,7 +49,7 @@ Replace the per-leaf full-precision vector blob in `cf_leaf_vectors` (`leaf_id -
 
 ---
 
-## 2. Node Encoding & Re-quantization (`crates/izzydb-storage/src/node.rs`)
+## 2. Node Encoding & Re-quantization (`crates/izzydb-storage/src/node/mod.rs`)
 
 - Remove `PackedLeafVectors`, `LeafVectorsView`, and `LEAF_VECS_HEADER_LEN`.
 - Add `encode_f32_slice(vals: &[f32]) -> Vec<u8>` (reusing `write_f32_le`).
@@ -59,9 +59,9 @@ Replace the per-leaf full-precision vector blob in `cf_leaf_vectors` (`leaf_id -
 
 ---
 
-## 3. Write, Split, Merge & LIRE Paths (`crates/izzydb/src/tree.rs`, `crates/izzydb/src/lire.rs`)
+## 3. Write, Split, Merge & LIRE Paths (`crates/izzydb/src/tree/mod.rs`, `crates/izzydb/src/lire.rs`)
 
-### `ClusteringTree::add_leaf` (`crates/izzydb/src/tree.rs`)
+### `ClusteringTree::add_leaf` (`crates/izzydb/src/tree/mod.rs`)
 - Stage `tx.put_vector(id, vec.clone())` and `tx.put_doc_loc(id, target_leaf)`.
 - Do **not** read full vectors up front; derive `new_count = leaf.entry_count() + 1` (existing `id` is already removed before routing if upserting).
 - **Non-overflow (`new_count <= max_leaf_size`):**
@@ -71,20 +71,20 @@ Replace the per-leaf full-precision vector blob in `cf_leaf_vectors` (`leaf_id -
 - **Overflow (`new_count > max_leaf_size`):**
   - Insert `id` into `leaf` (or pass `(id, &vec)` alongside `leaf`), stage `tx.put_leaf_node(target_leaf, leaf)`, and call `split_node`.
 
-### `ClusteringTree::remove_doc_internal` (`crates/izzydb/src/tree.rs`)
+### `ClusteringTree::remove_doc_internal` (`crates/izzydb/src/tree/mod.rs`)
 - Stage `tx.delete_vector(id)` and `tx.delete_doc_loc(id)`; remove `id` from `leaf` via `leaf.remove_entry(id, words)`.
 - Compute `new_count = leaf.entry_count()`.
 - If `new_count == 0`, zero out `leaf.centroid` and `leaf.rotated_centroid` (0 vector reads).
 - If `will_underflow`, persist `leaf` to `tx` and delegate directly to `handle_underflow` (avoids double-fetching vectors).
 - Otherwise, fetch remaining vectors via `tx.get_vectors_flat(&leaf.doc_ids)?`, recompute exact mean centroid, and re-encode if `new_count <= 16` or drifted.
 
-### `split_node` (`crates/izzydb/src/tree.rs`)
+### `split_node` (`crates/izzydb/src/tree/mod.rs`)
 - Fetch `flat_vecs = tx.get_vectors_flat(&leaf.doc_ids)?`.
 - Run `balanced_two_means`, partition into `(left_doc_ids, left_vecs)` and `(right_doc_ids, right_vecs)`.
 - Re-encode `left_leaf` and `right_leaf`, update `cf_leaf_entries` and `cf_doc_loc` for `right_doc_ids`.
 - **Zero writes to `cf_vectors`** (vectors stay at their `doc_id` keys).
 
-### `handle_underflow` (`crates/izzydb/src/tree.rs`)
+### `handle_underflow` (`crates/izzydb/src/tree/mod.rs`)
 - Remove all `tx.delete_leaf_vectors` and `tx.put_leaf_vectors` calls.
 - Fetch `left_vecs = tx.get_vectors_flat(&left_leaf.doc_ids)?` and `sib_vecs = tx.get_vectors_flat(&sib_leaf.doc_ids)?`.
 - On merge or redistribution, update `PackedLeafNode`s in `cf_leaf_entries` and moved entries in `cf_doc_loc`.
@@ -99,9 +99,9 @@ Replace the per-leaf full-precision vector blob in `cf_leaf_vectors` (`leaf_id -
 
 ---
 
-## 4. Search Path & Reranking (`crates/izzydb/src/search.rs`, `crates/izzydb-core/src/simd.rs`, `crates/izzydb-rabitq/src/simd.rs`)
+## 4. Search Path & Reranking (`crates/izzydb/src/search/mod.rs`, `crates/izzydb-core/src/simd.rs`, `crates/izzydb-rabitq/src/simd.rs`)
 
-- In `search` (`crates/izzydb/src/search.rs`):
+- In `search` (`crates/izzydb/src/search/mod.rs`):
   - After selecting the top `shortlist_len` candidates from Stage 1, sort `candidates` by `doc_id` ascending.
   - Fetch full vectors with one `storage.multi_get_vectors_pinned(&sorted_doc_ids)?` call.
   - Validate each slice has length `dim * 4` and score directly via `search_distance_bytes(config.metric, &q, slice)` (zero-copy over `DBPinnableSlice`).
@@ -110,9 +110,9 @@ Replace the per-leaf full-precision vector blob in `cf_leaf_vectors` (`leaf_id -
 
 ---
 
-## 5. Invariant Verification & Documentation (`crates/izzydb/src/verify.rs`, `docs/`)
+## 5. Invariant Verification & Documentation (`crates/izzydb/src/verify/mod.rs`, `docs/`)
 
-- **`verify_invariants` (`crates/izzydb/src/verify.rs`):**
+- **`verify_invariants` (`crates/izzydb/src/verify/mod.rs`):**
   - Replace `storage.all_leaf_vectors()` with `storage.all_vectors()`.
   - Check `disk_vectors.len() == disk_meta.num_vectors as usize`.
   - For every reachable leaf, verify every `doc_id` in `leaf.doc_ids` exists in `disk_vectors`, has `len == config.dim`, and has all finite components.
@@ -124,6 +124,6 @@ Replace the per-leaf full-precision vector blob in `cf_leaf_vectors` (`leaf_id -
 
 ## 6. Testing & Verification
 
-1. Run `cargo test` to verify all unit and integration tests (`crates/izzydb/tests/tree_tests.rs`, `crates/izzydb-storage/src/node.rs`, `crates/izzydb-rabitq/src/simd.rs`), including `verify_invariants` and `get_vector` upsert/delete/reopen checks.
+1. Run `cargo test` to verify all unit and integration tests (`crates/izzydb/tests/tree_tests.rs`, `crates/izzydb-storage/src/node/mod.rs`, `crates/izzydb-rabitq/src/simd.rs`), including `verify_invariants` and `get_vector` upsert/delete/reopen checks.
 2. Add targeted tests covering `add_leaf` fast-path vs. re-encode, splits, underflow merges/redistributions, and LIRE reassignments under `cf_vectors`.
 3. Run `cargo run --release -p izzydb-bench --bin recall_bench` to verify recall parity and measure insert + `search_with_rerank` latency.

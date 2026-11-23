@@ -3,8 +3,8 @@
 Detached columns store attributes **columnarly outside `cf_rows`**, allowing whole-column replacement (`M rows/s` throughput, `< 100 ms` atomic publish) and point updates without triggering segment copy-on-write (CoW) or re-indexing vectors/FTS.
 
 Implementation sources:
-- Schema `ColumnStorage::Detached`: [`crates/izzydb-core/src/schema.rs`](../../crates/izzydb-core/src/schema.rs)
-- Detached build, concurrent catch-up, atomic publish & point writes: [`crates/izzydb/src/detached.rs`](../../crates/izzydb/src/detached.rs)
+- Schema `ColumnStorage::Detached`: [`crates/izzydb-core/src/schema/mod.rs`](../../crates/izzydb-core/src/schema/mod.rs)
+- Detached build, concurrent catch-up, atomic publish & point writes: [`crates/izzydb/src/detached/mod.rs`](../../crates/izzydb/src/detached/mod.rs)
 - Filter / facet / `OrderBy` / `get` readers (`AttrReader`): [`crates/izzydb/src/attr_reader.rs`](../../crates/izzydb/src/attr_reader.rs)
 - Compaction-time detached preservation & GC: [`crates/izzydb/src/compaction.rs`](../../crates/izzydb/src/compaction.rs) & [`crates/izzydb-storage/src/storage/mod.rs`](../../crates/izzydb-storage/src/storage/mod.rs)
 

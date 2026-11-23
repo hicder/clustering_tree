@@ -4,9 +4,9 @@ This document describes the offline Parquet bulk importer, **populated-target ap
 
 Implementation sources:
 - Orchestrator (`bulk_import`, `build_ssts`, `ingest_ssts`, `bulk_append`): [`crates/izzydb-bulk/src/lib.rs`](../../crates/izzydb-bulk/src/lib.rs)
-- Parallel Parquet scanner & detached scanner: [`crates/izzydb-bulk/src/common/parquet_reader.rs`](../../crates/izzydb-bulk/src/common/parquet_reader.rs)
-- Segment SST emitters: [`crates/izzydb-bulk/src/pipeline.rs`](../../crates/izzydb-bulk/src/pipeline.rs)
-- ANN tree builder over `RowId`s: [`crates/izzydb-bulk/src/tree_builder.rs`](../../crates/izzydb-bulk/src/tree_builder.rs)
+- Parallel Parquet scanner & detached scanner: [`crates/izzydb-bulk/src/common/parquet_reader/mod.rs`](../../crates/izzydb-bulk/src/common/parquet_reader/mod.rs)
+- Segment SST emitters: [`crates/izzydb-bulk/src/pipeline/mod.rs`](../../crates/izzydb-bulk/src/pipeline/mod.rs)
+- ANN tree builder over `RowId`s: [`crates/izzydb-bulk/src/tree_builder/mod.rs`](../../crates/izzydb-bulk/src/tree_builder/mod.rs)
 - SST bundle manifest v2 (`SST_BUNDLE_FORMAT_VERSION = 2`): [`crates/izzydb-bulk/src/common/sst.rs`](../../crates/izzydb-bulk/src/common/sst.rs)
 - CLI (`izzydb-import import | append | columns`): [`crates/izzydb-bulk/src/bin/izzydb-import.rs`](../../crates/izzydb-bulk/src/bin/izzydb-import.rs)
 

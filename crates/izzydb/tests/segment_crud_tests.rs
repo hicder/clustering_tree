@@ -326,33 +326,29 @@ fn test_vectorless_collection_and_unsupported_stubs() {
         col.search(&[0.0], SearchOptions::new(5, 4), Some(&Filter::Eq("title".into(), "hello".into()))),
         Err(TreeError::InvalidConfig(_))
     ));
-    // Attribute filters work on vectorless collections
+    // Attribute filters, FTS, order_by, and facets work on vectorless collections
     assert_eq!(
         col.resolve_filter_doc_ids(&Filter::Eq("title".into(), "hello".into()))
             .unwrap(),
         vec![1]
     );
-    // FTS queries work on vectorless collections
     let bm25_hits = col.query_bm25(&RankBy::bm25("body", "hello"), None, 5).unwrap();
     assert_eq!(bm25_hits.len(), 1);
     assert_eq!(bm25_hits[0].id, 1);
+    let ord_hits = col.order_by(&[OrderBySpec::asc("title")], None, 5).unwrap();
+    assert_eq!(ord_hits.len(), 1);
+    assert_eq!(ord_hits[0].id, 1);
+    let facet_res = col.facet(None, &[FacetSpec::terms("title")]).unwrap();
+    assert_eq!(facet_res.terms("title").unwrap().buckets.len(), 1);
     assert!(matches!(
         col.hybrid_search(&[0.0], &RankBy::bm25("body", "hello"), HybridSearchOptions::new(5, SearchOptions::new(5, 4)), None),
         Err(TreeError::InvalidConfig(_))
     ));
-    // Unported APIs return Unsupported("v3: phase N")
-    assert!(matches!(
-        col.order_by(&[OrderBySpec::asc("title")], None, 5),
-        Err(TreeError::Unsupported(_))
-    ));
-    assert!(matches!(
-        col.facet(None, &[FacetSpec::terms("title")]),
-        Err(TreeError::Unsupported(_))
-    ));
     assert!(matches!(
         col.search_with_facets(&[0.0], SearchOptions::new(5, 4), None, &[], VectorFacetScope::TopK),
-        Err(TreeError::Unsupported(_))
+        Err(TreeError::InvalidConfig(_))
     ));
+    // Unported APIs return Unsupported("v3: phase N")
     assert!(matches!(
         col.verify_invariants(),
         Err(TreeError::Unsupported(_))

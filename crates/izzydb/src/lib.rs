@@ -1,7 +1,6 @@
 //! Segmented storage engine with global ANN, inverted attribute filters, and Block-Max MAXSCORE FTS.
 
 pub use izzydb_core::{config, error, facet as facet_types, filter, kmeans, metric, rank, rowset, schema};
-pub use izzydb_core::facet;
 pub use izzydb_fts as fts;
 pub use izzydb_rabitq as rabitq;
 pub use izzydb_storage::{codec, node, storage};
@@ -11,18 +10,21 @@ pub mod collection;
 /// Segment store, row allocation, sealing, and `RowId -> DocId` resolution.
 pub mod segments;
 
-// Legacy/unported v2 modules compiled out progressively as Phases 6-11 land.
+/// Batched `RowId`-sorted attribute readers (row store, columns, detached columns).
+pub(crate) mod attr_reader;
 /// Per-segment inverted attribute index.
 pub mod attr_index;
+/// Exact faceting engine over `RowSet` populations and global counts.
+pub mod facet;
 /// `RowSet` filter planner, cardinality estimation, and zone pruning.
 pub mod filter_plan;
 /// Full-text inverted index and Block-Max MAXSCORE engine.
 pub mod fts_index;
 /// SPFresh LIRE boundary-vector reassignment.
 pub mod lire;
-#[cfg(any())]
+/// Attribute-ordered top-k (`ORDER BY`) query execution.
 pub mod order_by;
-#[cfg(any())]
+/// Generalized `RankBy` scoring and boost/decay evaluation.
 pub mod rank_eval;
 /// Beam-search traversal, RaBitQ scanning, and exact reranking.
 pub mod search;

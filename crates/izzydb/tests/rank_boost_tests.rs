@@ -1,4 +1,3 @@
-#![cfg(any())] // v3: phase 6
 //! Exactness tests for filter boosts, attribute scoring, and general `Product` ranking against a
 //! brute-force reference evaluator.
 
@@ -7,9 +6,9 @@ use std::collections::{HashMap, HashSet};
 use izzydb::rank::{eval_decay, eval_saturate};
 use izzydb::{
     AttributeType, AttributeValue, Attributes, Bm25Result, Collection, CollectionConfig,
-    DecayMode, DistanceMetric, DocId, DocumentPatch, FacetSpec, Filter,
-    FullTextSearchConfig, HybridFacetScope, HybridSearchOptions, RankBy, ScalarValue,
-    SearchOptions, TokenQuery, TreeConfig, TreeError,
+    DecayMode, DistanceMetric, DocId, DocumentPatch, FacetSpec, Filter, FullTextSearchConfig,
+    HybridFacetScope, HybridSearchOptions, RankBy, ScalarValue, SearchOptions, SegmentConfig,
+    TokenQuery, TreeConfig, TreeError,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -82,7 +81,7 @@ fn build(dir: &TempDir) -> (Collection, HashMap<DocId, Attributes>) {
             let title: Vec<&str> = (0..nt).map(|_| WORDS[rng.random_range(0..8)]).collect();
             attrs.insert("title".into(), title.join(" ").into());
         }
-        col.upsert(id, &[0.0, 0.0, 0.0, 0.0], attrs.clone()).unwrap();
+        col.upsert(id, Some(&[0.0, 0.0, 0.0, 0.0]), attrs.clone()).unwrap();
         docs.insert(id, attrs);
     }
     (col, docs)
@@ -728,4 +727,70 @@ fn hybrid_and_facets_over_boosted_queries() {
         )
         .unwrap();
     assert_eq!(resp.total_hits as usize, positives.len());
+}
+
+#[test]
+fn multi_segment_churn_and_tiebreak_determinism() {
+    let dir = TempDir::new().unwrap();
+    let mut cfg = config().with_segment_config(SegmentConfig {
+        seal_rows: 64,
+        ..SegmentConfig::default()
+    });
+    cfg.vector = None;
+
+    let mut col = Collection::open(dir.path(), cfg).unwrap();
+    let mut docs: HashMap<DocId, Attributes> = HashMap::new();
+    for id in 0..N {
+        let mut a = Attributes::new();
+        a.insert("cat".into(), if id % 2 == 0 { "hot" } else { "cold" }.into());
+        a.insert("price".into(), AttributeValue::Float((id % 25) as f64));
+        a.insert("body".into(), if id % 3 == 0 { "alpha beta" } else { "gamma delta" }.into());
+        col.upsert(id, None, a.clone()).unwrap();
+        docs.insert(id, a);
+    }
+
+    // 30% churn shifting DocIds across open/sealed segments to verify DocId tie-break determinism.
+    for id in (0..N).step_by(3) {
+        if id % 6 == 0 {
+            col.delete(id).unwrap();
+            docs.remove(&id);
+        } else {
+            let new_price = (id % 5) as f64;
+            col.patch(
+                id,
+                DocumentPatch::new()
+                    .with_attribute("price", AttributeValue::Float(new_price))
+                    .with_attribute("cat", "hot".into()),
+            )
+            .unwrap();
+            let entry = docs.get_mut(&id).unwrap();
+            entry.insert("price".into(), AttributeValue::Float(new_price));
+            entry.insert("cat".into(), "hot".into());
+        }
+    }
+
+    // Constant-score expression: every matching doc scores exactly 3.0 -> ascending DocId order.
+    let const_hits = col
+        .query(&RankBy::product(3.0, RankBy::filter(Filter::Eq("cat".into(), "hot".into()))), None, 40)
+        .unwrap();
+    assert_eq!(const_hits.len(), 40);
+    assert!(const_hits.windows(2).all(|w| w[0].score == 3.0 && w[1].score == 3.0 && w[0].id < w[1].id));
+
+    // Exact parity against Reference for composite boost + decay expressions after churn.
+    let mut r = Reference::new(&col, &docs);
+    let expr = RankBy::Sum(vec![
+        RankBy::bm25("body", "alpha"),
+        RankBy::Decay {
+            attr: "price".into(),
+            origin: 0.0,
+            midpoint: 10.0,
+            exponent: 1.0,
+            mode: DecayMode::Forward,
+            missing: 0.0,
+        },
+    ]);
+    let filter = Filter::Eq("cat".into(), "hot".into());
+    let actual = col.query(&expr, Some(&filter), 25).unwrap();
+    let expected = r.scores(&expr, Some(&filter));
+    assert_matches_reference("multi-seg-churn", &actual, &expected, 25, false);
 }

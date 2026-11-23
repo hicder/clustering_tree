@@ -710,6 +710,43 @@ impl<'a> SegPostingView<'a> {
             Self::Roaring(slice) => Ok(decode_roaring_bitmap(slice)?.len()),
         }
     }
+
+    /// Count how many entries in this posting intersect with `mask`.
+    #[inline]
+    pub fn and_count(&self, mask: &RoaringBitmap) -> Result<u64> {
+        match *self {
+            Self::Sparse(slice) => {
+                let mut cnt = 0u64;
+                for chunk in slice.chunks_exact(4) {
+                    if mask.contains(u32::from_le_bytes(chunk.try_into().unwrap())) {
+                        cnt += 1;
+                    }
+                }
+                Ok(cnt)
+            }
+            Self::Roaring(slice) => Ok(decode_roaring_bitmap(slice)?.intersection_len(mask)),
+        }
+    }
+
+    /// OR entries of this posting that are present in `mask` into `dst`.
+    #[inline]
+    pub fn or_into_masked(&self, mask: &RoaringBitmap, dst: &mut RoaringBitmap) -> Result<()> {
+        match *self {
+            Self::Sparse(slice) => {
+                for chunk in slice.chunks_exact(4) {
+                    let v = u32::from_le_bytes(chunk.try_into().unwrap());
+                    if mask.contains(v) {
+                        dst.insert(v);
+                    }
+                }
+            }
+            Self::Roaring(slice) => {
+                let bm = decode_roaring_bitmap(slice)?;
+                *dst |= bm & mask;
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -801,7 +801,65 @@ impl Storage {
         Ok(())
     }
 
-    /// Cached per-segment zone map entries (`default[0x12]`).
+    /// Visit all `(val_bytes, seg, posting_bytes)` for `(attr_id, type_tag)` in `cf_attr_postings`,
+    /// ordered forward (`reverse == false`) or reverse (`reverse == true`) by `(val_bytes, seg)`.
+    pub fn visit_attr_postings_prefix(
+        &self,
+        attr_id: AttrId,
+        type_tag: u8,
+        reverse: bool,
+        mut visit: impl FnMut(&[u8], SegmentId, &[u8]) -> Result<bool>,
+    ) -> Result<()> {
+        let cf = self.cf(CF_ATTR_POSTINGS)?;
+        let prefix = encode_attr_prefix(attr_id, type_tag);
+        let mut options = ReadOptions::default();
+        options.set_iterate_range(PrefixRange(&prefix[..]));
+        options.set_total_order_seek(true);
+        let mut iter = self.db.raw_iterator_cf_opt(cf, options);
+        if reverse {
+            iter.seek_to_last();
+        } else {
+            iter.seek(&prefix);
+        }
+        while let Some((k, v)) = iter.item() {
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            let (val_prefix, seg) = split_posting_key(k)?;
+            if !visit(&val_prefix[3..], seg, v)? {
+                break;
+            }
+            if reverse {
+                iter.prev();
+            } else {
+                iter.next();
+            }
+        }
+        iter.status().map_err(map_db_err)
+    }
+
+    /// Largest encoded value in `default[0x06]` with live count `> 0` for `(attr_id, type_tag)`.
+    pub fn max_attr_count_key(&self, attr_id: AttrId, type_tag: u8) -> Result<Option<Vec<u8>>> {
+        let a = attr_id.to_be_bytes();
+        let prefix = [ATTR_COUNT_TAG, a[0], a[1], type_tag];
+        let mut options = ReadOptions::default();
+        options.set_iterate_range(PrefixRange(&prefix[..]));
+        options.set_total_order_seek(true);
+        let mut iter = self.db.raw_iterator_opt(options);
+        iter.seek_to_last();
+        while let Some((key, value)) = iter.item() {
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            if decode_count(value)? > 0 {
+                return Ok(Some(key[prefix.len()..].to_vec()));
+            }
+            iter.prev();
+        }
+        iter.status().map_err(map_db_err)?;
+        Ok(None)
+    }
+
     pub fn get_zones_cached(&self) -> Result<ZoneTable> {
         {
             let guard = self.zone_cache.read().expect("zone_cache poisoned");

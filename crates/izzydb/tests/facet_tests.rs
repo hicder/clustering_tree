@@ -1,4 +1,3 @@
-#![cfg(any())] // v3: phase 6
 //! Exact-parity tests for faceting against a brute-force oracle over the in-memory document model.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -10,7 +9,7 @@ use izzydb::facet::{
 use izzydb::{
     AttributeType, AttributeValue, Attributes, Bm25Overrides, Collection, CollectionConfig,
     DistanceMetric, DocId, DocumentPatch, Filter, FullTextSearchConfig, HybridSearchOptions,
-    RankBy, ScalarValue, SearchOptions, TreeConfig, TreeError,
+    RankBy, ScalarValue, SearchOptions, SegmentConfig, TreeConfig, TreeError,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -127,7 +126,7 @@ fn populate(col: &mut Collection, n: u64, seed: u64) -> Model {
     for id in 0..n {
         let v = random_vec(&mut rng);
         let a = gen_attrs(&mut rng, id);
-        col.upsert(id, &v, a.clone()).unwrap();
+        col.upsert(id, Some(&v), a.clone()).unwrap();
         model.insert(id, (v, a));
     }
     model
@@ -492,7 +491,7 @@ fn test_facet_unfiltered_all_kinds_parity() {
     let dir = TempDir::new().unwrap();
     let mut col = Collection::open(dir.path(), small_config()).unwrap();
     let model = populate(&mut col, 400, 1);
-    col.verify_invariants().unwrap();
+    col.verify_ann_invariants().unwrap();
 
     take_strategy_trace();
     let specs = without_array_ranges(all_specs());
@@ -513,26 +512,26 @@ fn test_facet_filtered_strategies_parity_and_crossover() {
 
     let cases: Vec<(&str, Filter, &str)> = vec![
         ("selective eq", eq("category", "rare"), "docs"),
-        ("broad eq", eq("category", "red"), "leaf_masks_no_views"),
+        ("broad eq", eq("category", "red"), "docs"),
         (
             "broad range",
             Filter::Gte("rank".into(), ScalarValue::Int(0)),
-            "leaf_masks_no_views",
+            "docs",
         ),
         (
             "contains",
             Filter::Contains("tags".into(), "x".into()),
-            "leaf_masks_no_views",
+            "docs",
         ),
         (
             "and of broad",
             Filter::And(vec![eq("category", "red"), Filter::Gt("rank".into(), ScalarValue::Int(-5))]),
-            "leaf_masks_no_views",
+            "docs",
         ),
         (
             "or",
             Filter::Or(vec![eq("category", "rare"), eq("category", "blue")]),
-            "leaf_masks_no_views",
+            "docs",
         ),
         (
             "complement of selective",
@@ -552,17 +551,17 @@ fn test_facet_filtered_strategies_parity_and_crossover() {
         (
             "complement of broad",
             Filter::Not(Box::new(eq("category", "red"))),
-            "leaf_masks_views",
+            "complement",
         ),
-        ("is_null", Filter::IsNull("rank".into()), "leaf_masks_views"),
-        ("is_not_null", Filter::IsNotNull("rank".into()), "leaf_masks_no_views"),
+        ("is_null", Filter::IsNull("rank".into()), "docs"),
+        ("is_not_null", Filter::IsNotNull("rank".into()), "docs"),
         (
             "mixed not/or",
             Filter::And(vec![
                 Filter::Or(vec![eq("category", "green"), Filter::Not(Box::new(eq("active", true)))]),
                 Filter::Lt("score".into(), ScalarValue::Float(50.0)),
             ]),
-            "leaf_masks_views",
+            "docs",
         ),
         (
             "empty result",
@@ -588,7 +587,7 @@ fn test_facet_filtered_strategies_parity_and_crossover() {
         assert_facets_eq(&got, &oracle(&simple, |_| pop.clone()), name);
         check_filter(&col, &model, Some(&f), &format!("{name} (all kinds)"));
     }
-    col.verify_invariants().unwrap();
+    col.verify_ann_invariants().unwrap();
 }
 
 #[test]
@@ -603,7 +602,7 @@ fn test_facet_crossover_beyond_forward_pass_limit() {
         let v = random_vec(&mut rng);
         let mut a = gen_attrs(&mut rng, id);
         a.insert("category".into(), if id % 400 == 0 { "few" } else { "many" }.into());
-        col.upsert(id, &v, a.clone()).unwrap();
+        col.upsert(id, Some(&v), a.clone()).unwrap();
         model.insert(id, (v, a));
     }
     let specs = vec![
@@ -627,7 +626,7 @@ fn test_facet_crossover_beyond_forward_pass_limit() {
     assert_eq!(take_strategy_trace(), vec!["docs"]);
     let pop2 = pop_by_filter(&model, Some(&f2));
     assert_facets_eq(&got2, &oracle(&specs, |_| pop2.clone()), "under 2048");
-    col.verify_invariants().unwrap();
+    col.verify_ann_invariants().unwrap();
 }
 
 #[test]
@@ -742,7 +741,7 @@ fn test_facet_edge_values_exact() {
     let v = [0.0f32; DIM];
     let mut put = |id: DocId, attrs: Vec<(&str, AttributeValue)>| {
         let a: Attributes = attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
-        col.upsert(id, &v, a).unwrap();
+        col.upsert(id, Some(&v), a).unwrap();
     };
     put(1, vec![("score", (-0.0).into()), ("big", AttributeValue::Int(i64::MIN)), ("category", "a\0b".into()),
         ("tags", vec!["t".to_string(), "t".to_string(), "u".to_string()].into()), ("nums", vec![10i64, 20].into())]);
@@ -794,12 +793,12 @@ fn test_facet_edge_values_exact() {
         let mut model = Model::new();
         for id in 1..=4u64 {
             let d = col.get(id).unwrap().unwrap();
-            model.insert(id, (d.embedding, d.attributes));
+            model.insert(id, (d.embedding.unwrap(), d.attributes));
         }
         let pop = pop_by_filter(&model, filter.as_ref());
         assert_facets_eq(&got, &oracle(&specs, |_| pop.clone()), &format!("edge {filter:?}"));
     }
-    col.verify_invariants().unwrap();
+    col.verify_ann_invariants().unwrap();
 }
 
 fn bm25_cases() -> Vec<(&'static str, RankBy, Box<dyn Fn(&str) -> bool>)> {
@@ -1027,7 +1026,7 @@ fn test_facet_churn_parity_and_reopen() {
                     next_id += 1;
                     let v = random_vec(&mut rng);
                     let a = gen_attrs(&mut rng, id);
-                    col.upsert(id, &v, a.clone()).unwrap();
+                    col.upsert(id, Some(&v), a.clone()).unwrap();
                     model.insert(id, (v, a));
                 }
                 2 => {
@@ -1107,43 +1106,54 @@ fn test_facet_churn_parity_and_reopen() {
                 }
             }
             if step % 40 == 39 {
-                col.verify_invariants().unwrap();
+                col.verify_ann_invariants().unwrap();
                 check_filter(&col, &model, None, &format!("churn step {step} global"));
                 check_filter(&col, &model, Some(&eq("category", "blue")), &format!("churn step {step} filtered"));
             }
         }
-        col.verify_invariants().unwrap();
+        col.verify_ann_invariants().unwrap();
         check_filter(&col, &model, Some(&Filter::Not(Box::new(eq("category", "red")))), "churn complement");
     }
-    // Reopen: persisted global counts must still be exact (and the marker must suppress backfill).
+    // Reopen: persisted global counts must still be exact.
     let col = Collection::open(dir.path(), small_config()).unwrap();
-    col.verify_invariants().unwrap();
+    col.verify_ann_invariants().unwrap();
     check_filter(&col, &model, None, "reopen global");
     check_filter(&col, &model, Some(&Filter::Gte("rank".into(), ScalarValue::Int(0))), "reopen filtered");
 }
 
 #[test]
-fn test_attr_counts_backfill_on_legacy_database() {
+fn test_facet_multi_segment_tombstones_parity() {
     let dir = TempDir::new().unwrap();
-    let model;
-    {
-        let mut col = Collection::open(dir.path(), small_config()).unwrap();
-        model = populate(&mut col, 150, 12);
-        col.verify_invariants().unwrap();
-    }
-    // Reproduce a database created before global counts existed.
-    {
-        let (storage, _) = izzydb::storage::Storage::open(dir.path(), &small_config().tree).unwrap();
-        storage.clear_attr_counts().unwrap();
-        assert!(!storage.has_attr_counts_marker().unwrap());
-        assert!(storage.all_attr_counts().unwrap().is_empty());
-    }
-    let mut col = Collection::open(dir.path(), small_config()).unwrap();
-    col.verify_invariants().unwrap(); // asserts exact counts + marker
-    check_filter(&col, &model, None, "backfilled global");
+    let cfg = small_config().with_segment_config(SegmentConfig {
+        seal_rows: 64,
+        ..SegmentConfig::default()
+    });
+    let mut col = Collection::open(dir.path(), cfg).unwrap();
+    let mut model = populate(&mut col, 260, 42);
 
-    // Subsequent mutations keep counts exact.
-    col.delete(3).unwrap();
-    col.upsert(9999, &[0.0; DIM], Attributes::from([("category".to_string(), "red".into())])).unwrap();
-    col.verify_invariants().unwrap();
+    // 30% churn (updates + deletes) spanning sealed and open segments.
+    for id in (0..260u64).step_by(3) {
+        if id % 6 == 0 {
+            assert!(col.delete(id).unwrap());
+            model.remove(&id);
+        } else {
+            let patch = DocumentPatch::new()
+                .with_attribute("category", "updated".into())
+                .clear_attribute("rank");
+            col.patch(id, patch).unwrap();
+            let entry = model.get_mut(&id).unwrap();
+            entry.1.insert("category".into(), "updated".into());
+            entry.1.remove("rank");
+        }
+    }
+
+    assert_eq!(col.len(), model.len() as u64);
+    check_filter(&col, &model, None, "multi-seg global");
+    check_filter(&col, &model, Some(&eq("category", "updated")), "multi-seg eq updated");
+    check_filter(
+        &col,
+        &model,
+        Some(&Filter::Not(Box::new(eq("category", "updated")))),
+        "multi-seg not updated",
+    );
 }

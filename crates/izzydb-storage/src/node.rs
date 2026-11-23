@@ -1,17 +1,17 @@
 use std::borrow::Cow;
 
-use izzydb_core::config::{DistanceMetric, DocId, LocalId, NodeId};
+use izzydb_core::config::{DistanceMetric, LocalId, NodeId, RowId};
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::metric::compute_weighted_centroid_flat;
 use izzydb_rabitq::{EncodeScratch, QuantizedEntry, RabitqQuantizer};
 
-const META_LEN: usize = 31;
+const META_LEN: usize = 51;
 const INTERNAL_HEADER_LEN: usize = 24;
 const LEAF_HEADER_LEN: usize = 24;
 
-/// Global tree metadata persisted in `cf_meta`.
+/// Global ANN tree metadata persisted in `default[\x01ann_meta]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TreeMeta {
+pub struct AnnMeta {
     pub root_id: NodeId,
     pub root_level: u8,
     pub next_node_id: NodeId,
@@ -20,9 +20,15 @@ pub struct TreeMeta {
     pub num_vectors: u64,
     pub rabitq_seed: u64,
     pub rabitq_bits: u8,
+    pub stale_rows: u64,
+    pub vacuum_epoch: u64,
+    pub vacuum_cursor: NodeId,
 }
 
-impl TreeMeta {
+/// Backward-compatible type alias for [`AnnMeta`].
+pub type TreeMeta = AnnMeta;
+
+impl AnnMeta {
     pub fn encode(&self) -> [u8; META_LEN] {
         let mut buf = [0u8; META_LEN];
         buf[0..4].copy_from_slice(&self.root_id.to_le_bytes());
@@ -33,13 +39,16 @@ impl TreeMeta {
         buf[14..22].copy_from_slice(&self.num_vectors.to_le_bytes());
         buf[22..30].copy_from_slice(&self.rabitq_seed.to_le_bytes());
         buf[30] = self.rabitq_bits;
+        buf[31..39].copy_from_slice(&self.stale_rows.to_le_bytes());
+        buf[39..47].copy_from_slice(&self.vacuum_epoch.to_le_bytes());
+        buf[47..51].copy_from_slice(&self.vacuum_cursor.to_le_bytes());
         buf
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != META_LEN {
             return Err(TreeError::CorruptedData(format!(
-                "TreeMeta expected {META_LEN} bytes, got {}",
+                "AnnMeta expected {META_LEN} bytes, got {}",
                 bytes.len()
             )));
         }
@@ -52,6 +61,9 @@ impl TreeMeta {
             num_vectors: u64::from_le_bytes(bytes[14..22].try_into().unwrap()),
             rabitq_seed: u64::from_le_bytes(bytes[22..30].try_into().unwrap()),
             rabitq_bits: bytes[30],
+            stale_rows: u64::from_le_bytes(bytes[31..39].try_into().unwrap()),
+            vacuum_epoch: u64::from_le_bytes(bytes[39..47].try_into().unwrap()),
+            vacuum_cursor: u32::from_le_bytes(bytes[47..51].try_into().unwrap()),
         })
     }
 }
@@ -239,9 +251,9 @@ impl PackedInternalNode {
     }
 }
 
-/// Packed slot-indexed leaf node (`local_id == slot`) stored in `cf_leaf_entries`.
+/// Packed slot-indexed leaf node (`slot` is leaf-local) stored in `cf_leaf_entries`.
 ///
-/// Arrays (`doc_ids`, `code_popcounts`, `res_norm_sqs`, `scales`, `codes`) are padded to
+/// Arrays (`row_ids`, `code_popcounts`, `res_norm_sqs`, `scales`, `codes`) are padded to
 /// `slot_cap.next_multiple_of(8)` so 8-wide RaBitQ SIMD loops execute cleanly over 64-byte tiles:
 /// `codes[((slot / 8) * rabitq_words + w) * 8 + (slot % 8)]`.
 #[derive(Debug, Clone, PartialEq)]
@@ -249,10 +261,11 @@ pub struct PackedLeafNode {
     pub parent_id: Option<NodeId>,
     pub slot_cap: usize,
     pub live_count: usize,
+    pub stale_hint: u32,
     pub live_mask: Vec<u64>,
     pub centroid: Vec<f32>,
     pub rotated_centroid: Vec<f32>,
-    pub doc_ids: Vec<DocId>,
+    pub row_ids: Vec<u64>,
     pub code_popcounts: Vec<u32>,
     pub res_norm_sqs: Vec<f32>,
     pub scales: Vec<f32>,
@@ -260,12 +273,12 @@ pub struct PackedLeafNode {
 }
 
 impl PackedLeafNode {
-    /// Construct a dense, encoded [`PackedLeafNode`] directly from `(centroid, doc_ids, flat_vectors)`
+    /// Construct a dense, encoded [`PackedLeafNode`] directly from `(centroid, row_ids, flat_vectors)`
     /// without a `TxContext`.
     pub fn from_entries(
         parent_id: Option<NodeId>,
         centroid: Vec<f32>,
-        doc_ids: &[DocId],
+        row_ids: &[RowId],
         flat_vectors: &[f32],
         quantizer: &RabitqQuantizer,
         dim: usize,
@@ -274,10 +287,10 @@ impl PackedLeafNode {
         let padded_dim = quantizer.padded_dim();
         let mut leaf = Self::empty(parent_id, dim, padded_dim);
         leaf.centroid = centroid;
-        if doc_ids.is_empty() {
+        if row_ids.is_empty() {
             quantizer.rotate_into(&leaf.centroid, &mut leaf.rotated_centroid);
         } else {
-            leaf.reset_and_encode(doc_ids, flat_vectors, quantizer, dim, scratch);
+            leaf.reset_and_encode(row_ids, flat_vectors, quantizer, dim, scratch);
         }
         leaf
     }
@@ -287,10 +300,11 @@ impl PackedLeafNode {
             parent_id,
             slot_cap: 0,
             live_count: 0,
+            stale_hint: 0,
             live_mask: Vec::new(),
             centroid: vec![0.0; dim],
             rotated_centroid: vec![0.0; padded_dim],
-            doc_ids: Vec::new(),
+            row_ids: Vec::new(),
             code_popcounts: Vec::new(),
             res_norm_sqs: Vec::new(),
             scales: Vec::new(),
@@ -308,8 +322,13 @@ impl PackedLeafNode {
         slot < self.slot_cap && ((self.live_mask[slot >> 6] >> (slot & 63)) & 1) != 0
     }
 
-    /// Collect all live `doc_ids` in slot order.
-    pub fn live_doc_ids(&self) -> Vec<DocId> {
+    #[inline]
+    pub fn row_id(&self, slot: usize) -> RowId {
+        RowId(self.row_ids[slot])
+    }
+
+    /// Collect all live `RowId`s in slot order.
+    pub fn live_row_ids(&self) -> Vec<RowId> {
         let mut out = Vec::with_capacity(self.live_count);
         for (w_idx, &word) in self.live_mask.iter().enumerate() {
             let mut b = word;
@@ -318,15 +337,15 @@ impl PackedLeafNode {
                 b &= b - 1;
                 let slot = (w_idx << 6) | bit;
                 if slot < self.slot_cap {
-                    out.push(self.doc_ids[slot]);
+                    out.push(RowId(self.row_ids[slot]));
                 }
             }
         }
         out
     }
 
-    /// Collect all `(slot as LocalId, doc_id)` pairs in ascending slot order.
-    pub fn live_slot_doc_pairs(&self) -> Vec<(LocalId, DocId)> {
+    /// Collect all `(slot as LocalId, RowId)` pairs in ascending slot order.
+    pub fn live_slot_row_pairs(&self) -> Vec<(LocalId, RowId)> {
         let mut out = Vec::with_capacity(self.live_count);
         for (w_idx, &word) in self.live_mask.iter().enumerate() {
             let mut b = word;
@@ -335,21 +354,22 @@ impl PackedLeafNode {
                 b &= b - 1;
                 let slot = (w_idx << 6) | bit;
                 if slot < self.slot_cap {
-                    out.push((slot as LocalId, self.doc_ids[slot]));
+                    out.push((slot as LocalId, RowId(self.row_ids[slot])));
                 }
             }
         }
         out
     }
 
-    pub fn find_slot(&self, doc_id: DocId) -> Option<usize> {
+    pub fn find_slot(&self, row_id: RowId) -> Option<usize> {
+        let raw = row_id.raw();
         for (w_idx, &word) in self.live_mask.iter().enumerate() {
             let mut b = word;
             while b != 0 {
                 let bit = b.trailing_zeros() as usize;
                 b &= b - 1;
                 let slot = (w_idx << 6) | bit;
-                if slot < self.slot_cap && self.doc_ids[slot] == doc_id {
+                if slot < self.slot_cap && self.row_ids[slot] == raw {
                     return Some(slot);
                 }
             }
@@ -362,7 +382,7 @@ impl PackedLeafNode {
         let padded = new_slot_cap.next_multiple_of(8);
         let mask_words = new_slot_cap.div_ceil(64);
         self.live_mask.resize(mask_words, 0);
-        self.doc_ids.resize(padded, 0);
+        self.row_ids.resize(padded, 0);
         self.code_popcounts.resize(padded, 0);
         self.res_norm_sqs.resize(padded, 0.0);
         self.scales.resize(padded, 0.0);
@@ -403,12 +423,11 @@ impl PackedLeafNode {
         }
     }
 
-    /// Insert or update `doc_id` at `known_slot` (or allocate/find a slot), keeping all
-    /// surviving entries' `local_id` (`== slot`) untouched.
+    /// Insert or update `row_id` at `known_slot` (or allocate/find a slot).
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_entry(
         &mut self,
-        doc_id: DocId,
+        row_id: RowId,
         known_slot: Option<LocalId>,
         res_norm_sq: f32,
         scale: f32,
@@ -417,10 +436,11 @@ impl PackedLeafNode {
         rabitq_words: usize,
     ) -> LocalId {
         debug_assert_eq!(code.len(), rabitq_words);
+        let raw = row_id.raw();
         let existing_slot = known_slot
             .map(|s| s as usize)
-            .filter(|&s| self.is_live(s) && self.doc_ids[s] == doc_id)
-            .or_else(|| self.find_slot(doc_id));
+            .filter(|&s| self.is_live(s) && self.row_ids[s] == raw)
+            .or_else(|| self.find_slot(row_id));
 
         let slot = match existing_slot {
             Some(s) => s,
@@ -428,7 +448,7 @@ impl PackedLeafNode {
                 let s = self.alloc_slot(rabitq_words);
                 self.live_mask[s >> 6] |= 1u64 << (s & 63);
                 self.live_count += 1;
-                self.doc_ids[s] = doc_id;
+                self.row_ids[s] = raw;
                 s
             }
         };
@@ -438,33 +458,43 @@ impl PackedLeafNode {
         slot as LocalId
     }
 
-    /// Allocate/find slot for `doc_id` with zeroed quantized fields (used before `re_encode_existing`).
-    pub fn insert_slot_for_reencode(&mut self, doc_id: DocId, rabitq_words: usize) -> LocalId {
-        if let Some(s) = self.find_slot(doc_id) {
+    /// Allocate/find slot for `row_id` with zeroed quantized fields (used before `re_encode_existing`).
+    pub fn insert_slot_for_reencode(&mut self, row_id: RowId, rabitq_words: usize) -> LocalId {
+        if let Some(s) = self.find_slot(row_id) {
             return s as LocalId;
         }
         let s = self.alloc_slot(rabitq_words);
         self.live_mask[s >> 6] |= 1u64 << (s & 63);
         self.live_count += 1;
-        self.doc_ids[s] = doc_id;
+        self.row_ids[s] = row_id.raw();
         s as LocalId
     }
 
-    /// Remove `doc_id` (optionally at `known_slot`) while keeping all surviving entries' slots untouched.
+    /// Remove `row_id` (optionally at `known_slot`) while keeping all surviving entries' slots untouched.
     pub fn remove_entry(
         &mut self,
-        doc_id: DocId,
+        row_id: RowId,
         known_slot: Option<LocalId>,
         rabitq_words: usize,
     ) -> Option<LocalId> {
+        let raw = row_id.raw();
         let slot = known_slot
             .map(|s| s as usize)
-            .filter(|&s| self.is_live(s) && self.doc_ids[s] == doc_id)
-            .or_else(|| self.find_slot(doc_id))?;
+            .filter(|&s| self.is_live(s) && self.row_ids[s] == raw)
+            .or_else(|| self.find_slot(row_id))?;
 
+        self.remove_slot(slot, rabitq_words);
+        Some(slot as LocalId)
+    }
+
+    /// Remove a slot directly (used when pruning stale entries by slot index).
+    pub fn remove_slot(&mut self, slot: usize, rabitq_words: usize) {
+        if !self.is_live(slot) {
+            return;
+        }
         self.live_mask[slot >> 6] &= !(1u64 << (slot & 63));
         self.live_count -= 1;
-        self.doc_ids[slot] = 0;
+        self.row_ids[slot] = 0;
         self.res_norm_sqs[slot] = 0.0;
         self.scales[slot] = 0.0;
         self.code_popcounts[slot] = 0;
@@ -481,11 +511,10 @@ impl PackedLeafNode {
         if new_cap != self.slot_cap {
             self.ensure_slot_storage(new_cap, rabitq_words);
         }
-        Some(slot as LocalId)
     }
 
-    /// Re-encode all live entries from `flat_vectors` (aligned with `self.live_slot_doc_pairs()`)
-    /// relative to `self.centroid` without altering any slot/`LocalId`.
+    /// Re-encode all live entries from `flat_vectors` (aligned with `self.live_slot_row_pairs()`)
+    /// relative to `self.centroid` without altering any slot.
     pub fn re_encode_existing(
         &mut self,
         flat_vectors: &[f32],
@@ -497,7 +526,7 @@ impl PackedLeafNode {
         let words = quantizer.num_words();
         quantizer.rotate_into(&self.centroid, &mut self.rotated_centroid);
 
-        let live_slots = self.live_slot_doc_pairs();
+        let live_slots = self.live_slot_row_pairs();
         assert_eq!(flat_vectors.len(), live_slots.len() * dim);
 
         let mut code_buf = vec![0u64; words];
@@ -511,29 +540,30 @@ impl PackedLeafNode {
         }
     }
 
-    /// Compact entries into dense slots `0..n` (`local_id = 0..n`) and encode from `flat_vectors`.
+    /// Compact entries into dense slots `0..n` and encode from `flat_vectors`.
     pub fn reset_and_encode(
         &mut self,
-        doc_ids: &[DocId],
+        row_ids: &[RowId],
         flat_vectors: &[f32],
         quantizer: &RabitqQuantizer,
         dim: usize,
         scratch: &mut EncodeScratch,
     ) {
-        let n = doc_ids.len();
+        let n = row_ids.len();
         let words = quantizer.num_words();
         self.live_mask.clear();
-        self.doc_ids.clear();
+        self.row_ids.clear();
         self.code_popcounts.clear();
         self.res_norm_sqs.clear();
         self.scales.clear();
         self.codes.clear();
 
         self.live_count = n;
+        self.stale_hint = 0;
         self.ensure_slot_storage(n, words);
-        for (i, &did) in doc_ids.iter().enumerate() {
+        for (i, &rid) in row_ids.iter().enumerate() {
             self.live_mask[i >> 6] |= 1u64 << (i & 63);
-            self.doc_ids[i] = did;
+            self.row_ids[i] = rid.raw();
         }
         self.re_encode_existing(flat_vectors, quantizer, dim, scratch);
     }
@@ -553,7 +583,7 @@ impl PackedLeafNode {
         debug_assert_eq!(self.centroid.len(), dim);
         debug_assert_eq!(self.rotated_centroid.len(), padded_dim);
         debug_assert_eq!(self.live_mask.len(), mask_words);
-        debug_assert_eq!(self.doc_ids.len(), padded_slots);
+        debug_assert_eq!(self.row_ids.len(), padded_slots);
         debug_assert_eq!(self.code_popcounts.len(), padded_slots);
         debug_assert_eq!(self.res_norm_sqs.len(), padded_slots);
         debug_assert_eq!(self.scales.len(), padded_slots);
@@ -582,9 +612,10 @@ impl PackedLeafNode {
             }
         }
         buf.extend_from_slice(&(self.live_count as u32).to_le_bytes());
-        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&self.stale_hint.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
         write_u64_le(&self.live_mask, &mut buf);
-        write_u64_le(&self.doc_ids, &mut buf);
+        write_u64_le(&self.row_ids, &mut buf);
         write_u64_le(&self.codes, &mut buf);
         write_f32_le(&self.res_norm_sqs, &mut buf);
         write_f32_le(&self.scales, &mut buf);
@@ -616,10 +647,11 @@ impl PackedLeafNode {
             parent_id: view.parent_id,
             slot_cap: view.slot_cap,
             live_count: view.live_count,
+            stale_hint: view.stale_hint,
             live_mask: read_u64_le(view.live_mask_bytes, mask_words)?,
             centroid: read_f32_le(view.centroid_bytes, dim)?,
             rotated_centroid: read_f32_le(view.rotated_centroid_bytes, padded_dim)?,
-            doc_ids: read_u64_le(view.doc_ids_bytes, padded_slots)?,
+            row_ids: read_u64_le(view.row_ids_bytes, padded_slots)?,
             code_popcounts,
             res_norm_sqs: read_f32_le(view.res_norm_sqs_bytes, padded_slots)?,
             scales: read_f32_le(view.scales_bytes, padded_slots)?,
@@ -647,9 +679,10 @@ pub struct LeafNodeView<'a> {
     pub popcount_u32: bool,
     pub slot_cap: usize,
     pub live_count: usize,
+    pub stale_hint: u32,
     pub padded_slots: usize,
     pub live_mask_bytes: &'a [u8],
-    pub doc_ids_bytes: &'a [u8],
+    pub row_ids_bytes: &'a [u8],
     pub codes_bytes: &'a [u8],
     pub res_norm_sqs_bytes: &'a [u8],
     pub scales_bytes: &'a [u8],
@@ -684,6 +717,7 @@ impl<'a> LeafNodeView<'a> {
         let mask_words = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
         let slot_cap = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
         let live_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let stale_hint = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
         if mask_words != slot_cap.div_ceil(64) || live_count > slot_cap {
             return Err(TreeError::CorruptedData(format!(
                 "invalid PackedLeafNode header: slot_cap={slot_cap}, live_count={live_count}, mask_words={mask_words}"
@@ -707,7 +741,7 @@ impl<'a> LeafNodeView<'a> {
         let mut off = LEAF_HEADER_LEN;
         let live_mask_bytes = &bytes[off..off + mask_words * 8];
         off += mask_words * 8;
-        let doc_ids_bytes = &bytes[off..off + padded_slots * 8];
+        let row_ids_bytes = &bytes[off..off + padded_slots * 8];
         off += padded_slots * 8;
         let codes_bytes = &bytes[off..off + padded_slots * rabitq_words * 8];
         off += padded_slots * rabitq_words * 8;
@@ -726,9 +760,10 @@ impl<'a> LeafNodeView<'a> {
             popcount_u32,
             slot_cap,
             live_count,
+            stale_hint,
             padded_slots,
             live_mask_bytes,
-            doc_ids_bytes,
+            row_ids_bytes,
             codes_bytes,
             res_norm_sqs_bytes,
             scales_bytes,
@@ -780,12 +815,12 @@ impl<'a> LeafNodeView<'a> {
     }
 
     #[inline]
-    pub fn doc_id(&self, slot: usize) -> DocId {
-        u64::from_le_bytes(
-            self.doc_ids_bytes[slot * 8..(slot + 1) * 8]
+    pub fn row_id(&self, slot: usize) -> RowId {
+        RowId(u64::from_le_bytes(
+            self.row_ids_bytes[slot * 8..(slot + 1) * 8]
                 .try_into()
                 .unwrap(),
-        )
+        ))
     }
 
     pub fn centroid_cow(&self, dim: usize) -> Result<Cow<'a, [f32]>> {
@@ -973,9 +1008,14 @@ mod tests {
         let words = 1;
         let mut leaf = PackedLeafNode::empty(Some(9), dim, padded_dim);
 
-        assert_eq!(leaf.upsert_entry(30, None, 1.5, 2.0, &[0xAA], 4, words), 0);
-        assert_eq!(leaf.upsert_entry(10, None, 0.5, 1.0, &[0x11], 2, words), 1);
-        assert_eq!(leaf.upsert_entry(20, None, 2.5, 3.0, &[0x55], 4, words), 2);
+        let r30 = RowId::new(1, 30);
+        let r10 = RowId::new(0, 10);
+        let r20 = RowId::new(2, 20);
+        let r40 = RowId::new(3, 40);
+
+        assert_eq!(leaf.upsert_entry(r30, None, 1.5, 2.0, &[0xAA], 4, words), 0);
+        assert_eq!(leaf.upsert_entry(r10, None, 0.5, 1.0, &[0x11], 2, words), 1);
+        assert_eq!(leaf.upsert_entry(r20, None, 2.5, 3.0, &[0x55], 4, words), 2);
         assert_eq!(leaf.slot_cap, 3);
         assert_eq!(leaf.live_count, 3);
 
@@ -983,29 +1023,29 @@ mod tests {
         let decoded = PackedLeafNode::decode(&bytes, dim, padded_dim, words).unwrap();
         assert_eq!(leaf, decoded);
 
-        // Removing slot 1 (doc 10) keeps slot 0 (doc 30) and slot 2 (doc 20) untouched!
-        assert_eq!(leaf.remove_entry(10, Some(1), words), Some(1));
+        // Removing slot 1 (r10) keeps slot 0 (r30) and slot 2 (r20) untouched!
+        assert_eq!(leaf.remove_entry(r10, Some(1), words), Some(1));
         assert_eq!(leaf.live_count, 2);
         assert_eq!(leaf.slot_cap, 3);
         assert!(!leaf.is_live(1));
         assert!(leaf.is_live(0));
         assert!(leaf.is_live(2));
-        assert_eq!(leaf.doc_ids[0], 30);
-        assert_eq!(leaf.doc_ids[2], 20);
+        assert_eq!(leaf.row_id(0), r30);
+        assert_eq!(leaf.row_id(2), r20);
 
         // Next insert reuses free slot 1!
-        assert_eq!(leaf.upsert_entry(40, None, 3.5, 4.0, &[0xFF], 8, words), 1);
+        assert_eq!(leaf.upsert_entry(r40, None, 3.5, 4.0, &[0xFF], 8, words), 1);
         assert_eq!(leaf.live_count, 3);
         assert_eq!(leaf.slot_cap, 3);
-        assert_eq!(leaf.doc_ids[1], 40);
+        assert_eq!(leaf.row_id(1), r40);
 
         // Multi-word test
         let words2 = 3;
         let mut leaf2 = PackedLeafNode::empty(None, dim, 192);
-        let s2 = leaf2.upsert_entry(2, None, 1.0, 1.0, &[1, 2, 3], 6, words2);
-        let s4 = leaf2.upsert_entry(4, None, 2.0, 2.0, &[4, 5, 6], 6, words2);
-        let s1 = leaf2.upsert_entry(1, None, 3.0, 3.0, &[7, 8, 9], 7, words2);
-        let s3 = leaf2.upsert_entry(3, None, 4.0, 4.0, &[10, 11, 12], 7, words2);
+        let s2 = leaf2.upsert_entry(RowId::new(0, 2), None, 1.0, 1.0, &[1, 2, 3], 6, words2);
+        let s4 = leaf2.upsert_entry(RowId::new(0, 4), None, 2.0, 2.0, &[4, 5, 6], 6, words2);
+        let s1 = leaf2.upsert_entry(RowId::new(0, 1), None, 3.0, 3.0, &[7, 8, 9], 7, words2);
+        let s3 = leaf2.upsert_entry(RowId::new(0, 3), None, 4.0, 4.0, &[10, 11, 12], 7, words2);
         assert_eq!((s2, s4, s1, s3), (0, 1, 2, 3));
         assert_eq!(leaf2.entry_code_word(2, 1, words2), 8);
         assert_eq!(leaf2.entry_code_word(3, 2, words2), 12);
@@ -1014,5 +1054,21 @@ mod tests {
             PackedLeafNode::decode(&bytes2, dim, 192, words2).unwrap(),
             leaf2
         );
+
+        // AnnMeta roundtrip
+        let meta = AnnMeta {
+            root_id: 1,
+            root_level: 2,
+            next_node_id: 99,
+            dim: 128,
+            metric: DistanceMetric::Cosine,
+            num_vectors: 1000,
+            rabitq_seed: 42,
+            rabitq_bits: 1,
+            stale_rows: 17,
+            vacuum_epoch: 3,
+            vacuum_cursor: 55,
+        };
+        assert_eq!(AnnMeta::decode(&meta.encode()).unwrap(), meta);
     }
 }

@@ -7,12 +7,14 @@ pub mod filter;
 pub mod kmeans;
 pub mod metric;
 pub mod rank;
+pub mod rowset;
 pub mod schema;
 pub mod simd;
 
 pub use config::{
-    AttrId, DistanceMetric, DocId, FTS_BLOCK_SIZE, FtsBlockId, FtsDocId, LocalId, NodeId,
-    TreeConfig, fts_block_id, fts_slot, make_fts_doc_id,
+    AttrId, ColumnGen, DEFAULT_SEAL_ROWS, DistanceMetric, DocId, FTS_BLOCK_SIZE, LocalId,
+    MAX_SEGMENT_ROWS, NodeId, ROW_BLOCK_SIZE, RowBlock, RowId, SegmentConfig, SegmentId,
+    SkipChunk, TermId, TreeConfig,
 };
 pub use error::{Result, TreeError};
 pub use facet::{
@@ -25,7 +27,8 @@ pub use rank::{
     Bm25Overrides, DecayMode, NullsOrder, OrderBySpec, OrderedResult, RankBy, SortDirection,
     eval_decay, eval_saturate, validate_order_by,
 };
+pub use rowset::{Liveness, RowSet, RowSetCursor};
 pub use schema::{
     AttributeConfig, AttributeType, AttributeValue, Attributes, CollectionConfig, CollectionSchema,
-    FullTextSearchConfig, Language, ScalarValue, Tokenizer,
+    ColumnStorage, FullTextSearchConfig, Language, ScalarValue, Tokenizer,
 };

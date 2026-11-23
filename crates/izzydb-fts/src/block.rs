@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use izzydb_core::config::{AttrId, FTS_BLOCK_SIZE, FTS_SKIP_CHUNK_SIZE, FtsBlockId, FtsDocId, TermId};
+use izzydb_core::config::{AttrId, FTS_BLOCK_SIZE, FTS_SKIP_CHUNK_SIZE, RowBlock, TermId};
 use izzydb_core::error::{Result, TreeError};
 
 pub const POSTING_BLOCK_HEADER_LEN: usize = 12;
@@ -89,35 +89,19 @@ pub struct AttrFtsStats {
     pub total_tokens: u64,
 }
 
-/// Global FTS metadata stored in `cf_meta["fts_meta"]`.
+/// Global FTS metadata stored in `default[\x01fts_meta]` (v4).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FtsMeta {
-    pub next_fts_doc_id: FtsDocId,
     pub next_term_id: TermId,
     pub per_attr_stats: BTreeMap<AttrId, AttrFtsStats>,
 }
 
 impl FtsMeta {
-    pub fn new(
-        next_fts_doc_id: FtsDocId,
-        next_term_id: TermId,
-        per_attr_stats: BTreeMap<AttrId, AttrFtsStats>,
-    ) -> Self {
+    pub fn new(next_term_id: TermId, per_attr_stats: BTreeMap<AttrId, AttrFtsStats>) -> Self {
         Self {
-            next_fts_doc_id,
             next_term_id,
             per_attr_stats,
         }
-    }
-
-    pub fn alloc_doc_id(&mut self) -> Result<FtsDocId> {
-        let id = self.next_fts_doc_id;
-        // Reserve FtsDocId::MAX (u32::MAX) as sentinel for "absent" in DocLoc.
-        if id == FtsDocId::MAX {
-            return Err(TreeError::Storage("FtsDocId u32 space exhausted".into()));
-        }
-        self.next_fts_doc_id = id + 1;
-        Ok(id)
     }
 
     pub fn alloc_term_id(&mut self) -> Result<TermId> {
@@ -130,8 +114,7 @@ impl FtsMeta {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(12 + self.per_attr_stats.len() * 18);
-        buf.extend_from_slice(&self.next_fts_doc_id.to_le_bytes());
+        let mut buf = Vec::with_capacity(8 + self.per_attr_stats.len() * 18);
         buf.extend_from_slice(&self.next_term_id.to_le_bytes());
         buf.extend_from_slice(&(self.per_attr_stats.len() as u32).to_le_bytes());
         for (&attr_id, stats) in &self.per_attr_stats {
@@ -143,23 +126,22 @@ impl FtsMeta {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 12 {
+        if bytes.len() < 8 {
             return Err(TreeError::CorruptedData(
                 "FtsMeta payload too short".into(),
             ));
         }
-        let next_fts_doc_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let next_term_id = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-        if bytes.len() != 12 + count * 18 {
+        let next_term_id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        if bytes.len() != 8 + count * 18 {
             return Err(TreeError::CorruptedData(format!(
                 "FtsMeta expected {} bytes, got {}",
-                12 + count * 18,
+                8 + count * 18,
                 bytes.len()
             )));
         }
         let mut per_attr_stats = BTreeMap::new();
-        let mut off = 12;
+        let mut off = 8;
         for _ in 0..count {
             let attr_id = u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap());
             let doc_count = u64::from_le_bytes(bytes[off + 2..off + 10].try_into().unwrap());
@@ -174,7 +156,6 @@ impl FtsMeta {
             off += 18;
         }
         Ok(Self {
-            next_fts_doc_id,
             next_term_id,
             per_attr_stats,
         })
@@ -238,13 +219,13 @@ impl TermStats {
     }
 }
 
-/// Term dictionary entry stored in `cf_fts_terms` with numeric `TermId`, `TermStats`,
+/// Term dictionary entry stored in `cf_fts_terms` (v4) with numeric `TermId`, `TermStats`,
 /// and optional inline single-block posting payload for rare terms (`doc_freq <= INLINE_TERM_MAX_DF`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TermRecord {
     pub term_id: TermId,
     pub stats: TermStats,
-    pub inline_block: Option<(FtsBlockId, Vec<u8>)>,
+    pub inline_block: Option<(RowBlock, Vec<u8>)>,
 }
 
 impl TermRecord {
@@ -259,7 +240,7 @@ impl TermRecord {
     pub fn with_inline(
         term_id: TermId,
         stats: TermStats,
-        block_id: FtsBlockId,
+        block_id: RowBlock,
         block_bytes: Vec<u8>,
     ) -> Self {
         Self {
@@ -281,14 +262,15 @@ impl TermRecord {
         let inline_len = self
             .inline_block
             .as_ref()
-            .map_or(0, |(_, bytes)| 4 + bytes.len());
+            .map_or(0, |(_, bytes)| 8 + bytes.len());
         let mut buf = Vec::with_capacity(TERM_RECORD_HEADER_LEN + inline_len);
         buf.extend_from_slice(&self.term_id.to_le_bytes());
         buf.extend_from_slice(&self.stats.encode());
         match &self.inline_block {
             Some((block_id, posting_bytes)) => {
                 buf.push(TERM_FLAG_INLINE);
-                buf.extend_from_slice(&block_id.to_le_bytes());
+                buf.extend_from_slice(&block_id.seg().to_le_bytes());
+                buf.extend_from_slice(&block_id.block().to_le_bytes());
                 buf.extend_from_slice(posting_bytes);
             }
             None => {
@@ -319,13 +301,15 @@ impl TermRecord {
                 None
             }
             TERM_FLAG_INLINE => {
-                if bytes.len() < TERM_RECORD_HEADER_LEN + 4 + POSTING_BLOCK_HEADER_LEN {
+                if bytes.len() < TERM_RECORD_HEADER_LEN + 8 + POSTING_BLOCK_HEADER_LEN {
                     return Err(TreeError::CorruptedData(
                         "inline TermRecord payload truncated".into(),
                     ));
                 }
-                let block_id = u32::from_le_bytes(bytes[21..25].try_into().unwrap());
-                let posting_bytes = bytes[25..].to_vec();
+                let seg = u32::from_le_bytes(bytes[21..25].try_into().unwrap());
+                let block = u32::from_le_bytes(bytes[25..29].try_into().unwrap());
+                let block_id = RowBlock::new(seg, block);
+                let posting_bytes = bytes[29..].to_vec();
                 let _ = PostingBlockView::parse(&posting_bytes)?;
                 Some((block_id, posting_bytes))
             }
@@ -1419,8 +1403,6 @@ mod tests {
     #[test]
     fn test_fts_meta_and_term_record_roundtrip() {
         let mut meta = FtsMeta::default();
-        assert_eq!(meta.alloc_doc_id().unwrap(), 0);
-        assert_eq!(meta.alloc_doc_id().unwrap(), 1);
         assert_eq!(meta.alloc_term_id().unwrap(), 0);
         assert_eq!(meta.alloc_term_id().unwrap(), 1);
         meta.per_attr_stats.insert(
@@ -1456,7 +1438,7 @@ mod tests {
         let rec_inline = TermRecord {
             term_id: 18,
             stats: ts,
-            inline_block: Some((4, blk.encode())),
+            inline_block: Some((RowBlock::new(2, 4), blk.encode())),
         };
         assert_eq!(TermRecord::decode(&rec_inline.encode()).unwrap(), rec_inline);
     }

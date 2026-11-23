@@ -1,11 +1,13 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 
-use izzydb_core::config::{AttrId, FtsBlockId, LocalId, NodeId, TermId};
+use izzydb_core::config::{
+    AttrId, ColumnGen, DocId, LocalId, ROW_BLOCK_SIZE, RowBlock, RowId, SegmentId, SkipChunk,
+    TermId,
+};
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::filter::{Filter, FtsPredicateKind, TokenQuery};
 use izzydb_core::schema::{
-    AttributeType, AttributeValue, Attributes, CollectionSchema, ScalarValue,
+    AttributeType, AttributeValue, Attributes, CollectionSchema, ColumnStorage, ScalarValue,
 };
 use roaring::RoaringBitmap;
 
@@ -17,49 +19,101 @@ pub const TAG_UINT: u8 = 0x03;
 pub const TAG_FLOAT: u8 = 0x04;
 pub const TAG_STRING: u8 = 0x05;
 
-const DOC_FORMAT_V2: u8 = 0x02;
-const DOC_HEADER_LEN: usize = 4;
-const DOC_DIR_ENTRY_LEN: usize = 8;
+// `default` CF keyspace tags.
+pub const INTERNAL_NODE_TAG: u8 = 0x02;
+pub const FTS_DOC_LEN_TAG: u8 = 0x05;
+pub const ATTR_COUNT_TAG: u8 = 0x06;
+pub const DETACHED_COUNT_TAG: u8 = 0x07;
+pub const SEG_DELETES_TAG: u8 = 0x10;
+pub const SEG_META_TAG: u8 = 0x11;
+pub const ZONE_TAG: u8 = 0x12;
+pub const DETACHED_META_TAG: u8 = 0x13;
+pub const DETACHED_OVERWRITTEN_TAG: u8 = 0x14;
 
-const DOC_VAL_NULL: u8 = 0;
-const DOC_VAL_BOOL: u8 = 1;
-const DOC_VAL_INT: u8 = 2;
-const DOC_VAL_UINT: u8 = 3;
-const DOC_VAL_FLOAT: u8 = 4;
-const DOC_VAL_STRING: u8 = 5;
-const DOC_VAL_STRING_ARRAY: u8 = 6;
-const DOC_VAL_INT_ARRAY: u8 = 7;
-const DOC_VAL_UINT_ARRAY: u8 = 8;
+const ROW_FORMAT_V3: u8 = 0x03;
+const ROW_FLAG_HAS_VECTOR: u8 = 0x01;
+const ROW_HEADER_LEN: usize = 4;
+const ROW_DIR_ENTRY_LEN: usize = 8;
 
-const LEAF_POSTING_SPARSE: u8 = 0x00;
-const LEAF_POSTING_DENSE: u8 = 0x01;
-const LEAF_POSTING_ROARING: u8 = 0x02;
-const LEAF_POSTING_SPARSE_MAX: usize = 16;
-const LEAF_POSTING_DENSE_MAX_LOCAL_ID: LocalId = 4095;
+const ROW_VAL_NULL: u8 = 0;
+const ROW_VAL_BOOL: u8 = 1;
+const ROW_VAL_INT: u8 = 2;
+const ROW_VAL_UINT: u8 = 3;
+const ROW_VAL_FLOAT: u8 = 4;
+const ROW_VAL_STRING: u8 = 5;
+const ROW_VAL_STRING_ARRAY: u8 = 6;
+const ROW_VAL_INT_ARRAY: u8 = 7;
+const ROW_VAL_UINT_ARRAY: u8 = 8;
 
-/// 3-byte RocksDB prefix (`attr_id BE || type_tag`) for `cf_attr_clusters` and `cf_attr_zones`.
+const SEG_POSTING_SPARSE: u8 = 0x00;
+const SEG_POSTING_ROARING: u8 = 0x01;
+pub const SEG_POSTING_SPARSE_MAX: usize = 32;
+
+pub const DOC_ID_BLOCK_BYTES: usize = ROW_BLOCK_SIZE * 8;
+pub const MANIFEST_BYTES: usize = 32;
+pub const SEGMENT_META_BYTES: usize = 44;
+pub const DETACHED_META_BYTES: usize = 24;
+
+pub const SEG_FLAG_HAS_COLUMNS: u8 = 0x01;
+pub const SEG_FLAG_HAS_VECTORS: u8 = 0x02;
+
+// ---------------------------------------------------------------------------
+// Key builders & decoders
+// ---------------------------------------------------------------------------
+
+#[inline]
+pub fn row_key(row: RowId) -> [u8; 8] {
+    row.to_be_bytes()
+}
+
+#[inline]
+pub fn decode_row_key(bytes: &[u8]) -> Result<RowId> {
+    if bytes.len() != 8 {
+        return Err(TreeError::CorruptedData(format!(
+            "row_key expected 8 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(RowId::from_be_bytes(bytes.try_into().unwrap()))
+}
+
+#[inline]
+pub fn doc_id_block_key(seg: SegmentId, block: u32) -> [u8; 8] {
+    let s = seg.to_be_bytes();
+    let b = block.to_be_bytes();
+    [s[0], s[1], s[2], s[3], b[0], b[1], b[2], b[3]]
+}
+
+#[inline]
+pub fn decode_doc_id_block_key(bytes: &[u8]) -> Result<(SegmentId, u32)> {
+    if bytes.len() != 8 {
+        return Err(TreeError::CorruptedData(format!(
+            "doc_id_block_key expected 8 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok((
+        u32::from_be_bytes(bytes[0..4].try_into().unwrap()),
+        u32::from_be_bytes(bytes[4..8].try_into().unwrap()),
+    ))
+}
+
+/// 3-byte prefix (`attr_id BE || type_tag`) for `cf_attr_postings` and `default[0x06]`.
 #[inline]
 pub fn encode_attr_prefix(attr_id: AttrId, type_tag: u8) -> [u8; 3] {
     let id = attr_id.to_be_bytes();
     [id[0], id[1], type_tag]
 }
 
-/// 7-byte RocksDB prefix (`attr_id BE || type_tag || cluster_id BE`) for cluster-first `cf_attr_postings`.
+/// Build an index value key (`attr_id BE || type_tag || encoded_val`) for `default[0x06]` counts
+/// and as the value prefix of `cf_attr_postings`.
 #[inline]
-pub fn encode_posting_prefix(attr_id: AttrId, type_tag: u8, cluster_id: NodeId) -> [u8; 7] {
-    let a = attr_id.to_be_bytes();
-    let c = cluster_id.to_be_bytes();
-    [a[0], a[1], type_tag, c[0], c[1], c[2], c[3]]
-}
-
-/// Build the `cf_attr_clusters` key for tracking presence (`TAG_PRESENT`) of `attr_id`.
-#[inline]
-pub fn encode_present_cluster_key(attr_id: AttrId) -> Vec<u8> {
+pub fn encode_present_attr_key(attr_id: AttrId) -> Vec<u8> {
     encode_attr_prefix(attr_id, TAG_PRESENT).to_vec()
 }
 
-/// Build a `cf_attr_clusters` key: `attr_id (u16 BE) || type_tag (u8) || encoded_val`.
-pub fn encode_scalar_cluster_key(attr_id: AttrId, val: &ScalarValue) -> Result<Vec<u8>> {
+/// Build an index value key: `attr_id (u16 BE) || type_tag (u8) || encoded_val`.
+pub fn encode_scalar_attr_key(attr_id: AttrId, val: &ScalarValue) -> Result<Vec<u8>> {
     let mut key = Vec::with_capacity(16);
     key.extend_from_slice(&attr_id.to_be_bytes());
     key.push(0); // placeholder for type_tag
@@ -68,61 +122,241 @@ pub fn encode_scalar_cluster_key(attr_id: AttrId, val: &ScalarValue) -> Result<V
     Ok(key)
 }
 
-/// Build a cluster-first `cf_attr_postings` key from a `cf_attr_clusters` key and `cluster_id`:
-/// `attr_id (u16 BE) || type_tag (u8) || cluster_id (u32 BE) || encoded_val`.
+/// Build a value-major `cf_attr_postings` key:
+/// `attr_id (u16 BE) || type_tag (u8) || encoded_val || seg (u32 BE)`.
 #[inline]
-pub fn make_posting_key(cluster_key: &[u8], cluster_id: NodeId) -> Vec<u8> {
-    debug_assert!(cluster_key.len() >= 3);
-    let mut key = Vec::with_capacity(cluster_key.len() + 4);
-    key.extend_from_slice(&cluster_key[..3]);
-    key.extend_from_slice(&cluster_id.to_be_bytes());
-    key.extend_from_slice(&cluster_key[3..]);
-    key
-}
-
-/// Build a cluster-first `cf_attr_postings` key from `(attr_id, type_tag, cluster_id, encoded_val)`.
-#[inline]
-pub fn encode_posting_key_parts(
-    attr_id: AttrId,
-    type_tag: u8,
-    cluster_id: NodeId,
-    encoded_val: &[u8],
-) -> Vec<u8> {
+pub fn posting_key(attr_id: AttrId, type_tag: u8, encoded_val: &[u8], seg: SegmentId) -> Vec<u8> {
     let mut key = Vec::with_capacity(7 + encoded_val.len());
-    key.extend_from_slice(&encode_posting_prefix(attr_id, type_tag, cluster_id));
+    key.extend_from_slice(&encode_attr_prefix(attr_id, type_tag));
     key.extend_from_slice(encoded_val);
+    key.extend_from_slice(&seg.to_be_bytes());
     key
 }
 
-/// Split a cluster-first `cf_attr_postings` key into `(attr_id, type_tag, cluster_id, encoded_val)`.
+/// Build a `cf_attr_postings` key from an `attr_key` (`attr_id BE || tag || encoded_val`) and `seg`.
 #[inline]
-pub fn split_posting_key(posting_key: &[u8]) -> Result<(AttrId, u8, NodeId, &[u8])> {
-    if posting_key.len() < 7 {
-        return Err(TreeError::CorruptedData(format!(
-            "cf_attr_postings key too short: {}",
-            posting_key.len()
-        )));
-    }
-    let attr_id = u16::from_be_bytes([posting_key[0], posting_key[1]]);
-    let type_tag = posting_key[2];
-    let cluster_id = u32::from_be_bytes(posting_key[3..7].try_into().unwrap());
-    Ok((attr_id, type_tag, cluster_id, &posting_key[7..]))
+pub fn make_posting_key(attr_key: &[u8], seg: SegmentId) -> Vec<u8> {
+    debug_assert!(attr_key.len() >= 3);
+    let mut key = Vec::with_capacity(attr_key.len() + 4);
+    key.extend_from_slice(attr_key);
+    key.extend_from_slice(&seg.to_be_bytes());
+    key
 }
 
-/// Reconstruct the `cf_attr_clusters` key from a cluster-first `cf_attr_postings` key.
+/// Split a `cf_attr_postings` key into `(prefix = attr_id || tag || encoded_val, seg)`.
+///
+/// Valid even when `encoded_val` contains embedded `0x00` bytes because `seg` is fixed-width 4 bytes
+/// at the tail and `encoded_val` is self-delimiting.
 #[inline]
-pub fn cluster_key_from_posting_key(posting_key: &[u8]) -> Result<Vec<u8>> {
-    if posting_key.len() < 7 {
+pub fn split_posting_key(key: &[u8]) -> Result<(&[u8], SegmentId)> {
+    if key.len() < 7 {
         return Err(TreeError::CorruptedData(format!(
             "cf_attr_postings key too short: {}",
-            posting_key.len()
+            key.len()
         )));
     }
-    let mut out = Vec::with_capacity(posting_key.len() - 4);
-    out.extend_from_slice(&posting_key[..3]);
-    out.extend_from_slice(&posting_key[7..]);
-    Ok(out)
+    let split = key.len() - 4;
+    let seg = u32::from_be_bytes(key[split..].try_into().unwrap());
+    Ok((&key[..split], seg))
 }
+
+/// Split a `cf_attr_postings` key into `(attr_id, type_tag, encoded_val, seg)`.
+#[inline]
+pub fn split_posting_key_parts(key: &[u8]) -> Result<(AttrId, u8, &[u8], SegmentId)> {
+    let (prefix, seg) = split_posting_key(key)?;
+    let attr_id = u16::from_be_bytes([prefix[0], prefix[1]]);
+    let type_tag = prefix[2];
+    Ok((attr_id, type_tag, &prefix[3..], seg))
+}
+
+/// 7-byte prefix (`attr_id BE || gen BE || type_tag`) for `cf_detached_postings`.
+#[inline]
+pub fn detached_posting_prefix(attr_id: AttrId, col_gen: ColumnGen, type_tag: u8) -> [u8; 7] {
+    let a = attr_id.to_be_bytes();
+    let g = col_gen.to_be_bytes();
+    [a[0], a[1], g[0], g[1], g[2], g[3], type_tag]
+}
+
+/// Build a `cf_detached_postings` key: `attr_id BE || gen BE || tag || encoded_val || seg BE`.
+#[inline]
+pub fn detached_posting_key(
+    attr_id: AttrId,
+    col_gen: ColumnGen,
+    type_tag: u8,
+    encoded_val: &[u8],
+    seg: SegmentId,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(11 + encoded_val.len());
+    key.extend_from_slice(&detached_posting_prefix(attr_id, col_gen, type_tag));
+    key.extend_from_slice(encoded_val);
+    key.extend_from_slice(&seg.to_be_bytes());
+    key
+}
+
+/// Split a `cf_detached_postings` key into `(prefix = attr || gen || tag || val, seg)`.
+#[inline]
+pub fn split_detached_posting_key(key: &[u8]) -> Result<(&[u8], SegmentId)> {
+    if key.len() < 11 {
+        return Err(TreeError::CorruptedData(format!(
+            "cf_detached_postings key too short: {}",
+            key.len()
+        )));
+    }
+    let split = key.len() - 4;
+    let seg = u32::from_be_bytes(key[split..].try_into().unwrap());
+    Ok((&key[..split], seg))
+}
+
+/// Build a 12-byte `cf_fts_postings` / `cf_fts_positions` key: `term_id BE || seg BE || block BE`.
+#[inline]
+pub fn fts_block_key(term: TermId, seg: SegmentId, block: u32) -> [u8; 12] {
+    let t = term.to_be_bytes();
+    let s = seg.to_be_bytes();
+    let b = block.to_be_bytes();
+    [
+        t[0], t[1], t[2], t[3], s[0], s[1], s[2], s[3], b[0], b[1], b[2], b[3],
+    ]
+}
+
+#[inline]
+pub fn fts_block_key_coord(term: TermId, block: RowBlock) -> [u8; 12] {
+    fts_block_key(term, block.seg(), block.block())
+}
+
+#[inline]
+pub fn decode_fts_block_key(bytes: &[u8]) -> Result<(TermId, RowBlock)> {
+    if bytes.len() != 12 {
+        return Err(TreeError::CorruptedData(format!(
+            "fts_block_key expected 12 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let term = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+    let seg = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
+    let block = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+    Ok((term, RowBlock::new(seg, block)))
+}
+
+/// Build a 12-byte `cf_fts_skips` key: `term_id BE || seg BE || chunk BE`.
+#[inline]
+pub fn fts_chunk_key(term: TermId, seg: SegmentId, chunk: u32) -> [u8; 12] {
+    fts_block_key(term, seg, chunk)
+}
+
+#[inline]
+pub fn fts_chunk_key_coord(term: TermId, chunk: SkipChunk) -> [u8; 12] {
+    fts_chunk_key(term, chunk.seg(), chunk.chunk())
+}
+
+#[inline]
+pub fn decode_fts_chunk_key(bytes: &[u8]) -> Result<(TermId, SkipChunk)> {
+    if bytes.len() != 12 {
+        return Err(TreeError::CorruptedData(format!(
+            "fts_chunk_key expected 12 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let term = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+    let seg = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
+    let chunk = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+    Ok((term, SkipChunk::new(seg, chunk)))
+}
+
+/// Build a 10-byte doc-len payload key (without the `0x05` `default` CF tag): `attr BE || seg BE || block BE`.
+#[inline]
+pub fn doc_len_key(attr: AttrId, seg: SegmentId, block: u32) -> [u8; 10] {
+    let a = attr.to_be_bytes();
+    let s = seg.to_be_bytes();
+    let b = block.to_be_bytes();
+    [a[0], a[1], s[0], s[1], s[2], s[3], b[0], b[1], b[2], b[3]]
+}
+
+#[inline]
+pub fn doc_len_key_coord(attr: AttrId, block: RowBlock) -> [u8; 10] {
+    doc_len_key(attr, block.seg(), block.block())
+}
+
+#[inline]
+pub fn decode_doc_len_key(bytes: &[u8]) -> Result<(AttrId, RowBlock)> {
+    if bytes.len() != 10 {
+        return Err(TreeError::CorruptedData(format!(
+            "doc_len_key expected 10 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let attr = u16::from_be_bytes([bytes[0], bytes[1]]);
+    let seg = u32::from_be_bytes(bytes[2..6].try_into().unwrap());
+    let block = u32::from_be_bytes(bytes[6..10].try_into().unwrap());
+    Ok((attr, RowBlock::new(seg, block)))
+}
+
+#[inline]
+pub fn seg_deletes_key(seg: SegmentId) -> [u8; 5] {
+    let s = seg.to_be_bytes();
+    [SEG_DELETES_TAG, s[0], s[1], s[2], s[3]]
+}
+
+#[inline]
+pub fn seg_meta_key(seg: SegmentId) -> [u8; 5] {
+    let s = seg.to_be_bytes();
+    [SEG_META_TAG, s[0], s[1], s[2], s[3]]
+}
+
+#[inline]
+pub fn zone_key(seg: SegmentId, attr: AttrId, tag: u8) -> [u8; 8] {
+    let s = seg.to_be_bytes();
+    let a = attr.to_be_bytes();
+    [ZONE_TAG, s[0], s[1], s[2], s[3], a[0], a[1], tag]
+}
+
+#[inline]
+pub fn column_key(seg: SegmentId, attr: AttrId, block: u32) -> [u8; 10] {
+    let s = seg.to_be_bytes();
+    let a = attr.to_be_bytes();
+    let b = block.to_be_bytes();
+    [s[0], s[1], s[2], s[3], a[0], a[1], b[0], b[1], b[2], b[3]]
+}
+
+#[inline]
+pub fn detached_key(attr: AttrId, col_gen: ColumnGen, seg: SegmentId, block: u32) -> [u8; 14] {
+    let a = attr.to_be_bytes();
+    let g = col_gen.to_be_bytes();
+    let s = seg.to_be_bytes();
+    let b = block.to_be_bytes();
+    [
+        a[0], a[1], g[0], g[1], g[2], g[3], s[0], s[1], s[2], s[3], b[0], b[1], b[2], b[3],
+    ]
+}
+
+#[inline]
+pub fn detached_meta_key(attr: AttrId) -> [u8; 3] {
+    let a = attr.to_be_bytes();
+    [DETACHED_META_TAG, a[0], a[1]]
+}
+
+#[inline]
+pub fn detached_overwritten_key(attr: AttrId, col_gen: ColumnGen, seg: SegmentId) -> [u8; 11] {
+    let a = attr.to_be_bytes();
+    let g = col_gen.to_be_bytes();
+    let s = seg.to_be_bytes();
+    [
+        DETACHED_OVERWRITTEN_TAG,
+        a[0],
+        a[1],
+        g[0],
+        g[1],
+        g[2],
+        g[3],
+        s[0],
+        s[1],
+        s[2],
+        s[3],
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Order-preserving scalar encodings
+// ---------------------------------------------------------------------------
 
 /// Encode a scalar value in order-preserving bytes and return its `type_tag`.
 pub fn encode_scalar_val_bytes(val: &ScalarValue, out: &mut Vec<u8>) -> Result<u8> {
@@ -203,8 +437,7 @@ pub fn encode_str_ordered(bytes: &[u8], out: &mut Vec<u8>) {
     out.push(0x00);
 }
 
-/// Escaped prefix encoding for typeahead scans: `0x00 -> 0x00 0xFF` with **no** terminator, so the
-/// result is a byte prefix of [`encode_str_ordered`] for every string starting with `bytes`.
+/// Escaped prefix encoding for typeahead scans: `0x00 -> 0x00 0xFF` with **no** terminator.
 #[inline]
 pub fn encode_str_prefix_ordered(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
@@ -219,13 +452,11 @@ pub fn encode_str_prefix_ordered(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Inverse of [`encode_i64_ordered`].
 #[inline]
 pub fn decode_i64_ordered(bytes: [u8; 8]) -> i64 {
     (u64::from_be_bytes(bytes) ^ (1u64 << 63)) as i64
 }
 
-/// Inverse of [`encode_f64_ordered`].
 #[inline]
 pub fn decode_f64_ordered(bytes: [u8; 8]) -> f64 {
     let ordered = u64::from_be_bytes(bytes);
@@ -237,7 +468,6 @@ pub fn decode_f64_ordered(bytes: [u8; 8]) -> f64 {
     f64::from_bits(bits)
 }
 
-/// Inverse of [`encode_str_ordered`]: un-escape `0x00 0xFF` and require the `0x00 0x00` terminator.
 pub fn decode_str_ordered(bytes: &[u8]) -> Result<String> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -277,8 +507,6 @@ pub fn decode_str_ordered(bytes: &[u8]) -> Result<String> {
         .map_err(|e| TreeError::CorruptedData(format!("invalid utf8 in ordered string: {e}")))
 }
 
-/// Decode an `encoded_val` from a `(type_tag, encoded_val)` index key back into a [`ScalarValue`].
-/// `TAG_PRESENT` decodes to [`ScalarValue::Null`].
 pub fn decode_scalar_val_bytes(type_tag: u8, bytes: &[u8]) -> Result<ScalarValue> {
     let arr8 = |b: &[u8]| -> Result<[u8; 8]> {
         b.try_into().map_err(|_| {
@@ -286,7 +514,14 @@ pub fn decode_scalar_val_bytes(type_tag: u8, bytes: &[u8]) -> Result<ScalarValue
         })
     };
     match type_tag {
-        TAG_PRESENT => Ok(ScalarValue::Null),
+        TAG_PRESENT => {
+            if !bytes.is_empty() {
+                return Err(TreeError::CorruptedData(
+                    "TAG_PRESENT value must be empty".into(),
+                ));
+            }
+            Ok(ScalarValue::Null)
+        }
         TAG_BOOL => match bytes {
             [0] => Ok(ScalarValue::Bool(false)),
             [1] => Ok(ScalarValue::Bool(true)),
@@ -302,7 +537,6 @@ pub fn decode_scalar_val_bytes(type_tag: u8, bytes: &[u8]) -> Result<ScalarValue
     }
 }
 
-/// `type_tag` under which an attribute's *values* (array elements for array types) are indexed.
 pub fn attr_type_value_tag(attr_type: AttributeType) -> u8 {
     match attr_type.scalar_type() {
         AttributeType::Bool => TAG_BOOL,
@@ -313,55 +547,41 @@ pub fn attr_type_value_tag(attr_type: AttributeType) -> u8 {
     }
 }
 
-/// Compact per-leaf posting set stored in `cf_attr_postings` using sparse `u16`s,
-/// dense `[u64; words]` bitsets, or a `RoaringBitmap` fallback for very large `LocalId`s.
+// ---------------------------------------------------------------------------
+// SegPosting (`cf_attr_postings`, `cf_detached_postings`)
+// ---------------------------------------------------------------------------
+
+/// Segment-local posting set (`LocalId`s within one segment).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LeafPosting {
+pub struct SegPosting {
     bm: RoaringBitmap,
 }
 
-impl LeafPosting {
+impl SegPosting {
     pub fn from_bitmap(bm: RoaringBitmap) -> Self {
         Self { bm }
     }
 
-    pub fn from_slots(slots: &[LocalId]) -> Self {
+    pub fn from_locals(locals: &[LocalId]) -> Self {
         let mut bm = RoaringBitmap::new();
-        for &slot in slots {
-            bm.insert(slot);
+        for &l in locals {
+            bm.insert(l);
         }
         Self { bm }
     }
 
-    /// Encode sorted unique `LocalId` slots directly without constructing a `RoaringBitmap`
-    /// for the common sparse and dense cases.
-    pub fn encode_sorted_slots(slots: &[LocalId]) -> Result<Vec<u8>> {
-        debug_assert!(slots.windows(2).all(|w| w[0] < w[1]));
-        let len = slots.len();
-        let max_id = slots.last().copied().unwrap_or(0);
-        if len <= LEAF_POSTING_SPARSE_MAX && max_id <= u16::MAX as u32 {
-            let mut buf = Vec::with_capacity(1 + len * 2);
-            buf.push(LEAF_POSTING_SPARSE);
-            for &id in slots {
-                buf.extend_from_slice(&(id as u16).to_le_bytes());
+    /// Encode strictly ascending `LocalId`s without allocating a `RoaringBitmap` in the sparse case.
+    pub fn encode_sorted_locals(locals: &[LocalId]) -> Result<Vec<u8>> {
+        debug_assert!(locals.windows(2).all(|w| w[0] < w[1]));
+        if locals.len() <= SEG_POSTING_SPARSE_MAX {
+            let mut buf = Vec::with_capacity(1 + locals.len() * 4);
+            buf.push(SEG_POSTING_SPARSE);
+            for &id in locals {
+                buf.extend_from_slice(&id.to_le_bytes());
             }
             return Ok(buf);
         }
-        if max_id <= LEAF_POSTING_DENSE_MAX_LOCAL_ID {
-            let num_words = (max_id as usize / 64) + 1;
-            let mut words = vec![0u64; num_words];
-            for &id in slots {
-                words[(id as usize) >> 6] |= 1u64 << (id & 63);
-            }
-            let mut buf = Vec::with_capacity(3 + num_words * 8);
-            buf.push(LEAF_POSTING_DENSE);
-            buf.extend_from_slice(&(num_words as u16).to_le_bytes());
-            for w in words {
-                buf.extend_from_slice(&w.to_le_bytes());
-            }
-            return Ok(buf);
-        }
-        let bm = RoaringBitmap::from_sorted_iter(slots.iter().copied())
+        let bm = RoaringBitmap::from_sorted_iter(locals.iter().copied())
             .map_err(|e| TreeError::Storage(format!("roaring build error: {e}")))?;
         Self::from_bitmap(bm).encode()
     }
@@ -389,33 +609,22 @@ impl LeafPosting {
         self.bm.remove(local_id)
     }
 
+    pub fn or_bitmap(&mut self, other: &RoaringBitmap) {
+        self.bm |= other;
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let len = self.bm.len() as usize;
-        let max_id = self.bm.max().unwrap_or(0);
-        if len <= LEAF_POSTING_SPARSE_MAX && max_id <= u16::MAX as u32 {
-            let mut buf = Vec::with_capacity(1 + len * 2);
-            buf.push(LEAF_POSTING_SPARSE);
+        if len <= SEG_POSTING_SPARSE_MAX {
+            let mut buf = Vec::with_capacity(1 + len * 4);
+            buf.push(SEG_POSTING_SPARSE);
             for id in self.bm.iter() {
-                buf.extend_from_slice(&(id as u16).to_le_bytes());
-            }
-            return Ok(buf);
-        }
-        if max_id <= LEAF_POSTING_DENSE_MAX_LOCAL_ID {
-            let num_words = (max_id as usize / 64) + 1;
-            let mut words = vec![0u64; num_words];
-            for id in self.bm.iter() {
-                words[(id as usize) >> 6] |= 1u64 << (id & 63);
-            }
-            let mut buf = Vec::with_capacity(3 + num_words * 8);
-            buf.push(LEAF_POSTING_DENSE);
-            buf.extend_from_slice(&(num_words as u16).to_le_bytes());
-            for w in words {
-                buf.extend_from_slice(&w.to_le_bytes());
+                buf.extend_from_slice(&id.to_le_bytes());
             }
             return Ok(buf);
         }
         let mut buf = Vec::with_capacity(1 + self.bm.serialized_size());
-        buf.push(LEAF_POSTING_ROARING);
+        buf.push(SEG_POSTING_ROARING);
         self.bm
             .serialize_into(&mut buf)
             .map_err(|e| TreeError::Storage(format!("roaring serialize error: {e}")))?;
@@ -423,187 +632,466 @@ impl LeafPosting {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let view = LeafPostingView::parse(bytes)?;
-        match view {
-            LeafPostingView::Sparse(slice) => {
-                let mut bm = RoaringBitmap::new();
-                for chunk in slice.chunks_exact(2) {
-                    bm.insert(u16::from_le_bytes([chunk[0], chunk[1]]) as u32);
-                }
-                Ok(Self { bm })
-            }
-            LeafPostingView::Dense(slice) => {
-                let mut bm = RoaringBitmap::new();
-                for (w_idx, chunk) in slice.chunks_exact(8).enumerate() {
-                    let mut w = u64::from_le_bytes(chunk.try_into().unwrap());
-                    while w != 0 {
-                        let bit = w.trailing_zeros();
-                        w &= w - 1;
-                        bm.insert(((w_idx as u32) << 6) | bit);
-                    }
-                }
-                Ok(Self { bm })
-            }
-            LeafPostingView::Roaring(slice) => {
-                let bm = decode_roaring_bitmap(slice)?;
-                Ok(Self { bm })
-            }
-        }
+        let view = SegPostingView::parse(bytes)?;
+        let mut bm = RoaringBitmap::new();
+        view.or_into(&mut bm)?;
+        Ok(Self { bm })
     }
 }
 
-/// Zero-copy borrowed view over an encoded [`LeafPosting`] in `cf_attr_postings`.
+/// Zero-copy borrowed view over an encoded [`SegPosting`].
 #[derive(Debug, Clone, Copy)]
-pub enum LeafPostingView<'a> {
+pub enum SegPostingView<'a> {
     Sparse(&'a [u8]),
-    Dense(&'a [u8]),
     Roaring(&'a [u8]),
 }
 
-impl<'a> LeafPostingView<'a> {
+impl<'a> SegPostingView<'a> {
     #[inline]
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
         if bytes.is_empty() {
-            return Err(TreeError::CorruptedData("empty LeafPosting".into()));
+            return Err(TreeError::CorruptedData("empty SegPosting".into()));
         }
         match bytes[0] {
-            LEAF_POSTING_SPARSE => {
+            SEG_POSTING_SPARSE => {
                 let rest = &bytes[1..];
-                if !rest.len().is_multiple_of(2) {
+                if !rest.len().is_multiple_of(4) {
                     return Err(TreeError::CorruptedData(
-                        "LeafPosting sparse payload odd byte length".into(),
+                        "SegPosting sparse payload length not multiple of 4".into(),
                     ));
+                }
+                if rest.len() > SEG_POSTING_SPARSE_MAX * 4 {
+                    return Err(TreeError::CorruptedData(format!(
+                        "SegPosting sparse payload too large: {} entries",
+                        rest.len() / 4
+                    )));
+                }
+                let mut prev: Option<u32> = None;
+                for chunk in rest.chunks_exact(4) {
+                    let v = u32::from_le_bytes(chunk.try_into().unwrap());
+                    if let Some(p) = prev
+                        && v <= p
+                    {
+                        return Err(TreeError::CorruptedData(
+                            "SegPosting sparse payload not strictly ascending".into(),
+                        ));
+                    }
+                    prev = Some(v);
                 }
                 Ok(Self::Sparse(rest))
             }
-            LEAF_POSTING_DENSE => {
-                if bytes.len() < 3 {
-                    return Err(TreeError::CorruptedData(
-                        "LeafPosting dense header truncated".into(),
-                    ));
-                }
-                let num_words = u16::from_le_bytes([bytes[1], bytes[2]]) as usize;
-                let rest = &bytes[3..];
-                if rest.len() != num_words * 8 {
-                    return Err(TreeError::CorruptedData(format!(
-                        "LeafPosting dense expected {} bytes, got {}",
-                        num_words * 8,
-                        rest.len()
-                    )));
-                }
-                Ok(Self::Dense(rest))
-            }
-            LEAF_POSTING_ROARING => Ok(Self::Roaring(&bytes[1..])),
+            SEG_POSTING_ROARING => Ok(Self::Roaring(&bytes[1..])),
             other => Err(TreeError::CorruptedData(format!(
-                "unknown LeafPosting tag: {other}"
+                "unknown SegPosting tag: {other}"
             ))),
         }
     }
 
+    /// OR this posting into `dst` without intermediate `RoaringBitmap` allocation for the sparse form.
     #[inline]
-    pub fn or_into_words(&self, dst: &mut [u64]) -> Result<()> {
-        match self {
+    pub fn or_into(&self, dst: &mut RoaringBitmap) -> Result<()> {
+        match *self {
             Self::Sparse(slice) => {
-                for chunk in slice.chunks_exact(2) {
-                    let id = u16::from_le_bytes([chunk[0], chunk[1]]) as usize;
-                    let w = id >> 6;
-                    if w < dst.len() {
-                        dst[w] |= 1u64 << (id & 63);
-                    }
-                }
-            }
-            Self::Dense(slice) => {
-                let words = (slice.len() / 8).min(dst.len());
-                #[cfg(target_endian = "little")]
-                if let Ok(src) = bytemuck::try_cast_slice::<u8, u64>(slice) {
-                    for (d, &s) in dst.iter_mut().zip(src[..words].iter()) {
-                        *d |= s;
-                    }
-                    return Ok(());
-                }
-                for (w_idx, chunk) in slice.chunks_exact(8).take(words).enumerate() {
-                    dst[w_idx] |= u64::from_le_bytes(chunk.try_into().unwrap());
+                for chunk in slice.chunks_exact(4) {
+                    dst.insert(u32::from_le_bytes(chunk.try_into().unwrap()));
                 }
             }
             Self::Roaring(slice) => {
                 let bm = decode_roaring_bitmap(slice)?;
-                for id in bm.iter() {
-                    let idx = id as usize;
-                    let w = idx >> 6;
-                    if w < dst.len() {
-                        dst[w] |= 1u64 << (idx & 63);
-                    }
-                }
+                *dst |= bm;
             }
         }
         Ok(())
     }
-}
 
-impl LeafPostingView<'_> {
-    /// Number of local ids in the posting (no allocation for `Sparse` / `Dense`).
     pub fn count(&self) -> Result<u64> {
-        match self {
-            Self::Sparse(slice) => Ok((slice.len() / 2) as u64),
-            Self::Dense(slice) => Ok(slice
-                .chunks_exact(8)
-                .map(|c| u64::from_le_bytes(c.try_into().unwrap()).count_ones() as u64)
-                .sum()),
+        match *self {
+            Self::Sparse(slice) => Ok((slice.len() / 4) as u64),
             Self::Roaring(slice) => Ok(decode_roaring_bitmap(slice)?.len()),
         }
     }
-
-    /// Number of local ids in the posting that are also set in `mask` (little-endian slot words).
-    /// Ids beyond `mask.len() * 64` are ignored. No allocation for `Sparse` / `Dense`.
-    pub fn count_and_mask(&self, mask: &[u64]) -> Result<u64> {
-        match self {
-            Self::Sparse(slice) => {
-                let mut n = 0u64;
-                for chunk in slice.chunks_exact(2) {
-                    let id = u16::from_le_bytes([chunk[0], chunk[1]]) as usize;
-                    if let Some(&w) = mask.get(id >> 6) {
-                        n += (w >> (id & 63)) & 1;
-                    }
-                }
-                Ok(n)
-            }
-            Self::Dense(slice) => {
-                let mut n = 0u64;
-                for (chunk, &m) in slice.chunks_exact(8).zip(mask.iter()) {
-                    n += (u64::from_le_bytes(chunk.try_into().unwrap()) & m).count_ones() as u64;
-                }
-                Ok(n)
-            }
-            Self::Roaring(slice) => {
-                let bm = decode_roaring_bitmap(slice)?;
-                let mut n = 0u64;
-                for id in bm.iter() {
-                    let id = id as usize;
-                    if let Some(&w) = mask.get(id >> 6) {
-                        n += (w >> (id & 63)) & 1;
-                    }
-                }
-                Ok(n)
-            }
-        }
-    }
 }
 
-/// Encode per-leaf `(min_bytes, max_bytes)` zone map for an ordered attribute.
-pub fn encode_zone_map(map: &BTreeMap<NodeId, (Vec<u8>, Vec<u8>)>) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + map.len() * 24);
-    buf.extend_from_slice(&(map.len() as u32).to_le_bytes());
-    for (&leaf_id, (min_b, max_b)) in map {
-        buf.extend_from_slice(&leaf_id.to_le_bytes());
-        buf.extend_from_slice(&(min_b.len() as u16).to_le_bytes());
-        buf.extend_from_slice(&(max_b.len() as u16).to_le_bytes());
-        buf.extend_from_slice(min_b);
-        buf.extend_from_slice(max_b);
+// ---------------------------------------------------------------------------
+// DocIdBlock (`cf_row_doc_ids`)
+// ---------------------------------------------------------------------------
+
+pub fn encode_doc_id_block(ids: &[DocId; ROW_BLOCK_SIZE]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(DOC_ID_BLOCK_BYTES);
+    #[cfg(target_endian = "little")]
+    {
+        buf.extend_from_slice(bytemuck::cast_slice(ids));
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &id in ids {
+            buf.extend_from_slice(&id.to_le_bytes());
+        }
     }
     buf
 }
 
-/// Zero-copy bounded cursor for decoding little-endian binary payloads.
+pub fn decode_doc_id_block(bytes: &[u8]) -> Result<Box<[DocId; ROW_BLOCK_SIZE]>> {
+    if bytes.len() != DOC_ID_BLOCK_BYTES {
+        return Err(TreeError::CorruptedData(format!(
+            "DocIdBlock expected {DOC_ID_BLOCK_BYTES} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut out = Box::new([0u64; ROW_BLOCK_SIZE]);
+    #[cfg(target_endian = "little")]
+    if let Ok(src) = bytemuck::try_cast_slice::<u8, u64>(bytes) {
+        out.copy_from_slice(src);
+        return Ok(out);
+    }
+    for (dst, chunk) in out.iter_mut().zip(bytes.chunks_exact(8)) {
+        *dst = u64::from_le_bytes(chunk.try_into().unwrap());
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Segment metadata, Manifest, ZoneEntry, DetachedMeta
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SegmentState {
+    Open = 0,
+    Sealed = 1,
+    Building = 2,
+    Forwarding = 3,
+    Retired = 4,
+}
+
+impl SegmentState {
+    pub fn from_u8(val: u8) -> Result<Self> {
+        match val {
+            0 => Ok(Self::Open),
+            1 => Ok(Self::Sealed),
+            2 => Ok(Self::Building),
+            3 => Ok(Self::Forwarding),
+            4 => Ok(Self::Retired),
+            other => Err(TreeError::CorruptedData(format!(
+                "unknown SegmentState byte: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentMeta {
+    pub state: SegmentState,
+    pub flags: u8,
+    pub row_count: u32,
+    pub deleted_count: u32,
+    pub forward_target: SegmentId,
+    pub forward_base: LocalId,
+    pub forwarded_at_epoch: u64,
+    pub created_seq: u64,
+    pub sealed_seq: u64,
+}
+
+impl SegmentMeta {
+    pub fn new_open(created_seq: u64) -> Self {
+        Self {
+            state: SegmentState::Open,
+            flags: 0,
+            row_count: 0,
+            deleted_count: 0,
+            forward_target: 0,
+            forward_base: 0,
+            forwarded_at_epoch: 0,
+            created_seq,
+            sealed_seq: 0,
+        }
+    }
+
+    pub fn encode(&self) -> [u8; SEGMENT_META_BYTES] {
+        let mut buf = [0u8; SEGMENT_META_BYTES];
+        buf[0] = 1; // version
+        buf[1] = self.state as u8;
+        buf[2] = self.flags;
+        buf[3] = 0;
+        buf[4..8].copy_from_slice(&self.row_count.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.deleted_count.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.forward_target.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.forward_base.to_le_bytes());
+        buf[20..28].copy_from_slice(&self.forwarded_at_epoch.to_le_bytes());
+        buf[28..36].copy_from_slice(&self.created_seq.to_le_bytes());
+        buf[36..44].copy_from_slice(&self.sealed_seq.to_le_bytes());
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != SEGMENT_META_BYTES {
+            return Err(TreeError::CorruptedData(format!(
+                "SegmentMeta expected {SEGMENT_META_BYTES} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        if bytes[0] != 1 {
+            return Err(TreeError::CorruptedData(format!(
+                "unsupported SegmentMeta version: {}",
+                bytes[0]
+            )));
+        }
+        if bytes[3] != 0 {
+            return Err(TreeError::CorruptedData(format!(
+                "invalid SegmentMeta reserved byte: {}",
+                bytes[3]
+            )));
+        }
+        let state = SegmentState::from_u8(bytes[1])?;
+        let flags = bytes[2];
+        let row_count = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let deleted_count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        if deleted_count > row_count {
+            return Err(TreeError::CorruptedData(format!(
+                "SegmentMeta deleted_count ({deleted_count}) > row_count ({row_count})"
+            )));
+        }
+        Ok(Self {
+            state,
+            flags,
+            row_count,
+            deleted_count,
+            forward_target: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            forward_base: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            forwarded_at_epoch: u64::from_le_bytes(bytes[20..28].try_into().unwrap()),
+            created_seq: u64::from_le_bytes(bytes[28..36].try_into().unwrap()),
+            sealed_seq: u64::from_le_bytes(bytes[36..44].try_into().unwrap()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Manifest {
+    pub open_segment: Option<SegmentId>,
+    pub next_segment_id: SegmentId,
+    pub seal_rows: u32,
+    pub live_rows: u64,
+    pub total_rows: u64,
+}
+
+impl Manifest {
+    pub fn new(seal_rows: u32) -> Self {
+        Self {
+            open_segment: None,
+            next_segment_id: 0,
+            seal_rows,
+            live_rows: 0,
+            total_rows: 0,
+        }
+    }
+
+    pub fn encode(&self) -> [u8; MANIFEST_BYTES] {
+        let mut buf = [0u8; MANIFEST_BYTES];
+        buf[0] = 1; // version
+        match self.open_segment {
+            Some(seg) => {
+                buf[1] = 1;
+                buf[8..12].copy_from_slice(&seg.to_le_bytes());
+            }
+            None => {
+                buf[1] = 0;
+            }
+        }
+        buf[4..8].copy_from_slice(&self.next_segment_id.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.seal_rows.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.live_rows.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.total_rows.to_le_bytes());
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != MANIFEST_BYTES {
+            return Err(TreeError::CorruptedData(format!(
+                "Manifest expected {MANIFEST_BYTES} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        if bytes[0] != 1 {
+            return Err(TreeError::CorruptedData(format!(
+                "unsupported Manifest version: {}",
+                bytes[0]
+            )));
+        }
+        if bytes[2] != 0 || bytes[3] != 0 {
+            return Err(TreeError::CorruptedData(
+                "invalid Manifest reserved bytes".into(),
+            ));
+        }
+        let open_raw = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let open_segment = match bytes[1] {
+            0 => None,
+            1 => Some(open_raw),
+            other => {
+                return Err(TreeError::CorruptedData(format!(
+                    "invalid Manifest has_open byte: {other}"
+                )));
+            }
+        };
+        let next_segment_id = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let seal_rows = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let live_rows = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let total_rows = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+        if live_rows > total_rows {
+            return Err(TreeError::CorruptedData(format!(
+                "Manifest live_rows ({live_rows}) > total_rows ({total_rows})"
+            )));
+        }
+        Ok(Self {
+            open_segment,
+            next_segment_id,
+            seal_rows,
+            live_rows,
+            total_rows,
+        })
+    }
+}
+
+/// Per-segment min/max ordered scalar bounds stored in `default[0x12 || seg || attr || tag]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZoneEntry {
+    pub min: Vec<u8>,
+    pub max: Vec<u8>,
+}
+
+impl ZoneEntry {
+    pub fn singleton(val: &[u8]) -> Self {
+        Self {
+            min: val.to_vec(),
+            max: val.to_vec(),
+        }
+    }
+
+    /// Widen bounds to include `val`; returns `true` if `min` or `max` changed.
+    pub fn widen(&mut self, val: &[u8]) -> bool {
+        let mut changed = false;
+        if val < self.min.as_slice() {
+            self.min.clear();
+            self.min.extend_from_slice(val);
+            changed = true;
+        }
+        if val > self.max.as_slice() {
+            self.max.clear();
+            self.max.extend_from_slice(val);
+            changed = true;
+        }
+        changed
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(4 + self.min.len() + self.max.len());
+        buf.extend_from_slice(&(self.min.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&(self.max.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&self.min);
+        buf.extend_from_slice(&self.max);
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 4 {
+            return Err(TreeError::CorruptedData(format!(
+                "ZoneEntry too short: {}",
+                bytes.len()
+            )));
+        }
+        let min_len = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        let max_len = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
+        let expected = 4usize
+            .checked_add(min_len)
+            .and_then(|x| x.checked_add(max_len))
+            .ok_or_else(|| TreeError::CorruptedData("ZoneEntry length overflow".into()))?;
+        if bytes.len() != expected || min_len == 0 || max_len == 0 {
+            return Err(TreeError::CorruptedData(format!(
+                "ZoneEntry expected {expected} bytes (non-empty bounds), got {}",
+                bytes.len()
+            )));
+        }
+        let min = bytes[4..4 + min_len].to_vec();
+        let max = bytes[4 + min_len..].to_vec();
+        if min > max {
+            return Err(TreeError::CorruptedData(
+                "ZoneEntry min > max".into(),
+            ));
+        }
+        Ok(Self { min, max })
+    }
+}
+
+/// Per-detached-column metadata stored in `default[0x13 || attr_id BE]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetachedMeta {
+    pub state: u8,
+    pub current_gen: ColumnGen,
+    pub pending_gen: ColumnGen,
+    pub retired_below: ColumnGen,
+    pub built_against_watermark: RowId,
+}
+
+impl Default for DetachedMeta {
+    fn default() -> Self {
+        Self {
+            state: 0,
+            current_gen: 0,
+            pending_gen: 0,
+            retired_below: 0,
+            built_against_watermark: RowId(0),
+        }
+    }
+}
+
+impl DetachedMeta {
+    pub fn encode(&self) -> [u8; DETACHED_META_BYTES] {
+        let mut buf = [0u8; DETACHED_META_BYTES];
+        buf[0] = 1; // version
+        buf[1] = self.state;
+        buf[2..4].copy_from_slice(&0u16.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.current_gen.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.pending_gen.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.retired_below.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.built_against_watermark.to_le_bytes());
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != DETACHED_META_BYTES {
+            return Err(TreeError::CorruptedData(format!(
+                "DetachedMeta expected {DETACHED_META_BYTES} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        if bytes[0] != 1 {
+            return Err(TreeError::CorruptedData(format!(
+                "unsupported DetachedMeta version: {}",
+                bytes[0]
+            )));
+        }
+        if bytes[2] != 0 || bytes[3] != 0 {
+            return Err(TreeError::CorruptedData(
+                "invalid DetachedMeta reserved bytes".into(),
+            ));
+        }
+        Ok(Self {
+            state: bytes[1],
+            current_gen: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            pending_gen: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            retired_below: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            built_against_watermark: RowId::from_le_bytes(bytes[16..24].try_into().unwrap()),
+        })
+    }
+}
+
+/// Stub for 256-row columnar block codec (implemented in Phase 7).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColumnBlock;
+
+// ---------------------------------------------------------------------------
+// RowView v3 (`cf_rows`)
+// ---------------------------------------------------------------------------
+
 struct ByteReader<'a> {
     bytes: &'a [u8],
     off: usize,
@@ -626,12 +1114,6 @@ impl<'a> ByteReader<'a> {
         let slice = &self.bytes[self.off..end];
         self.off = end;
         Ok(slice)
-    }
-
-    #[inline]
-    fn read_u16_le(&mut self, label: &str) -> Result<u16> {
-        let s = self.read_bytes(2, label)?;
-        Ok(u16::from_le_bytes([s[0], s[1]]))
     }
 
     #[inline]
@@ -658,26 +1140,15 @@ impl<'a> ByteReader<'a> {
     }
 }
 
-/// Decode per-leaf `(min_bytes, max_bytes)` zone map for an ordered attribute.
-pub fn decode_zone_map(bytes: &[u8]) -> Result<BTreeMap<NodeId, (Vec<u8>, Vec<u8>)>> {
-    let mut r = ByteReader::new(bytes);
-    let count = r.read_u32_le("zone map count")? as usize;
-    let mut map = BTreeMap::new();
-    for _ in 0..count {
-        let leaf_id = r.read_u32_le("zone map leaf_id")?;
-        let min_len = r.read_u16_le("zone map min_len")? as usize;
-        let max_len = r.read_u16_le("zone map max_len")? as usize;
-        let min_b = r.read_bytes(min_len, "zone map min_bound")?.to_vec();
-        let max_b = r.read_bytes(max_len, "zone map max_bound")?.to_vec();
-        map.insert(leaf_id, (min_b, max_b));
-    }
-    r.expect_eof("zone map payload")?;
-    Ok(map)
-}
-
-/// Encode forward document attributes into compact v2 binary form with an `AttrId`-sorted
-/// offset directory for O(log F) zero-copy field access.
-pub fn encode_attributes(schema: &CollectionSchema, attrs: &Attributes) -> Result<Vec<u8>> {
+/// Encode inline document attributes into compact v3 binary form (`cf_rows`) with an
+/// `AttrId`-sorted offset directory for O(log F) zero-copy field access.
+///
+/// Detached attributes in `attrs` are skipped (they live in `cf_detached`).
+pub fn encode_row(
+    schema: &CollectionSchema,
+    attrs: &Attributes,
+    has_vector: bool,
+) -> Result<Vec<u8>> {
     let mut items: Vec<(AttrId, &AttributeValue)> = Vec::with_capacity(attrs.len());
     for (name, val) in attrs {
         let entry = schema
@@ -686,33 +1157,36 @@ pub fn encode_attributes(schema: &CollectionSchema, attrs: &Attributes) -> Resul
                 name: name.clone(),
                 reason: "attribute is not declared in collection schema".into(),
             })?;
+        if entry.storage == ColumnStorage::Detached {
+            continue;
+        }
         items.push((entry.id, val));
     }
     items.sort_unstable_by_key(|&(id, _)| id);
 
     let count = items.len();
-    let dir_end = DOC_HEADER_LEN + count * DOC_DIR_ENTRY_LEN;
+    let dir_end = ROW_HEADER_LEN + count * ROW_DIR_ENTRY_LEN;
     let mut buf = Vec::with_capacity(dir_end + count * 12);
-    buf.push(DOC_FORMAT_V2);
-    buf.push(0);
+    buf.push(ROW_FORMAT_V3);
+    buf.push(if has_vector { ROW_FLAG_HAS_VECTOR } else { 0 });
     buf.extend_from_slice(&(count as u16).to_le_bytes());
     buf.resize(dir_end, 0);
 
     for (idx, (attr_id, val)) in items.into_iter().enumerate() {
         let offset = buf.len() as u32;
         let kind = match val {
-            AttributeValue::Null => DOC_VAL_NULL,
+            AttributeValue::Null => ROW_VAL_NULL,
             AttributeValue::Bool(b) => {
                 buf.push(if *b { 1 } else { 0 });
-                DOC_VAL_BOOL
+                ROW_VAL_BOOL
             }
             AttributeValue::Int(v) => {
                 buf.extend_from_slice(&v.to_le_bytes());
-                DOC_VAL_INT
+                ROW_VAL_INT
             }
             AttributeValue::Uint(v) => {
                 buf.extend_from_slice(&v.to_le_bytes());
-                DOC_VAL_UINT
+                ROW_VAL_UINT
             }
             AttributeValue::Float(v) => {
                 if v.is_nan() {
@@ -725,11 +1199,11 @@ pub fn encode_attributes(schema: &CollectionSchema, attrs: &Attributes) -> Resul
                     });
                 }
                 buf.extend_from_slice(&v.to_le_bytes());
-                DOC_VAL_FLOAT
+                ROW_VAL_FLOAT
             }
             AttributeValue::String(s) => {
                 buf.extend_from_slice(s.as_bytes());
-                DOC_VAL_STRING
+                ROW_VAL_STRING
             }
             AttributeValue::StringArray(arr) => {
                 buf.extend_from_slice(&(arr.len() as u32).to_le_bytes());
@@ -738,24 +1212,24 @@ pub fn encode_attributes(schema: &CollectionSchema, attrs: &Attributes) -> Resul
                     buf.extend_from_slice(&(sb.len() as u32).to_le_bytes());
                     buf.extend_from_slice(sb);
                 }
-                DOC_VAL_STRING_ARRAY
+                ROW_VAL_STRING_ARRAY
             }
             AttributeValue::IntArray(arr) => {
                 buf.extend_from_slice(&(arr.len() as u32).to_le_bytes());
                 for &v in arr {
                     buf.extend_from_slice(&v.to_le_bytes());
                 }
-                DOC_VAL_INT_ARRAY
+                ROW_VAL_INT_ARRAY
             }
             AttributeValue::UintArray(arr) => {
                 buf.extend_from_slice(&(arr.len() as u32).to_le_bytes());
                 for &v in arr {
                     buf.extend_from_slice(&v.to_le_bytes());
                 }
-                DOC_VAL_UINT_ARRAY
+                ROW_VAL_UINT_ARRAY
             }
         };
-        let entry_off = DOC_HEADER_LEN + idx * DOC_DIR_ENTRY_LEN;
+        let entry_off = ROW_HEADER_LEN + idx * ROW_DIR_ENTRY_LEN;
         buf[entry_off..entry_off + 2].copy_from_slice(&attr_id.to_le_bytes());
         buf[entry_off + 2] = kind;
         buf[entry_off + 3] = 0;
@@ -764,36 +1238,51 @@ pub fn encode_attributes(schema: &CollectionSchema, attrs: &Attributes) -> Resul
     Ok(buf)
 }
 
-/// Zero-copy view over a v2 `cf_docs` blob supporting O(log F) single-attribute reads
-/// without allocating a `BTreeMap` or decoding untouched fields.
+/// Zero-copy view over a v3 `cf_rows` blob supporting O(log F) single-attribute reads.
 #[derive(Debug, Clone, Copy)]
-pub struct DocView<'a> {
+pub struct RowView<'a> {
     bytes: &'a [u8],
+    flags: u8,
     count: usize,
 }
 
-impl<'a> DocView<'a> {
+impl<'a> RowView<'a> {
     #[inline]
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
-        if bytes.len() < DOC_HEADER_LEN {
+        if bytes.len() < ROW_HEADER_LEN {
             return Err(TreeError::CorruptedData(
-                "cf_docs payload too short".into(),
+                "cf_rows payload too short".into(),
             ));
         }
-        if bytes[0] != DOC_FORMAT_V2 {
+        if bytes[0] != ROW_FORMAT_V3 {
             return Err(TreeError::CorruptedData(format!(
-                "unsupported cf_docs format version: {}",
+                "unsupported cf_rows format version: {}",
                 bytes[0]
             )));
         }
+        let flags = bytes[1];
+        if (flags & !ROW_FLAG_HAS_VECTOR) != 0 {
+            return Err(TreeError::CorruptedData(format!(
+                "unknown cf_rows flags: {flags:#04x}"
+            )));
+        }
         let count = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
-        let dir_end = DOC_HEADER_LEN + count * DOC_DIR_ENTRY_LEN;
+        let dir_end = ROW_HEADER_LEN + count * ROW_DIR_ENTRY_LEN;
         if bytes.len() < dir_end {
             return Err(TreeError::CorruptedData(
-                "cf_docs directory truncated".into(),
+                "cf_rows directory truncated".into(),
             ));
         }
-        Ok(Self { bytes, count })
+        Ok(Self {
+            bytes,
+            flags,
+            count,
+        })
+    }
+
+    #[inline]
+    pub fn has_vector(&self) -> bool {
+        (self.flags & ROW_FLAG_HAS_VECTOR) != 0
     }
 
     #[inline]
@@ -807,13 +1296,13 @@ impl<'a> DocView<'a> {
     }
 
     #[inline]
-    fn dir_entry(&self, idx: usize) -> (AttrId, u8, usize, usize) {
-        let off = DOC_HEADER_LEN + idx * DOC_DIR_ENTRY_LEN;
+    pub fn dir_entry(&self, idx: usize) -> (AttrId, u8, usize, usize) {
+        let off = ROW_HEADER_LEN + idx * ROW_DIR_ENTRY_LEN;
         let attr_id = u16::from_le_bytes([self.bytes[off], self.bytes[off + 1]]);
         let kind = self.bytes[off + 2];
         let start = u32::from_le_bytes(self.bytes[off + 4..off + 8].try_into().unwrap()) as usize;
         let end = if idx + 1 < self.count {
-            let next_off = DOC_HEADER_LEN + (idx + 1) * DOC_DIR_ENTRY_LEN;
+            let next_off = ROW_HEADER_LEN + (idx + 1) * ROW_DIR_ENTRY_LEN;
             u32::from_le_bytes(
                 self.bytes[next_off + 4..next_off + 8]
                     .try_into()
@@ -831,7 +1320,7 @@ impl<'a> DocView<'a> {
         let mut hi = self.count;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let off = DOC_HEADER_LEN + mid * DOC_DIR_ENTRY_LEN;
+            let off = ROW_HEADER_LEN + mid * ROW_DIR_ENTRY_LEN;
             let id = u16::from_le_bytes([self.bytes[off], self.bytes[off + 1]]);
             match id.cmp(&target_id) {
                 Ordering::Less => lo = mid + 1,
@@ -848,7 +1337,6 @@ impl<'a> DocView<'a> {
         None
     }
 
-    /// Decode a single attribute by `AttrId` if present (allocates only for that field).
     pub fn decode_field(&self, target_id: AttrId) -> Result<Option<AttributeValue>> {
         let Some((kind, payload)) = self.find_entry(target_id) else {
             return Ok(None);
@@ -856,42 +1344,38 @@ impl<'a> DocView<'a> {
         decode_payload_value(kind, payload).map(Some)
     }
 
-    /// Zero-copy typed access to one attribute (`None` if the document has no entry for it).
-    pub fn get_raw_field(&self, attr_id: AttrId) -> Result<Option<DocFieldRef<'a>>> {
+    pub fn get_raw_field(&self, attr_id: AttrId) -> Result<Option<RowFieldRef<'a>>> {
         let Some((kind, payload)) = self.find_entry(attr_id) else {
             return Ok(None);
         };
-        DocFieldRef::from_raw(kind, payload).map(Some)
+        RowFieldRef::from_raw(kind, payload).map(Some)
     }
 
-    /// Zero-copy numeric read of a scalar `Int` / `Uint` / `Float` attribute as `f64`.
-    /// Returns `None` when the attribute is absent, `Null`, or not numeric.
     #[inline]
     pub fn get_numeric_f64(&self, attr_id: AttrId) -> Result<Option<f64>> {
         Ok(match self.get_raw_field(attr_id)? {
-            Some(DocFieldRef::Scalar(RawScalar::Int(v))) => Some(v as f64),
-            Some(DocFieldRef::Scalar(RawScalar::Uint(v))) => Some(v as f64),
-            Some(DocFieldRef::Scalar(RawScalar::Float(v))) => Some(v),
+            Some(RowFieldRef::Scalar(RawScalar::Int(v))) => Some(v as f64),
+            Some(RowFieldRef::Scalar(RawScalar::Uint(v))) => Some(v as f64),
+            Some(RowFieldRef::Scalar(RawScalar::Float(v))) => Some(v),
             _ => None,
         })
     }
 
-    /// Read a scalar attribute as an owned [`ScalarValue`] (`Null` if absent, `Null`, or an array).
     pub fn get_scalar(&self, attr_id: AttrId) -> Result<ScalarValue> {
         Ok(match self.get_raw_field(attr_id)? {
-            Some(DocFieldRef::Scalar(RawScalar::Bool(v))) => ScalarValue::Bool(v),
-            Some(DocFieldRef::Scalar(RawScalar::Int(v))) => ScalarValue::Int(v),
-            Some(DocFieldRef::Scalar(RawScalar::Uint(v))) => ScalarValue::Uint(v),
-            Some(DocFieldRef::Scalar(RawScalar::Float(v))) => ScalarValue::Float(v),
-            Some(DocFieldRef::Scalar(RawScalar::Str(b))) => ScalarValue::String(
+            Some(RowFieldRef::Scalar(RawScalar::Bool(v))) => ScalarValue::Bool(v),
+            Some(RowFieldRef::Scalar(RawScalar::Int(v))) => ScalarValue::Int(v),
+            Some(RowFieldRef::Scalar(RawScalar::Uint(v))) => ScalarValue::Uint(v),
+            Some(RowFieldRef::Scalar(RawScalar::Float(v))) => ScalarValue::Float(v),
+            Some(RowFieldRef::Scalar(RawScalar::Str(b))) => ScalarValue::String(
                 String::from_utf8(b.to_vec())
-                    .map_err(|_| TreeError::CorruptedData("cf_docs string not utf-8".into()))?,
+                    .map_err(|_| TreeError::CorruptedData("cf_rows string not utf-8".into()))?,
             ),
             _ => ScalarValue::Null,
         })
     }
 
-    /// Evaluate a [`Filter`] directly against this `DocView` without decoding untouched fields.
+    /// Evaluate a [`Filter`] directly against this `RowView` without decoding untouched fields.
     pub fn matches_filter<F>(
         &self,
         schema: &CollectionSchema,
@@ -924,7 +1408,7 @@ impl<'a> DocView<'a> {
                     return Ok(false);
                 };
                 match (self.find_entry(entry.id), target) {
-                    (None | Some((DOC_VAL_NULL, _)), ScalarValue::Null) => Ok(true),
+                    (None | Some((ROW_VAL_NULL, _)), ScalarValue::Null) => Ok(true),
                     (Some((kind, payload)), target) => raw_eq_scalar(kind, payload, target),
                     (None, _) => Ok(false),
                 }
@@ -934,7 +1418,7 @@ impl<'a> DocView<'a> {
                     return Ok(true);
                 };
                 match (self.find_entry(entry.id), target) {
-                    (None | Some((DOC_VAL_NULL, _)), ScalarValue::Null) => Ok(false),
+                    (None | Some((ROW_VAL_NULL, _)), ScalarValue::Null) => Ok(false),
                     (Some((kind, payload)), target) => Ok(!raw_eq_scalar(kind, payload, target)?),
                     (None, _) => Ok(true),
                 }
@@ -944,7 +1428,7 @@ impl<'a> DocView<'a> {
                     return Ok(false);
                 };
                 match self.find_entry(entry.id) {
-                    None | Some((DOC_VAL_NULL, _)) => {
+                    None | Some((ROW_VAL_NULL, _)) => {
                         Ok(targets.iter().any(|t| matches!(t, ScalarValue::Null)))
                     }
                     Some((kind, payload)) => {
@@ -962,7 +1446,7 @@ impl<'a> DocView<'a> {
                     return Ok(true);
                 };
                 match self.find_entry(entry.id) {
-                    None | Some((DOC_VAL_NULL, _)) => {
+                    None | Some((ROW_VAL_NULL, _)) => {
                         Ok(!targets.iter().any(|t| matches!(t, ScalarValue::Null)))
                     }
                     Some((kind, payload)) => {
@@ -1016,7 +1500,7 @@ impl<'a> DocView<'a> {
                 };
                 Ok(matches!(
                     self.find_entry(entry.id),
-                    None | Some((DOC_VAL_NULL, _))
+                    None | Some((ROW_VAL_NULL, _))
                 ))
             }
             Filter::IsNotNull(attr) => {
@@ -1025,7 +1509,7 @@ impl<'a> DocView<'a> {
                 };
                 Ok(!matches!(
                     self.find_entry(entry.id),
-                    None | Some((DOC_VAL_NULL, _))
+                    None | Some((ROW_VAL_NULL, _))
                 ))
             }
             other => {
@@ -1058,20 +1542,17 @@ impl<'a> DocView<'a> {
     }
 }
 
-/// One scalar element borrowed from a `cf_docs` blob.
+/// One scalar element borrowed from a `cf_rows` blob.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RawScalar<'a> {
     Bool(bool),
     Int(i64),
     Uint(u64),
     Float(f64),
-    /// UTF-8 string bytes (not escaped).
     Str(&'a [u8]),
 }
 
 impl RawScalar<'_> {
-    /// Append the order-preserving index encoding of this value to `out` (normalizing `-0.0`)
-    /// and return its `type_tag`.
     #[inline]
     pub fn encode_into(&self, out: &mut Vec<u8>) -> u8 {
         match *self {
@@ -1088,7 +1569,6 @@ impl RawScalar<'_> {
                 TAG_UINT
             }
             RawScalar::Float(v) => {
-                // NaN is rejected at write time; fall back to canonical bits defensively.
                 let bytes = encode_f64_ordered(v).unwrap_or([0xFF; 8]);
                 out.extend_from_slice(&bytes);
                 TAG_FLOAT
@@ -1101,9 +1581,9 @@ impl RawScalar<'_> {
     }
 }
 
-/// Zero-copy borrowed attribute value from a [`DocView`].
+/// Zero-copy borrowed attribute value from a [`RowView`].
 #[derive(Debug, Clone, Copy)]
-pub enum DocFieldRef<'a> {
+pub enum RowFieldRef<'a> {
     Null,
     Scalar(RawScalar<'a>),
     StringArray(&'a [u8]),
@@ -1111,30 +1591,30 @@ pub enum DocFieldRef<'a> {
     UintArray(&'a [u8]),
 }
 
-impl<'a> DocFieldRef<'a> {
+impl<'a> RowFieldRef<'a> {
     fn from_raw(kind: u8, payload: &'a [u8]) -> Result<Self> {
         let fixed8 = |what: &str| -> Result<[u8; 8]> {
             payload
                 .try_into()
-                .map_err(|_| TreeError::CorruptedData(format!("cf_docs {what} truncated")))
+                .map_err(|_| TreeError::CorruptedData(format!("cf_rows {what} truncated")))
         };
         Ok(match kind {
-            DOC_VAL_NULL => Self::Null,
-            DOC_VAL_BOOL => match payload {
+            ROW_VAL_NULL => Self::Null,
+            ROW_VAL_BOOL => match payload {
                 [0] => Self::Scalar(RawScalar::Bool(false)),
                 [1] => Self::Scalar(RawScalar::Bool(true)),
-                _ => return Err(TreeError::CorruptedData("cf_docs bool invalid".into())),
+                _ => return Err(TreeError::CorruptedData("cf_rows bool invalid".into())),
             },
-            DOC_VAL_INT => Self::Scalar(RawScalar::Int(i64::from_le_bytes(fixed8("i64")?))),
-            DOC_VAL_UINT => Self::Scalar(RawScalar::Uint(u64::from_le_bytes(fixed8("u64")?))),
-            DOC_VAL_FLOAT => Self::Scalar(RawScalar::Float(f64::from_le_bytes(fixed8("f64")?))),
-            DOC_VAL_STRING => Self::Scalar(RawScalar::Str(payload)),
-            DOC_VAL_STRING_ARRAY => Self::StringArray(payload),
-            DOC_VAL_INT_ARRAY => Self::IntArray(payload),
-            DOC_VAL_UINT_ARRAY => Self::UintArray(payload),
+            ROW_VAL_INT => Self::Scalar(RawScalar::Int(i64::from_le_bytes(fixed8("i64")?))),
+            ROW_VAL_UINT => Self::Scalar(RawScalar::Uint(u64::from_le_bytes(fixed8("u64")?))),
+            ROW_VAL_FLOAT => Self::Scalar(RawScalar::Float(f64::from_le_bytes(fixed8("f64")?))),
+            ROW_VAL_STRING => Self::Scalar(RawScalar::Str(payload)),
+            ROW_VAL_STRING_ARRAY => Self::StringArray(payload),
+            ROW_VAL_INT_ARRAY => Self::IntArray(payload),
+            ROW_VAL_UINT_ARRAY => Self::UintArray(payload),
             other => {
                 return Err(TreeError::CorruptedData(format!(
-                    "unknown cf_docs value kind: {other}"
+                    "unknown cf_rows value kind: {other}"
                 )));
             }
         })
@@ -1145,35 +1625,33 @@ impl<'a> DocFieldRef<'a> {
         matches!(self, Self::Null)
     }
 
-    /// Visit every element (the single value for scalars, each element for arrays, nothing for
-    /// `Null` or empty arrays). Duplicate array elements are visited once per occurrence.
     pub fn for_each_scalar(&self, mut f: impl FnMut(RawScalar<'a>)) -> Result<()> {
         match *self {
             Self::Null => {}
             Self::Scalar(v) => f(v),
             Self::StringArray(payload) => {
                 let mut r = ByteReader::new(payload);
-                let len = r.read_u32_le("cf_docs string array len")? as usize;
+                let len = r.read_u32_le("cf_rows string array len")? as usize;
                 for _ in 0..len {
-                    let n = r.read_u32_le("cf_docs string elem len")? as usize;
-                    f(RawScalar::Str(r.read_bytes(n, "cf_docs string elem")?));
+                    let n = r.read_u32_le("cf_rows string elem len")? as usize;
+                    f(RawScalar::Str(r.read_bytes(n, "cf_rows string elem")?));
                 }
-                r.expect_eof("cf_docs string array")?;
+                r.expect_eof("cf_rows string array")?;
             }
             Self::IntArray(payload) => {
                 let mut r = ByteReader::new(payload);
-                let len = r.read_u32_le("cf_docs int array len")? as usize;
-                let body = r.read_bytes(len * 8, "cf_docs int array")?;
-                r.expect_eof("cf_docs int array")?;
+                let len = r.read_u32_le("cf_rows int array len")? as usize;
+                let body = r.read_bytes(len * 8, "cf_rows int array")?;
+                r.expect_eof("cf_rows int array")?;
                 for c in body.chunks_exact(8) {
                     f(RawScalar::Int(i64::from_le_bytes(c.try_into().unwrap())));
                 }
             }
             Self::UintArray(payload) => {
                 let mut r = ByteReader::new(payload);
-                let len = r.read_u32_le("cf_docs uint array len")? as usize;
-                let body = r.read_bytes(len * 8, "cf_docs uint array")?;
-                r.expect_eof("cf_docs uint array")?;
+                let len = r.read_u32_le("cf_rows uint array len")? as usize;
+                let body = r.read_bytes(len * 8, "cf_rows uint array")?;
+                r.expect_eof("cf_rows uint array")?;
                 for c in body.chunks_exact(8) {
                     f(RawScalar::Uint(u64::from_le_bytes(c.try_into().unwrap())));
                 }
@@ -1185,54 +1663,54 @@ impl<'a> DocFieldRef<'a> {
 
 fn raw_eq_scalar(kind: u8, payload: &[u8], target: &ScalarValue) -> Result<bool> {
     match (kind, target) {
-        (DOC_VAL_NULL, ScalarValue::Null) => Ok(true),
-        (DOC_VAL_BOOL, ScalarValue::Bool(b)) => {
+        (ROW_VAL_NULL, ScalarValue::Null) => Ok(true),
+        (ROW_VAL_BOOL, ScalarValue::Bool(b)) => {
             if payload.len() != 1 {
-                return Err(TreeError::CorruptedData("cf_docs bool len".into()));
+                return Err(TreeError::CorruptedData("cf_rows bool len".into()));
             }
             Ok((payload[0] != 0) == *b)
         }
-        (DOC_VAL_INT, ScalarValue::Int(b)) => {
+        (ROW_VAL_INT, ScalarValue::Int(b)) => {
             if payload.len() != 8 {
-                return Err(TreeError::CorruptedData("cf_docs i64 len".into()));
+                return Err(TreeError::CorruptedData("cf_rows i64 len".into()));
             }
             Ok(i64::from_le_bytes(payload.try_into().unwrap()) == *b)
         }
-        (DOC_VAL_UINT, ScalarValue::Uint(b)) => {
+        (ROW_VAL_UINT, ScalarValue::Uint(b)) => {
             if payload.len() != 8 {
-                return Err(TreeError::CorruptedData("cf_docs u64 len".into()));
+                return Err(TreeError::CorruptedData("cf_rows u64 len".into()));
             }
             Ok(u64::from_le_bytes(payload.try_into().unwrap()) == *b)
         }
-        (DOC_VAL_FLOAT, ScalarValue::Float(b)) => {
+        (ROW_VAL_FLOAT, ScalarValue::Float(b)) => {
             if payload.len() != 8 {
-                return Err(TreeError::CorruptedData("cf_docs f64 len".into()));
+                return Err(TreeError::CorruptedData("cf_rows f64 len".into()));
             }
             let a = f64::from_le_bytes(payload.try_into().unwrap());
             Ok(!a.is_nan() && !b.is_nan() && a == *b)
         }
-        (DOC_VAL_STRING, ScalarValue::String(b)) => Ok(payload == b.as_bytes()),
+        (ROW_VAL_STRING, ScalarValue::String(b)) => Ok(payload == b.as_bytes()),
         _ => Ok(false),
     }
 }
 
 fn raw_cmp_scalar(kind: u8, payload: &[u8], target: &ScalarValue) -> Result<Option<Ordering>> {
     match (kind, target) {
-        (DOC_VAL_INT, ScalarValue::Int(b)) => {
+        (ROW_VAL_INT, ScalarValue::Int(b)) => {
             if payload.len() != 8 {
-                return Err(TreeError::CorruptedData("cf_docs i64 len".into()));
+                return Err(TreeError::CorruptedData("cf_rows i64 len".into()));
             }
             Ok(Some(i64::from_le_bytes(payload.try_into().unwrap()).cmp(b)))
         }
-        (DOC_VAL_UINT, ScalarValue::Uint(b)) => {
+        (ROW_VAL_UINT, ScalarValue::Uint(b)) => {
             if payload.len() != 8 {
-                return Err(TreeError::CorruptedData("cf_docs u64 len".into()));
+                return Err(TreeError::CorruptedData("cf_rows u64 len".into()));
             }
             Ok(Some(u64::from_le_bytes(payload.try_into().unwrap()).cmp(b)))
         }
-        (DOC_VAL_FLOAT, ScalarValue::Float(b)) => {
+        (ROW_VAL_FLOAT, ScalarValue::Float(b)) => {
             if payload.len() != 8 {
-                return Err(TreeError::CorruptedData("cf_docs f64 len".into()));
+                return Err(TreeError::CorruptedData("cf_rows f64 len".into()));
             }
             let a = f64::from_le_bytes(payload.try_into().unwrap());
             if a.is_nan() || b.is_nan() {
@@ -1243,9 +1721,9 @@ fn raw_cmp_scalar(kind: u8, payload: &[u8], target: &ScalarValue) -> Result<Opti
                 Ok(Some(an.total_cmp(&bn)))
             }
         }
-        (DOC_VAL_STRING, ScalarValue::String(b)) => {
+        (ROW_VAL_STRING, ScalarValue::String(b)) => {
             let s = std::str::from_utf8(payload)
-                .map_err(|e| TreeError::CorruptedData(format!("invalid utf8 in cf_docs: {e}")))?;
+                .map_err(|e| TreeError::CorruptedData(format!("invalid utf8 in cf_rows: {e}")))?;
             Ok(Some(s.cmp(b.as_str())))
         }
         _ => Ok(None),
@@ -1254,21 +1732,21 @@ fn raw_cmp_scalar(kind: u8, payload: &[u8], target: &ScalarValue) -> Result<Opti
 
 fn raw_contains_scalar(kind: u8, payload: &[u8], target: &ScalarValue) -> Result<bool> {
     match (kind, target) {
-        (DOC_VAL_STRING_ARRAY, ScalarValue::String(t)) => {
+        (ROW_VAL_STRING_ARRAY, ScalarValue::String(t)) => {
             if payload.len() < 4 {
-                return Err(TreeError::CorruptedData("cf_docs str array len".into()));
+                return Err(TreeError::CorruptedData("cf_rows str array len".into()));
             }
             let arr_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
             let mut off = 4usize;
             let tb = t.as_bytes();
             for _ in 0..arr_len {
                 if off + 4 > payload.len() {
-                    return Err(TreeError::CorruptedData("cf_docs str elem len".into()));
+                    return Err(TreeError::CorruptedData("cf_rows str elem len".into()));
                 }
                 let slen = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
                 off += 4;
                 if off + slen > payload.len() {
-                    return Err(TreeError::CorruptedData("cf_docs str elem".into()));
+                    return Err(TreeError::CorruptedData("cf_rows str elem".into()));
                 }
                 if &payload[off..off + slen] == tb {
                     return Ok(true);
@@ -1277,13 +1755,13 @@ fn raw_contains_scalar(kind: u8, payload: &[u8], target: &ScalarValue) -> Result
             }
             Ok(false)
         }
-        (DOC_VAL_INT_ARRAY, ScalarValue::Int(t)) => {
+        (ROW_VAL_INT_ARRAY, ScalarValue::Int(t)) => {
             if payload.len() < 4 {
-                return Err(TreeError::CorruptedData("cf_docs int array len".into()));
+                return Err(TreeError::CorruptedData("cf_rows int array len".into()));
             }
             let arr_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
             if payload.len() != 4 + arr_len * 8 {
-                return Err(TreeError::CorruptedData("cf_docs int array".into()));
+                return Err(TreeError::CorruptedData("cf_rows int array".into()));
             }
             for chunk in payload[4..].chunks_exact(8) {
                 if i64::from_le_bytes(chunk.try_into().unwrap()) == *t {
@@ -1292,13 +1770,13 @@ fn raw_contains_scalar(kind: u8, payload: &[u8], target: &ScalarValue) -> Result
             }
             Ok(false)
         }
-        (DOC_VAL_UINT_ARRAY, ScalarValue::Uint(t)) => {
+        (ROW_VAL_UINT_ARRAY, ScalarValue::Uint(t)) => {
             if payload.len() < 4 {
-                return Err(TreeError::CorruptedData("cf_docs uint array len".into()));
+                return Err(TreeError::CorruptedData("cf_rows uint array len".into()));
             }
             let arr_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
             if payload.len() != 4 + arr_len * 8 {
-                return Err(TreeError::CorruptedData("cf_docs uint array".into()));
+                return Err(TreeError::CorruptedData("cf_rows uint array".into()));
             }
             for chunk in payload[4..].chunks_exact(8) {
                 if u64::from_le_bytes(chunk.try_into().unwrap()) == *t {
@@ -1313,83 +1791,83 @@ fn raw_contains_scalar(kind: u8, payload: &[u8], target: &ScalarValue) -> Result
 
 fn decode_payload_value(kind: u8, payload: &[u8]) -> Result<AttributeValue> {
     match kind {
-        DOC_VAL_NULL => {
+        ROW_VAL_NULL => {
             if !payload.is_empty() {
-                return Err(TreeError::CorruptedData("cf_docs null non-empty".into()));
+                return Err(TreeError::CorruptedData("cf_rows null non-empty".into()));
             }
             Ok(AttributeValue::Null)
         }
-        DOC_VAL_BOOL => {
+        ROW_VAL_BOOL => {
             if payload.len() != 1 {
-                return Err(TreeError::CorruptedData("cf_docs bool truncated".into()));
+                return Err(TreeError::CorruptedData("cf_rows bool truncated".into()));
             }
             let b = match payload[0] {
                 0 => false,
                 1 => true,
                 other => {
                     return Err(TreeError::CorruptedData(format!(
-                        "invalid bool byte in cf_docs: {other}"
+                        "invalid bool byte in cf_rows: {other}"
                     )));
                 }
             };
             Ok(AttributeValue::Bool(b))
         }
-        DOC_VAL_INT => {
+        ROW_VAL_INT => {
             if payload.len() != 8 {
-                return Err(TreeError::CorruptedData("cf_docs i64 truncated".into()));
+                return Err(TreeError::CorruptedData("cf_rows i64 truncated".into()));
             }
             Ok(AttributeValue::Int(i64::from_le_bytes(
                 payload.try_into().unwrap(),
             )))
         }
-        DOC_VAL_UINT => {
+        ROW_VAL_UINT => {
             if payload.len() != 8 {
-                return Err(TreeError::CorruptedData("cf_docs u64 truncated".into()));
+                return Err(TreeError::CorruptedData("cf_rows u64 truncated".into()));
             }
             Ok(AttributeValue::Uint(u64::from_le_bytes(
                 payload.try_into().unwrap(),
             )))
         }
-        DOC_VAL_FLOAT => {
+        ROW_VAL_FLOAT => {
             if payload.len() != 8 {
-                return Err(TreeError::CorruptedData("cf_docs f64 truncated".into()));
+                return Err(TreeError::CorruptedData("cf_rows f64 truncated".into()));
             }
             Ok(AttributeValue::Float(f64::from_le_bytes(
                 payload.try_into().unwrap(),
             )))
         }
-        DOC_VAL_STRING => {
+        ROW_VAL_STRING => {
             let s = std::str::from_utf8(payload)
-                .map_err(|e| TreeError::CorruptedData(format!("invalid utf8 in cf_docs: {e}")))?
+                .map_err(|e| TreeError::CorruptedData(format!("invalid utf8 in cf_rows: {e}")))?
                 .to_owned();
             Ok(AttributeValue::String(s))
         }
-        DOC_VAL_STRING_ARRAY => {
+        ROW_VAL_STRING_ARRAY => {
             let mut r = ByteReader::new(payload);
-            let len = r.read_u32_le("cf_docs string array len")? as usize;
+            let len = r.read_u32_le("cf_rows string array len")? as usize;
             let mut arr = Vec::with_capacity(len);
             for _ in 0..len {
-                arr.push(r.read_len_prefixed_str("cf_docs string elem")?);
+                arr.push(r.read_len_prefixed_str("cf_rows string elem")?);
             }
-            r.expect_eof("cf_docs string array")?;
+            r.expect_eof("cf_rows string array")?;
             Ok(AttributeValue::StringArray(arr))
         }
-        DOC_VAL_INT_ARRAY => {
+        ROW_VAL_INT_ARRAY => {
             let mut r = ByteReader::new(payload);
-            let len = r.read_u32_le("cf_docs int array len")? as usize;
-            let body = r.read_bytes(len * 8, "cf_docs int array")?;
-            r.expect_eof("cf_docs int array")?;
+            let len = r.read_u32_le("cf_rows int array len")? as usize;
+            let body = r.read_bytes(len * 8, "cf_rows int array")?;
+            r.expect_eof("cf_rows int array")?;
             let arr = body
                 .chunks_exact(8)
                 .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
                 .collect();
             Ok(AttributeValue::IntArray(arr))
         }
-        DOC_VAL_UINT_ARRAY => {
+        ROW_VAL_UINT_ARRAY => {
             let mut r = ByteReader::new(payload);
-            let len = r.read_u32_le("cf_docs uint array len")? as usize;
-            let body = r.read_bytes(len * 8, "cf_docs uint array")?;
-            r.expect_eof("cf_docs uint array")?;
+            let len = r.read_u32_le("cf_rows uint array len")? as usize;
+            let body = r.read_bytes(len * 8, "cf_rows uint array")?;
+            r.expect_eof("cf_rows uint array")?;
             let arr = body
                 .chunks_exact(8)
                 .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
@@ -1397,20 +1875,19 @@ fn decode_payload_value(kind: u8, payload: &[u8]) -> Result<AttributeValue> {
             Ok(AttributeValue::UintArray(arr))
         }
         other => Err(TreeError::CorruptedData(format!(
-            "unknown cf_docs value kind: {other}"
+            "unknown cf_rows value kind: {other}"
         ))),
     }
 }
 
-/// Decode forward document attributes into `(AttrId, AttributeValue)` pairs without string lookups.
-pub fn decode_attribute_entries(bytes: &[u8]) -> Result<Vec<(AttrId, AttributeValue)>> {
-    let view = DocView::parse(bytes)?;
+pub fn decode_row_entries(bytes: &[u8]) -> Result<Vec<(AttrId, AttributeValue)>> {
+    let view = RowView::parse(bytes)?;
     let mut out = Vec::with_capacity(view.count);
     for idx in 0..view.count {
         let (attr_id, kind, start, end) = view.dir_entry(idx);
         if end < start || end > bytes.len() {
             return Err(TreeError::CorruptedData(
-                "cf_docs directory offset out of bounds".into(),
+                "cf_rows directory offset out of bounds".into(),
             ));
         }
         let val = decode_payload_value(kind, &bytes[start..end])?;
@@ -1419,23 +1896,20 @@ pub fn decode_attribute_entries(bytes: &[u8]) -> Result<Vec<(AttrId, AttributeVa
     Ok(out)
 }
 
-/// Decode forward document attributes into an [`Attributes`] map using `schema`.
-pub fn decode_attributes(schema: &CollectionSchema, bytes: &[u8]) -> Result<Attributes> {
-    let entries = decode_attribute_entries(bytes)?;
+pub fn decode_row_attributes(schema: &CollectionSchema, bytes: &[u8]) -> Result<Attributes> {
+    let entries = decode_row_entries(bytes)?;
     let mut map = Attributes::new();
     for (attr_id, val) in entries {
         let entry = schema.get_by_id(attr_id).ok_or_else(|| {
-            TreeError::CorruptedData(format!("cf_docs references unknown attr_id {attr_id}"))
+            TreeError::CorruptedData(format!("cf_rows references unknown attr_id {attr_id}"))
         })?;
         map.insert(entry.name.clone(), val);
     }
     Ok(map)
 }
 
-/// Extract all distinct `cf_attr_clusters` keys to index for a document's `(AttrId, AttributeValue)` list.
-///
-/// Only `filterable` attributes are indexed. Every non-null attribute emits both its value key(s)
-/// and its `TAG_PRESENT` presence key.
+/// Extract all distinct `attr_key`s (`attr_id BE || tag || encoded_val`) to index for a row's
+/// `(AttrId, AttributeValue)` list (filterable inline attributes only).
 pub fn extract_index_keys_from_entries(
     schema: &CollectionSchema,
     entries: &[(AttrId, AttributeValue)],
@@ -1444,10 +1918,10 @@ pub fn extract_index_keys_from_entries(
     for (attr_id, val) in entries {
         let Some(schema_entry) = schema.get_by_id(*attr_id) else {
             return Err(TreeError::CorruptedData(format!(
-                "unknown attr_id {attr_id} in document"
+                "unknown attr_id {attr_id} in row"
             )));
         };
-        if !schema_entry.filterable {
+        if !schema_entry.filterable || schema_entry.storage != ColumnStorage::Inline {
             continue;
         }
         append_index_keys_for_value(*attr_id, val, &mut keys)?;
@@ -1457,7 +1931,6 @@ pub fn extract_index_keys_from_entries(
     Ok(keys)
 }
 
-/// Extract all distinct `cf_attr_clusters` keys to index for an [`Attributes`] map.
 pub fn extract_index_keys(schema: &CollectionSchema, attrs: &Attributes) -> Result<Vec<Vec<u8>>> {
     let mut keys: Vec<Vec<u8>> = Vec::with_capacity(attrs.len() * 2);
     for (name, val) in attrs {
@@ -1467,11 +1940,20 @@ pub fn extract_index_keys(schema: &CollectionSchema, attrs: &Attributes) -> Resu
                 reason: "attribute is not declared in collection schema".into(),
             });
         };
-        if !schema_entry.filterable {
+        if !schema_entry.filterable || schema_entry.storage != ColumnStorage::Inline {
             continue;
         }
         append_index_keys_for_value(schema_entry.id, val, &mut keys)?;
     }
+    keys.sort_unstable();
+    keys.dedup();
+    Ok(keys)
+}
+
+/// Extract distinct `attr_key`s (`attr_id BE || tag || encoded_val`) for a single attribute value.
+pub fn extract_index_keys_for_attr(attr_id: AttrId, val: &AttributeValue) -> Result<Vec<Vec<u8>>> {
+    let mut keys = Vec::new();
+    append_index_keys_for_value(attr_id, val, &mut keys)?;
     keys.sort_unstable();
     keys.dedup();
     Ok(keys)
@@ -1485,20 +1967,20 @@ fn append_index_keys_for_value(
     if matches!(val, AttributeValue::Null) {
         return Ok(());
     }
-    keys.push(encode_present_cluster_key(attr_id));
+    keys.push(encode_present_attr_key(attr_id));
     match val {
         AttributeValue::Null => unreachable!(),
         AttributeValue::Bool(b) => {
-            keys.push(encode_scalar_cluster_key(attr_id, &ScalarValue::Bool(*b))?);
+            keys.push(encode_scalar_attr_key(attr_id, &ScalarValue::Bool(*b))?);
         }
         AttributeValue::Int(v) => {
-            keys.push(encode_scalar_cluster_key(attr_id, &ScalarValue::Int(*v))?);
+            keys.push(encode_scalar_attr_key(attr_id, &ScalarValue::Int(*v))?);
         }
         AttributeValue::Uint(v) => {
-            keys.push(encode_scalar_cluster_key(attr_id, &ScalarValue::Uint(*v))?);
+            keys.push(encode_scalar_attr_key(attr_id, &ScalarValue::Uint(*v))?);
         }
         AttributeValue::Float(v) => {
-            keys.push(encode_scalar_cluster_key(attr_id, &ScalarValue::Float(*v))?);
+            keys.push(encode_scalar_attr_key(attr_id, &ScalarValue::Float(*v))?);
         }
         AttributeValue::String(s) => {
             let mut key = Vec::with_capacity(5 + s.len());
@@ -1538,7 +2020,10 @@ fn append_index_keys_for_value(
     Ok(())
 }
 
-/// Serialize a `RoaringBitmap` into bytes.
+// ---------------------------------------------------------------------------
+// Roaring & FTS term dictionary keys
+// ---------------------------------------------------------------------------
+
 pub fn encode_roaring_bitmap(bm: &RoaringBitmap) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(bm.serialized_size());
     bm.serialize_into(&mut buf)
@@ -1546,13 +2031,11 @@ pub fn encode_roaring_bitmap(bm: &RoaringBitmap) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Deserialize a `RoaringBitmap` from bytes.
 pub fn decode_roaring_bitmap(bytes: &[u8]) -> Result<RoaringBitmap> {
     RoaringBitmap::deserialize_from(bytes)
         .map_err(|e| TreeError::CorruptedData(format!("roaring deserialize error: {e}")))
 }
 
-/// Build a `cf_fts_terms` key: `attr_id (u16 BE) || token_utf8`.
 #[inline]
 pub fn encode_fts_term_key(attr_id: AttrId, token: &str) -> Vec<u8> {
     let tb = token.as_bytes();
@@ -1562,7 +2045,6 @@ pub fn encode_fts_term_key(attr_id: AttrId, token: &str) -> Vec<u8> {
     key
 }
 
-/// Decode a `cf_fts_terms` key into `(attr_id, token_utf8)`.
 pub fn decode_fts_term_key(key: &[u8]) -> Result<(AttrId, String)> {
     if key.len() < 2 {
         return Err(TreeError::CorruptedData(
@@ -1576,62 +2058,9 @@ pub fn decode_fts_term_key(key: &[u8]) -> Result<(AttrId, String)> {
     Ok((attr_id, token))
 }
 
-/// Build the 4-byte `term_id (u32 BE)` prefix used by `cf_fts_postings`, `cf_fts_positions`, and `cf_fts_skips`.
 #[inline]
 pub fn encode_fts_term_id_prefix(term_id: TermId) -> [u8; 4] {
     term_id.to_be_bytes()
-}
-
-/// Build a 4-byte `block_id` key for `cf_fts_rev_doc_map`.
-#[inline]
-pub fn encode_fts_block_key(block_id: u32) -> [u8; 4] {
-    block_id.to_be_bytes()
-}
-
-/// Build an 8-byte key for `cf_fts_postings`, `cf_fts_positions`, or `cf_fts_skips`:
-/// `term_id (u32 BE) || block_or_chunk_id (u32 BE)`.
-#[inline]
-pub fn encode_fts_term_id_key(term_id: TermId, block_or_chunk_id: u32) -> [u8; 8] {
-    let t = term_id.to_be_bytes();
-    let b = block_or_chunk_id.to_be_bytes();
-    [t[0], t[1], t[2], t[3], b[0], b[1], b[2], b[3]]
-}
-
-/// Decode an 8-byte `term_id || block_or_chunk_id` key.
-#[inline]
-pub fn decode_fts_term_id_key(key: &[u8]) -> Result<(TermId, u32)> {
-    if key.len() != 8 {
-        return Err(TreeError::CorruptedData(format!(
-            "FTS term_id key expected 8 bytes, got {}",
-            key.len()
-        )));
-    }
-    Ok((
-        u32::from_be_bytes(key[0..4].try_into().unwrap()),
-        u32::from_be_bytes(key[4..8].try_into().unwrap()),
-    ))
-}
-
-/// Build a `cf_fts_doc_lens` key: `attr_id (u16 BE) || block_id (u32 BE)`.
-#[inline]
-pub fn encode_fts_doc_len_key(attr_id: AttrId, block_id: FtsBlockId) -> [u8; 6] {
-    let a = attr_id.to_be_bytes();
-    let b = block_id.to_be_bytes();
-    [a[0], a[1], b[0], b[1], b[2], b[3]]
-}
-
-/// Decode a `cf_fts_doc_lens` key into `(attr_id, block_id)`.
-#[inline]
-pub fn decode_fts_doc_len_key(key: &[u8]) -> Result<(AttrId, FtsBlockId)> {
-    if key.len() != 6 {
-        return Err(TreeError::CorruptedData(format!(
-            "cf_fts_doc_lens key expected 6 bytes, got {}",
-            key.len()
-        )));
-    }
-    let attr_id = u16::from_be_bytes([key[0], key[1]]);
-    let block_id = u32::from_be_bytes([key[2], key[3], key[4], key[5]]);
-    Ok((attr_id, block_id))
 }
 
 #[cfg(test)]
@@ -1641,278 +2070,164 @@ mod tests {
     use izzydb_core::schema::CollectionConfig;
 
     #[test]
-    fn test_order_preserving_encodings() {
-        let ints = [i64::MIN, -1000, -1, 0, 1, 1000, i64::MAX];
-        let enc_ints: Vec<Vec<u8>> = ints
-            .iter()
-            .map(|&v| encode_scalar_cluster_key(1, &ScalarValue::Int(v)).unwrap())
-            .collect();
-        for w in enc_ints.windows(2) {
+    fn key_ordering_and_splitting() {
+        // row_key order == RowId order
+        let rows = [
+            RowId::new(0, 0),
+            RowId::new(0, 255),
+            RowId::new(0, 256),
+            RowId::new(1, 0),
+            RowId::new(u32::MAX, 10),
+        ];
+        let rkeys: Vec<[u8; 8]> = rows.iter().map(|&r| row_key(r)).collect();
+        for w in rkeys.windows(2) {
             assert!(w[0] < w[1]);
         }
-
-        let floats = [
-            f64::NEG_INFINITY,
-            -1e10,
-            -1.5,
-            -f64::MIN_POSITIVE,
-            -0.0,
-            0.0,
-            f64::MIN_POSITIVE,
-            1.5,
-            1e10,
-            f64::INFINITY,
-        ];
-        let enc_floats: Vec<Vec<u8>> = floats
-            .iter()
-            .map(|&v| encode_scalar_cluster_key(1, &ScalarValue::Float(v)).unwrap())
-            .collect();
-        assert_eq!(enc_floats[4], enc_floats[5]);
-        for i in 0..enc_floats.len() - 1 {
-            if i == 4 {
-                continue;
-            }
-            assert!(enc_floats[i] < enc_floats[i + 1], "failed at {i}");
+        for (&r, &k) in rows.iter().zip(rkeys.iter()) {
+            assert_eq!(decode_row_key(&k).unwrap(), r);
         }
 
-        let strs = ["", "\0", "\0\0", "\0a", "a", "ab", "ab\0", "ab\0c", "abc"];
-        let enc_strs: Vec<Vec<u8>> = strs
-            .iter()
-            .map(|&s| encode_scalar_cluster_key(1, &ScalarValue::String(s.into())).unwrap())
-            .collect();
-        for w in enc_strs.windows(2) {
-            assert!(w[0] < w[1], "{:?} not < {:?}", w[0], w[1]);
-        }
+        // posting_key for (attr, tag, val) scans segments ascending, even with embedded 0x00 in strings
+        let s = "a\0b\0c";
+        let mut val_bytes = Vec::new();
+        encode_str_ordered(s.as_bytes(), &mut val_bytes);
+        let pk1 = posting_key(7, TAG_STRING, &val_bytes, 2);
+        let pk2 = posting_key(7, TAG_STRING, &val_bytes, 10);
+        assert!(pk1 < pk2);
+        let (pre1, seg1) = split_posting_key(&pk1).unwrap();
+        let (pre2, seg2) = split_posting_key(&pk2).unwrap();
+        assert_eq!(seg1, 2);
+        assert_eq!(seg2, 10);
+        assert_eq!(pre1, pre2);
+        let (a, tag, vb, seg) = split_posting_key_parts(&pk1).unwrap();
+        assert_eq!((a, tag, seg), (7, TAG_STRING, 2));
+        assert_eq!(decode_str_ordered(vb).unwrap(), s);
+
+        // detached posting key
+        let dpk = detached_posting_key(3, 99, TAG_STRING, &val_bytes, 5);
+        let (dpre, dseg) = split_detached_posting_key(&dpk).unwrap();
+        assert_eq!(dseg, 5);
+        assert!(dpre.starts_with(&detached_posting_prefix(3, 99, TAG_STRING)));
     }
 
     #[test]
-    fn test_docview_numeric_and_scalar_accessors() {
-        let cfg = CollectionConfig::new(TreeConfig::new(4, DistanceMetric::L2Squared))
-            .with_attribute("i", AttributeType::Int, true)
-            .with_attribute("u", AttributeType::Uint, false)
-            .with_attribute("f", AttributeType::Float, true)
-            .with_attribute("s", AttributeType::String, true)
-            .with_attribute("tags", AttributeType::StringArray, true)
-            .with_attribute("absent", AttributeType::Int, true);
-        let schema = CollectionSchema::from_config(&cfg).unwrap();
-        let id = |n: &str| schema.get_by_name(n).unwrap().id;
+    fn fixed_codecs_roundtrip_and_corruption() {
+        let m = Manifest {
+            open_segment: Some(3),
+            next_segment_id: 4,
+            seal_rows: 65_536,
+            live_rows: 1000,
+            total_rows: 1200,
+        };
+        assert_eq!(Manifest::decode(&m.encode()).unwrap(), m);
+        let m2 = Manifest::new(1024);
+        assert_eq!(Manifest::decode(&m2.encode()).unwrap(), m2);
 
-        let mut attrs = Attributes::new();
-        attrs.insert("i".into(), AttributeValue::Int(-7));
-        attrs.insert("u".into(), AttributeValue::Uint(u64::from(u32::MAX) + 5));
-        attrs.insert("f".into(), AttributeValue::Float(-2.5));
-        attrs.insert("s".into(), "héllo".into());
-        attrs.insert("tags".into(), vec!["a".to_string()].into());
-        let bytes = encode_attributes(&schema, &attrs).unwrap();
-        let view = DocView::parse(&bytes).unwrap();
+        let sm = SegmentMeta {
+            state: SegmentState::Forwarding,
+            flags: SEG_FLAG_HAS_COLUMNS | SEG_FLAG_HAS_VECTORS,
+            row_count: 500,
+            deleted_count: 100,
+            forward_target: 9,
+            forward_base: 42,
+            forwarded_at_epoch: 7,
+            created_seq: 111,
+            sealed_seq: 222,
+        };
+        assert_eq!(SegmentMeta::decode(&sm.encode()).unwrap(), sm);
 
-        assert_eq!(view.get_numeric_f64(id("i")).unwrap(), Some(-7.0));
-        assert_eq!(
-            view.get_numeric_f64(id("u")).unwrap(),
-            Some((u64::from(u32::MAX) + 5) as f64)
-        );
-        assert_eq!(view.get_numeric_f64(id("f")).unwrap(), Some(-2.5));
-        assert_eq!(view.get_numeric_f64(id("s")).unwrap(), None);
-        assert_eq!(view.get_numeric_f64(id("tags")).unwrap(), None);
-        assert_eq!(view.get_numeric_f64(id("absent")).unwrap(), None);
+        let mut ze = ZoneEntry::singleton(b"hello");
+        assert!(ze.widen(b"alpha"));
+        assert!(ze.widen(b"zeta"));
+        assert!(!ze.widen(b"mid"));
+        assert_eq!(ZoneEntry::decode(&ze.encode()).unwrap(), ze);
 
-        assert_eq!(view.get_scalar(id("i")).unwrap(), ScalarValue::Int(-7));
-        assert_eq!(view.get_scalar(id("f")).unwrap(), ScalarValue::Float(-2.5));
-        assert_eq!(
-            view.get_scalar(id("s")).unwrap(),
-            ScalarValue::String("héllo".into())
-        );
-        assert_eq!(view.get_scalar(id("tags")).unwrap(), ScalarValue::Null);
-        assert_eq!(view.get_scalar(id("absent")).unwrap(), ScalarValue::Null);
+        let dm = DetachedMeta {
+            state: 1,
+            current_gen: 4,
+            pending_gen: 5,
+            retired_below: 3,
+            built_against_watermark: RowId::new(2, 99),
+        };
+        assert_eq!(DetachedMeta::decode(&dm.encode()).unwrap(), dm);
+
+        let mut block = [0u64; ROW_BLOCK_SIZE];
+        block[0] = 11;
+        block[255] = u64::MAX;
+        let enc_b = encode_doc_id_block(&block);
+        assert_eq!(enc_b.len(), DOC_ID_BLOCK_BYTES);
+        assert_eq!(*decode_doc_id_block(&enc_b).unwrap(), block);
+
+        // Random / invalid lengths rejected
+        for bad_len in [0usize, 1, 5, 31, 33, 43, 45, 2047, 2049] {
+            let buf = vec![0u8; bad_len];
+            assert!(Manifest::decode(&buf).is_err());
+            assert!(SegmentMeta::decode(&buf).is_err());
+            assert!(DetachedMeta::decode(&buf).is_err());
+            assert!(decode_doc_id_block(&buf).is_err());
+        }
+        assert!(ZoneEntry::decode(&[0u8; 3]).is_err());
+        assert!(ZoneEntry::decode(&ZoneEntry { min: vec![b'z'], max: vec![b'a'] }.encode()).is_err());
     }
 
     #[test]
-    fn test_attributes_roundtrip_docview_and_index_keys() {
+    fn seg_posting_roundtrip_sparse_and_roaring() {
+        let mut sp = SegPosting::default();
+        for i in 0..32u32 {
+            sp.insert(i * 1000);
+        }
+        let b1 = sp.encode().unwrap();
+        assert_eq!(b1[0], SEG_POSTING_SPARSE);
+        assert_eq!(SegPosting::decode(&b1).unwrap(), sp);
+
+        let mut bm = RoaringBitmap::new();
+        SegPostingView::parse(&b1).unwrap().or_into(&mut bm).unwrap();
+        assert_eq!(&bm, sp.as_bitmap());
+
+        sp.insert(99_999);
+        let b2 = sp.encode().unwrap();
+        assert_eq!(b2[0], SEG_POSTING_ROARING);
+        assert_eq!(SegPosting::decode(&b2).unwrap(), sp);
+
+        // Unsorted sparse payload rejected
+        let mut bad = vec![SEG_POSTING_SPARSE];
+        bad.extend_from_slice(&5u32.to_le_bytes());
+        bad.extend_from_slice(&5u32.to_le_bytes());
+        assert!(SegPostingView::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn row_view_v3_roundtrip_and_detached_skip() {
         let cfg = CollectionConfig::new(TreeConfig::new(4, DistanceMetric::L2Squared))
             .with_attribute("tag", AttributeType::String, true)
             .with_attribute("score", AttributeType::Float, true)
-            .with_attribute("tags", AttributeType::StringArray, true)
-            .with_attribute("raw_note", AttributeType::String, false);
+            .with_detached_attribute("pop", AttributeType::Float, true);
         let schema = CollectionSchema::from_config(&cfg).unwrap();
 
         let mut attrs = Attributes::new();
         attrs.insert("tag".into(), "alpha".into());
         attrs.insert("score".into(), 3.5f64.into());
-        attrs.insert(
-            "tags".into(),
-            vec!["a".to_string(), "b".to_string(), "a".to_string()].into(),
+        attrs.insert("pop".into(), 99.0f64.into());
+
+        let bytes = encode_row(&schema, &attrs, true).unwrap();
+        let view = RowView::parse(&bytes).unwrap();
+        assert!(view.has_vector());
+        assert_eq!(view.len(), 2); // detached 'pop' omitted from row
+
+        let decoded = decode_row_attributes(&schema, &bytes).unwrap();
+        assert!(!decoded.contains_key("pop"));
+        assert_eq!(decoded.get("tag"), Some(&AttributeValue::String("alpha".into())));
+        assert_eq!(
+            view.get_numeric_f64(schema.get_by_name("score").unwrap().id).unwrap(),
+            Some(3.5)
         );
-        attrs.insert("raw_note".into(), "ignored_by_index".into());
-
-        let bytes = encode_attributes(&schema, &attrs).unwrap();
-        let decoded = decode_attributes(&schema, &bytes).unwrap();
-        assert_eq!(attrs, decoded);
-
-        let view = DocView::parse(&bytes).unwrap();
         assert!(
             view.matches_filter(
                 &schema,
-                &Filter::And(vec![
-                    Filter::Eq("tag".into(), "alpha".into()),
-                    Filter::Gt("score".into(), 3.0f64.into()),
-                    Filter::Contains("tags".into(), "b".into()),
-                ]),
-                &mut |_, _, _, _, _| false,
+                &Filter::Eq("tag".into(), "alpha".into()),
+                &mut |_, _, _, _, _| false
             )
             .unwrap()
         );
-        assert!(
-            !view
-                .matches_filter(
-                    &schema,
-                    &Filter::Eq("tag".into(), "beta".into()),
-                    &mut |_, _, _, _, _| false,
-                )
-                .unwrap()
-        );
-
-        let keys1 = extract_index_keys(&schema, &attrs).unwrap();
-        let entries = decode_attribute_entries(&bytes).unwrap();
-        let keys2 = extract_index_keys_from_entries(&schema, &entries).unwrap();
-        assert_eq!(keys1, keys2);
-        assert_eq!(keys1.len(), 7);
-    }
-
-    #[test]
-    fn test_leaf_posting_roundtrip() {
-        let mut p1 = LeafPosting::default();
-        p1.insert(7);
-        let b1 = p1.encode().unwrap();
-        assert_eq!(b1.len(), 3);
-        assert_eq!(LeafPosting::decode(&b1).unwrap(), p1);
-
-        let mut p2 = LeafPosting::default();
-        for id in (0..80).step_by(2) {
-            p2.insert(id);
-        }
-        let b2 = p2.encode().unwrap();
-        assert_eq!(b2[0], LEAF_POSTING_DENSE);
-        assert_eq!(LeafPosting::decode(&b2).unwrap(), p2);
-        let mut words = [0u64; 2];
-        LeafPostingView::parse(&b2).unwrap().or_into_words(&mut words).unwrap();
-        assert_eq!(words[0].count_ones() + words[1].count_ones(), 40);
-    }
-    #[test]
-    fn ordered_decoders_roundtrip() {
-        for v in [i64::MIN, -1, 0, 1, i64::MAX] {
-            assert_eq!(decode_i64_ordered(encode_i64_ordered(v)), v);
-        }
-        for v in [f64::NEG_INFINITY, -1.5, 0.0, 2.25, f64::MAX, f64::INFINITY] {
-            assert_eq!(decode_f64_ordered(encode_f64_ordered(v).unwrap()), v);
-        }
-        // -0.0 normalizes to +0.0
-        assert_eq!(
-            decode_f64_ordered(encode_f64_ordered(-0.0).unwrap()).to_bits(),
-            0.0f64.to_bits()
-        );
-        for s in ["", "abc", "a\0b", "\0", "héllo \u{1F600}", "a\0\0"] {
-            let mut buf = Vec::new();
-            encode_str_ordered(s.as_bytes(), &mut buf);
-            assert_eq!(decode_str_ordered(&buf).unwrap(), s);
-            let pre = encode_str_prefix_ordered(s.as_bytes());
-            assert!(buf.starts_with(&pre));
-        }
-        assert!(decode_str_ordered(b"abc").is_err());
-        let vals = [
-            ScalarValue::Bool(true),
-            ScalarValue::Int(-7),
-            ScalarValue::Uint(u64::MAX),
-            ScalarValue::Float(3.5),
-            ScalarValue::String("x\0y".into()),
-        ];
-        for v in vals {
-            let mut buf = Vec::new();
-            let tag = encode_scalar_val_bytes(&v, &mut buf).unwrap();
-            assert_eq!(decode_scalar_val_bytes(tag, &buf).unwrap(), v);
-        }
-        assert_eq!(
-            decode_scalar_val_bytes(TAG_PRESENT, &[]).unwrap(),
-            ScalarValue::Null
-        );
-    }
-
-    #[test]
-    fn prefix_encoding_is_not_confused_by_nul() {
-        let mut a = Vec::new();
-        encode_str_ordered(b"a", &mut a);
-        let mut a_nul = Vec::new();
-        encode_str_ordered(b"a\0x", &mut a_nul);
-        let pre = encode_str_prefix_ordered(b"a\0");
-        assert!(a_nul.starts_with(&pre));
-        assert!(!a.starts_with(&pre));
-    }
-
-    #[test]
-    fn leaf_posting_count_and_mask_all_forms() {
-        let mut sparse = LeafPosting::default();
-        for id in [1u32, 5, 70, 130] {
-            sparse.insert(id);
-        }
-        let mut dense = LeafPosting::default();
-        for id in 0..40u32 {
-            dense.insert(id * 3);
-        }
-        let mut roaring = LeafPosting::default();
-        for id in [3u32, 5000, 70000] {
-            roaring.insert(id);
-        }
-        let mask = [0xFFu64, u64::MAX, 0];
-        for (lp, expect_count) in [(&sparse, 4u64), (&dense, 40), (&roaring, 3)] {
-            let bytes = lp.encode().unwrap();
-            let view = LeafPostingView::parse(&bytes).unwrap();
-            assert_eq!(view.count().unwrap(), expect_count);
-            let mut words = [0u64; 3];
-            view.or_into_words(&mut words).unwrap();
-            let expected: u64 = words
-                .iter()
-                .zip(mask.iter())
-                .map(|(w, m)| (w & m).count_ones() as u64)
-                .sum();
-            assert_eq!(view.count_and_mask(&mask).unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn doc_view_raw_fields() {
-        use izzydb_core::config::{DistanceMetric, TreeConfig};
-        use izzydb_core::schema::CollectionConfig;
-        let cfg = CollectionConfig::new(TreeConfig::new(4, DistanceMetric::L2Squared))
-            .with_attribute("s", AttributeType::String, true)
-            .with_attribute("i", AttributeType::Int, true)
-            .with_attribute("sa", AttributeType::StringArray, true)
-            .with_attribute("ia", AttributeType::IntArray, true)
-            .with_attribute("e", AttributeType::UintArray, true)
-            .with_attribute("m", AttributeType::Float, true);
-        let schema = CollectionSchema::from_config(&cfg).unwrap();
-        let mut attrs = Attributes::new();
-        attrs.insert("s".into(), "hi".into());
-        attrs.insert("i".into(), AttributeValue::Int(-5));
-        attrs.insert("sa".into(), vec!["a".to_string(), "b".to_string(), "a".to_string()].into());
-        attrs.insert("ia".into(), vec![3i64, 1].into());
-        attrs.insert("e".into(), Vec::<u64>::new().into());
-        let bytes = encode_attributes(&schema, &attrs).unwrap();
-        let view = DocView::parse(&bytes).unwrap();
-        let id = |n: &str| schema.get_by_name(n).unwrap().id;
-
-        let mut got = Vec::new();
-        view.get_raw_field(id("s")).unwrap().unwrap().for_each_scalar(|v| got.push(v)).unwrap();
-        assert_eq!(got, vec![RawScalar::Str(b"hi")]);
-        got.clear();
-        view.get_raw_field(id("sa")).unwrap().unwrap().for_each_scalar(|v| got.push(v)).unwrap();
-        assert_eq!(got, vec![RawScalar::Str(b"a"), RawScalar::Str(b"b"), RawScalar::Str(b"a")]);
-        got.clear();
-        view.get_raw_field(id("ia")).unwrap().unwrap().for_each_scalar(|v| got.push(v)).unwrap();
-        assert_eq!(got, vec![RawScalar::Int(3), RawScalar::Int(1)]);
-        got.clear();
-        let empty = view.get_raw_field(id("e")).unwrap().unwrap();
-        assert!(!empty.is_null());
-        empty.for_each_scalar(|v| got.push(v)).unwrap();
-        assert!(got.is_empty());
-        assert!(view.get_raw_field(id("m")).unwrap().is_none());
     }
 }

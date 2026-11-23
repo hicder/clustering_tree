@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+default-members = [
+    "crates/izzydb-core",
+    "crates/izzydb-fts",
+    "crates/izzydb-rabitq",
+    "crates/izzydb-storage",
+]
 
 [workspace.package]
 version = "0.1.0"

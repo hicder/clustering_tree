@@ -315,15 +315,16 @@ fn test_vectorless_collection_and_unsupported_stubs() {
     ));
     assert_eq!(col.get(1).unwrap().unwrap().embedding, None);
 
-    // Unported APIs return Unsupported("v3: phase N")
+    // Vector search on a vectorless collection returns InvalidConfig
     assert!(matches!(
         col.search(&[0.0], SearchOptions::new(5, 4), None),
-        Err(TreeError::Unsupported(_))
+        Err(TreeError::InvalidConfig(_))
     ));
     assert!(matches!(
         col.search(&[0.0], SearchOptions::new(5, 4), Some(&Filter::Eq("title".into(), "hello".into()))),
-        Err(TreeError::Unsupported(_))
+        Err(TreeError::InvalidConfig(_))
     ));
+    // Unported APIs return Unsupported("v3: phase N")
     assert!(matches!(
         col.resolve_filter_doc_ids(&Filter::Eq("title".into(), "hello".into())),
         Err(TreeError::Unsupported(_))

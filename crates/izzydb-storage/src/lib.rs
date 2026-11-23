@@ -14,7 +14,7 @@ pub use storage::{
     CF_ATTR_POSTINGS, CF_COLUMNS, CF_DETACHED, CF_DETACHED_POSTINGS, CF_FTS_POSITIONS,
     CF_FTS_POSTINGS, CF_FTS_SKIPS, CF_FTS_TERMS, CF_ID_MAP, CF_LEAF_ENTRIES, CF_ROW_DOC_IDS,
     CF_ROWS, CF_VECTORS, DEFAULT_CF_NAME, DROPPED_SEGMENTS_KEY, DocLenBlockTable, FTS_META_KEY,
-    MANIFEST_KEY, RocksDocLenCursor, RocksSkipCursor, SCHEMA_KEY, SegmentEntry, SegmentTable,
-    SegmentTableSnapshot, Storage, StorageBatch, TxContext, ZoneTable, cf_options_for,
+    MANIFEST_KEY, LeafVisitAction, RocksDocLenCursor, RocksSkipCursor, SCHEMA_KEY, SegmentEntry,
+    SegmentTable, SegmentTableSnapshot, Storage, StorageBatch, TxContext, ZoneTable, cf_options_for,
     default_sst_block_cache, doc_key, encode_count, node_key, tagged_key, tagged_vec,
 };

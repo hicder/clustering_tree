@@ -196,6 +196,46 @@ impl<'a> TxContext<'a> {
         self.dirty_seg_deletes.remove(&seg);
     }
 
+    /// Resolve a [`RowId`] against uncommitted `TxContext` mutations and the base `SegmentTable`,
+    /// returning `None` if tombstoned, dropped, retired, or out of range, or the forwarded live [`RowId`].
+    pub fn resolve_row(&self, mut row: RowId) -> Option<RowId> {
+        let snap = self.storage.segments.snapshot();
+        for _ in 0..8 {
+            let seg = row.seg();
+            if let Some(ref dropped) = self.dirty_dropped_segments
+                && dropped.contains(seg)
+            {
+                return None;
+            }
+            let meta = match self.dirty_seg_meta.get(&seg) {
+                Some(Some(m)) => m,
+                Some(None) => return None,
+                None => &snap.get(seg)?.meta,
+            };
+            let local = row.local();
+            if local >= meta.row_count {
+                return None;
+            }
+            let deleted_bm = self
+                .dirty_seg_deletes
+                .get(&seg)
+                .or_else(|| snap.get(seg).and_then(|e| e.deleted.as_deref()));
+            if deleted_bm.is_some_and(|bm| bm.contains(local)) {
+                return None;
+            }
+            match meta.state {
+                SegmentState::Open | SegmentState::Sealed => return Some(row),
+                SegmentState::Forwarding => {
+                    let del_rank = deleted_bm.map_or(0, |bm| bm.rank(local) as u32);
+                    let rank = local - del_rank;
+                    row = RowId::new(meta.forward_target, meta.forward_base + rank);
+                }
+                SegmentState::Building | SegmentState::Retired => return None,
+            }
+        }
+        None
+    }
+
     // -----------------------------------------------------------------------
     // Rows, vectors, id map, and row->doc block map
     // -----------------------------------------------------------------------

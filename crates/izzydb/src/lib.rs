@@ -11,22 +11,22 @@ pub mod collection;
 /// Segment store, row allocation, sealing, and `RowId -> DocId` resolution.
 pub mod segments;
 
-// Legacy/unported v2 modules compiled out progressively as Phases 3-11 land.
+// Legacy/unported v2 modules compiled out progressively as Phases 4-11 land.
 #[cfg(any())]
 pub mod attr_index;
 #[cfg(any())]
 pub mod fts_index;
-#[cfg(any())]
+/// SPFresh LIRE boundary-vector reassignment.
 pub mod lire;
 #[cfg(any())]
 pub mod order_by;
 #[cfg(any())]
 pub mod rank_eval;
-#[cfg(any())]
+/// Beam-search traversal, RaBitQ scanning, and exact reranking.
 pub mod search;
-#[cfg(any())]
+/// SIMD distance and RaBitQ leaf-scoring re-exports.
 pub mod simd;
-#[cfg(any())]
+/// Global ANN clustering tree over `RowId`s.
 pub mod tree;
 #[cfg(any())]
 pub mod verify;
@@ -55,45 +55,10 @@ pub use schema::{
     AttributeConfig, AttributeType, AttributeValue, Attributes, CollectionConfig, CollectionSchema,
     ColumnStorage, FullTextSearchConfig, Language, ScalarValue, Tokenizer,
 };
-
-/// Parameters controlling quantized vector search and exact reranking.
-#[derive(Debug, Clone, Copy)]
-pub struct SearchOptions {
-    pub k: usize,
-    pub beam_width: usize,
-    pub rerank_candidates: Option<usize>,
-    /// Materialized filtered sets with `<= exact_scan_threshold` vector rows use exact scan.
-    pub exact_scan_threshold: usize,
-    /// Maximum number of leaves probed during filtered dynamic expansion.
-    pub max_expanded_leaves: Option<usize>,
-}
-
-impl SearchOptions {
-    pub fn new(k: usize, beam_width: usize) -> Self {
-        Self {
-            k,
-            beam_width,
-            rerank_candidates: None,
-            exact_scan_threshold: 4_096,
-            max_expanded_leaves: None,
-        }
-    }
-
-    pub fn with_rerank(mut self, rerank_candidates: usize) -> Self {
-        self.rerank_candidates = Some(rerank_candidates);
-        self
-    }
-
-    pub fn with_exact_scan_threshold(mut self, threshold: usize) -> Self {
-        self.exact_scan_threshold = threshold;
-        self
-    }
-
-    pub fn with_max_expanded_leaves(mut self, max_leaves: usize) -> Self {
-        self.max_expanded_leaves = Some(max_leaves);
-        self
-    }
-}
+pub use search::SearchOptions;
+pub use tree::{
+    AnnIndex, ClusteringTree, MaintenanceOptions, MaintenanceStats, VacuumBudget, VacuumStats,
+};
 
 /// Summary statistics for the ANN clustering tree (Phase 3 / 11).
 #[derive(Debug, Clone, PartialEq, Eq)]

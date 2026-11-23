@@ -21,8 +21,13 @@ use izzydb_storage::codec::{
 use izzydb_storage::node::{AnnMeta, PackedInternalNode, decode_f32_slice};
 use izzydb_storage::{SegmentTableSnapshot, Storage, TxContext};
 
-use crate::segments::{RowIndexHook, SegmentStore};
-use crate::{CollectionStats, SearchOptions};
+use crate::search;
+use crate::segments::{RowIndexHook, RowResolver, SegmentStore};
+use crate::tree::{
+    AnnIndex, MaintenanceOptions, MaintenanceStats, VacuumBudget, VacuumStats,
+    load_internal_caches, vacuum_ann_storage, verify_tree_invariants,
+};
+use crate::{CollectionStats, SearchOptions, TreeStats};
 
 /// Partial document mutation applied to an existing document.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -153,6 +158,7 @@ pub struct Collection {
     pub(crate) segments: SegmentStore,
     pub(crate) manifest: Manifest,
     pub(crate) ann_meta: Option<AnnMeta>,
+    pub(crate) ann: Option<AnnIndex>,
     pub(crate) internal_cache: HashMap<NodeId, PackedInternalNode>,
     pub(crate) leaf_parent: HashMap<NodeId, NodeId>,
 }
@@ -184,6 +190,14 @@ impl Collection {
 
         let storage = Arc::new(storage);
         let segments = SegmentStore::new(config.segment.seal_rows);
+        let (ann, internal_cache, leaf_parent) = match (&config.vector, &ann_meta) {
+            (Some(vcfg), Some(meta)) => {
+                let ann = AnnIndex::new(vcfg.clone(), meta.rabitq_seed)?;
+                let (internal_cache, leaf_parent) = load_internal_caches(&storage)?;
+                (Some(ann), internal_cache, leaf_parent)
+            }
+            _ => (None, HashMap::new(), HashMap::new()),
+        };
         Ok(Self {
             storage,
             config,
@@ -191,8 +205,9 @@ impl Collection {
             segments,
             manifest,
             ann_meta,
-            internal_cache: HashMap::new(),
-            leaf_parent: HashMap::new(),
+            ann,
+            internal_cache,
+            leaf_parent,
         })
     }
 
@@ -206,6 +221,10 @@ impl Collection {
 
     pub fn vector_config(&self) -> Option<&TreeConfig> {
         self.config.vector.as_ref()
+    }
+
+    pub fn ann_meta(&self) -> Option<&AnnMeta> {
+        self.ann_meta.as_ref()
     }
 
     pub fn len(&self) -> u64 {
@@ -252,6 +271,7 @@ impl Collection {
         let Some(open_seg) = self.manifest.open_segment else {
             return Ok(None);
         };
+        let hooks = collect_hooks(self.ann.as_ref());
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -259,7 +279,6 @@ impl Collection {
             self.manifest.clone(),
             self.ann_meta.clone(),
         );
-        let hooks: [&dyn RowIndexHook; 0] = [];
         self.segments.seal(&mut tx, open_seg, &hooks)?;
         let (manifest, ann_meta) = tx.commit()?;
         self.manifest = manifest;
@@ -279,6 +298,7 @@ impl Collection {
         let prepared_vec = self.prepare_optional_vector(embedding)?;
         let new_row_bytes = encode_row(&self.schema, &attributes, prepared_vec.is_some())?;
 
+        let hooks = collect_hooks(self.ann.as_ref());
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -286,7 +306,6 @@ impl Collection {
             self.manifest.clone(),
             self.ann_meta.clone(),
         );
-        let hooks: [&dyn RowIndexHook; 0] = [];
         let changed = upsert_one_in_tx(
             &self.segments,
             &self.schema,
@@ -319,6 +338,7 @@ impl Collection {
             prepared.push((doc.id, pvec, row_bytes));
         }
 
+        let hooks = collect_hooks(self.ann.as_ref());
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -326,7 +346,6 @@ impl Collection {
             self.manifest.clone(),
             self.ann_meta.clone(),
         );
-        let hooks: [&dyn RowIndexHook; 0] = [];
         let mut any_changed = false;
         for (id, pvec, row_bytes) in prepared {
             if upsert_one_in_tx(
@@ -355,6 +374,7 @@ impl Collection {
         self.reject_detached_attributes(&patch.attributes)?;
         let prepared_vec = self.prepare_optional_vector(patch.embedding.as_deref())?;
 
+        let hooks = collect_hooks(self.ann.as_ref());
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -362,7 +382,6 @@ impl Collection {
             self.manifest.clone(),
             self.ann_meta.clone(),
         );
-        let hooks: [&dyn RowIndexHook; 0] = [];
         let changed = apply_patch_in_tx(
             &self.segments,
             &self.schema,
@@ -401,6 +420,7 @@ impl Collection {
             }
         }
 
+        let hooks = collect_hooks(self.ann.as_ref());
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -408,7 +428,6 @@ impl Collection {
             self.manifest.clone(),
             self.ann_meta.clone(),
         );
-        let hooks: [&dyn RowIndexHook; 0] = [];
         let mut any_changed = false;
         for (&(id, ref patch), pv) in patches.iter().zip(prepared_vecs.iter()) {
             if apply_patch_in_tx(
@@ -433,6 +452,7 @@ impl Collection {
 
     /// Delete a document atomically. Returns `true` if `id` existed.
     pub fn delete(&mut self, id: DocId) -> Result<bool> {
+        let hooks = collect_hooks(self.ann.as_ref());
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -446,8 +466,11 @@ impl Collection {
         let old_bytes = tx.get_row_bytes(old_row)?.ok_or_else(|| {
             TreeError::InvariantViolation(format!("row {old_row:?} missing in cf_rows"))
         })?;
-        let _old_view = RowView::parse(&old_bytes)?;
+        let old_view = RowView::parse(&old_bytes)?;
         self.segments.tombstone(&mut tx, old_row)?;
+        for hook in &hooks {
+            hook.on_delete(&mut tx, &self.schema, old_row, &old_view, old_view.has_vector())?;
+        }
         tx.delete_id_map(id);
         let (manifest, ann_meta) = tx.commit()?;
         self.manifest = manifest;
@@ -474,6 +497,7 @@ impl Collection {
             return Ok(0);
         }
 
+        let hooks = collect_hooks(self.ann.as_ref());
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -486,8 +510,11 @@ impl Collection {
             let old_bytes = tx.get_row_bytes(old_row)?.ok_or_else(|| {
                 TreeError::InvariantViolation(format!("row {old_row:?} missing in cf_rows"))
             })?;
-            let _old_view = RowView::parse(&old_bytes)?;
+            let old_view = RowView::parse(&old_bytes)?;
             self.segments.tombstone(&mut tx, old_row)?;
+            for hook in &hooks {
+                hook.on_delete(&mut tx, &self.schema, old_row, &old_view, old_view.has_vector())?;
+            }
             tx.delete_id_map(doc_id);
         }
         let (manifest, ann_meta) = tx.commit()?;
@@ -591,14 +618,87 @@ impl Collection {
 
     pub fn search(
         &self,
-        _query: &[f32],
-        _opts: SearchOptions,
+        query: &[f32],
+        opts: SearchOptions,
         filter: Option<&Filter>,
     ) -> Result<Vec<SearchResult>> {
+        let (Some(ann), Some(ann_meta)) = (&self.ann, &self.ann_meta) else {
+            return Err(TreeError::InvalidConfig(
+                "collection has no vector index".into(),
+            ));
+        };
         if filter.is_some() {
             return Err(TreeError::Unsupported("v3: phase 4".into()));
         }
-        Err(TreeError::Unsupported("v3: phase 3".into()))
+        let row_hits = search::search(
+            &self.storage,
+            &self.internal_cache,
+            ann_meta,
+            &ann.quantizer,
+            query,
+            opts,
+            &ann.config,
+        )?;
+        if row_hits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sorted = row_hits;
+        sorted.sort_unstable_by_key(|&(row, _)| row);
+        let rows: Vec<RowId> = sorted.iter().map(|&(r, _)| r).collect();
+        let doc_ids = RowResolver::resolve_all(&self.storage, &rows)?;
+        let mut results: Vec<SearchResult> = doc_ids
+            .into_iter()
+            .zip(sorted)
+            .map(|(id, (_, distance))| SearchResult { id, distance })
+            .collect();
+        results.sort_unstable_by(|a, b| {
+            a.distance
+                .total_cmp(&b.distance)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(results)
+    }
+
+    /// Incrementally vacuum stale ANN slots and merge/rebalance underflowing leaves up to `budget`.
+    pub fn vacuum_ann(&mut self, budget: VacuumBudget) -> Result<VacuumStats> {
+        let Some(ref ann) = self.ann else {
+            return Ok(VacuumStats::default());
+        };
+        vacuum_ann_storage(
+            &self.storage,
+            ann,
+            &mut self.manifest,
+            &mut self.ann_meta,
+            &mut self.internal_cache,
+            &mut self.leaf_parent,
+            budget,
+        )
+    }
+
+    /// Run background maintenance (ANN vacuum when stale ratio exceeds threshold; Phase 9 adds compaction).
+    pub fn maintenance(&mut self, opts: MaintenanceOptions) -> Result<MaintenanceStats> {
+        let mut stats = MaintenanceStats::default();
+        if let Some(ref meta) = self.ann_meta {
+            let total = meta.num_vectors + meta.stale_rows;
+            if total > 0 && (meta.stale_rows as f64 / total as f64) > opts.vacuum_stale_ratio {
+                stats.vacuum = Some(self.vacuum_ann(opts.vacuum_budget)?);
+            }
+        }
+        Ok(stats)
+    }
+
+    /// Verify ANN tree structural invariants against `SegmentTableSnapshot`.
+    pub fn verify_ann_invariants(&self) -> Result<Option<TreeStats>> {
+        match (&self.ann, &self.ann_meta) {
+            (Some(ann), Some(meta)) => Ok(Some(verify_tree_invariants(
+                &self.storage,
+                &self.internal_cache,
+                &self.leaf_parent,
+                meta,
+                &ann.config,
+            )?)),
+            _ => Ok(None),
+        }
     }
 
     pub fn resolve_filter_doc_ids(&self, _filter: &Filter) -> Result<Vec<DocId>> {
@@ -694,6 +794,14 @@ impl Collection {
     pub fn verify_invariants(&self) -> Result<CollectionStats> {
         Err(TreeError::Unsupported("v3: phase 11".into()))
     }
+}
+
+fn collect_hooks<'a>(ann: Option<&'a AnnIndex>) -> Vec<&'a dyn RowIndexHook> {
+    let mut hooks: Vec<&'a dyn RowIndexHook> = Vec::with_capacity(1);
+    if let Some(a) = ann {
+        hooks.push(a);
+    }
+    hooks
 }
 
 fn vectors_bitwise_equal(

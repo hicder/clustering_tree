@@ -35,6 +35,14 @@ pub use segments::{SegmentEntry, SegmentTable, SegmentTableSnapshot};
 pub use tx::TxContext;
 pub use types::{DocLenBlockTable, ZoneTable};
 
+/// Control flow returned by [`Storage::visit_leaf_nodes_from`] callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafVisitAction {
+    Continue,
+    StopBefore,
+    StopAfter,
+}
+
 use types::{decode_u32_key, decode_u64_key, map_db_err};
 
 pub const DEFAULT_CF_NAME: &str = DEFAULT_COLUMN_FAMILY_NAME;
@@ -962,6 +970,55 @@ impl Storage {
         self.scan_cf(CF_LEAF_ENTRIES, decode_u32_key, |v| {
             PackedLeafNode::decode(v, self.dim, self.padded_dim, self.rabitq_words)
         })
+    }
+
+    /// Iterate `cf_leaf_entries` in ascending `NodeId` order starting at `start_leaf_id`.
+    /// When `visit` returns `Ok(false)`, stops immediately at `leaf_id` (if `stop_after` was not
+    /// requested) or after `leaf_id`: passing `(bool_should_continue, bool_advance_past_current)`.
+    pub fn visit_leaf_nodes_from(
+        &self,
+        start_leaf_id: NodeId,
+        mut visit: impl FnMut(NodeId, &[u8]) -> Result<LeafVisitAction>,
+    ) -> Result<Option<NodeId>> {
+        let cf = self.cf(CF_LEAF_ENTRIES)?;
+        let start_key = node_key(start_leaf_id);
+        let mut iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&start_key, rocksdb::Direction::Forward));
+        while let Some(item) = iter.next() {
+            let (k, v) = item.map_err(map_db_err)?;
+            let leaf_id = decode_u32_key(&k)?;
+            match visit(leaf_id, &v)? {
+                LeafVisitAction::Continue => {}
+                LeafVisitAction::StopBefore => return Ok(Some(leaf_id)),
+                LeafVisitAction::StopAfter => {
+                    return match iter.next() {
+                        Some(next_item) => {
+                            let (nk, _) = next_item.map_err(map_db_err)?;
+                            Ok(Some(decode_u32_key(&nk)?))
+                        }
+                        None => Ok(None),
+                    };
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn all_vectors(&self) -> Result<Vec<(RowId, Vec<f32>)>> {
+        self.scan_cf(
+            CF_VECTORS,
+            |k| {
+                let arr: [u8; 8] = k.try_into().map_err(|_| {
+                    TreeError::CorruptedData(format!(
+                        "cf_vectors key expected 8 bytes, got {}",
+                        k.len()
+                    ))
+                })?;
+                Ok(RowId::from_be_bytes(arr))
+            },
+            |v| decode_f32_slice(v, self.dim),
+        )
     }
 
     pub fn all_id_map(&self) -> Result<Vec<(DocId, RowId)>> {

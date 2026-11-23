@@ -793,16 +793,32 @@ fn search_post_filter(
             row_pairs.dedup_by_key(|(r, _)| *r);
             for chunk in row_pairs.chunks(128) {
                 let rows: Vec<RowId> = chunk.iter().map(|&(r, _)| r).collect();
-                let slices = storage.multi_get_row_bytes_pinned(&rows)?;
-                for (&(row, cand), opt_slice) in chunk.iter().zip(slices.iter()) {
-                    let slice = opt_slice.as_ref().ok_or_else(|| {
-                        TreeError::InvariantViolation(format!("row {row:?} missing in cf_rows"))
-                    })?;
-                    let view = RowView::parse(slice)?;
-                    if view.matches_filter(schema, res_filter, &mut |kind, attr, query, last_as_prefix, val| {
-                        fts_index.matches_fts_attr(schema, kind, attr, query, last_as_prefix, val)
-                    })? {
-                        verified.push(cand);
+                if crate::detached::filter_mentions_detached(schema, res_filter) {
+                    let flags = crate::detached::filter_rows_mixed_batch(
+                        storage, schema, fts_index, res_filter, &rows,
+                    )?;
+                    for (&(_, cand), ok) in chunk.iter().zip(flags) {
+                        if ok {
+                            verified.push(cand);
+                        }
+                    }
+                } else {
+                    let slices = storage.multi_get_row_bytes_pinned(&rows)?;
+                    for (&(row, cand), opt_slice) in chunk.iter().zip(slices.iter()) {
+                        let slice = opt_slice.as_ref().ok_or_else(|| {
+                            TreeError::InvariantViolation(format!("row {row:?} missing in cf_rows"))
+                        })?;
+                        let view = RowView::parse(slice)?;
+                        if view.matches_filter(
+                            schema,
+                            res_filter,
+                            &mut |kind, attr, query, last_as_prefix, val| {
+                                fts_index
+                                    .matches_fts_attr(schema, kind, attr, query, last_as_prefix, val)
+                            },
+                        )? {
+                            verified.push(cand);
+                        }
                     }
                 }
             }

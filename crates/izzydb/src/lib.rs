@@ -16,6 +16,8 @@ pub(crate) mod attr_reader;
 pub mod attr_index;
 /// Seal-time and maintenance transposition into `cf_columns`.
 pub(crate) mod columns;
+/// Detached columns (`cf_detached`, whole-column ingest/publish, point overwrites).
+pub mod detached;
 /// Exact faceting engine over `RowSet` populations and global counts.
 pub mod facet;
 /// `RowSet` filter planner, cardinality estimation, and zone pruning.
@@ -40,6 +42,10 @@ pub mod verify;
 pub use attr_index::AttributeIndex;
 pub use collection::{
     Collection, Document, DocumentPatch, HybridSearchOptions, HybridSearchResult, SearchResult,
+};
+pub use detached::{
+    DetachedBuildStats, DetachedDuplicatePolicy, DetachedIngestBuilder, DetachedJob,
+    DetachedPublishStats, DetachedWriteMode,
 };
 #[doc(hidden)]
 pub use columns::set_force_column_row_fallback;

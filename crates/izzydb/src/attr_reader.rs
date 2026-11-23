@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use izzydb_core::config::{AttrId, RowId, SegmentId};
+use izzydb_core::config::{AttrId, ColumnGen, RowId, SegmentId};
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::schema::{CollectionSchema, ColumnStorage, ScalarValue};
 use izzydb_storage::codec::{RowView, SEG_FLAG_HAS_COLUMNS, SegmentState};
@@ -12,6 +12,7 @@ use izzydb_storage::column::ColumnBlockView;
 use izzydb_storage::{SegmentTableSnapshot, Storage};
 
 use crate::columns::force_row_fallback_enabled;
+use crate::detached::all_detached_gens;
 
 const READER_CHUNK_SIZE: usize = 1024;
 
@@ -102,66 +103,99 @@ impl AttrReader for RowStoreReader<'_> {
     }
 }
 
-/// Phase 7 `AttrReader`: reads sealed segments with `SEG_FLAG_HAS_COLUMNS` from `cf_columns`
-/// in sorted `(seg, attr, block)` batches, automatically falling back to `cf_rows` for the open
-/// segment or segments whose column build is deferred.
+/// Phase 7 & 8 `AttrReader`: reads sealed segments with `SEG_FLAG_HAS_COLUMNS` from `cf_columns`
+/// and detached attributes from `cf_detached` at `current_gen`, automatically falling back to
+/// `cf_rows` for open or un-columnarized inline segments.
 pub(crate) struct ColumnReader<'a> {
     storage: &'a Storage,
     schema: &'a CollectionSchema,
     snap: Arc<SegmentTableSnapshot>,
     row_fallback: RowStoreReader<'a>,
+    detached_gens: HashMap<AttrId, ColumnGen>,
     force_rows: bool,
 }
 
 impl<'a> ColumnReader<'a> {
-    pub(crate) fn new(storage: &'a Storage, schema: &'a CollectionSchema) -> Self {
-        Self {
+    pub(crate) fn new(storage: &'a Storage, schema: &'a CollectionSchema) -> Result<Self> {
+        let detached_gens = all_detached_gens(storage)?;
+        Ok(Self {
             storage,
             schema,
             snap: storage.segment_snapshot(),
             row_fallback: RowStoreReader::new(storage),
+            detached_gens,
             force_rows: force_row_fallback_enabled(),
-        }
+        })
+    }
+
+    #[inline]
+    pub(crate) fn is_detached(&self, attr: AttrId) -> bool {
+        self.schema
+            .get_by_id(attr)
+            .is_some_and(|e| e.storage == ColumnStorage::Detached)
+    }
+
+    #[inline]
+    pub(crate) fn detached_gen(&self, attr: AttrId) -> ColumnGen {
+        self.detached_gens.get(&attr).copied().unwrap_or(0)
     }
 
     #[inline]
     pub(crate) fn segment_has_columns(&self, seg: SegmentId, attr: AttrId) -> bool {
-        if self.force_rows {
-            return false;
-        }
         let Some(entry) = self.schema.get_by_id(attr) else {
             return false;
         };
-        if entry.storage != ColumnStorage::Inline || !entry.is_columnar() {
+        if entry.storage == ColumnStorage::Detached {
+            return true;
+        }
+        if self.force_rows || !entry.is_columnar() {
             return false;
         }
-        self.snap
-            .get(seg)
-            .is_some_and(|s| {
-                s.meta.state == SegmentState::Sealed
-                    && (s.meta.flags & SEG_FLAG_HAS_COLUMNS) != 0
-            })
+        self.snap.get(seg).is_some_and(|s| {
+            s.meta.state == SegmentState::Sealed && (s.meta.flags & SEG_FLAG_HAS_COLUMNS) != 0
+        })
     }
 
-    /// Collect sorted `(seg, block)` pairs needed from `cf_columns`, plus fallback `RowId`s.
+    /// Collect sorted `(seg, block)` pairs for columnar segments plus fallback `RowId`s.
     fn split_rows_for_attr(
         &self,
         attr: AttrId,
         rows: &[RowId],
-    ) -> (Vec<(SegmentId, AttrId, u32)>, Vec<RowId>) {
-        let mut block_keys: Vec<(SegmentId, AttrId, u32)> = Vec::new();
+    ) -> (Vec<(SegmentId, u32)>, Vec<RowId>) {
+        let mut block_coords: Vec<(SegmentId, u32)> = Vec::new();
         let mut fallback_rows: Vec<RowId> = Vec::new();
         for &row in rows {
             if self.segment_has_columns(row.seg(), attr) {
-                let k = (row.seg(), attr, row.block_idx());
-                if block_keys.last().copied() != Some(k) {
-                    block_keys.push(k);
+                let k = (row.seg(), row.block_idx());
+                if block_coords.last().copied() != Some(k) {
+                    block_coords.push(k);
                 }
             } else {
                 fallback_rows.push(row);
             }
         }
-        (block_keys, fallback_rows)
+        (block_coords, fallback_rows)
+    }
+
+    pub(crate) fn fetch_column_slices(
+        &self,
+        attr: AttrId,
+        coords: &[(SegmentId, u32)],
+    ) -> Result<Vec<Option<izzydb_storage::DBPinnableSlice<'_>>>> {
+        if self.is_detached(attr) {
+            let g = self.detached_gen(attr);
+            let keys: Vec<(AttrId, ColumnGen, SegmentId, u32)> = coords
+                .iter()
+                .map(|&(seg, blk)| (attr, g, seg, blk))
+                .collect();
+            self.storage.multi_get_detached_blocks_pinned(&keys, true)
+        } else {
+            let keys: Vec<(SegmentId, AttrId, u32)> = coords
+                .iter()
+                .map(|&(seg, blk)| (seg, attr, blk))
+                .collect();
+            self.storage.multi_get_column_blocks_pinned(&keys, true)
+        }
     }
 }
 
@@ -176,22 +210,20 @@ impl AttrReader for ColumnReader<'_> {
         if rows.is_empty() {
             return Ok(());
         }
-        let (block_keys, fallback_rows) = self.split_rows_for_attr(attr, rows);
-        if block_keys.is_empty() {
+        let (block_coords, fallback_rows) = self.split_rows_for_attr(attr, rows);
+        if block_coords.is_empty() {
             return self.row_fallback.read_scalars(attr, rows, out);
         }
 
-        let block_slices = self
-            .storage
-            .multi_get_column_blocks_pinned(&block_keys, true)?;
+        let block_slices = self.fetch_column_slices(attr, &block_coords)?;
         let mut block_views: HashMap<(SegmentId, u32), Option<ColumnBlockView<'_>>> =
-            HashMap::with_capacity(block_keys.len());
-        for (&(seg, _, block), opt_slice) in block_keys.iter().zip(block_slices.iter()) {
+            HashMap::with_capacity(block_coords.len());
+        for (&coord, opt_slice) in block_coords.iter().zip(block_slices.iter()) {
             let parsed = opt_slice
                 .as_ref()
                 .map(|s| ColumnBlockView::parse(s))
                 .transpose()?;
-            block_views.insert((seg, block), parsed);
+            block_views.insert(coord, parsed);
         }
 
         let mut fb_vals: Vec<Option<ScalarValue>> = Vec::new();
@@ -229,22 +261,20 @@ impl AttrReader for ColumnReader<'_> {
         if rows.is_empty() {
             return Ok(());
         }
-        let (block_keys, fallback_rows) = self.split_rows_for_attr(attr, rows);
-        if block_keys.is_empty() {
+        let (block_coords, fallback_rows) = self.split_rows_for_attr(attr, rows);
+        if block_coords.is_empty() {
             return self.row_fallback.read_numeric_batch(attr, rows, out);
         }
 
-        let block_slices = self
-            .storage
-            .multi_get_column_blocks_pinned(&block_keys, true)?;
+        let block_slices = self.fetch_column_slices(attr, &block_coords)?;
         let mut block_views: HashMap<(SegmentId, u32), Option<ColumnBlockView<'_>>> =
-            HashMap::with_capacity(block_keys.len());
-        for (&(seg, _, block), opt_slice) in block_keys.iter().zip(block_slices.iter()) {
+            HashMap::with_capacity(block_coords.len());
+        for (&coord, opt_slice) in block_coords.iter().zip(block_slices.iter()) {
             let parsed = opt_slice
                 .as_ref()
                 .map(|s| ColumnBlockView::parse(s))
                 .transpose()?;
-            block_views.insert((seg, block), parsed);
+            block_views.insert(coord, parsed);
         }
 
         let mut fb_vals: Vec<Option<f64>> = Vec::new();

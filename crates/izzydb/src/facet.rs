@@ -11,7 +11,7 @@ use izzydb_core::error::{Result, TreeError};
 pub use izzydb_core::facet::*;
 use izzydb_core::filter::Filter;
 use izzydb_core::rowset::{Liveness, RowSet};
-use izzydb_core::schema::{AttributeType, CollectionSchema, ScalarValue};
+use izzydb_core::schema::{AttributeType, CollectionSchema, ColumnStorage, ScalarValue};
 use izzydb_storage::codec::{
     RowFieldRef, SegPostingView, attr_type_value_tag, decode_f64_ordered, decode_i64_ordered,
     decode_scalar_val_bytes, encode_present_attr_key, encode_scalar_val_bytes,
@@ -350,24 +350,47 @@ impl AttrAccs {
 
     fn load_global_counts(&mut self, env: &FacetEnv<'_>) -> Result<()> {
         for acc in &mut self.accs {
+            let is_detached = env
+                .schema
+                .get_by_id(acc.attr_id)
+                .is_some_and(|e| e.storage == ColumnStorage::Detached);
+            let col_gen = if is_detached {
+                crate::detached::current_detached_gen(env.storage, acc.attr_id)?
+            } else {
+                0
+            };
             if acc.need_values {
                 let sel = acc.sel.clone();
                 let values = &mut acc.values;
-                env.storage
-                    .visit_attr_counts(acc.attr_id, acc.type_tag, sel.start(), |val, c| {
-                        if sel.past_end(val) {
-                            return Ok(false);
-                        }
-                        if c > 0 {
-                            values.insert(val.to_vec(), c);
-                        }
-                        Ok(true)
-                    })?;
+                let cb = |val: &[u8], c: u64| -> Result<bool> {
+                    if sel.past_end(val) {
+                        return Ok(false);
+                    }
+                    if c > 0 {
+                        values.insert(val.to_vec(), c);
+                    }
+                    Ok(true)
+                };
+                if is_detached {
+                    env.storage.visit_detached_counts(
+                        acc.attr_id,
+                        col_gen,
+                        acc.type_tag,
+                        sel.start(),
+                        cb,
+                    )?;
+                } else {
+                    env.storage
+                        .visit_attr_counts(acc.attr_id, acc.type_tag, sel.start(), cb)?;
+                }
             }
             if acc.need_present {
-                acc.present = env
-                    .storage
-                    .get_attr_count(&encode_present_attr_key(acc.attr_id))?;
+                let key = encode_present_attr_key(acc.attr_id);
+                acc.present = if is_detached {
+                    env.storage.get_detached_count(col_gen, &key)?
+                } else {
+                    env.storage.get_attr_count(&key)?
+                };
             }
         }
         Ok(())
@@ -379,7 +402,7 @@ impl AttrAccs {
         if self.accs.is_empty() || sorted_rows.is_empty() {
             return Ok(());
         }
-        let col_reader = ColumnReader::new(env.storage, env.schema);
+        let col_reader = ColumnReader::new(env.storage, env.schema)?;
         let mut key_buf: Vec<u8> = Vec::with_capacity(32);
         let mut elems: Vec<Vec<u8>> = Vec::new();
         let mut need_row_store = vec![false; sorted_rows.len()];
@@ -387,13 +410,13 @@ impl AttrAccs {
 
         for (ai, acc) in self.accs.iter_mut().enumerate() {
             let mut col_rows: Vec<usize> = Vec::new();
-            let mut block_keys: Vec<(SegmentId, AttrId, u32)> = Vec::new();
+            let mut block_coords: Vec<(SegmentId, u32)> = Vec::new();
             for (ri, &row) in sorted_rows.iter().enumerate() {
                 if col_reader.segment_has_columns(row.seg(), acc.attr_id) {
                     col_rows.push(ri);
-                    let k = (row.seg(), acc.attr_id, row.block_idx());
-                    if block_keys.last().copied() != Some(k) {
-                        block_keys.push(k);
+                    let k = (row.seg(), row.block_idx());
+                    if block_coords.last().copied() != Some(k) {
+                        block_coords.push(k);
                     }
                 } else {
                     need_row_store[ri] = true;
@@ -403,12 +426,10 @@ impl AttrAccs {
             if col_rows.is_empty() {
                 continue;
             }
-            let block_slices = env
-                .storage
-                .multi_get_column_blocks_pinned(&block_keys, true)?;
+            let block_slices = col_reader.fetch_column_slices(acc.attr_id, &block_coords)?;
             let mut block_views: HashMap<(SegmentId, u32), Option<ColumnBlockView<'_>>> =
-                HashMap::with_capacity(block_keys.len());
-            for (&(seg, _, block), opt_slice) in block_keys.iter().zip(block_slices.iter()) {
+                HashMap::with_capacity(block_coords.len());
+            for (&(seg, block), opt_slice) in block_coords.iter().zip(block_slices.iter()) {
                 let parsed = opt_slice
                     .as_ref()
                     .map(|s| ColumnBlockView::parse(s))
@@ -530,47 +551,91 @@ impl AttrAccs {
         if self.accs.is_empty() || pop.is_empty() {
             return Ok(());
         }
+        let mut key_buf: Vec<u8> = Vec::with_capacity(32);
+        let mut elems: Vec<Vec<u8>> = Vec::new();
         for acc in &mut self.accs {
+            let is_detached = env
+                .schema
+                .get_by_id(acc.attr_id)
+                .is_some_and(|e| e.storage == ColumnStorage::Detached);
+            let col_gen = if is_detached {
+                crate::detached::current_detached_gen(env.storage, acc.attr_id)?
+            } else {
+                0
+            };
+
+            let mut ow_pop_by_seg: HashMap<SegmentId, RoaringBitmap> = HashMap::new();
+            let mut clean_pop_by_seg: HashMap<SegmentId, RoaringBitmap> = HashMap::new();
+            if is_detached {
+                for (seg, ow_bm) in env.storage.all_detached_overwritten(acc.attr_id, col_gen)? {
+                    if let Some(pop_bm) = pop.segment(seg) {
+                        let ow_in_pop = &ow_bm & pop_bm;
+                        if !ow_in_pop.is_empty() {
+                            clean_pop_by_seg.insert(seg, pop_bm - &ow_in_pop);
+                            ow_pop_by_seg.insert(seg, ow_in_pop);
+                        }
+                    }
+                }
+            }
+            let effective_mask = |seg: SegmentId| -> Option<&RoaringBitmap> {
+                if let Some(clean) = clean_pop_by_seg.get(&seg) {
+                    Some(clean)
+                } else {
+                    pop.segment(seg)
+                }
+            };
+
             if acc.need_present {
                 let key = encode_present_attr_key(acc.attr_id);
-                env.storage
-                    .visit_attr_postings_for_value(&key, |seg, bytes| {
-                        let Some(pop_bm) = pop.segment(seg) else {
-                            return Ok(());
-                        };
-                        acc.present += SegPostingView::parse(bytes)?.and_count(pop_bm)?;
-                        Ok(())
-                    })?;
+                if is_detached {
+                    env.storage.visit_detached_postings_for_value(
+                        acc.attr_id,
+                        col_gen,
+                        key[2],
+                        &key[3..],
+                        |seg, bytes| {
+                            let Some(mask) = effective_mask(seg) else {
+                                return Ok(());
+                            };
+                            acc.present += SegPostingView::parse(bytes)?.and_count(mask)?;
+                            Ok(())
+                        },
+                    )?;
+                } else {
+                    env.storage
+                        .visit_attr_postings_for_value(&key, |seg, bytes| {
+                            let Some(pop_bm) = pop.segment(seg) else {
+                                return Ok(());
+                            };
+                            acc.present += SegPostingView::parse(bytes)?.and_count(pop_bm)?;
+                            Ok(())
+                        })?;
+                }
             }
-            if !acc.need_values && acc.array_ranges.is_empty() {
-                continue;
-            }
-            for ar in &mut acc.array_ranges {
-                ar.scratch.clear();
-            }
-            let sel = acc.sel.clone();
-            let need_values = acc.need_values;
-            let AttrAcc {
-                values,
-                array_ranges,
-                attr_id,
-                type_tag,
-                ..
-            } = acc;
-            env.storage.visit_attr_postings_range(
-                *attr_id,
-                *type_tag,
-                sel.start(),
-                |val, seg, bytes| {
+
+            if acc.need_values || !acc.array_ranges.is_empty() {
+                for ar in &mut acc.array_ranges {
+                    ar.scratch.clear();
+                }
+                let sel = acc.sel.clone();
+                let need_values = acc.need_values;
+                let AttrAcc {
+                    values,
+                    array_ranges,
+                    attr_id,
+                    type_tag,
+                    ..
+                } = acc;
+                let visit_posting = |val: &[u8], seg: SegmentId, bytes: &[u8]| -> Result<bool> {
                     if sel.past_end(val) {
                         return Ok(false);
                     }
-                    let Some(pop_bm) = pop.segment(seg) else {
+                    let Some(mask) = effective_mask(seg) else {
                         return Ok(true);
                     };
                     let view = SegPostingView::parse(bytes)?;
                     if need_values {
-                        let c = view.and_count(pop_bm)?;
+                        let c = view.and_count(mask)?;
                         if c > 0 {
                             bump(values, val, c);
                         }
@@ -583,17 +648,112 @@ impl AttrAccs {
                                     .scratch
                                     .entry(seg)
                                     .or_insert_with(|| vec![RoaringBitmap::new(); n_buckets]);
-                                view.or_into_masked(pop_bm, &mut sb[b])?;
+                                view.or_into_masked(mask, &mut sb[b])?;
                             }
                         }
                     }
                     Ok(true)
-                },
-            )?;
-            for ar in &mut acc.array_ranges {
-                for seg_buckets in ar.scratch.values() {
-                    for (b, bm) in seg_buckets.iter().enumerate() {
-                        ar.counts[b] += bm.len();
+                };
+                if is_detached {
+                    env.storage.visit_detached_postings_range(
+                        *attr_id,
+                        col_gen,
+                        *type_tag,
+                        sel.start(),
+                        visit_posting,
+                    )?;
+                } else {
+                    env.storage.visit_attr_postings_range(
+                        *attr_id,
+                        *type_tag,
+                        sel.start(),
+                        visit_posting,
+                    )?;
+                }
+                for ar in &mut acc.array_ranges {
+                    for seg_buckets in ar.scratch.values() {
+                        for (b, bm) in seg_buckets.iter().enumerate() {
+                            ar.counts[b] += bm.len();
+                        }
+                    }
+                }
+            }
+
+            // Re-evaluate overwritten rows in `pop` directly from `cf_detached`.
+            if !ow_pop_by_seg.is_empty() {
+                let mut ow_keys: Vec<(AttrId, u32, SegmentId, u32)> = Vec::new();
+                let mut seg_blocks: Vec<(SegmentId, u32, Vec<u8>)> = Vec::new();
+                let mut seg_list: Vec<(SegmentId, RoaringBitmap)> = ow_pop_by_seg.into_iter().collect();
+                seg_list.sort_unstable_by_key(|(s, _)| *s);
+                for (seg, bm) in seg_list {
+                    for local in bm.iter() {
+                        let blk = local >> 8;
+                        let slot = (local & 0xFF) as u8;
+                        if let Some(last) = seg_blocks.last_mut()
+                            && last.0 == seg
+                            && last.1 == blk
+                        {
+                            last.2.push(slot);
+                        } else {
+                            seg_blocks.push((seg, blk, vec![slot]));
+                            ow_keys.push((acc.attr_id, col_gen, seg, blk));
+                        }
+                    }
+                }
+                let slices = env
+                    .storage
+                    .multi_get_detached_blocks_pinned(&ow_keys, true)?;
+                let is_array = acc.array_ranges.is_empty()
+                    && matches!(
+                        env.schema.get_by_id(acc.attr_id).map(|e| e.attr_type),
+                        Some(
+                            AttributeType::IntArray
+                                | AttributeType::UintArray
+                                | AttributeType::StringArray
+                        )
+                    );
+                let collect_elems = !acc.array_ranges.is_empty() || is_array;
+                for ((_, _, slots), opt_slice) in seg_blocks.iter().zip(slices.iter()) {
+                    let Some(slice) = opt_slice.as_ref() else {
+                        continue;
+                    };
+                    let view = ColumnBlockView::parse(slice)?;
+                    for &slot in slots {
+                        if !view.is_present(slot) {
+                            continue;
+                        }
+                        if acc.need_present {
+                            acc.present += 1;
+                        }
+                        if !acc.need_values && acc.array_ranges.is_empty() {
+                            continue;
+                        }
+                        if !collect_elems {
+                            if acc.need_values {
+                                view.for_each_encoded_value(slot, &mut key_buf, |enc| {
+                                    bump(&mut acc.values, enc, 1);
+                                })?;
+                            }
+                            continue;
+                        }
+                        elems.clear();
+                        view.for_each_encoded_value(slot, &mut key_buf, |enc| {
+                            elems.push(enc.to_vec());
+                        })?;
+                        for ar in &mut acc.array_ranges {
+                            for (b, r) in ar.ranges.iter().enumerate() {
+                                if elems.iter().any(|e| r.contains(e)) {
+                                    ar.counts[b] += 1;
+                                }
+                            }
+                        }
+                        if acc.need_values {
+                            elems.sort_unstable();
+                            elems.dedup();
+                            for e in &elems {
+                                bump(&mut acc.values, e, 1);
+                            }
+                        }
                     }
                 }
             }

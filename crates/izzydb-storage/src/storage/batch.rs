@@ -186,8 +186,16 @@ impl<'a> StorageBatch<'a> {
         self.put_cf(CF_DETACHED, key, bytes);
     }
 
+    pub fn delete_detached_block(&mut self, key: &[u8; 14]) {
+        self.delete_cf(CF_DETACHED, key);
+    }
+
     pub fn put_detached_posting(&mut self, key: &[u8], bytes: &[u8]) {
         self.put_cf(CF_DETACHED_POSTINGS, key, bytes);
+    }
+
+    pub fn delete_detached_posting(&mut self, key: &[u8]) {
+        self.delete_cf(CF_DETACHED_POSTINGS, key);
     }
 
     pub fn put_attr_count(&mut self, attr_key: &[u8], count: u64) {

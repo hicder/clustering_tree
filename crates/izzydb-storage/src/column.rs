@@ -134,6 +134,38 @@ impl ColumnBlockBuilder {
         }
     }
 
+    /// Overlay sparse `(slot, AttributeValue)` updates onto an optional existing [`ColumnBlockView`],
+    /// returning `Ok(None)` if the resulting block has zero present values (caller should delete key).
+    pub fn merge_block(
+        existing: Option<&ColumnBlockView<'_>>,
+        attr_type: AttributeType,
+        updates: &[(u8, AttributeValue)],
+    ) -> Result<Option<Vec<u8>>> {
+        let mut by_slot: [Option<&AttributeValue>; ROW_BLOCK_SIZE] = [None; ROW_BLOCK_SIZE];
+        for (slot, val) in updates {
+            by_slot[*slot as usize] = Some(val);
+        }
+        let mut builder = Self::new(attr_type);
+        for slot_idx in 0..ROW_BLOCK_SIZE {
+            let slot = slot_idx as u8;
+            if let Some(new_val) = by_slot[slot_idx] {
+                if !matches!(new_val, AttributeValue::Null) {
+                    builder.set_attr_value(slot, new_val)?;
+                }
+            } else if let Some(ev) = existing
+                && ev.is_present(slot)
+            {
+                let old_val = ev.decode_attr_value(slot)?;
+                builder.set_attr_value(slot, &old_val)?;
+            }
+        }
+        if builder.present_count() == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(builder.encode()))
+        }
+    }
+
     /// Set `slot` (`0..=255`) from an [`AttributeValue`].
     ///
     /// Note: variable-length builders (`String`, `*Array`) require slots to be inserted in

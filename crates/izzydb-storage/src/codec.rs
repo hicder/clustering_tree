@@ -193,6 +193,35 @@ pub fn detached_posting_key(
     key
 }
 
+/// Build `default[0x07]` key suffix (`attr_id BE || gen BE || tag || encoded_val`)
+/// given `attr_key` (`attr_id BE || tag || encoded_val`).
+#[inline]
+pub fn detached_count_suffix(col_gen: ColumnGen, attr_key: &[u8]) -> Vec<u8> {
+    debug_assert!(attr_key.len() >= 3);
+    let mut out = Vec::with_capacity(4 + attr_key.len());
+    out.extend_from_slice(&attr_key[0..2]);
+    out.extend_from_slice(&col_gen.to_be_bytes());
+    out.extend_from_slice(&attr_key[2..]);
+    out
+}
+
+/// 6-byte `(attr_id BE || gen BE)` prefix and exclusive upper bound for `DeleteRange` GC.
+#[inline]
+pub fn detached_gen_bounds(attr_id: AttrId, col_gen: ColumnGen) -> ([u8; 6], [u8; 6]) {
+    let mut lo = [0u8; 6];
+    lo[0..2].copy_from_slice(&attr_id.to_be_bytes());
+    lo[2..6].copy_from_slice(&col_gen.to_be_bytes());
+    let mut hi = lo;
+    for b in hi.iter_mut().rev() {
+        if *b < 0xFF {
+            *b += 1;
+            break;
+        }
+        *b = 0;
+    }
+    (lo, hi)
+}
+
 /// Split a `cf_detached_postings` key into `(prefix = attr || gen || tag || val, seg)`.
 #[inline]
 pub fn split_detached_posting_key(key: &[u8]) -> Result<(&[u8], SegmentId)> {

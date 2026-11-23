@@ -21,7 +21,7 @@ use izzydb_core::facet::{FacetSpec, FacetedSearchResponse};
 use izzydb_core::filter::Filter;
 use izzydb_core::rank::{NullsOrder, OrderBySpec, OrderedResult, SortDirection, validate_order_by};
 use izzydb_core::rowset::{Liveness, RowSet};
-use izzydb_core::schema::ScalarValue;
+use izzydb_core::schema::{ColumnStorage, ScalarValue};
 use izzydb_storage::SegmentTableSnapshot;
 use izzydb_storage::codec::{
     SegPostingView, decode_scalar_val_bytes, ordered_type_tag,
@@ -158,7 +158,7 @@ impl Collection {
         }
 
         if results.len() < top_k {
-            let reader = ColumnReader::new(&self.storage, &self.schema);
+            let reader = ColumnReader::new(&self.storage, &self.schema)?;
             self.stream_value_groups(primary, &pop, &mut |value, group_rows| {
                 let remaining = top_k - results.len();
                 if order_by.len() == 1 {
@@ -242,7 +242,7 @@ impl Collection {
         rows: &[RowId],
         limit: usize,
     ) -> Result<Vec<(DocId, Vec<ScalarValue>)>> {
-        let reader = ColumnReader::new(&self.storage, &self.schema);
+        let reader = ColumnReader::new(&self.storage, &self.schema)?;
         sort_rows_with_reader(&self.storage, &self.schema, &reader, order_by, rows, limit)
     }
 
@@ -299,39 +299,158 @@ impl Collection {
             f(value, group_rows)
         };
 
-        self.storage
-            .visit_attr_postings_prefix(entry.id, tag, reverse, |val_bytes, seg, posting| {
+        if entry.storage == ColumnStorage::Detached {
+            let col_gen = crate::detached::current_detached_gen(&self.storage, entry.id)?;
+            let (ow_live_by_seg, mut ow_true_vals) =
+                crate::detached::collect_overwritten_true_values(
+                    &self.storage,
+                    &snap,
+                    entry,
+                    col_gen,
+                )?;
+
+            let pop_allows_seg = |seg: SegmentId| -> bool {
                 if !snap.is_visible_segment(seg) {
-                    return Ok(true);
+                    return false;
                 }
-                let allowed_seg = match pop {
+                match pop {
                     OrderPopulation::RowSet(mask) => mask.segment(seg).is_some(),
                     OrderPopulation::Lazy { seed: Some(s), .. } => s.segment(seg).is_some(),
                     _ => true,
-                };
-                if !allowed_seg {
-                    return Ok(true);
                 }
+            };
 
-                if cur_val.as_deref() != Some(val_bytes) {
-                    if let Some(prev_val) = cur_val.take() {
-                        let keep_going =
-                            flush_group(&prev_val, std::mem::take(&mut cur_segs), &snap)?;
-                        if !keep_going {
+            let flush_ow_before = |target_val: Option<&[u8]>,
+                                   ow_true_vals: &mut BTreeMap<Vec<u8>, BTreeMap<SegmentId, RoaringBitmap>>,
+                                   flush_group: &mut dyn FnMut(&[u8], BTreeMap<SegmentId, RoaringBitmap>, &SegmentTableSnapshot) -> Result<bool>|
+             -> Result<bool> {
+                loop {
+                    let next_key = if reverse {
+                        ow_true_vals.keys().next_back().cloned()
+                    } else {
+                        ow_true_vals.keys().next().cloned()
+                    };
+                    let Some(k) = next_key else {
+                        return Ok(true);
+                    };
+                    let comes_before = match target_val {
+                        None => true,
+                        Some(tv) => {
+                            if reverse {
+                                k.as_slice() > tv
+                            } else {
+                                k.as_slice() < tv
+                            }
+                        }
+                    };
+                    if !comes_before {
+                        return Ok(true);
+                    }
+                    let segs = ow_true_vals.remove(&k).unwrap();
+                    if !flush_group(&k, segs, &snap)? {
+                        return Ok(false);
+                    }
+                }
+            };
+
+            self.storage.visit_detached_postings_prefix(
+                entry.id,
+                col_gen,
+                tag,
+                reverse,
+                |val_bytes, seg, posting| {
+                    if !pop_allows_seg(seg) {
+                        return Ok(true);
+                    }
+                    if cur_val.as_deref() != Some(val_bytes) {
+                        if let Some(prev_val) = cur_val.take() {
+                            if !flush_ow_before(Some(&prev_val), &mut ow_true_vals, &mut flush_group)? {
+                                stopped = true;
+                                return Ok(false);
+                            }
+                            let mut prev_segs = std::mem::take(&mut cur_segs);
+                            if let Some(extra) = ow_true_vals.remove(&prev_val) {
+                                for (eseg, ebm) in extra {
+                                    if pop_allows_seg(eseg) {
+                                        *prev_segs.entry(eseg).or_default() |= ebm;
+                                    }
+                                }
+                            }
+                            if !flush_group(&prev_val, prev_segs, &snap)? {
+                                stopped = true;
+                                return Ok(false);
+                            }
+                        }
+                        if !flush_ow_before(Some(val_bytes), &mut ow_true_vals, &mut flush_group)? {
                             stopped = true;
                             return Ok(false);
                         }
+                        cur_val = Some(val_bytes.to_vec());
                     }
-                    cur_val = Some(val_bytes.to_vec());
+                    let dst = cur_segs.entry(seg).or_default();
+                    SegPostingView::parse(posting)?.or_into(dst)?;
+                    if let Some(ow_bm) = ow_live_by_seg.get(&seg) {
+                        *dst -= ow_bm;
+                    }
+                    Ok(true)
+                },
+            )?;
+
+            if !stopped && let Some(last_val) = cur_val.take() {
+                if flush_ow_before(Some(&last_val), &mut ow_true_vals, &mut flush_group)? {
+                    let mut last_segs = std::mem::take(&mut cur_segs);
+                    if let Some(extra) = ow_true_vals.remove(&last_val) {
+                        for (eseg, ebm) in extra {
+                            if pop_allows_seg(eseg) {
+                                *last_segs.entry(eseg).or_default() |= ebm;
+                            }
+                        }
+                    }
+                    if !flush_group(&last_val, last_segs, &snap)? {
+                        stopped = true;
+                    }
+                } else {
+                    stopped = true;
                 }
+            }
+            if !stopped {
+                let _ = flush_ow_before(None, &mut ow_true_vals, &mut flush_group)?;
+            }
+        } else {
+            self.storage
+                .visit_attr_postings_prefix(entry.id, tag, reverse, |val_bytes, seg, posting| {
+                    if !snap.is_visible_segment(seg) {
+                        return Ok(true);
+                    }
+                    let allowed_seg = match pop {
+                        OrderPopulation::RowSet(mask) => mask.segment(seg).is_some(),
+                        OrderPopulation::Lazy { seed: Some(s), .. } => s.segment(seg).is_some(),
+                        _ => true,
+                    };
+                    if !allowed_seg {
+                        return Ok(true);
+                    }
 
-                let dst = cur_segs.entry(seg).or_default();
-                SegPostingView::parse(posting)?.or_into(dst)?;
-                Ok(true)
-            })?;
+                    if cur_val.as_deref() != Some(val_bytes) {
+                        if let Some(prev_val) = cur_val.take() {
+                            let keep_going =
+                                flush_group(&prev_val, std::mem::take(&mut cur_segs), &snap)?;
+                            if !keep_going {
+                                stopped = true;
+                                return Ok(false);
+                            }
+                        }
+                        cur_val = Some(val_bytes.to_vec());
+                    }
 
-        if !stopped && let Some(last_val) = cur_val.take() {
-            let _ = flush_group(&last_val, std::mem::take(&mut cur_segs), &snap)?;
+                    let dst = cur_segs.entry(seg).or_default();
+                    SegPostingView::parse(posting)?.or_into(dst)?;
+                    Ok(true)
+                })?;
+
+            if !stopped && let Some(last_val) = cur_val.take() {
+                let _ = flush_group(&last_val, std::mem::take(&mut cur_segs), &snap)?;
+            }
         }
         Ok(())
     }

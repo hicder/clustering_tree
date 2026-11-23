@@ -89,6 +89,7 @@ impl Default for MaintenanceOptions {
 pub struct MaintenanceStats {
     pub vacuum: Option<VacuumStats>,
     pub columns_built: usize,
+    pub detached_rebuilt: usize,
 }
 
 /// Summary of a child node passed during root creation, parent attachment, and redistribution.

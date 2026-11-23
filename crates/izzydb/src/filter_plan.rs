@@ -8,7 +8,7 @@ use izzydb_core::config::{AttrId, RowId, SegmentId, for_each_set_bit_256};
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::filter::{Filter, FtsPredicateKind, TokenQuery};
 use izzydb_core::rowset::{Liveness, RowSet};
-use izzydb_core::schema::{CollectionSchema, ColumnStorage, ScalarValue};
+use izzydb_core::schema::{CollectionSchema, ColumnStorage, ScalarValue, SchemaEntry};
 use izzydb_storage::codec::{
     RowView, SEG_FLAG_HAS_COLUMNS, SegPostingView, SegmentState, ZoneEntry, encode_f64_ordered,
     encode_i64_ordered, encode_present_attr_key, encode_scalar_attr_key, encode_str_ordered,
@@ -18,6 +18,10 @@ use izzydb_storage::column::ColumnBlockView;
 use izzydb_storage::{SegmentTableSnapshot, Storage, ZoneTable};
 
 use crate::columns::force_row_fallback_enabled;
+use crate::detached::{
+    apply_overwritten_correction_for_filter, block_slot_matches_any_encoded, current_detached_gen,
+    filter_mentions_detached, filter_rows_mixed_batch,
+};
 use crate::fts_index::FtsIndex;
 
 const DEFAULT_MIN_MATERIALIZE_LIMIT: u64 = 65_536;
@@ -182,6 +186,7 @@ pub(crate) fn materialize_lazy(
     seed: Option<&RowSet>,
 ) -> Result<RowSet> {
     let mut segs: Vec<(SegmentId, RoaringBitmap)> = Vec::new();
+    let has_detached = filter_mentions_detached(schema, residual);
     match seed {
         Some(seed_rs) => {
             let mut batch: Vec<RowId> = Vec::with_capacity(1024);
@@ -208,8 +213,10 @@ pub(crate) fn materialize_lazy(
                 if live_cand.is_empty() {
                     continue;
                 }
-                if let Some(bm) =
-                    try_eval_column_filter_segment(storage, schema, snap, seg, &live_cand, residual)?
+                if !has_detached
+                    && let Some(bm) = try_eval_column_filter_segment(
+                        storage, schema, snap, seg, &live_cand, residual,
+                    )?
                 {
                     if !bm.is_empty() {
                         segs.push((seg, bm));
@@ -228,20 +235,39 @@ pub(crate) fn materialize_lazy(
                             break;
                         }
                     }
-                    let slices = storage.multi_get_row_bytes_pinned(&batch)?;
-                    for (&row, opt_slice) in batch.iter().zip(slices.iter()) {
-                        let slice = opt_slice.as_ref().ok_or_else(|| {
-                            TreeError::InvariantViolation(format!("row {row:?} missing in cf_rows"))
-                        })?;
-                        let view = RowView::parse(slice)?;
-                        if view.matches_filter(
-                            schema,
-                            residual,
-                            &mut |kind, attr, query, last_as_prefix, val| {
-                                fts.matches_fts_attr(schema, kind, attr, query, last_as_prefix, val)
-                            },
-                        )? {
-                            bm.insert(row.local());
+                    if has_detached {
+                        let matched =
+                            filter_rows_mixed_batch(storage, schema, fts, residual, &batch)?;
+                        for (&row, ok) in batch.iter().zip(matched) {
+                            if ok {
+                                bm.insert(row.local());
+                            }
+                        }
+                    } else {
+                        let slices = storage.multi_get_row_bytes_pinned(&batch)?;
+                        for (&row, opt_slice) in batch.iter().zip(slices.iter()) {
+                            let slice = opt_slice.as_ref().ok_or_else(|| {
+                                TreeError::InvariantViolation(format!(
+                                    "row {row:?} missing in cf_rows"
+                                ))
+                            })?;
+                            let view = RowView::parse(slice)?;
+                            if view.matches_filter(
+                                schema,
+                                residual,
+                                &mut |kind, attr, query, last_as_prefix, val| {
+                                    fts.matches_fts_attr(
+                                        schema,
+                                        kind,
+                                        attr,
+                                        query,
+                                        last_as_prefix,
+                                        val,
+                                    )
+                                },
+                            )? {
+                                bm.insert(row.local());
+                            }
                         }
                     }
                 }
@@ -252,8 +278,10 @@ pub(crate) fn materialize_lazy(
             Ok(RowSet::from_sorted_segs(segs))
         }
         None => {
+            let mut batch: Vec<RowId> = Vec::with_capacity(1024);
             for seg in snap.visible_segments() {
-                if let Some(live_bm) = snap.live_bitmap(seg)
+                if !has_detached
+                    && let Some(live_bm) = snap.live_bitmap(seg)
                     && let Some(bm) = try_eval_column_filter_segment(
                         storage, schema, snap, seg, &live_bm, residual,
                     )?
@@ -265,22 +293,53 @@ pub(crate) fn materialize_lazy(
                 }
 
                 let mut bm = RoaringBitmap::new();
-                storage.visit_segment_rows(seg, |row, bytes| {
-                    if !snap.is_live(row) {
-                        return Ok(());
+                if has_detached {
+                    let Some(live_bm) = snap.live_bitmap(seg) else {
+                        continue;
+                    };
+                    let mut cursor = live_bm.iter().peekable();
+                    while cursor.peek().is_some() {
+                        batch.clear();
+                        for _ in 0..1024 {
+                            if let Some(local) = cursor.next() {
+                                batch.push(RowId::new(seg, local));
+                            } else {
+                                break;
+                            }
+                        }
+                        let matched =
+                            filter_rows_mixed_batch(storage, schema, fts, residual, &batch)?;
+                        for (&row, ok) in batch.iter().zip(matched) {
+                            if ok {
+                                bm.insert(row.local());
+                            }
+                        }
                     }
-                    let view = RowView::parse(bytes)?;
-                    if view.matches_filter(
-                        schema,
-                        residual,
-                        &mut |kind, attr, query, last_as_prefix, val| {
-                            fts.matches_fts_attr(schema, kind, attr, query, last_as_prefix, val)
-                        },
-                    )? {
-                        bm.insert(row.local());
-                    }
-                    Ok(())
-                })?;
+                } else {
+                    storage.visit_segment_rows(seg, |row, bytes| {
+                        if !snap.is_live(row) {
+                            return Ok(());
+                        }
+                        let view = RowView::parse(bytes)?;
+                        if view.matches_filter(
+                            schema,
+                            residual,
+                            &mut |kind, attr, query, last_as_prefix, val| {
+                                fts.matches_fts_attr(
+                                    schema,
+                                    kind,
+                                    attr,
+                                    query,
+                                    last_as_prefix,
+                                    val,
+                                )
+                            },
+                        )? {
+                            bm.insert(row.local());
+                        }
+                        Ok(())
+                    })?;
+                }
                 if !bm.is_empty() {
                     segs.push((seg, bm));
                 }
@@ -673,7 +732,8 @@ fn estimate_node(ctx: &PlanCtx<'_>, node: &CompiledNode) -> Result<u64> {
                 TreeError::InvalidFilter(format!("unknown attribute '{attr}'"))
             })?;
             let key = encode_scalar_attr_key(entry.id, val)?;
-            Ok(ctx.storage.get_attr_count(&key)?.min(ctx.live_rows))
+            let cnt = get_attr_or_detached_count(ctx.storage, entry, &key)?;
+            Ok(cnt.min(ctx.live_rows))
         }
         CompiledNode::In { attr, vals, .. } | CompiledNode::ContainsAny { attr, vals, .. } => {
             let entry = ctx.schema.get_by_name(attr).ok_or_else(|| {
@@ -695,12 +755,14 @@ fn estimate_node(ctx: &PlanCtx<'_>, node: &CompiledNode) -> Result<u64> {
             seen_keys.sort_unstable();
             seen_keys.dedup();
             for key in seen_keys {
-                sum = sum.saturating_add(ctx.storage.get_attr_count(&key)?);
+                sum = sum.saturating_add(get_attr_or_detached_count(ctx.storage, entry, &key)?);
             }
             if has_null {
-                let present = ctx
-                    .storage
-                    .get_attr_count(&encode_present_attr_key(entry.id))?;
+                let present = get_attr_or_detached_count(
+                    ctx.storage,
+                    entry,
+                    &encode_present_attr_key(entry.id),
+                )?;
                 sum = sum.saturating_add(ctx.live_rows.saturating_sub(present));
             }
             Ok(sum.min(ctx.live_rows))
@@ -709,21 +771,28 @@ fn estimate_node(ctx: &PlanCtx<'_>, node: &CompiledNode) -> Result<u64> {
             let entry = ctx.schema.get_by_name(attr).ok_or_else(|| {
                 TreeError::InvalidFilter(format!("unknown attribute '{attr}'"))
             })?;
-            let present = ctx
-                .storage
-                .get_attr_count(&encode_present_attr_key(entry.id))?;
+            let present = get_attr_or_detached_count(
+                ctx.storage,
+                entry,
+                &encode_present_attr_key(entry.id),
+            )?;
             Ok(present.min(ctx.live_rows))
         }
         CompiledNode::IsNull { attr, .. } => {
             let entry = ctx.schema.get_by_name(attr).ok_or_else(|| {
                 TreeError::InvalidFilter(format!("unknown attribute '{attr}'"))
             })?;
-            let present = ctx
-                .storage
-                .get_attr_count(&encode_present_attr_key(entry.id))?;
+            let present = get_attr_or_detached_count(
+                ctx.storage,
+                entry,
+                &encode_present_attr_key(entry.id),
+            )?;
             Ok(ctx.live_rows.saturating_sub(present))
         }
         CompiledNode::Range { attr, lo, hi, .. } => {
+            let entry = ctx.schema.get_by_name(attr).ok_or_else(|| {
+                TreeError::InvalidFilter(format!("unknown attribute '{attr}'"))
+            })?;
             let (attr_id, tag, lo_bytes, hi_bytes) =
                 encode_range_bounds(ctx.schema, attr, lo.as_ref(), hi.as_ref())?;
             if range_is_empty(lo_bytes.as_ref(), hi_bytes.as_ref()) {
@@ -732,23 +801,28 @@ fn estimate_node(ctx: &PlanCtx<'_>, node: &CompiledNode) -> Result<u64> {
             let start = lo_bytes.as_ref().map_or(&[][..], |(b, _)| b.as_slice());
             let mut sum = 0u64;
             let cap = ctx.materialize_limit.saturating_add(1);
-            ctx.storage
-                .visit_attr_counts(attr_id, tag, start, |val_bytes, cnt| {
-                    if let Some((ref lo_b, incl)) = lo_bytes
-                        && (val_bytes < lo_b.as_slice()
-                            || (!incl && val_bytes == lo_b.as_slice()))
-                    {
-                        return Ok(true);
-                    }
-                    if let Some((ref hi_b, incl)) = hi_bytes
-                        && (val_bytes > hi_b.as_slice()
-                            || (!incl && val_bytes == hi_b.as_slice()))
-                    {
-                        return Ok(false);
-                    }
-                    sum = sum.saturating_add(cnt);
-                    Ok(sum < cap)
-                })?;
+            let visit_cb = |val_bytes: &[u8], cnt: u64| -> Result<bool> {
+                if let Some((ref lo_b, incl)) = lo_bytes
+                    && (val_bytes < lo_b.as_slice() || (!incl && val_bytes == lo_b.as_slice()))
+                {
+                    return Ok(true);
+                }
+                if let Some((ref hi_b, incl)) = hi_bytes
+                    && (val_bytes > hi_b.as_slice() || (!incl && val_bytes == hi_b.as_slice()))
+                {
+                    return Ok(false);
+                }
+                sum = sum.saturating_add(cnt);
+                Ok(sum < cap)
+            };
+            if entry.storage == ColumnStorage::Detached {
+                let col_gen = current_detached_gen(ctx.storage, attr_id)?;
+                ctx.storage
+                    .visit_detached_counts(attr_id, col_gen, tag, start, visit_cb)?;
+            } else {
+                ctx.storage
+                    .visit_attr_counts(attr_id, tag, start, visit_cb)?;
+            }
             Ok(sum.min(ctx.live_rows))
         }
         CompiledNode::And(children, _) => {
@@ -799,7 +873,7 @@ fn eval_plan(ctx: &mut PlanCtx<'_>, node: &CompiledNode) -> Result<(FilterPlan, 
             }
             let entry = ctx.schema.get_by_name(attr).unwrap();
             let attr_key = encode_scalar_attr_key(entry.id, val)?;
-            let rs = load_postings_for_key(ctx.storage, ctx.snap, &attr_key)?;
+            let rs = load_postings_for_keys(ctx.storage, ctx.snap, entry, &[attr_key])?;
             let actual = rs.len();
             if actual == 0 {
                 Ok((FilterPlan::Empty, 0))
@@ -822,7 +896,6 @@ fn eval_plan(ctx: &mut PlanCtx<'_>, node: &CompiledNode) -> Result<(FilterPlan, 
                 ));
             }
             let entry = ctx.schema.get_by_name(attr).unwrap();
-            let mut by_seg: BTreeMap<SegmentId, RoaringBitmap> = BTreeMap::new();
             let mut has_null = false;
             let mut keys: Vec<Vec<u8>> = Vec::with_capacity(vals.len());
             for v in vals {
@@ -837,15 +910,13 @@ fn eval_plan(ctx: &mut PlanCtx<'_>, node: &CompiledNode) -> Result<(FilterPlan, 
             }
             keys.sort_unstable();
             keys.dedup();
-            for key in keys {
-                merge_postings_for_key(ctx.storage, ctx.snap, &key, &mut by_seg)?;
-            }
-            let mut rs = finalize_seg_map(ctx.snap, by_seg);
+            let mut rs = load_postings_for_keys(ctx.storage, ctx.snap, entry, &keys)?;
             if has_null {
-                let present = load_postings_for_key(
+                let present = load_postings_for_keys(
                     ctx.storage,
                     ctx.snap,
-                    &encode_present_attr_key(entry.id),
+                    entry,
+                    &[encode_present_attr_key(entry.id)],
                 )?;
                 let null_rows = RowSet::from_all_live(ctx.snap).and_not(&present);
                 rs = rs.or(&null_rows);
@@ -872,10 +943,11 @@ fn eval_plan(ctx: &mut PlanCtx<'_>, node: &CompiledNode) -> Result<(FilterPlan, 
                 ));
             }
             let entry = ctx.schema.get_by_name(attr).unwrap();
-            let rs = load_postings_for_key(
+            let rs = load_postings_for_keys(
                 ctx.storage,
                 ctx.snap,
-                &encode_present_attr_key(entry.id),
+                entry,
+                &[encode_present_attr_key(entry.id)],
             )?;
             let actual = rs.len();
             if actual == 0 {
@@ -899,10 +971,11 @@ fn eval_plan(ctx: &mut PlanCtx<'_>, node: &CompiledNode) -> Result<(FilterPlan, 
                 ));
             }
             let entry = ctx.schema.get_by_name(attr).unwrap();
-            let present = load_postings_for_key(
+            let present = load_postings_for_keys(
                 ctx.storage,
                 ctx.snap,
-                &encode_present_attr_key(entry.id),
+                entry,
+                &[encode_present_attr_key(entry.id)],
             )?;
             let rs = RowSet::from_all_live(ctx.snap).and_not(&present);
             let actual = rs.len();
@@ -926,12 +999,13 @@ fn eval_plan(ctx: &mut PlanCtx<'_>, node: &CompiledNode) -> Result<(FilterPlan, 
                     est,
                 ));
             }
+            let entry = ctx.schema.get_by_name(attr).unwrap();
             let (attr_id, tag, lo_bytes, hi_bytes) =
                 encode_range_bounds(ctx.schema, attr, lo.as_ref(), hi.as_ref())?;
             if range_is_empty(lo_bytes.as_ref(), hi_bytes.as_ref()) {
                 return Ok((FilterPlan::Empty, 0));
             }
-            let rs = load_postings_range(ctx, attr_id, tag, lo_bytes.as_ref(), hi_bytes.as_ref())?;
+            let rs = load_postings_range(ctx, entry, attr_id, tag, lo_bytes.as_ref(), hi_bytes.as_ref())?;
             let actual = rs.len();
             if actual == 0 {
                 Ok((FilterPlan::Empty, 0))
@@ -1133,14 +1207,78 @@ fn eval_plan(ctx: &mut PlanCtx<'_>, node: &CompiledNode) -> Result<(FilterPlan, 
     }
 }
 
-fn load_postings_for_key(
+#[inline]
+fn get_attr_or_detached_count(
+    storage: &Storage,
+    entry: &SchemaEntry,
+    attr_key: &[u8],
+) -> Result<u64> {
+    if entry.storage == ColumnStorage::Detached {
+        let col_gen = current_detached_gen(storage, entry.id)?;
+        storage.get_detached_count(col_gen, attr_key)
+    } else {
+        storage.get_attr_count(attr_key)
+    }
+}
+
+fn load_postings_for_keys(
     storage: &Storage,
     snap: &SegmentTableSnapshot,
-    attr_key: &[u8],
+    entry: &SchemaEntry,
+    attr_keys: &[Vec<u8>],
 ) -> Result<RowSet> {
     let mut by_seg: BTreeMap<SegmentId, RoaringBitmap> = BTreeMap::new();
-    merge_postings_for_key(storage, snap, attr_key, &mut by_seg)?;
-    Ok(finalize_seg_map(snap, by_seg))
+    if entry.storage == ColumnStorage::Detached {
+        if attr_keys.is_empty() {
+            return Ok(RowSet::empty());
+        }
+        let col_gen = current_detached_gen(storage, entry.id)?;
+        let is_present_only = attr_keys.iter().any(|k| k.len() == 3);
+        let mut enc_targets: Vec<Vec<u8>> = if is_present_only {
+            Vec::new()
+        } else {
+            attr_keys.iter().map(|k| k[3..].to_vec()).collect()
+        };
+        enc_targets.sort_unstable();
+        enc_targets.dedup();
+        for key in attr_keys {
+            let tag = key[2];
+            storage.visit_detached_postings_for_value(
+                entry.id,
+                col_gen,
+                tag,
+                &key[3..],
+                |seg, bytes| {
+                    if !snap.is_visible_segment(seg) {
+                        return Ok(());
+                    }
+                    let dst = by_seg.entry(seg).or_default();
+                    SegPostingView::parse(bytes)?.or_into(dst)?;
+                    Ok(())
+                },
+            )?;
+        }
+        apply_overwritten_correction_for_filter(
+            storage,
+            snap,
+            entry,
+            col_gen,
+            &mut by_seg,
+            |view, slot| {
+                if is_present_only {
+                    Ok(true)
+                } else {
+                    block_slot_matches_any_encoded(view, slot, &enc_targets)
+                }
+            },
+        )?;
+        Ok(finalize_seg_map(snap, by_seg))
+    } else {
+        for key in attr_keys {
+            merge_postings_for_key(storage, snap, key, &mut by_seg)?;
+        }
+        Ok(finalize_seg_map(snap, by_seg))
+    }
 }
 
 fn merge_postings_for_key(
@@ -1237,6 +1375,7 @@ fn zone_overlaps(
 
 fn load_postings_range(
     ctx: &mut PlanCtx<'_>,
+    entry: &SchemaEntry,
     attr_id: AttrId,
     tag: u8,
     lo: Option<&(Vec<u8>, bool)>,
@@ -1263,26 +1402,82 @@ fn load_postings_range(
     let mut by_seg: BTreeMap<SegmentId, RoaringBitmap> = BTreeMap::new();
     let mut visited_segs = RoaringBitmap::new();
 
-    ctx.storage
-        .visit_attr_postings_range(attr_id, tag, start_val, |val_bytes, seg, bytes| {
-            if let Some((lo_b, lo_incl)) = lo
-                && (val_bytes < lo_b.as_slice() || (!*lo_incl && val_bytes == lo_b.as_slice()))
-            {
-                return Ok(true);
-            }
-            if let Some((hi_b, hi_incl)) = hi
-                && (val_bytes > hi_b.as_slice() || (!*hi_incl && val_bytes == hi_b.as_slice()))
-            {
-                return Ok(false);
-            }
-            if !eligible_segs.contains(seg) {
-                return Ok(true);
-            }
-            visited_segs.insert(seg);
-            let dst = by_seg.entry(seg).or_default();
-            SegPostingView::parse(bytes)?.or_into(dst)?;
-            Ok(true)
-        })?;
+    if entry.storage == ColumnStorage::Detached {
+        let col_gen = current_detached_gen(ctx.storage, attr_id)?;
+        ctx.storage.visit_detached_postings_range(
+            attr_id,
+            col_gen,
+            tag,
+            start_val,
+            |val_bytes, seg, bytes| {
+                if let Some((lo_b, lo_incl)) = lo
+                    && (val_bytes < lo_b.as_slice()
+                        || (!*lo_incl && val_bytes == lo_b.as_slice()))
+                {
+                    return Ok(true);
+                }
+                if let Some((hi_b, hi_incl)) = hi
+                    && (val_bytes > hi_b.as_slice()
+                        || (!*hi_incl && val_bytes == hi_b.as_slice()))
+                {
+                    return Ok(false);
+                }
+                if !eligible_segs.contains(seg) {
+                    return Ok(true);
+                }
+                visited_segs.insert(seg);
+                let dst = by_seg.entry(seg).or_default();
+                SegPostingView::parse(bytes)?.or_into(dst)?;
+                Ok(true)
+            },
+        )?;
+        let mut buf = Vec::new();
+        apply_overwritten_correction_for_filter(
+            ctx.storage,
+            ctx.snap,
+            entry,
+            col_gen,
+            &mut by_seg,
+            |view, slot| {
+                let mut matched = false;
+                view.for_each_encoded_value(slot, &mut buf, |val_bytes| {
+                    let ok_lo = lo.is_none_or(|(lo_b, incl)| {
+                        val_bytes > lo_b.as_slice() || (*incl && val_bytes == lo_b.as_slice())
+                    });
+                    let ok_hi = hi.is_none_or(|(hi_b, incl)| {
+                        val_bytes < hi_b.as_slice() || (*incl && val_bytes == hi_b.as_slice())
+                    });
+                    if ok_lo && ok_hi {
+                        matched = true;
+                    }
+                })?;
+                Ok(matched)
+            },
+        )?;
+    } else {
+        ctx.storage
+            .visit_attr_postings_range(attr_id, tag, start_val, |val_bytes, seg, bytes| {
+                if let Some((lo_b, lo_incl)) = lo
+                    && (val_bytes < lo_b.as_slice()
+                        || (!*lo_incl && val_bytes == lo_b.as_slice()))
+                {
+                    return Ok(true);
+                }
+                if let Some((hi_b, hi_incl)) = hi
+                    && (val_bytes > hi_b.as_slice()
+                        || (!*hi_incl && val_bytes == hi_b.as_slice()))
+                {
+                    return Ok(false);
+                }
+                if !eligible_segs.contains(seg) {
+                    return Ok(true);
+                }
+                visited_segs.insert(seg);
+                let dst = by_seg.entry(seg).or_default();
+                SegPostingView::parse(bytes)?.or_into(dst)?;
+                Ok(true)
+            })?;
+    }
 
     ctx.trace.range_segments_visited += visited_segs.len() as usize;
     Ok(finalize_seg_map(ctx.snap, by_seg))

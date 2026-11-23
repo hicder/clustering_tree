@@ -18,7 +18,7 @@ use izzydb_core::error::Result;
 use izzydb_core::filter::Filter;
 use izzydb_core::rank::{DecayMode, OrderBySpec, RankBy, eval_decay, eval_saturate};
 use izzydb_core::rowset::RowSet;
-use izzydb_core::schema::{AttributeType, CollectionSchema, ScalarValue};
+use izzydb_core::schema::{AttributeType, CollectionSchema, ColumnStorage, ScalarValue};
 use izzydb_core::simd::{batch_eval_decay, batch_eval_saturate};
 use izzydb_fts::{Bm25Result, RankModifier};
 use izzydb_storage::SegmentTableSnapshot;
@@ -138,7 +138,7 @@ impl Node {
                     0.0
                 }
             }
-            Node::Attr { id, missing } => match ctx.view.get_numeric_f64(*id)? {
+            Node::Attr { id, missing } => match ctx.get_numeric_f64(*id)? {
                 Some(v) => clamp_f32(v),
                 None => *missing,
             },
@@ -147,7 +147,7 @@ impl Node {
                 midpoint,
                 exponent,
                 missing,
-            } => match ctx.view.get_numeric_f64(*id)? {
+            } => match ctx.get_numeric_f64(*id)? {
                 Some(v) => eval_saturate(v, *midpoint, *exponent),
                 None => *missing,
             },
@@ -158,7 +158,7 @@ impl Node {
                 exponent,
                 mode,
                 missing,
-            } => match ctx.view.get_numeric_f64(*id)? {
+            } => match ctx.get_numeric_f64(*id)? {
                 Some(v) => eval_decay(v, *origin, *midpoint, *exponent, *mode),
                 None => *missing,
             },
@@ -389,6 +389,15 @@ impl<'c, 'b> RowCtx<'c, 'b> {
     }
 
     pub(crate) fn filter_matches(&self, f: &Filter) -> Result<bool> {
+        if crate::detached::filter_mentions_detached(&self.coll.schema, f) {
+            return Ok(crate::detached::filter_rows_mixed_batch(
+                &self.coll.storage,
+                &self.coll.schema,
+                &self.coll.fts_index,
+                f,
+                &[self.row_id],
+            )?[0]);
+        }
         self.view.matches_filter(
             &self.coll.schema,
             f,
@@ -403,6 +412,29 @@ impl<'c, 'b> RowCtx<'c, 'b> {
                 )
             },
         )
+    }
+
+    pub(crate) fn get_numeric_f64(&self, id: AttrId) -> Result<Option<f64>> {
+        if self
+            .coll
+            .schema
+            .get_by_id(id)
+            .is_some_and(|e| e.storage == ColumnStorage::Detached)
+        {
+            let col_gen = crate::detached::current_detached_gen(&self.coll.storage, id)?;
+            let Some(slice) = self.coll.storage.get_detached_block_pinned(
+                id,
+                col_gen,
+                self.row_id.seg(),
+                self.row_id.block_idx(),
+            )?
+            else {
+                return Ok(None);
+            };
+            let blk = ColumnBlockView::parse(&slice)?;
+            return Ok(blk.get_numeric_f64(self.row_id.slot()));
+        }
+        self.view.get_numeric_f64(id)
     }
 }
 
@@ -590,7 +622,13 @@ impl Collection {
             return Ok(None);
         }
         let tag = ordered_type_tag(entry.attr_type)?;
-        let Some(vbytes) = self.storage.max_attr_count_key(attr_id, tag)? else {
+        let vbytes_opt = if entry.storage == ColumnStorage::Detached {
+            let col_gen = crate::detached::current_detached_gen(&self.storage, attr_id)?;
+            self.storage.max_detached_count_key(attr_id, col_gen, tag)?
+        } else {
+            self.storage.max_attr_count_key(attr_id, tag)?
+        };
+        let Some(vbytes) = vbytes_opt else {
             return Ok(Some(0.0));
         };
         let v = match decode_scalar_val_bytes(tag, &vbytes)? {
@@ -941,7 +979,7 @@ impl Collection {
         if rowset.is_empty() {
             return Ok(());
         }
-        let col_reader = ColumnReader::new(&self.storage, &self.schema);
+        let col_reader = ColumnReader::new(&self.storage, &self.schema)?;
         let row_reader = RowStoreReader::new(&self.storage);
         let mut lex_scores = vec![0.0f32; lex_maps.len()];
         let mut batch: Vec<RowId> = Vec::with_capacity(SCAN_BATCH);
@@ -1111,11 +1149,25 @@ impl Collection {
                 by_block.push((blk, m));
             }
         }
-        let keys: Vec<(SegmentId, AttrId, u32)> = by_block
-            .iter()
-            .map(|&(blk, _)| (seg, attr_id, blk))
-            .collect();
-        let slices = self.storage.multi_get_column_blocks_pinned(&keys, true)?;
+        let slices = if self
+            .schema
+            .get_by_id(attr_id)
+            .is_some_and(|e| e.storage == ColumnStorage::Detached)
+        {
+            let col_gen = crate::detached::current_detached_gen(&self.storage, attr_id)?;
+            let det_keys: Vec<(AttrId, izzydb_core::config::ColumnGen, SegmentId, u32)> = by_block
+                .iter()
+                .map(|&(blk, _)| (attr_id, col_gen, seg, blk))
+                .collect();
+            self.storage
+                .multi_get_detached_blocks_pinned(&det_keys, true)?
+        } else {
+            let keys: Vec<(SegmentId, AttrId, u32)> = by_block
+                .iter()
+                .map(|&(blk, _)| (seg, attr_id, blk))
+                .collect();
+            self.storage.multi_get_column_blocks_pinned(&keys, true)?
+        };
 
         let mut f64_buf = [0.0f64; ROW_BLOCK_SIZE];
         let mut out_scores = [0.0f32; ROW_BLOCK_SIZE];

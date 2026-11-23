@@ -5,20 +5,25 @@ use roaring::RoaringBitmap;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
 
 use izzydb_core::config::{
-    AttrId, DocId, LocalId, NodeId, ROW_BLOCK_SIZE, RowBlock, RowId, SegmentId, SkipChunk, TermId,
+    AttrId, ColumnGen, DocId, LocalId, NodeId, ROW_BLOCK_SIZE, RowBlock, RowId, SegmentId,
+    SkipChunk, TermId,
 };
 use izzydb_core::error::{Result, TreeError};
 
 use crate::codec::{
-    ATTR_COUNT_TAG, Manifest, SegPosting, SegmentMeta, SegmentState, ZoneEntry, column_key,
-    encode_fts_term_id_prefix, encode_roaring_bitmap, fts_chunk_key_coord, split_posting_key_parts,
+    ATTR_COUNT_TAG, DETACHED_COUNT_TAG, DETACHED_OVERWRITTEN_TAG, DetachedMeta, Manifest,
+    SegPosting, SegmentMeta, SegmentState, ZoneEntry, column_key, detached_count_suffix,
+    detached_gen_bounds, detached_key, encode_fts_term_id_prefix, encode_roaring_bitmap,
+    fts_chunk_key_coord, split_posting_key_parts,
 };
 use crate::node::{AnnMeta, PackedInternalNode, PackedLeafNode, decode_f32_into};
 
 use super::batch::StorageBatch;
 use super::segments::SegmentEntry;
 use super::types::map_db_err;
-use super::{CF_ATTR_POSTINGS, CF_FTS_SKIPS, Storage};
+use super::{
+    CF_ATTR_POSTINGS, CF_DETACHED, CF_DETACHED_POSTINGS, CF_FTS_SKIPS, Storage,
+};
 
 /// Read-your-own-writes transaction overlay across segment store, id map, ANN tree,
 /// attribute postings, zones, counts, and FTS indexes.
@@ -43,6 +48,7 @@ pub struct TxContext<'a> {
     dirty_dropped_segments: Option<RoaringBitmap>,
     dirty_postings: BTreeMap<Vec<u8>, RoaringBitmap>,
     dirty_zone: BTreeMap<(SegmentId, AttrId, u8), ZoneEntry>,
+    dirty_zone_deletes: HashSet<(SegmentId, AttrId, u8)>,
     dirty_attr_count_deltas: BTreeMap<Vec<u8>, i64>,
     fts_meta_bytes: Option<Vec<u8>>,
     fts_meta_dirty: bool,
@@ -52,6 +58,12 @@ pub struct TxContext<'a> {
     dirty_fts_positions: BTreeMap<(TermId, RowBlock), Option<Vec<u8>>>,
     dirty_fts_doc_lens: BTreeMap<(AttrId, RowBlock), Option<Vec<u8>>>,
     dirty_columns: BTreeMap<[u8; 10], Vec<u8>>,
+    dirty_detached_meta: BTreeMap<AttrId, DetachedMeta>,
+    dirty_detached_blocks: BTreeMap<(AttrId, ColumnGen, SegmentId, u32), Option<Vec<u8>>>,
+    dirty_detached_postings: BTreeMap<Vec<u8>, RoaringBitmap>,
+    dirty_detached_count_deltas: BTreeMap<Vec<u8>, i64>,
+    dirty_detached_overwritten: BTreeMap<(AttrId, ColumnGen, SegmentId), RoaringBitmap>,
+    retire_detached_gens: Vec<(AttrId, ColumnGen)>,
 }
 
 impl<'a> TxContext<'a> {
@@ -83,6 +95,7 @@ impl<'a> TxContext<'a> {
             dirty_dropped_segments: None,
             dirty_postings: BTreeMap::new(),
             dirty_zone: BTreeMap::new(),
+            dirty_zone_deletes: HashSet::new(),
             dirty_attr_count_deltas: BTreeMap::new(),
             fts_meta_bytes: None,
             fts_meta_dirty: false,
@@ -92,6 +105,12 @@ impl<'a> TxContext<'a> {
             dirty_fts_positions: BTreeMap::new(),
             dirty_fts_doc_lens: BTreeMap::new(),
             dirty_columns: BTreeMap::new(),
+            dirty_detached_meta: BTreeMap::new(),
+            dirty_detached_blocks: BTreeMap::new(),
+            dirty_detached_postings: BTreeMap::new(),
+            dirty_detached_count_deltas: BTreeMap::new(),
+            dirty_detached_overwritten: BTreeMap::new(),
+            retire_detached_gens: Vec::new(),
         }
     }
 
@@ -668,6 +687,98 @@ impl<'a> TxContext<'a> {
     // Commit
     // -----------------------------------------------------------------------
 
+    pub fn delete_zone_entry(&mut self, seg: SegmentId, attr_id: AttrId, tag: u8) {
+        self.dirty_zone.remove(&(seg, attr_id, tag));
+        self.dirty_zone_deletes.insert((seg, attr_id, tag));
+    }
+
+    pub fn set_zone_entry(&mut self, seg: SegmentId, attr_id: AttrId, tag: u8, entry: ZoneEntry) {
+        self.dirty_zone_deletes.remove(&(seg, attr_id, tag));
+        self.dirty_zone.insert((seg, attr_id, tag), entry);
+    }
+
+    pub fn get_detached_meta(&self, attr_id: AttrId) -> Result<DetachedMeta> {
+        if let Some(m) = self.dirty_detached_meta.get(&attr_id) {
+            return Ok(m.clone());
+        }
+        Ok(self.storage.get_detached_meta(attr_id)?.unwrap_or_default())
+    }
+
+    pub fn put_detached_meta(&mut self, attr_id: AttrId, meta: DetachedMeta) {
+        self.dirty_detached_meta.insert(attr_id, meta);
+    }
+
+    pub fn get_detached_block_bytes(
+        &self,
+        attr_id: AttrId,
+        col_gen: ColumnGen,
+        seg: SegmentId,
+        block: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        let key = (attr_id, col_gen, seg, block);
+        if let Some(opt) = self.dirty_detached_blocks.get(&key) {
+            return Ok(opt.clone());
+        }
+        Ok(self
+            .storage
+            .get_detached_block_pinned(attr_id, col_gen, seg, block)?
+            .map(|s| s.to_vec()))
+    }
+
+    pub fn put_detached_block_bytes(
+        &mut self,
+        attr_id: AttrId,
+        col_gen: ColumnGen,
+        seg: SegmentId,
+        block: u32,
+        bytes: Option<Vec<u8>>,
+    ) {
+        self.dirty_detached_blocks
+            .insert((attr_id, col_gen, seg, block), bytes);
+    }
+
+    pub fn add_detached_posting(&mut self, key: Vec<u8>, local: LocalId) {
+        self.dirty_detached_postings
+            .entry(key)
+            .or_default()
+            .insert(local);
+    }
+
+    pub fn adjust_detached_count(&mut self, col_gen: ColumnGen, attr_key: &[u8], delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        let suffix = detached_count_suffix(col_gen, attr_key);
+        let entry = self.dirty_detached_count_deltas.entry(suffix).or_insert(0);
+        *entry += delta;
+    }
+
+    pub fn record_detached_overwritten(
+        &mut self,
+        attr_id: AttrId,
+        col_gen: ColumnGen,
+        seg: SegmentId,
+        local: LocalId,
+    ) -> Result<()> {
+        let key = (attr_id, col_gen, seg);
+        if !self.dirty_detached_overwritten.contains_key(&key) {
+            let existing = self
+                .storage
+                .get_detached_overwritten(attr_id, col_gen, seg)?
+                .unwrap_or_default();
+            self.dirty_detached_overwritten.insert(key, existing);
+        }
+        self.dirty_detached_overwritten
+            .get_mut(&key)
+            .unwrap()
+            .insert(local);
+        Ok(())
+    }
+
+    pub fn retire_detached_gen(&mut self, attr_id: AttrId, col_gen: ColumnGen) {
+        self.retire_detached_gens.push((attr_id, col_gen));
+    }
+
     pub fn commit(mut self) -> Result<(Manifest, Option<AnnMeta>)> {
         let mut batch = self.storage.new_batch();
         self.stage_manifest_and_segments(&mut batch)?;
@@ -676,6 +787,7 @@ impl<'a> TxContext<'a> {
         self.stage_attr_counts(&mut batch)?;
         self.stage_fts_writes(&mut batch);
         self.stage_columns(&mut batch);
+        self.stage_detached(&mut batch)?;
 
         self.storage.write_batch(batch)?;
 
@@ -764,6 +876,9 @@ impl<'a> TxContext<'a> {
         }
         for (&(seg, attr_id, tag), entry) in &self.dirty_zone {
             batch.put_zone_entry(seg, attr_id, tag, entry);
+        }
+        for &(seg, attr_id, tag) in &self.dirty_zone_deletes {
+            batch.delete_zone_entry(seg, attr_id, tag);
         }
         Ok(())
     }
@@ -861,6 +976,107 @@ impl<'a> TxContext<'a> {
         }
     }
 
+    fn stage_detached(&self, batch: &mut StorageBatch<'_>) -> Result<()> {
+        for &(attr_id, col_gen) in &self.retire_detached_gens {
+            let (lo, hi) = detached_gen_bounds(attr_id, col_gen);
+            batch.delete_range_cf(CF_DETACHED, &lo, &hi);
+            batch.delete_range_cf(CF_DETACHED_POSTINGS, &lo, &hi);
+
+            let mut cnt_lo = [0u8; 7];
+            cnt_lo[0] = DETACHED_COUNT_TAG;
+            cnt_lo[1..7].copy_from_slice(&lo);
+            let mut cnt_hi = [0u8; 7];
+            cnt_hi[0] = DETACHED_COUNT_TAG;
+            cnt_hi[1..7].copy_from_slice(&hi);
+            batch.delete_range_default(&cnt_lo, &cnt_hi);
+
+            let mut ow_lo = [0u8; 7];
+            ow_lo[0] = DETACHED_OVERWRITTEN_TAG;
+            ow_lo[1..7].copy_from_slice(&lo);
+            let mut ow_hi = [0u8; 7];
+            ow_hi[0] = DETACHED_OVERWRITTEN_TAG;
+            ow_hi[1..7].copy_from_slice(&hi);
+            batch.delete_range_default(&ow_lo, &ow_hi);
+        }
+
+        for (&attr_id, meta) in &self.dirty_detached_meta {
+            batch.put_detached_meta(attr_id, meta);
+        }
+        for (&(attr_id, col_gen, seg, block), opt_bytes) in &self.dirty_detached_blocks {
+            let key = detached_key(attr_id, col_gen, seg, block);
+            match opt_bytes {
+                Some(bytes) => batch.put_detached_block(&key, bytes),
+                None => batch.delete_detached_block(&key),
+            }
+        }
+        if !self.dirty_detached_postings.is_empty() {
+            let keys: Vec<Vec<u8>> = self.dirty_detached_postings.keys().cloned().collect();
+            let existing = self.storage.multi_get_detached_posting_slices(&keys)?;
+            for ((key, delta_bm), opt_slice) in self.dirty_detached_postings.iter().zip(existing) {
+                let mut merged = match opt_slice {
+                    Some(slice) => SegPosting::decode(&slice)?,
+                    None => SegPosting::default(),
+                };
+                merged.or_bitmap(delta_bm);
+                batch.put_detached_posting(key, &merged.encode()?);
+            }
+        }
+        if !self.dirty_detached_count_deltas.is_empty() {
+            let mut deltas: Vec<(&Vec<u8>, i64)> = self
+                .dirty_detached_count_deltas
+                .iter()
+                .filter(|&(_, &d)| d != 0)
+                .map(|(k, &d)| (k, d))
+                .collect();
+            deltas.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            if !deltas.is_empty() {
+                let db_keys: Vec<Vec<u8>> = deltas
+                    .iter()
+                    .map(|(suffix, _)| {
+                        let mut k = Vec::with_capacity(1 + suffix.len());
+                        k.push(DETACHED_COUNT_TAG);
+                        k.extend_from_slice(suffix);
+                        k
+                    })
+                    .collect();
+                let current = self.storage.db.multi_get(db_keys.iter());
+                for ((suffix, delta), cur) in deltas.iter().zip(current) {
+                    let cur = match cur.map_err(map_db_err)? {
+                        Some(bytes) => {
+                            let arr: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
+                                TreeError::CorruptedData(format!(
+                                    "detached count expected 8 bytes, got {}",
+                                    bytes.len()
+                                ))
+                            })?;
+                            u64::from_le_bytes(arr) as i128
+                        }
+                        None => 0,
+                    };
+                    let next = cur + *delta as i128;
+                    if next < 0 {
+                        return Err(TreeError::InvariantViolation(format!(
+                            "detached count underflow for suffix {suffix:?}: {cur} + {delta}"
+                        )));
+                    }
+                    if next == 0 {
+                        batch.delete_detached_count(suffix);
+                    } else {
+                        batch.put_detached_count(suffix, next as u64);
+                    }
+                }
+            }
+        }
+        for (&(attr_id, col_gen, seg), bm) in &self.dirty_detached_overwritten {
+            if bm.is_empty() {
+                batch.delete_detached_overwritten(attr_id, col_gen, seg);
+            } else {
+                batch.put_detached_overwritten(attr_id, col_gen, seg, &encode_roaring_bitmap(bm)?);
+            }
+        }
+        Ok(())
+    }
+
     fn flush_caches_after_commit(&mut self) {
         if let Some(dropped) = self.dirty_dropped_segments.take() {
             *self
@@ -930,7 +1146,7 @@ impl<'a> TxContext<'a> {
             }
         }
 
-        if !self.dirty_zone.is_empty() {
+        if !self.dirty_zone.is_empty() || !self.dirty_zone_deletes.is_empty() {
             let mut zguard = self
                 .storage
                 .zone_cache
@@ -938,6 +1154,11 @@ impl<'a> TxContext<'a> {
                 .expect("zone_cache poisoned");
             if let Some(ref mut table_arc) = *zguard {
                 let map = Arc::make_mut(table_arc);
+                for (seg, attr_id, tag) in std::mem::take(&mut self.dirty_zone_deletes) {
+                    if let Some(seg_map) = map.get_mut(&(attr_id, tag)) {
+                        seg_map.remove(&seg);
+                    }
+                }
                 for ((seg, attr_id, tag), entry) in std::mem::take(&mut self.dirty_zone) {
                     map.entry((attr_id, tag)).or_default().insert(seg, entry);
                 }

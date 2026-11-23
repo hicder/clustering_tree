@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use izzydb_core::config::{DocId, NodeId, RowId, SegmentId, TreeConfig};
+use izzydb_core::config::{AttrId, DocId, NodeId, RowId, SegmentId, TreeConfig};
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::facet::{
     FacetResults, FacetSpec, FacetedSearchResponse, HybridFacetScope, VectorFacetScope,
@@ -15,7 +15,7 @@ use izzydb_core::filter::Filter;
 use izzydb_core::metric::prepare_vector;
 use izzydb_core::rank::{OrderBySpec, OrderedResult, RankBy};
 use izzydb_core::rowset::RowSet;
-use izzydb_core::schema::{AttributeValue, Attributes, CollectionConfig, CollectionSchema, ColumnStorage};
+use izzydb_core::schema::{AttributeValue, Attributes, CollectionConfig, CollectionSchema};
 use izzydb_fts::Bm25Result;
 use izzydb_storage::codec::{
     Manifest, RowView, SEG_FLAG_HAS_COLUMNS, SegmentState, decode_row_attributes,
@@ -25,6 +25,9 @@ use izzydb_storage::node::{AnnMeta, PackedInternalNode, decode_f32_slice};
 use izzydb_storage::{SegmentTableSnapshot, Storage, TxContext};
 
 use crate::attr_index::AttributeIndex;
+use crate::detached::{
+    self, DetachedIngestBuilder, DetachedJob, DetachedPublishStats,
+};
 use crate::facet::{FacetEnv, Population};
 use crate::filter_plan::{self, FilterPlanTrace};
 use crate::fts_index::FtsIndex;
@@ -264,17 +267,9 @@ impl Collection {
         }
     }
 
-    fn reject_detached_attributes(&self, attrs: &Attributes) -> Result<()> {
-        for name in attrs.keys() {
-            if let Some(entry) = self.schema.get_by_name(name)
-                && entry.storage == ColumnStorage::Detached
-            {
-                return Err(TreeError::Unsupported(
-                    "v3: phase 8 (detached attributes)".into(),
-                ));
-            }
-        }
-        Ok(())
+    pub(crate) fn apply_tx_commit(&mut self, manifest: Manifest, ann_meta: Option<AnnMeta>) {
+        self.manifest = manifest;
+        self.ann_meta = ann_meta;
     }
 
     /// Force sealing the current open segment, if one exists and is non-empty.
@@ -297,6 +292,35 @@ impl Collection {
         Ok(Some(open_seg))
     }
 
+    /// Start building an atomic whole-column detached ingest job on `&self`.
+    pub fn detached_ingest(&self) -> DetachedIngestBuilder<'_> {
+        DetachedIngestBuilder::new(self)
+    }
+
+    /// Atomically publish a staged [`DetachedJob`] onto the collection, resolving concurrent
+    /// writes above the build watermark.
+    pub fn publish_detached(&mut self, job: DetachedJob) -> Result<DetachedPublishStats> {
+        detached::publish_detached_job(self, job)
+    }
+
+    /// Point write a single detached attribute value onto an existing live document in place
+    /// (without moving its `RowId`).
+    pub fn set_detached(
+        &mut self,
+        id: DocId,
+        attr: impl Into<String>,
+        value: AttributeValue,
+    ) -> Result<()> {
+        let mut attrs = Attributes::new();
+        attrs.insert(attr.into(), value);
+        detached::apply_point_detached_batch(self, &[(id, attrs)])
+    }
+
+    /// Point write detached attribute updates onto existing live documents atomically in place.
+    pub fn set_detached_batch(&mut self, updates: &[(DocId, Attributes)]) -> Result<()> {
+        detached::apply_point_detached_batch(self, updates)
+    }
+
     /// Insert or update a single document atomically.
     pub fn upsert(
         &mut self,
@@ -305,9 +329,10 @@ impl Collection {
         attributes: Attributes,
     ) -> Result<()> {
         self.schema.validate_attributes(&attributes)?;
-        self.reject_detached_attributes(&attributes)?;
+        let (inline_attrs, detached_updates) =
+            detached::partition_attributes(&self.schema, &attributes);
         let prepared_vec = self.prepare_optional_vector(embedding)?;
-        let new_row_bytes = encode_row(&self.schema, &attributes, prepared_vec.is_some())?;
+        let new_row_bytes = encode_row(&self.schema, &inline_attrs, prepared_vec.is_some())?;
 
         let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index, &self.fts_index);
         let mut tx = TxContext::new(
@@ -324,6 +349,7 @@ impl Collection {
             id,
             prepared_vec.as_deref(),
             new_row_bytes,
+            &detached_updates,
             &hooks,
         )?;
         if changed {
@@ -343,10 +369,11 @@ impl Collection {
         let mut prepared = Vec::with_capacity(docs.len());
         for doc in docs {
             self.schema.validate_attributes(&doc.attributes)?;
-            self.reject_detached_attributes(&doc.attributes)?;
+            let (inline_attrs, detached_updates) =
+                detached::partition_attributes(&self.schema, &doc.attributes);
             let pvec = self.prepare_optional_vector(doc.embedding.as_deref())?;
-            let row_bytes = encode_row(&self.schema, &doc.attributes, pvec.is_some())?;
-            prepared.push((doc.id, pvec, row_bytes));
+            let row_bytes = encode_row(&self.schema, &inline_attrs, pvec.is_some())?;
+            prepared.push((doc.id, pvec, row_bytes, detached_updates));
         }
 
         let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index, &self.fts_index);
@@ -358,7 +385,7 @@ impl Collection {
             self.ann_meta.clone(),
         );
         let mut any_changed = false;
-        for (id, pvec, row_bytes) in prepared {
+        for (id, pvec, row_bytes, detached_updates) in prepared {
             if upsert_one_in_tx(
                 &self.segments,
                 &self.schema,
@@ -366,6 +393,7 @@ impl Collection {
                 id,
                 pvec.as_deref(),
                 row_bytes,
+                &detached_updates,
                 &hooks,
             )? {
                 any_changed = true;
@@ -382,7 +410,8 @@ impl Collection {
     /// Apply a partial update (`DocumentPatch`) to an existing document atomically.
     pub fn patch(&mut self, id: DocId, patch: DocumentPatch) -> Result<()> {
         self.schema.validate_attributes(&patch.attributes)?;
-        self.reject_detached_attributes(&patch.attributes)?;
+        let (inline_attrs, detached_updates) =
+            detached::partition_attributes(&self.schema, &patch.attributes);
         let prepared_vec = self.prepare_optional_vector(patch.embedding.as_deref())?;
 
         let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index, &self.fts_index);
@@ -399,7 +428,8 @@ impl Collection {
             &mut tx,
             id,
             prepared_vec.as_deref(),
-            &patch.attributes,
+            &inline_attrs,
+            &detached_updates,
             &hooks,
         )?;
         if changed {
@@ -416,11 +446,12 @@ impl Collection {
             return Ok(());
         }
         let mut prepared_vecs = Vec::with_capacity(patches.len());
+        let mut split_attrs = Vec::with_capacity(patches.len());
         let mut doc_ids = Vec::with_capacity(patches.len());
         for &(id, ref patch) in patches {
             self.schema.validate_attributes(&patch.attributes)?;
-            self.reject_detached_attributes(&patch.attributes)?;
             prepared_vecs.push(self.prepare_optional_vector(patch.embedding.as_deref())?);
+            split_attrs.push(detached::partition_attributes(&self.schema, &patch.attributes));
             doc_ids.push(id);
         }
 
@@ -440,14 +471,17 @@ impl Collection {
             self.ann_meta.clone(),
         );
         let mut any_changed = false;
-        for (&(id, ref patch), pv) in patches.iter().zip(prepared_vecs.iter()) {
+        for ((&(id, _), pv), (inline_attrs, detached_updates)) in
+            patches.iter().zip(prepared_vecs.iter()).zip(split_attrs.iter())
+        {
             if apply_patch_in_tx(
                 &self.segments,
                 &self.schema,
                 &mut tx,
                 id,
                 pv.as_deref(),
-                &patch.attributes,
+                inline_attrs,
+                detached_updates,
                 &hooks,
             )? {
                 any_changed = true;
@@ -482,6 +516,7 @@ impl Collection {
         for hook in &hooks {
             hook.on_delete(&mut tx, &self.schema, old_row, &old_view, old_view.has_vector())?;
         }
+        detached::delete_detached_in_tx(&mut tx, &self.schema, old_row)?;
         tx.delete_id_map(id);
         let (manifest, ann_meta) = tx.commit()?;
         self.manifest = manifest;
@@ -526,6 +561,7 @@ impl Collection {
             for hook in &hooks {
                 hook.on_delete(&mut tx, &self.schema, old_row, &old_view, old_view.has_vector())?;
             }
+            detached::delete_detached_in_tx(&mut tx, &self.schema, old_row)?;
             tx.delete_id_map(doc_id);
         }
         let (manifest, ann_meta) = tx.commit()?;
@@ -534,7 +570,7 @@ impl Collection {
         Ok(targets.len() as u64)
     }
 
-    /// Retrieve a document's stored vector and inline attributes by `id`.
+    /// Retrieve a document's stored vector and attributes (inline + detached) by `id`.
     pub fn get(&self, id: DocId) -> Result<Option<Document>> {
         let Some(row) = self.storage.get_id_map(id)? else {
             return Ok(None);
@@ -550,7 +586,8 @@ impl Collection {
         } else {
             None
         };
-        let attributes = decode_row_attributes(&self.schema, &row_bytes)?;
+        let mut attributes = decode_row_attributes(&self.schema, &row_bytes)?;
+        detached::read_detached_attrs_for_row(&self.storage, &self.schema, row, &mut attributes)?;
         Ok(Some(Document {
             id,
             embedding,
@@ -579,8 +616,9 @@ impl Collection {
         let row_slices = self.storage.multi_get_row_bytes_pinned(&sorted_rows)?;
 
         let mut vec_rows: Vec<(RowId, usize)> = Vec::new();
-        let mut decoded_attrs: Vec<Option<(usize, DocId, Attributes)>> =
+        let mut decoded_attrs: Vec<(usize, DocId, Attributes)> =
             Vec::with_capacity(to_fetch.len());
+        let mut per_row_attrs: Vec<Attributes> = Vec::with_capacity(to_fetch.len());
 
         for (i, (&(row, slot, doc_id), opt_slice)) in
             to_fetch.iter().zip(row_slices.iter()).enumerate()
@@ -593,8 +631,15 @@ impl Collection {
                 vec_rows.push((row, i));
             }
             let attributes = decode_row_attributes(&self.schema, slice)?;
-            decoded_attrs.push(Some((slot, doc_id, attributes)));
+            per_row_attrs.push(attributes);
+            decoded_attrs.push((slot, doc_id, Attributes::new()));
         }
+        detached::read_detached_attrs_for_rows_sorted(
+            &self.storage,
+            &self.schema,
+            &sorted_rows,
+            &mut per_row_attrs,
+        )?;
 
         let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; to_fetch.len()];
         if !vec_rows.is_empty() {
@@ -611,14 +656,14 @@ impl Collection {
             }
         }
 
-        for (idx, item) in decoded_attrs.into_iter().enumerate() {
-            if let Some((slot, doc_id, attributes)) = item {
-                out[slot] = Some(Document {
-                    id: doc_id,
-                    embedding: embeddings[idx].take(),
-                    attributes,
-                });
-            }
+        for (idx, ((slot, doc_id, _), attributes)) in
+            decoded_attrs.into_iter().zip(per_row_attrs).enumerate()
+        {
+            out[slot] = Some(Document {
+                id: doc_id,
+                embedding: embeddings[idx].take(),
+                attributes,
+            });
         }
         Ok(out)
     }
@@ -767,6 +812,7 @@ impl Collection {
                 stats.vacuum = Some(self.vacuum_ann(opts.vacuum_budget)?);
             }
         }
+        stats.detached_rebuilt = detached::rebuild_fragmented_detached_columns(self)?;
         Ok(stats)
     }
 
@@ -804,7 +850,8 @@ impl Collection {
     pub fn update_by_filter(&mut self, filter: &Filter, patch: &DocumentPatch) -> Result<u64> {
         filter.validate(&self.schema)?;
         self.schema.validate_attributes(&patch.attributes)?;
-        self.reject_detached_attributes(&patch.attributes)?;
+        let (inline_attrs, detached_updates) =
+            detached::partition_attributes(&self.schema, &patch.attributes);
         let prepared_vec = self.prepare_optional_vector(patch.embedding.as_deref())?;
 
         let doc_ids = self.resolve_filter_doc_ids(filter)?;
@@ -830,7 +877,8 @@ impl Collection {
                     &mut tx,
                     id,
                     prepared_vec.as_deref(),
-                    &patch.attributes,
+                    &inline_attrs,
+                    &detached_updates,
                     &hooks,
                 )? {
                     any_changed = true;
@@ -1199,6 +1247,7 @@ fn vectors_bitwise_equal(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn upsert_one_in_tx(
     segments: &SegmentStore,
     schema: &CollectionSchema,
@@ -1206,6 +1255,7 @@ fn upsert_one_in_tx(
     id: DocId,
     prepared_vec: Option<&[f32]>,
     new_row_bytes: Vec<u8>,
+    detached_updates: &[(AttrId, AttributeValue)],
     hooks: &[&dyn RowIndexHook],
 ) -> Result<bool> {
     let prev_row = tx.get_id_map(id)?;
@@ -1217,12 +1267,19 @@ fn upsert_one_in_tx(
         if old_bytes == new_row_bytes
             && vectors_bitwise_equal(tx, old_row, old_view.has_vector(), prepared_vec)?
         {
-            return Ok(false);
+            return detached::apply_detached_write_on_existing_row(
+                tx,
+                schema,
+                old_row,
+                detached_updates,
+                true,
+            );
         }
         segments.tombstone(tx, old_row)?;
         for hook in hooks {
             hook.on_delete(tx, schema, old_row, &old_view, old_view.has_vector())?;
         }
+        detached::delete_detached_in_tx(tx, schema, old_row)?;
     }
 
     let new_row = segments.alloc_row(tx)?;
@@ -1232,17 +1289,20 @@ fn upsert_one_in_tx(
     for hook in hooks {
         hook.on_insert(tx, schema, new_row, &new_view, prepared_vec, prev_row)?;
     }
+    detached::write_detached_on_new_row(tx, schema, None, new_row, detached_updates, false)?;
     segments.maybe_seal(tx, schema, hooks)?;
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_patch_in_tx(
     segments: &SegmentStore,
     schema: &CollectionSchema,
     tx: &mut TxContext<'_>,
     id: DocId,
     prepared_vec: Option<&[f32]>,
-    patch_attrs: &Attributes,
+    inline_patch_attrs: &Attributes,
+    detached_updates: &[(AttrId, AttributeValue)],
     hooks: &[&dyn RowIndexHook],
 ) -> Result<bool> {
     let Some(old_row) = tx.get_id_map(id)? else {
@@ -1263,18 +1323,18 @@ fn apply_patch_in_tx(
         None => None,
     };
 
-    let new_row_bytes = if patch_attrs.is_empty() {
+    let inline_changed_bytes: Option<Vec<u8>> = if inline_patch_attrs.is_empty() {
         if vectors_bitwise_equal(tx, old_row, old_view.has_vector(), effective_vec.as_deref())? {
-            return Ok(false);
-        }
-        // Keep existing inline attributes, just potentially update has_vector flag if needed
-        let mut attrs = Attributes::new();
-        for (attr_id, val) in decode_row_entries(&old_bytes)? {
-            if let Some(entry) = schema.get_by_id(attr_id) {
-                attrs.insert(entry.name.clone(), val);
+            None
+        } else {
+            let mut attrs = Attributes::new();
+            for (attr_id, val) in decode_row_entries(&old_bytes)? {
+                if let Some(entry) = schema.get_by_id(attr_id) {
+                    attrs.insert(entry.name.clone(), val);
+                }
             }
+            Some(encode_row(schema, &attrs, effective_vec.is_some())?)
         }
-        encode_row(schema, &attrs, effective_vec.is_some())?
     } else {
         let old_entries = decode_row_entries(&old_bytes)?;
         let mut merged = Attributes::new();
@@ -1283,7 +1343,7 @@ fn apply_patch_in_tx(
                 merged.insert(entry.name.clone(), val);
             }
         }
-        for (name, val) in patch_attrs {
+        for (name, val) in inline_patch_attrs {
             if matches!(val, AttributeValue::Null) {
                 merged.remove(name);
             } else {
@@ -1294,9 +1354,23 @@ fn apply_patch_in_tx(
         if encoded == old_bytes
             && vectors_bitwise_equal(tx, old_row, old_view.has_vector(), effective_vec.as_deref())?
         {
+            None
+        } else {
+            Some(encoded)
+        }
+    };
+
+    let Some(new_row_bytes) = inline_changed_bytes else {
+        if detached_updates.is_empty() {
             return Ok(false);
         }
-        encoded
+        return detached::apply_detached_write_on_existing_row(
+            tx,
+            schema,
+            old_row,
+            detached_updates,
+            false,
+        );
     };
 
     segments.tombstone(tx, old_row)?;
@@ -1318,6 +1392,14 @@ fn apply_patch_in_tx(
             Some(old_row),
         )?;
     }
+    detached::write_detached_on_new_row(
+        tx,
+        schema,
+        Some(old_row),
+        new_row,
+        detached_updates,
+        true,
+    )?;
     segments.maybe_seal(tx, schema, hooks)?;
     Ok(true)
 }

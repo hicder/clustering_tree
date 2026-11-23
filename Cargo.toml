@@ -7,6 +7,7 @@ default-members = [
     "crates/izzydb-rabitq",
     "crates/izzydb-storage",
     "crates/izzydb",
+    "crates/izzydb-bulk",
 ]
 
 [workspace.package]

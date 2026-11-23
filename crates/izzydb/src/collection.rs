@@ -1244,6 +1244,111 @@ impl Collection {
     pub fn verify_invariants(&self) -> Result<CollectionStats> {
         Err(TreeError::Unsupported("v3: phase 11".into()))
     }
+
+    #[doc(hidden)]
+    pub fn with_bulk_tx<F>(&mut self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut TxContext<'_>, &BulkTxHelper<'_>) -> Result<()>,
+    {
+        let helper = BulkTxHelper {
+            segments: &self.segments,
+            schema: &self.schema,
+            ann: self.ann.as_ref(),
+            attr_index: &self.attr_index,
+            fts_index: &self.fts_index,
+            ann_meta: self.ann_meta.as_ref(),
+            old_internal_ids: self.internal_cache.keys().copied().collect(),
+            old_leaf_ids: {
+                let mut lids: Vec<NodeId> = self.leaf_parent.keys().copied().collect();
+                if let Some(ref cur_meta) = self.ann_meta
+                    && cur_meta.root_level == 0
+                {
+                    lids.push(cur_meta.root_id);
+                }
+                lids.sort_unstable();
+                lids.dedup();
+                lids
+            },
+        };
+        let mut tx = TxContext::new(
+            &self.storage,
+            &mut self.internal_cache,
+            &mut self.leaf_parent,
+            self.manifest.clone(),
+            self.ann_meta.clone(),
+        );
+        f(&mut tx, &helper)?;
+        let (manifest, ann_meta) = tx.commit()?;
+        self.manifest = manifest;
+        self.ann_meta = ann_meta;
+        Ok(())
+    }
+}
+
+#[doc(hidden)]
+pub struct BulkTxHelper<'a> {
+    segments: &'a SegmentStore,
+    schema: &'a CollectionSchema,
+    ann: Option<&'a AnnIndex>,
+    attr_index: &'a AttributeIndex,
+    fts_index: &'a FtsIndex,
+    ann_meta: Option<&'a AnnMeta>,
+    old_internal_ids: Vec<NodeId>,
+    old_leaf_ids: Vec<NodeId>,
+}
+
+impl<'a> BulkTxHelper<'a> {
+    pub fn delete_row_for_replace(&self, tx: &mut TxContext<'_>, old_row: RowId) -> Result<()> {
+        let old_bytes = tx.get_row_bytes(old_row)?.ok_or_else(|| {
+            TreeError::InvariantViolation(format!("row {old_row:?} missing in cf_rows"))
+        })?;
+        let old_view = RowView::parse(&old_bytes)?;
+        self.segments.tombstone(tx, old_row)?;
+        let hooks = collect_hooks(self.ann, self.attr_index, self.fts_index);
+        for hook in &hooks {
+            hook.on_delete(tx, self.schema, old_row, &old_view, old_view.has_vector())?;
+        }
+        detached::delete_detached_in_tx(tx, self.schema, old_row)?;
+        Ok(())
+    }
+
+    pub fn insert_vector(
+        &self,
+        tx: &mut TxContext<'_>,
+        row: RowId,
+        prepared_vec: &[f32],
+    ) -> Result<()> {
+        let Some(ann) = self.ann else {
+            return Ok(());
+        };
+        let empty_bytes = encode_row(self.schema, &Attributes::new(), true)?;
+        let empty_view = RowView::parse(&empty_bytes)?;
+        ann.on_insert(tx, self.schema, row, &empty_view, Some(prepared_vec), None)
+    }
+
+    pub fn replace_ann_tree(
+        &self,
+        tx: &mut TxContext<'_>,
+        new_meta: AnnMeta,
+        internals: Vec<(NodeId, PackedInternalNode)>,
+        leaves: Vec<(NodeId, izzydb_storage::node::PackedLeafNode)>,
+    ) -> Result<()> {
+        let _ = self.ann_meta;
+        for &nid in &self.old_internal_ids {
+            tx.delete_internal_node(nid);
+        }
+        for &lid in &self.old_leaf_ids {
+            tx.delete_leaf_node(lid);
+        }
+        for (nid, node) in internals {
+            tx.put_internal_node(nid, node);
+        }
+        for (lid, leaf) in leaves {
+            tx.put_leaf_node(lid, leaf);
+        }
+        *tx.ann_meta_mut()? = new_meta;
+        Ok(())
+    }
 }
 
 fn collect_hooks<'a>(

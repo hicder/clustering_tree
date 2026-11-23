@@ -1,110 +1,59 @@
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 
-use izzydb::config::{DistanceMetric, DocId, FtsDocId, NodeId, TreeConfig};
+use izzydb::config::{DistanceMetric, NodeId, RowId, TreeConfig};
 use izzydb::error::{Result, TreeError};
 use izzydb::kmeans::balanced_two_means;
 use izzydb::metric::{cluster_distance, compute_mean_centroid, compute_weighted_centroid};
-use izzydb::node::{PackedInternalNode, TreeMeta};
+use izzydb::node::{AnnMeta, PackedInternalNode};
 use izzydb::search::route_to_leaf_with;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
+pub struct VecEntry {
+    pub row_id: RowId,
+    pub vec_idx: u32,
+}
+
 pub struct AssignedLeaf {
     pub leaf_id: NodeId,
     pub parent_id: Option<NodeId>,
     pub centroid: Vec<f32>,
-    pub rows: Vec<u32>,
-    pub first_fts_doc_id: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Placement {
-    pub leaf_id: NodeId,
-    pub local_id: u32,
-    pub fts_doc_id: u32,
-}
-
-impl Placement {
-    pub const SIZE: usize = 12;
-
-    #[inline]
-    pub fn encode(self) -> [u8; Self::SIZE] {
-        let mut buf = [0u8; Self::SIZE];
-        buf[0..4].copy_from_slice(&self.leaf_id.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.local_id.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.fts_doc_id.to_le_bytes());
-        buf
-    }
-
-    #[inline]
-    pub fn decode(bytes: &[u8]) -> Self {
-        Self {
-            leaf_id: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            local_id: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            fts_doc_id: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-        }
-    }
+    pub entries: Vec<VecEntry>,
 }
 
 pub struct BuiltTree {
-    pub meta: TreeMeta,
+    pub meta: AnnMeta,
     pub internal_nodes: Vec<(NodeId, PackedInternalNode)>,
     pub leaves: Vec<AssignedLeaf>,
-    pub placement_by_row_path: PathBuf,
 }
 
 #[inline]
-pub fn read_vector_at(vectors_bytes: &[u8], row: u32, dim: usize) -> &[f32] {
-    let start = (row as usize) * dim * 4;
+pub fn read_vector_at(vectors_bytes: &[u8], vec_idx: u32, dim: usize) -> &[f32] {
+    let start = (vec_idx as usize) * dim * 4;
     let slice = &vectors_bytes[start..start + dim * 4];
-    #[cfg(target_endian = "little")]
-    if let Ok(typed) = bytemuck::try_cast_slice::<u8, f32>(slice) {
-        return typed;
-    }
-    panic!("vectors.bin must be 4-byte aligned on little-endian targets");
-}
-
-#[inline]
-pub fn read_doc_id_at(doc_ids_bytes: &[u8], row: u32) -> DocId {
-    let off = (row as usize) * 8;
-    u64::from_le_bytes(doc_ids_bytes[off..off + 8].try_into().unwrap())
+    bytemuck::cast_slice(slice)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_tree_and_assign(
-    live_rows: &[u32],
-    total_rows_read: u64,
+    entries: &[VecEntry],
     vectors_bytes: &[u8],
-    doc_ids_bytes: &[u8],
     config: &TreeConfig,
     fill_factor: f32,
     train_sample: usize,
     memory_budget_bytes: usize,
     rabitq_seed: u64,
-    has_fts: bool,
-    stage_dir: &Path,
     pool: &rayon::ThreadPool,
 ) -> Result<BuiltTree> {
-    let n = live_rows.len();
     let dim = config.dim;
     let metric = config.metric;
-    let placement_path = stage_dir.join("placement.bin");
+    let n = entries.len();
 
-    if has_fts && n >= FtsDocId::MAX as usize {
-        return Err(TreeError::Storage("FtsDocId u32 space exhausted".into()));
-    }
-
-    // Trivial case: 0 vectors.
     if n == 0 {
-        File::create(&placement_path)
-            .map_err(|e| TreeError::Storage(format!("create placement.bin: {e}")))?;
-        let meta = TreeMeta {
+        let meta = AnnMeta {
             root_id: 1,
             root_level: 0,
             next_node_id: 2,
@@ -113,45 +62,38 @@ pub fn build_tree_and_assign(
             num_vectors: 0,
             rabitq_seed,
             rabitq_bits: 1,
+            stale_rows: 0,
+            vacuum_epoch: 0,
+            vacuum_cursor: 0,
         };
         let root_leaf = AssignedLeaf {
             leaf_id: 1,
             parent_id: None,
             centroid: vec![0.0; dim],
-            rows: Vec::new(),
-            first_fts_doc_id: 0,
+            entries: Vec::new(),
         };
         return Ok(BuiltTree {
             meta,
             internal_nodes: Vec::new(),
             leaves: vec![root_leaf],
-            placement_by_row_path: placement_path,
         });
     }
 
-    // Single root-leaf case: N <= max_leaf_size.
     if n <= config.max_leaf_size {
-        let mut rows = live_rows.to_vec();
-        rows.sort_unstable_by_key(|&r| read_doc_id_at(doc_ids_bytes, r));
-        let vec_refs: Vec<&[f32]> = rows
+        let mut sorted = entries.to_vec();
+        sorted.sort_unstable_by_key(|e| e.row_id);
+        let vec_refs: Vec<&[f32]> = sorted
             .iter()
-            .map(|&r| read_vector_at(vectors_bytes, r, dim))
+            .map(|e| read_vector_at(vectors_bytes, e.vec_idx, dim))
             .collect();
         let centroid = compute_mean_centroid(&vec_refs, dim, metric);
         let leaf = AssignedLeaf {
             leaf_id: 1,
             parent_id: None,
             centroid,
-            rows,
-            first_fts_doc_id: 0,
+            entries: sorted,
         };
-        write_placement_file(
-            &placement_path,
-            total_rows_read as usize,
-            std::slice::from_ref(&leaf),
-            has_fts,
-        )?;
-        let meta = TreeMeta {
+        let meta = AnnMeta {
             root_id: 1,
             root_level: 0,
             next_node_id: 2,
@@ -160,29 +102,33 @@ pub fn build_tree_and_assign(
             num_vectors: n as u64,
             rabitq_seed,
             rabitq_bits: 1,
+            stale_rows: 0,
+            vacuum_epoch: 0,
+            vacuum_cursor: 0,
         };
         return Ok(BuiltTree {
             meta,
             internal_nodes: Vec::new(),
             leaves: vec![leaf],
-            placement_by_row_path: placement_path,
         });
     }
 
-    // Phase 2: Sample and train skeleton.
     let target_leaf_size = ((fill_factor * config.max_leaf_size as f32).round() as usize)
         .clamp(config.min_leaf_size, config.max_leaf_size);
 
     let max_sample_by_mem = (memory_budget_bytes / 2)
         .max(16 * 1024 * 1024)
         / (dim * 4).max(4);
-    let sample_cap = train_sample.max(config.max_leaf_size * 4).min(max_sample_by_mem).max(2);
+    let sample_cap = train_sample
+        .max(config.max_leaf_size * 4)
+        .min(max_sample_by_mem)
+        .max(2);
     let sample_n = n.min(sample_cap);
 
-    let sample_rows = sample_live_rows(live_rows, sample_n, rabitq_seed);
-    let sample_refs: Vec<&[f32]> = sample_rows
+    let sample_entries = sample_vec_entries(entries, sample_n, rabitq_seed);
+    let sample_refs: Vec<&[f32]> = sample_entries
         .iter()
-        .map(|&r| read_vector_at(vectors_bytes, r, dim))
+        .map(|e| read_vector_at(vectors_bytes, e.vec_idx, dim))
         .collect();
 
     let skel_leaves = build_skeleton_leaves(
@@ -198,8 +144,7 @@ pub fn build_tree_and_assign(
 
     let mut tree = build_skeleton_hierarchy(skel_leaves, config);
 
-    // Phase 3a: Route every live vector through the skeleton in parallel.
-    let route_meta = TreeMeta {
+    let route_meta = AnnMeta {
         root_id: tree.root_idx as NodeId,
         root_level: tree.root_level,
         next_node_id: 0,
@@ -208,17 +153,20 @@ pub fn build_tree_and_assign(
         num_vectors: n as u64,
         rabitq_seed,
         rabitq_bits: 1,
+        stale_rows: 0,
+        vacuum_epoch: 0,
+        vacuum_cursor: 0,
     };
-    let route_cache: HashMap<NodeId, PackedInternalNode> = tree.build_routing_cache(dim, metric);
+    let route_cache = tree.build_routing_cache(dim, metric);
 
-    let mut assigned_leaf_for_live = vec![0usize; n];
+    let mut assigned_leaf_for_entry = vec![0usize; n];
     pool.install(|| -> Result<()> {
-        assigned_leaf_for_live
+        assigned_leaf_for_entry
             .par_chunks_mut(4096)
-            .zip(live_rows.par_chunks(4096))
-            .try_for_each(|(out_chunk, row_chunk)| -> Result<()> {
-                for (out, &row) in out_chunk.iter_mut().zip(row_chunk.iter()) {
-                    let v = read_vector_at(vectors_bytes, row, dim);
+            .zip(entries.par_chunks(4096))
+            .try_for_each(|(out_chunk, entry_chunk)| -> Result<()> {
+                for (out, entry) in out_chunk.iter_mut().zip(entry_chunk.iter()) {
+                    let v = read_vector_at(vectors_bytes, entry.vec_idx, dim);
                     let lid = route_to_leaf_with(
                         |nid| {
                             route_cache.get(&nid).ok_or_else(|| {
@@ -237,54 +185,34 @@ pub fn build_tree_and_assign(
     })?;
     drop(route_cache);
 
-    // Counting sort live rows into skeleton leaves.
     let num_skel_leaves = tree.leaves.len();
     let mut counts = vec![0usize; num_skel_leaves];
-    for &leaf_idx in &assigned_leaf_for_live {
+    for &leaf_idx in &assigned_leaf_for_entry {
         counts[leaf_idx] += 1;
     }
     for (idx, leaf) in tree.leaves.iter_mut().enumerate() {
-        leaf.rows = Vec::with_capacity(counts[idx]);
+        leaf.entries = Vec::with_capacity(counts[idx]);
     }
-    for (&row, &leaf_idx) in live_rows.iter().zip(assigned_leaf_for_live.iter()) {
-        tree.leaves[leaf_idx].rows.push(row);
+    for (&entry, &leaf_idx) in entries.iter().zip(assigned_leaf_for_entry.iter()) {
+        tree.leaves[leaf_idx].entries.push(entry);
     }
-    drop(assigned_leaf_for_live);
+    drop(assigned_leaf_for_entry);
 
-    // Phase 3b: Repair leaf and internal node sizes bottom-up.
-    tree.repair(
-        vectors_bytes,
-        config,
-        target_leaf_size,
-        pool,
-    )?;
-
-    // Phase 3c: Assign BFS NodeIds, sort leaf rows by doc_id, assign slots and fts_doc_id.
-    let built = tree.finalize(
-        doc_ids_bytes,
-        total_rows_read as usize,
-        dim,
-        metric,
-        rabitq_seed,
-        has_fts,
-        &placement_path,
-    )?;
-
-    Ok(built)
+    tree.repair(vectors_bytes, config, target_leaf_size, pool)?;
+    Ok(tree.finalize(dim, metric, rabitq_seed))
 }
 
-fn sample_live_rows(live_rows: &[u32], sample_n: usize, seed: u64) -> Vec<u32> {
-    let n = live_rows.len();
+fn sample_vec_entries(entries: &[VecEntry], sample_n: usize, seed: u64) -> Vec<VecEntry> {
+    let n = entries.len();
     if sample_n >= n {
-        return live_rows.to_vec();
+        return entries.to_vec();
     }
-    // Floyd's algorithm / reservoir sampling for uniform sample without replacement.
     let mut rng = SmallRng::seed_from_u64(seed ^ 0x9e37_79b9_7f4a_7c15);
-    let mut reservoir: Vec<u32> = live_rows[..sample_n].to_vec();
-    for (i, &r) in live_rows.iter().enumerate().skip(sample_n) {
+    let mut reservoir: Vec<VecEntry> = entries[..sample_n].to_vec();
+    for (i, &e) in entries.iter().enumerate().skip(sample_n) {
         let j = rng.random_range(0..=i);
         if j < sample_n {
-            reservoir[j] = r;
+            reservoir[j] = e;
         }
     }
     reservoir
@@ -294,14 +222,14 @@ struct SkelLeaf {
     centroid: Vec<f32>,
     weight: u64,
     parent: Option<usize>,
-    rows: Vec<u32>,
+    entries: Vec<VecEntry>,
     alive: bool,
 }
 
 struct SkelInternal {
     level: u8,
     parent: Option<usize>,
-    children: Vec<usize>, // at level == 1: indices into leaves; at level > 1: indices into internals
+    children: Vec<usize>,
     subtree_count: u64,
     centroid: Vec<f32>,
     alive: bool,
@@ -320,7 +248,6 @@ fn build_skeleton_leaves(
     let mut out = Vec::new();
     let mut stack = vec![initial_indices];
 
-    // Enforce at least 2 leaves since total_n > max_leaf_size.
     while let Some(indices) = stack.pop() {
         let projected = (indices.len() as f64) * (total_n as f64) / (sample_n as f64);
         let force_split = out.is_empty() && stack.is_empty() && indices.len() >= 2;
@@ -342,7 +269,7 @@ fn build_skeleton_leaves(
                 centroid,
                 weight: projected.round().max(1.0) as u64,
                 parent: None,
-                rows: Vec::new(),
+                entries: Vec::new(),
                 alive: true,
             });
         }
@@ -365,7 +292,6 @@ fn build_skeleton_hierarchy(mut leaves: Vec<SkelLeaf>, config: &TreeConfig) -> S
     let target_f = ((0.75 * max_f as f32).round() as usize).clamp(min_f, max_f);
 
     let mut internals: Vec<SkelInternal> = Vec::new();
-    // Current level nodes: (node_idx, weight, centroid)
     let mut cur_level_is_leaf = true;
     let mut cur_nodes: Vec<(usize, u64, Vec<f32>)> = leaves
         .iter()
@@ -377,7 +303,6 @@ fn build_skeleton_hierarchy(mut leaves: Vec<SkelLeaf>, config: &TreeConfig) -> S
     loop {
         let c = cur_nodes.len();
         if c <= max_f {
-            // Single root internal node at `level`.
             let root_idx = internals.len();
             let children: Vec<usize> = cur_nodes.iter().map(|&(idx, _, _)| idx).collect();
             let weighted: Vec<(&[f32], u64)> = cur_nodes
@@ -409,7 +334,6 @@ fn build_skeleton_hierarchy(mut leaves: Vec<SkelLeaf>, config: &TreeConfig) -> S
             };
         }
 
-        // Partition `c` nodes into `p` balanced parent groups, each in `[min_f, max_f]`.
         let mut p = c.div_ceil(target_f).max(2);
         while c / p < min_f {
             p -= 1;
@@ -457,8 +381,6 @@ fn build_skeleton_hierarchy(mut leaves: Vec<SkelLeaf>, config: &TreeConfig) -> S
     }
 }
 
-/// Partition `items` (length `n`, with `k * min_f <= n <= k * max_f`) into `k` groups
-/// each of size in `[min_f, max_f]`.
 fn split_weighted_into_k(
     items: &[(&[f32], u64)],
     k: usize,
@@ -568,7 +490,11 @@ fn move_by_margin(
 }
 
 impl SkelTree {
-    fn build_routing_cache(&self, dim: usize, metric: DistanceMetric) -> HashMap<NodeId, PackedInternalNode> {
+    fn build_routing_cache(
+        &self,
+        dim: usize,
+        metric: DistanceMetric,
+    ) -> HashMap<NodeId, PackedInternalNode> {
         let mut cache = HashMap::with_capacity(self.internals.len());
         for (idx, node) in self.internals.iter().enumerate() {
             let children: Vec<(NodeId, u64, &[f32])> = node
@@ -608,36 +534,36 @@ impl SkelTree {
         let min_leaf = config.min_leaf_size;
         let max_leaf = config.max_leaf_size;
 
-        // 1. Split oversize leaves in parallel to compute partitions, then update tree.
         let oversize_ids: Vec<usize> = (0..self.leaves.len())
-            .filter(|&i| self.leaves[i].alive && self.leaves[i].rows.len() > max_leaf)
+            .filter(|&i| self.leaves[i].alive && self.leaves[i].entries.len() > max_leaf)
             .collect();
 
-        type LeafSplits = (usize, Vec<(Vec<u32>, Vec<f32>)>);
+        type LeafSplits = (usize, Vec<(Vec<VecEntry>, Vec<f32>)>);
         let splits: Vec<LeafSplits> = pool.install(|| {
             oversize_ids
                 .par_iter()
                 .map(|&lid| {
-                    let rows = &self.leaves[lid].rows;
-                    let n = rows.len();
+                    let entries = &self.leaves[lid].entries;
+                    let n = entries.len();
                     let min_k = n.div_ceil(max_leaf);
                     let max_k = (n / min_leaf).max(min_k);
                     let k = n.div_ceil(target_leaf_size).clamp(min_k, max_k).max(2);
-                    let items: Vec<(&[f32], u64)> = rows
+                    let items: Vec<(&[f32], u64)> = entries
                         .iter()
-                        .map(|&r| (read_vector_at(vectors_bytes, r, dim), 1u64))
+                        .map(|e| (read_vector_at(vectors_bytes, e.vec_idx, dim), 1u64))
                         .collect();
                     let groups = split_weighted_into_k(&items, k, min_leaf, max_leaf, dim, metric);
                     let parts = groups
                         .into_iter()
                         .map(|g| {
-                            let part_rows: Vec<u32> = g.into_iter().map(|i| rows[i]).collect();
-                            let refs: Vec<&[f32]> = part_rows
+                            let part_entries: Vec<VecEntry> =
+                                g.into_iter().map(|i| entries[i]).collect();
+                            let refs: Vec<&[f32]> = part_entries
                                 .iter()
-                                .map(|&r| read_vector_at(vectors_bytes, r, dim))
+                                .map(|e| read_vector_at(vectors_bytes, e.vec_idx, dim))
                                 .collect();
                             let cent = compute_mean_centroid(&refs, dim, metric);
-                            (part_rows, cent)
+                            (part_entries, cent)
                         })
                         .collect();
                     (lid, parts)
@@ -647,17 +573,17 @@ impl SkelTree {
 
         for (lid, mut parts) in splits {
             let parent = self.leaves[lid].parent;
-            let (first_rows, first_cent) = parts.remove(0);
-            self.leaves[lid].rows = first_rows;
+            let (first_entries, first_cent) = parts.remove(0);
+            self.leaves[lid].entries = first_entries;
             self.leaves[lid].centroid = first_cent;
 
-            for (part_rows, part_cent) in parts {
+            for (part_entries, part_cent) in parts {
                 let new_lid = self.leaves.len();
                 self.leaves.push(SkelLeaf {
                     centroid: part_cent,
-                    weight: part_rows.len() as u64,
+                    weight: part_entries.len() as u64,
                     parent,
-                    rows: part_rows,
+                    entries: part_entries,
                     alive: true,
                 });
                 if let Some(pid) = parent {
@@ -666,48 +592,46 @@ impl SkelTree {
             }
         }
 
-        // 2. Remove empty leaves and merge/rebalance undersize leaves.
         let leaf_count = self.leaves.len();
         for lid in 0..leaf_count {
             if !self.leaves[lid].alive {
                 continue;
             }
-            if self.leaves[lid].rows.is_empty() {
+            if self.leaves[lid].entries.is_empty() {
                 self.detach_leaf(lid);
                 continue;
             }
-            while self.leaves[lid].alive && self.leaves[lid].rows.len() < min_leaf {
+            while self.leaves[lid].alive && self.leaves[lid].entries.len() < min_leaf {
                 let Some(sib_id) = self.find_nearest_alive_sibling_leaf(lid, metric) else {
                     break;
                 };
-                let mut combined = std::mem::take(&mut self.leaves[lid].rows);
-                combined.append(&mut self.leaves[sib_id].rows);
+                let mut combined = std::mem::take(&mut self.leaves[lid].entries);
+                combined.append(&mut self.leaves[sib_id].entries);
                 if combined.len() <= max_leaf {
                     let refs: Vec<&[f32]> = combined
                         .iter()
-                        .map(|&r| read_vector_at(vectors_bytes, r, dim))
+                        .map(|e| read_vector_at(vectors_bytes, e.vec_idx, dim))
                         .collect();
                     self.leaves[sib_id].centroid = compute_mean_centroid(&refs, dim, metric);
-                    self.leaves[sib_id].rows = combined;
+                    self.leaves[sib_id].entries = combined;
                     self.detach_leaf(lid);
                     break;
                 } else {
                     let items: Vec<(&[f32], u64)> = combined
                         .iter()
-                        .map(|&r| (read_vector_at(vectors_bytes, r, dim), 1u64))
+                        .map(|e| (read_vector_at(vectors_bytes, e.vec_idx, dim), 1u64))
                         .collect();
                     let split = balanced_two_means(&items, min_leaf, max_leaf, dim, metric);
-                    let rows1: Vec<u32> = split.part1.into_iter().map(|i| combined[i]).collect();
-                    let rows2: Vec<u32> = split.part2.into_iter().map(|i| combined[i]).collect();
-                    self.leaves[lid].rows = rows1;
+                    let e1: Vec<VecEntry> = split.part1.into_iter().map(|i| combined[i]).collect();
+                    let e2: Vec<VecEntry> = split.part2.into_iter().map(|i| combined[i]).collect();
+                    self.leaves[lid].entries = e1;
                     self.leaves[lid].centroid = split.centroid1;
-                    self.leaves[sib_id].rows = rows2;
+                    self.leaves[sib_id].entries = e2;
                     self.leaves[sib_id].centroid = split.centroid2;
                 }
             }
         }
 
-        // 3. Recompute leaf centroids in parallel from exact assigned vectors.
         let alive_leaf_ids: Vec<usize> = (0..self.leaves.len())
             .filter(|&i| self.leaves[i].alive)
             .collect();
@@ -716,9 +640,9 @@ impl SkelTree {
                 .par_iter()
                 .map(|&lid| {
                     let refs: Vec<&[f32]> = self.leaves[lid]
-                        .rows
+                        .entries
                         .iter()
-                        .map(|&r| read_vector_at(vectors_bytes, r, dim))
+                        .map(|e| read_vector_at(vectors_bytes, e.vec_idx, dim))
                         .collect();
                     (lid, compute_mean_centroid(&refs, dim, metric))
                 })
@@ -726,18 +650,16 @@ impl SkelTree {
         });
         for (lid, cent) in leaf_centroids {
             self.leaves[lid].centroid = cent;
-            self.leaves[lid].weight = self.leaves[lid].rows.len() as u64;
+            self.leaves[lid].weight = self.leaves[lid].entries.len() as u64;
         }
 
-        // 4. Repair internal nodes bottom-up so all fanout and depth invariants hold.
         self.repair_internals(config)?;
-
         Ok(())
     }
 
     fn detach_leaf(&mut self, lid: usize) {
         self.leaves[lid].alive = false;
-        self.leaves[lid].rows.clear();
+        self.leaves[lid].entries.clear();
         if let Some(pid) = self.leaves[lid].parent.take() {
             self.internals[pid].children.retain(|&c| c != lid);
         }
@@ -745,7 +667,6 @@ impl SkelTree {
 
     fn find_nearest_alive_sibling_leaf(&self, lid: usize, metric: DistanceMetric) -> Option<usize> {
         let cent = &self.leaves[lid].centroid;
-        // Prefer siblings under the same parent first.
         if let Some(pid) = self.leaves[lid].parent {
             let best_same_parent = self.internals[pid]
                 .children
@@ -761,7 +682,6 @@ impl SkelTree {
                 return best_same_parent;
             }
         }
-        // Fallback: any other alive leaf in the tree.
         (0..self.leaves.len())
             .filter(|&cid| cid != lid && self.leaves[cid].alive)
             .min_by(|&a, &b| {
@@ -784,7 +704,6 @@ impl SkelTree {
                 .filter(|&i| self.internals[i].alive && self.internals[i].level == level)
                 .collect();
 
-            // Recompute stats & prune empty nodes.
             for &nid in &level_nodes {
                 self.recompute_internal_stats(nid, dim, metric);
                 if self.internals[nid].children.is_empty() {
@@ -792,7 +711,6 @@ impl SkelTree {
                 }
             }
 
-            // Split any oversize nodes at this level.
             for &nid in &level_nodes {
                 if !self.internals[nid].alive {
                     continue;
@@ -802,7 +720,6 @@ impl SkelTree {
                 }
             }
 
-            // Merge/rebalance any undersize non-root nodes at this level.
             let current_level_nodes: Vec<usize> = (0..self.internals.len())
                 .filter(|&i| self.internals[i].alive && self.internals[i].level == level)
                 .collect();
@@ -855,7 +772,6 @@ impl SkelTree {
             level += 1;
         }
 
-        // Collapse root if it shrank to a single child (cannot become level 0 because N > max_leaf_size).
         while self.internals[self.root_idx].children.len() == 1 && self.root_level > 1 {
             let only_child = self.internals[self.root_idx].children[0];
             self.internals[self.root_idx].alive = false;
@@ -864,7 +780,6 @@ impl SkelTree {
             self.root_level -= 1;
         }
 
-        // Final bottom-up stats recomputation.
         for lv in 1..=self.root_level {
             let ids: Vec<usize> = (0..self.internals.len())
                 .filter(|&i| self.internals[i].alive && self.internals[i].level == lv)
@@ -880,7 +795,7 @@ impl SkelTree {
     fn child_summary(&self, cid: usize, parent_level: u8) -> (Vec<f32>, u64) {
         if parent_level == 1 {
             let l = &self.leaves[cid];
-            (l.centroid.clone(), l.rows.len() as u64)
+            (l.centroid.clone(), l.entries.len() as u64)
         } else {
             let c = &self.internals[cid];
             (c.centroid.clone(), c.subtree_count)
@@ -976,7 +891,6 @@ impl SkelTree {
                 self.internals[pid].children.push(new_id);
             }
         } else {
-            // Split root: create a new root above `created_ids` (splitting further if > max_f).
             let new_root_idx = self.internals.len();
             for &cid in &created_ids {
                 self.internals[cid].parent = Some(new_root_idx);
@@ -1026,18 +940,7 @@ impl SkelTree {
             })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn finalize(
-        mut self,
-        doc_ids_bytes: &[u8],
-        total_rows_read: usize,
-        dim: usize,
-        metric: DistanceMetric,
-        rabitq_seed: u64,
-        has_fts: bool,
-        placement_path: &Path,
-    ) -> Result<BuiltTree> {
-        // BFS from root_idx to assign NodeIds: root = 1, internals contiguous, then leaves contiguous.
+    fn finalize(mut self, dim: usize, metric: DistanceMetric, rabitq_seed: u64) -> BuiltTree {
         let mut internal_order: Vec<usize> = Vec::new();
         let mut leaf_order: Vec<usize> = Vec::new();
         let mut queue = std::collections::VecDeque::new();
@@ -1057,7 +960,8 @@ impl SkelTree {
             }
         }
 
-        let mut internal_id_map: HashMap<usize, NodeId> = HashMap::with_capacity(internal_order.len());
+        let mut internal_id_map: HashMap<usize, NodeId> =
+            HashMap::with_capacity(internal_order.len());
         let mut next_id: NodeId = 1;
         for &idx in &internal_order {
             internal_id_map.insert(idx, next_id);
@@ -1080,7 +984,7 @@ impl SkelTree {
                 .map(|&cid| {
                     if skel.level == 1 {
                         let l = &self.leaves[cid];
-                        (leaf_id_map[&cid], l.rows.len() as u64, l.centroid.as_slice())
+                        (leaf_id_map[&cid], l.entries.len() as u64, l.centroid.as_slice())
                     } else {
                         let c = &self.internals[cid];
                         (internal_id_map[&cid], c.subtree_count, c.centroid.as_slice())
@@ -1098,35 +1002,24 @@ impl SkelTree {
         }
 
         let mut assigned_leaves = Vec::with_capacity(leaf_order.len());
-        let mut next_fts_doc_id: u32 = 0;
         let mut total_vectors: u64 = 0;
 
         for &idx in &leaf_order {
             let leaf_id = leaf_id_map[&idx];
             let skel = &mut self.leaves[idx];
             let parent_id = skel.parent.map(|p| internal_id_map[&p]);
-            let mut rows = std::mem::take(&mut skel.rows);
-            rows.sort_unstable_by_key(|&r| read_doc_id_at(doc_ids_bytes, r));
-
-            let first_fts_doc_id = next_fts_doc_id;
-            if has_fts {
-                next_fts_doc_id = next_fts_doc_id
-                    .checked_add(rows.len() as u32)
-                    .ok_or_else(|| TreeError::Storage("FtsDocId u32 space exhausted".into()))?;
-            }
-            total_vectors += rows.len() as u64;
+            let mut entries = std::mem::take(&mut skel.entries);
+            entries.sort_unstable_by_key(|e| e.row_id);
+            total_vectors += entries.len() as u64;
             assigned_leaves.push(AssignedLeaf {
                 leaf_id,
                 parent_id,
                 centroid: std::mem::take(&mut skel.centroid),
-                rows,
-                first_fts_doc_id,
+                entries,
             });
         }
 
-        write_placement_file(placement_path, total_rows_read, &assigned_leaves, has_fts)?;
-
-        let meta = TreeMeta {
+        let meta = AnnMeta {
             root_id: 1,
             root_level: self.root_level,
             next_node_id: next_id,
@@ -1135,49 +1028,15 @@ impl SkelTree {
             num_vectors: total_vectors,
             rabitq_seed,
             rabitq_bits: 1,
+            stale_rows: 0,
+            vacuum_epoch: 0,
+            vacuum_cursor: 0,
         };
 
-        Ok(BuiltTree {
+        BuiltTree {
             meta,
             internal_nodes: packed_internals,
             leaves: assigned_leaves,
-            placement_by_row_path: placement_path.to_path_buf(),
-        })
-    }
-}
-
-fn write_placement_file(
-    placement_path: &Path,
-    total_rows_read: usize,
-    leaves: &[AssignedLeaf],
-    has_fts: bool,
-) -> Result<()> {
-    let mut placements = vec![0u8; total_rows_read * Placement::SIZE];
-    for leaf in leaves {
-        for (slot, &row) in leaf.rows.iter().enumerate() {
-            let fts_doc_id = if has_fts {
-                leaf.first_fts_doc_id + slot as u32
-            } else {
-                FtsDocId::MAX
-            };
-            let enc = Placement {
-                leaf_id: leaf.leaf_id,
-                local_id: slot as u32,
-                fts_doc_id,
-            }
-            .encode();
-            let off = (row as usize) * Placement::SIZE;
-            placements[off..off + Placement::SIZE].copy_from_slice(&enc);
         }
     }
-    let file = File::create(placement_path)
-        .map_err(|e| TreeError::Storage(format!("create placement.bin: {e}")))?;
-    let mut writer = BufWriter::with_capacity(256 * 1024, file);
-    writer
-        .write_all(&placements)
-        .map_err(|e| TreeError::Storage(format!("write placement.bin: {e}")))?;
-    writer
-        .flush()
-        .map_err(|e| TreeError::Storage(format!("flush placement.bin: {e}")))?;
-    Ok(())
 }

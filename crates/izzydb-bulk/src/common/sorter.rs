@@ -346,3 +346,33 @@ pub fn read_bytes_req(r: &mut impl Read) -> io::Result<Vec<u8>> {
     r.read_exact(&mut out)?;
     Ok(out)
 }
+
+pub struct KvItem {
+    pub key: Vec<u8>,
+    pub val: Vec<u8>,
+}
+
+impl SortItem for KvItem {
+    #[inline]
+    fn cmp_key(a: &Self, b: &Self) -> Ordering {
+        a.key.cmp(&b.key)
+    }
+
+    #[inline]
+    fn estimated_bytes(&self) -> usize {
+        self.key.len() + self.val.len() + 32
+    }
+
+    fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
+        write_bytes_lp(w, &self.key)?;
+        write_bytes_lp(w, &self.val)
+    }
+
+    fn read_from(r: &mut impl Read) -> io::Result<Option<Self>> {
+        let Some(key) = read_bytes_lp(r)? else {
+            return Ok(None);
+        };
+        let val = read_bytes_req(r)?;
+        Ok(Some(Self { key, val }))
+    }
+}

@@ -3,13 +3,13 @@
 This document specifies IzzyDB v3's attribute schema (`Inline` and `Detached`), filter AST, order-preserving encodings, **value-major per-segment** inverted index (`AttributeIndex`), exact live counts (`0x06`/`0x07`), per-segment zone maps (`0x12`), and faceting engine.
 
 Implementation sources:
-- Schema & `ColumnStorage::{Inline, Detached}`: [`crates/izzydb-core/src/schema.rs`](../../crates/izzydb-core/src/schema.rs)
+- Schema & `ColumnStorage::{Inline, Detached}`: [`crates/izzydb-core/src/schema/mod.rs`](../../crates/izzydb-core/src/schema/mod.rs)
 - Filter AST & validation: [`crates/izzydb-core/src/filter.rs`](../../crates/izzydb-core/src/filter.rs)
-- `RowView` v3, `SegPosting`, `ZoneEntry`, and scalar order-preserving codecs: [`crates/izzydb-storage/src/codec.rs`](../../crates/izzydb-storage/src/codec.rs)
+- `RowView` v3, `SegPosting`, `ZoneEntry`, and scalar order-preserving codecs: [`crates/izzydb-codec/src/lib.rs`](../../crates/izzydb-codec/src/lib.rs)
 - `ColumnBlock` readers (`AttrReader`, `ColumnReader`, `RowStoreReader`): [`crates/izzydb/src/attr_reader.rs`](../../crates/izzydb/src/attr_reader.rs)
 - `AttributeIndex` write hook: [`crates/izzydb/src/attr_index.rs`](../../crates/izzydb/src/attr_index.rs)
-- Filter planner (`RowSet`): [`crates/izzydb/src/filter_plan.rs`](../../crates/izzydb/src/filter_plan.rs)
-- Faceting engine: [`crates/izzydb/src/facet.rs`](../../crates/izzydb/src/facet.rs)
+- Filter planner (`RowSet`): [`crates/izzydb/src/filter_plan/mod.rs`](../../crates/izzydb/src/filter_plan/mod.rs)
+- Faceting engine: [`crates/izzydb/src/facet/mod.rs`](../../crates/izzydb/src/facet/mod.rs)
 
 ---
 
@@ -74,7 +74,7 @@ Every `encoded_val` is **self-delimiting**, so parsers can unambiguously split t
 
 ---
 
-## 5. Faceting Engine (`crates/izzydb/src/facet.rs`)
+## 5. Faceting Engine (`crates/izzydb/src/facet/mod.rs`)
 
 Every `filterable = true` attribute (both `Inline` and `Detached`) supports exact `Terms`, `Ranges`, `Stats`, and `Histogram` facets plus disjunctive `FacetFilterMode` (`ExcludeSelf`, etc.). Strategy dispatch per `FacetGroup`:
 

@@ -1,6 +1,6 @@
 //! RocksDB-backed packed node storage, binary codecs, and transaction overlay for `izzydb`.
 
-pub mod codec;
+pub use izzydb_codec as codec;
 pub mod column;
 pub mod node;
 pub mod storage;

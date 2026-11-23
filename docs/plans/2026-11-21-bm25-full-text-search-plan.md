@@ -310,7 +310,7 @@ Implemented in `FtsIndex` and integrated into `Filter`:
 
 ## 7. Invariant Verification (`Collection::verify_invariants`)
 
-Extend `verify_collection_invariants` ([`crates/izzydb/src/verify.rs`](file:///home/hieu/code/izzydb/crates/izzydb/src/verify.rs)) to verify:
+Extend `verify_collection_invariants` ([`crates/izzydb/src/verify/mod.rs`](file:///home/hieu/code/izzydb/crates/izzydb/src/verify/mod.rs)) to verify:
 1. **`FtsDocId` bijection:** `cf_fts_doc_map` and `cf_fts_rev_doc_map` form a 1-to-1 bijection with `cf_docs` (when the schema has ≥ 1 FTS attribute), with every `fts_doc_id < fts_meta.next_fts_doc_id`.
 2. **Full FTS reconstruction check:** Re-analyze every document's FTS-enabled attributes from `cf_docs`, rebuild expected `AttrFtsStats`, `cf_fts_terms` (`doc_freq` exact; `max_tf` ≥ true max, `min_dl` ≤ true min), `cf_fts_postings` (exact slots, `tf`, `dl`, `block.max_tf`, `block.min_dl`, no empty blocks), and `cf_fts_positions`, and assert exact parity with disk.
 

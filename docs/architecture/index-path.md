@@ -3,11 +3,11 @@
 This document describes how `Collection` coordinates `SegmentStore`, `AnnIndex`, `AttributeIndex`, `FtsIndex`, and detached columns during live mutations (`upsert`, `patch`, `delete`) and background maintenance (`seal`, `compact`, `vacuum_ann`).
 
 Implementation sources:
-- Top-level write coordinator: [`crates/izzydb/src/collection.rs`](../../crates/izzydb/src/collection.rs)
+- Top-level write coordinator: [`crates/izzydb/src/collection/mod.rs`](../../crates/izzydb/src/collection/mod.rs)
 - Append-only segment allocator & `RowIndexHook`: [`crates/izzydb/src/segments.rs`](../../crates/izzydb/src/segments.rs)
-- Global ANN tree over `RowId`s: [`crates/izzydb/src/tree.rs`](../../crates/izzydb/src/tree.rs)
+- Global ANN tree over `RowId`s: [`crates/izzydb/src/tree/mod.rs`](../../crates/izzydb/src/tree/mod.rs)
 - Value-major segment attribute index: [`crates/izzydb/src/attr_index.rs`](../../crates/izzydb/src/attr_index.rs)
-- Segment-scoped FTS index: [`crates/izzydb/src/fts_index.rs`](../../crates/izzydb/src/fts_index.rs)
+- Segment-scoped FTS index: [`crates/izzydb/src/fts_index/mod.rs`](../../crates/izzydb/src/fts_index/mod.rs)
 
 *(For offline compaction and forwarding details, see [`segments-and-compaction.md`](segments-and-compaction.md); for detached columns, see [`detached-columns.md`](detached-columns.md).)*
 

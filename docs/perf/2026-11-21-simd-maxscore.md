@@ -1,6 +1,6 @@
 # SIMD Block-Max MAXSCORE & v2 Posting Layout (2026-11-21)
 
-This note documents the storage layout, upper-bound tightening, runtime-dispatched SIMD kernels, and query-execution improvements introduced in commit [`66d8ec00`](../../crates/izzydb-fts/src/simd.rs) (`perf(fts)!: implement SIMD Block-Max MAXSCORE with v2 posting encoding`).
+This note documents the storage layout, upper-bound tightening, runtime-dispatched SIMD kernels, and query-execution improvements introduced in commit [`66d8ec00`](../../crates/izzydb-fts/src/simd/mod.rs) (`perf(fts)!: implement SIMD Block-Max MAXSCORE with v2 posting encoding`).
 
 ## Baseline Bottlenecks (v1 Posting Layout)
 
@@ -16,14 +16,14 @@ Prior to this change, `FtsIndex` already executed Block-Max MAXSCORE over 256-do
 ## Changes Implemented
 
 ### 1. Out-of-Line `DocLenBlock` (`cf_fts_doc_lens`) & Shared `dl_norm` Cache
-([`crates/izzydb-fts/src/block.rs`](../../crates/izzydb-fts/src/block.rs), [`crates/izzydb-fts/src/maxscore.rs`](../../crates/izzydb-fts/src/maxscore.rs), [`crates/izzydb-storage/src/storage.rs`](../../crates/izzydb-storage/src/storage.rs), [`crates/izzydb-storage/src/codec.rs`](../../crates/izzydb-storage/src/codec.rs))
+([`crates/izzydb-fts/src/block/mod.rs`](../../crates/izzydb-fts/src/block/mod.rs), [`crates/izzydb-fts/src/maxscore/mod.rs`](../../crates/izzydb-fts/src/maxscore/mod.rs), [`crates/izzydb-storage/src/storage/mod.rs`](../../crates/izzydb-storage/src/storage/mod.rs), [`crates/izzydb-codec/src/lib.rs`](../../crates/izzydb-codec/src/lib.rs))
 
 - **Dedicated column family (`CF_FTS_DOC_LENS` / `cf_fts_doc_lens`):** Document lengths are now stored once per `(attr_id, block_id)` using a 6-byte big-endian key (`attr_id: u16 BE || block_id: u32 BE`), configured with `point_lookup_cf_opts(&block_cache, true)` (uncompressed, Bloom-filtered, pinned L0 index/filter blocks).
 - **`DocLenBlock` & `DocLenBlockView`:** Each block holds 256 `dl` slots with a 4-byte header (`width: u8`, `reserved: u8 = 0`, `count: u16 LE`) followed by 256 packed integers at `IntWidth` (`U8`, `U16`, or `U32` selected via `IntWidth::min_for_max(max_dl)`).
 - **Shared `DlNormCache`:** `execute_rank_by` interns `(attr_id, c1, c2)` groups (where `c1 = k1 * (1 - b)` and `c2 = k1 * b / avgdl`). For each visited `block_id`, `prepare_dl_norm_256` computes `dl_norm[s] = max(c1 + c2 * dl[s], f32::MIN_POSITIVE)` once via SIMD and shares the `[f32; 256]` slice across all query terms in that group.
 
 ### 2. v2 TF-Only Sparse/Dense `PackedPostingBlock`
-([`crates/izzydb-fts/src/block.rs`](../../crates/izzydb-fts/src/block.rs), [`crates/izzydb-core/src/schema.rs`](../../crates/izzydb-core/src/schema.rs))
+([`crates/izzydb-fts/src/block/mod.rs`](../../crates/izzydb-fts/src/block/mod.rs), [`crates/izzydb-core/src/schema/mod.rs`](../../crates/izzydb-core/src/schema/mod.rs))
 
 - Removed `dls` from `PackedPostingBlock` so posting blocks store only term frequencies (`tf`) using `IntWidth` (`U8` / `U16` / `U32`), and switched automatically between two layouts at `POSTING_DENSE_THRESHOLD = 96`:
   - **Sparse (`count < 96`):** 12-byte header + `slots: [u8; count]` + packed `tfs: [u8|u16|u32; count]` LE.
@@ -32,7 +32,7 @@ Prior to this change, `FtsIndex` already executed Block-Max MAXSCORE over 256-do
 - Bumped `CollectionSchema` persistence format from version `2` to version `3`.
 
 ### 3. Tighter `min_dl_over_tf` Upper Bounds
-([`crates/izzydb-fts/src/block.rs`](../../crates/izzydb-fts/src/block.rs), [`crates/izzydb-fts/src/bm25.rs`](../../crates/izzydb-fts/src/bm25.rs))
+([`crates/izzydb-fts/src/block/mod.rs`](../../crates/izzydb-fts/src/block/mod.rs), [`crates/izzydb-fts/src/bm25.rs`](../../crates/izzydb-fts/src/bm25.rs))
 
 - Replaced `min_dl: u32` with `min_dl_over_tf: f32` in both `TermStats` (`cf_fts_terms`) and `PostingBlockHeader`.
 - `dl_over_tf_lower_bound(dl, tf)` computes `(dl as f64) / (tf as f64)` and applies `f32::next_down()` whenever `(r as f64) > exact`, ensuring `min_dl_over_tf <= dl / tf` for every posting in the term or block.
@@ -45,7 +45,7 @@ Prior to this change, `FtsIndex` already executed Block-Max MAXSCORE over 256-do
   in `f64` before casting to `f32`, giving a mathematically sound upper bound that is significantly tighter when high-`tf` documents are longer than the block's shortest document.
 
 ### 4. Runtime-Dispatched SIMD Kernels
-([`crates/izzydb-fts/src/simd.rs`](../../crates/izzydb-fts/src/simd.rs), [`crates/izzydb-fts/src/bm25.rs`](../../crates/izzydb-fts/src/bm25.rs))
+([`crates/izzydb-fts/src/simd/mod.rs`](../../crates/izzydb-fts/src/simd/mod.rs), [`crates/izzydb-fts/src/bm25.rs`](../../crates/izzydb-fts/src/bm25.rs))
 
 `SimdTier::detect()` selects `Avx512` (`avx512f`), `Avx2` (`avx2` + `fma`), `Neon` (`aarch64` `neon`), or `Scalar` at runtime for all 256-slot block operations:
 
@@ -60,14 +60,14 @@ Prior to this change, `FtsIndex` already executed Block-Max MAXSCORE over 256-do
 | `merge_max_256` / `merge_add_256` | Multi-clause score merging | Vectorized elementwise `max` and `add` across 256 floats for `PrefixMax` (`last_as_prefix`) and `MaxBranches` (`RankBy::Max`) |
 
 ### 5. Progressive Non-Essential Pruning, Zero-Alloc Cursor Seeks & Verification
-([`crates/izzydb-fts/src/maxscore.rs`](../../crates/izzydb-fts/src/maxscore.rs), [`crates/izzydb-storage/src/storage.rs`](../../crates/izzydb-storage/src/storage.rs), [`crates/izzydb/src/fts_index.rs`](../../crates/izzydb/src/fts_index.rs), [`crates/izzydb/src/verify.rs`](../../crates/izzydb/src/verify.rs))
+([`crates/izzydb-fts/src/maxscore/mod.rs`](../../crates/izzydb-fts/src/maxscore/mod.rs), [`crates/izzydb-storage/src/storage/mod.rs`](../../crates/izzydb-storage/src/storage/mod.rs), [`crates/izzydb/src/fts_index/mod.rs`](../../crates/izzydb/src/fts_index/mod.rs), [`crates/izzydb/src/verify/mod.rs`](../../crates/izzydb/src/verify/mod.rs))
 
 - **Progressive `active_mask` pruning:** After essential clauses execute on `block_id`, `execute_rank_by` computes `max_ess = max_score_256(...)`. If `max_ess + non_ess_ub >= theta`, it seeks non-essential clauses to `block_id` to form a tighter per-block bound `tight_ub = max_ess + non_ess_block_ub`. Surviving blocks iterate non-essential clauses in **descending** global `term_max` order, narrowing `active_mask` before each clause via `filter_ge_256(tier, &scores, &active_mask, (theta - rem_ub) - tight_eps)` and breaking early once `active_mask == [0; 4]`.
 - **Zero-allocation cursor seek:** `RocksPostingCursor::seek_block` reuses a pre-reserved `seek_buf` (`truncate(prefix_len)` + `extend_from_slice(&target.to_be_bytes())`).
 - **Invariant verification:** `verify_collection_invariants` checks `cf_fts_doc_lens` parity and `min_dl_over_tf` bounds against `cf_docs`.
 
 ### 6. Follow-Up Hot-Path Optimizations
-([`crates/izzydb-storage/src/storage.rs`](../../crates/izzydb-storage/src/storage.rs), [`crates/izzydb-fts/src/maxscore.rs`](../../crates/izzydb-fts/src/maxscore.rs), [`crates/izzydb-fts/src/simd.rs`](../../crates/izzydb-fts/src/simd.rs), [`crates/izzydb/src/fts_index.rs`](../../crates/izzydb/src/fts_index.rs))
+([`crates/izzydb-storage/src/storage/mod.rs`](../../crates/izzydb-storage/src/storage/mod.rs), [`crates/izzydb-fts/src/maxscore/mod.rs`](../../crates/izzydb-fts/src/maxscore/mod.rs), [`crates/izzydb-fts/src/simd/mod.rs`](../../crates/izzydb-fts/src/simd/mod.rs), [`crates/izzydb/src/fts_index/mod.rs`](../../crates/izzydb/src/fts_index/mod.rs))
 
 - **Per-attribute `DocLenBlock` cache (`RocksDocLenCursor`):** `Storage::fts_doc_lens_cache` lazily caches each attribute's `cf_fts_doc_lens` vector as an `Arc<Vec<Option<Box<[u8]>>>>` on first query and updates it write-through in `TxContext::commit`, replacing per-block RocksDB `get_pinned_cf` lookups (~204 µs at `n = 100,000`) with lock-free array indexing.
 - **Cached cursor `current_block` & `cur + 1` single-step `next()`:** `RocksPostingCursor` caches `current_block: Option<FtsBlockId>` (eliminating repeated `iter.key()`/`iter.valid()` FFI calls) and uses a single `iter.next()` instead of `iter.seek(...)` in `seek_block` whenever `cur + 1 == target`.
@@ -96,4 +96,4 @@ Measured apples-to-apples via `cargo run --release -p izzydb-bench --bin fts_ben
 | Medium 8-term | 1,434.1 µs | 1,959.9 µs | **734.2 µs** | 76,369.3 µs | **1.95×** | **104.0×** |
 | Long 50-term LLM | 4,799.2 µs | 5,252.5 µs | **3,156.3 µs** | 163,742.2 µs | **1.52×** | **51.9×** |
 
-*(Note on `66d8ec00` commit history: the original `66d8ec00` commit message listed only the 3-term `93.4 µs` baseline—measured on the older `fts_bench` without a warmup iteration—because Medium 8-term was newly added in `66d8ec00` and the unwarmed 50-term baseline `562.8 µs` was omitted. `Avx2` and `aarch64` `Neon` kernels are compiled and unit-tested against `Scalar` parity in [`crates/izzydb-fts/src/simd.rs`](../../crates/izzydb-fts/src/simd.rs), while hardware benchmarks above reflect `Avx512` on AMD Ryzen 9 7950X.)*
+*(Note on `66d8ec00` commit history: the original `66d8ec00` commit message listed only the 3-term `93.4 µs` baseline—measured on the older `fts_bench` without a warmup iteration—because Medium 8-term was newly added in `66d8ec00` and the unwarmed 50-term baseline `562.8 µs` was omitted. `Avx2` and `aarch64` `Neon` kernels are compiled and unit-tested against `Scalar` parity in [`crates/izzydb-fts/src/simd/mod.rs`](../../crates/izzydb-fts/src/simd/mod.rs), while hardware benchmarks above reflect `Avx512` on AMD Ryzen 9 7950X.)*

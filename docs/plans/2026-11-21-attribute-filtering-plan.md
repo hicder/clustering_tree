@@ -94,7 +94,7 @@ To support both point lookups (`Eq`, `In`, `Contains`) and RocksDB range scans (
 
 ## 3. Public Interface (`Collection` vs `ClusteringTree`)
 
-### 3.1 `Collection` (`crates/izzydb/src/collection.rs`)
+### 3.1 `Collection` (`crates/izzydb/src/collection/mod.rs`)
 
 ```rust
 pub struct Collection {
@@ -248,7 +248,7 @@ For broader filters (`All` or `bm.len() > exhaustive_cluster_threshold`):
 
 ---
 
-## 7. Invariant Verification (`crates/izzydb/src/verify.rs`)
+## 7. Invariant Verification (`crates/izzydb/src/verify/mod.rs`)
 
 Extend `verify_invariants` to `Collection::verify_invariants`:
 1. Existing `ClusteringTree` invariants (disjoint internal/leaf CFs, no orphans, `cf_vectors` completeness, `cf_doc_loc` bijection including `local_id` uniqueness and `< leaf.next_local_id`).

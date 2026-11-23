@@ -1,6 +1,6 @@
 # Ranking, Boosting, and Attribute Sorting
 
-This document describes how `izzydb` executes the generalized `RankBy` AST (BM25, filter boosts, attribute scores, multiplicative products) and attribute-ordered queries (`OrderBy`). Implementation: [`rank.rs`](../../crates/izzydb-core/src/rank.rs) (AST, math, normalization), [`maxscore.rs`](../../crates/izzydb-fts/src/maxscore.rs) (pruned lexical execution), [`rank_eval.rs`](../../crates/izzydb/src/rank_eval.rs) (planner and exact executors), [`order_by.rs`](../../crates/izzydb/src/order_by.rs) (index-order scan).
+This document describes how `izzydb` executes the generalized `RankBy` AST (BM25, filter boosts, attribute scores, multiplicative products) and attribute-ordered queries (`OrderBy`). Implementation: [`rank.rs`](../../crates/izzydb-core/src/rank.rs) (AST, math, normalization), [`maxscore.rs`](../../crates/izzydb-fts/src/maxscore/mod.rs) (pruned lexical execution), [`rank_eval.rs`](../../crates/izzydb/src/rank_eval/mod.rs) (planner and exact executors), [`order_by.rs`](../../crates/izzydb/src/order_by.rs) (index-order scan).
 
 Attribute scores read through `AttrReader` (`cf_columns` on sealed segments, `cf_detached` on detached columns, and zero-copy `RowView` in `cf_rows` on open segments); filter boosts reuse `FilterPlan`; `OrderBy` streams value-major `cf_attr_postings` / `cf_detached_postings` keys.
 

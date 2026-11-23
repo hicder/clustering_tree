@@ -3,13 +3,13 @@
 This document specifies the persistent RocksDB key-value encodings, packed node/vector/row/columnar blob formats, order-preserving attribute encodings, FTS block formats, and RaBitQ bit-packing layouts in IzzyDB v3.
 
 Implementation sources:
-- Column families, RocksDB keys, compaction filters, and CF options: [`crates/izzydb-storage/src/storage/mod.rs`](../../crates/izzydb-storage/src/storage/mod.rs)
-- Packed ANN node/metadata serialization and zero-copy views: [`crates/izzydb-storage/src/node.rs`](../../crates/izzydb-storage/src/node.rs)
-- `RowView` v3, `SegPosting`, `Manifest`, `SegmentMeta`, `DetachedMeta`, zone maps: [`crates/izzydb-storage/src/codec.rs`](../../crates/izzydb-storage/src/codec.rs)
-- `ColumnBlock` & `ColumnBlockBuilder` (`cf_columns`, `cf_detached`): [`crates/izzydb-storage/src/column.rs`](../../crates/izzydb-storage/src/column.rs)
-- FTS metadata, `TermRecord` v4, `SkipBlock`, `DocLenBlock`, v3 `PackedPostingBlock`, and `PackedPositionBlock`: [`crates/izzydb-fts/src/block.rs`](../../crates/izzydb-fts/src/block.rs)
-- ID aliases, `RowId`/`RowBlock`/`SkipChunk`, and schema types: [`crates/izzydb-core/src/config.rs`](../../crates/izzydb-core/src/config.rs), [`crates/izzydb-core/src/schema.rs`](../../crates/izzydb-core/src/schema.rs)
-- Structural and index invariants: [`crates/izzydb/src/verify.rs`](../../crates/izzydb/src/verify.rs)
+- Column families, RocksDB keys, compaction filters, and CF options: [`crates/izzydb-storage/src/storage/`](../../crates/izzydb-storage/src/storage/)
+- Packed ANN node/metadata serialization and zero-copy views: [`crates/izzydb-storage/src/node/mod.rs`](../../crates/izzydb-storage/src/node/mod.rs)
+- `RowView` v3, `SegPosting`, `Manifest`, `SegmentMeta`, `DetachedMeta`, zone maps: [`crates/izzydb-codec/src/lib.rs`](../../crates/izzydb-codec/src/lib.rs)
+- `ColumnBlock` & `ColumnBlockBuilder` (`cf_columns`, `cf_detached`): [`crates/izzydb-storage/src/column/mod.rs`](../../crates/izzydb-storage/src/column/mod.rs)
+- FTS metadata, `TermRecord` v4, `SkipBlock`, `DocLenBlock`, v3 `PackedPostingBlock`, and `PackedPositionBlock`: [`crates/izzydb-fts/src/block/mod.rs`](../../crates/izzydb-fts/src/block/mod.rs)
+- ID aliases, `RowId`/`RowBlock`/`SkipChunk`, and schema types: [`crates/izzydb-core/src/config.rs`](../../crates/izzydb-core/src/config.rs), [`crates/izzydb-core/src/schema/mod.rs`](../../crates/izzydb-core/src/schema/mod.rs)
+- Structural and index invariants: [`crates/izzydb/src/verify/mod.rs`](../../crates/izzydb/src/verify/mod.rs)
 
 *(For how the FTS SIMD Block-Max MAXSCORE engine consumes FTS blocks, see [`blockmax-simd.md`](blockmax-simd.md). For segment compaction and detached columns, see [`segments-and-compaction.md`](segments-and-compaction.md) and [`detached-columns.md`](detached-columns.md).)*
 
@@ -144,7 +144,7 @@ One attribute for one 256-slot `RowBlock` (`block = local >> 8`):
 
 ## 5. Consistency Invariants (`Collection::verify_invariants`)
 
-Verified exhaustively by `crates/izzydb/src/verify.rs`:
+Verified exhaustively by `crates/izzydb/src/verify/mod.rs`:
 1. **Schema & Manifest / Segment Table:** `Manifest.next_segment_id > max(seg)` across all `0x11` keys; at most one `Open` segment equal to `Manifest.open_segment`; zero dropped segment leaks into `0x11` or `0x10`; `0x10` deletion bitmaps bounded by `< row_count` with `|bitmap| == deleted_count`.
 2. **Row / DocId Bijection:** For every non-dropped segment, `cf_rows` keys equal `0..row_count`; `cf_id_map` is an exact bijection onto live `(RowId, DocId)` entries mirrored in `cf_row_doc_ids`.
 3. **ANN Tree (when `has_vectors`):** Every live row with `has_vector` has **exactly one** effective leaf entry across `cf_leaf_entries` (after resolving `Forwarding` segments); every non-effective entry points to a tombstoned/forwarded-dead/dropped row; `AnnMeta.num_vectors == live_vector_rows` and `AnnMeta.stale_rows == physical_entries - effective_entries`. (Vectorless collections have zero ANN keys.)

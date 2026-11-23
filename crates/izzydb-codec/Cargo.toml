@@ -1,0 +1,11 @@
+[package]
+name = "izzydb-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Keyspace layout and binary codecs (keys, posting lists, segment metadata, packed rows) for izzydb"
+
+[dependencies]
+bytemuck.workspace = true
+izzydb-core.workspace = true
+roaring.workspace = true

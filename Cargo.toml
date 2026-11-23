@@ -17,6 +17,7 @@ tempfile = "3"
 thiserror = "2"
 
 izzydb = { path = "crates/izzydb" }
+izzydb-codec = { path = "crates/izzydb-codec" }
 izzydb-core = { path = "crates/izzydb-core" }
 izzydb-fts = { path = "crates/izzydb-fts" }
 izzydb-rabitq = { path = "crates/izzydb-rabitq" }

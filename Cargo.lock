@@ -753,6 +753,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "izzydb-codec"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "izzydb-core",
+ "roaring",
+]
+
+[[package]]
 name = "izzydb-core"
 version = "0.1.0"
 dependencies = [
@@ -786,6 +795,7 @@ name = "izzydb-storage"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "izzydb-codec",
  "izzydb-core",
  "izzydb-fts",
  "izzydb-rabitq",

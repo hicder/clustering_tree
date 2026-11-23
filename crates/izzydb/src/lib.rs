@@ -14,6 +14,8 @@ pub mod segments;
 pub(crate) mod attr_reader;
 /// Per-segment inverted attribute index.
 pub mod attr_index;
+/// Seal-time and maintenance transposition into `cf_columns`.
+pub(crate) mod columns;
 /// Exact faceting engine over `RowSet` populations and global counts.
 pub mod facet;
 /// `RowSet` filter planner, cardinality estimation, and zone pruning.
@@ -39,6 +41,8 @@ pub use attr_index::AttributeIndex;
 pub use collection::{
     Collection, Document, DocumentPatch, HybridSearchOptions, HybridSearchResult, SearchResult,
 };
+#[doc(hidden)]
+pub use columns::set_force_column_row_fallback;
 pub use filter_plan::{FilterPlanTrace, FilteredSearchRegime};
 pub use fts_index::{FtsIndex, LivenessMaskProvider};
 pub use config::{

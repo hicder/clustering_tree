@@ -17,9 +17,10 @@ use izzydb_storage::codec::{
     decode_scalar_val_bytes, encode_present_attr_key, encode_scalar_val_bytes,
     encode_str_prefix_ordered,
 };
+use izzydb_storage::column::ColumnBlockView;
 use izzydb_storage::Storage;
 
-use crate::attr_reader::{AttrReader, RowStoreReader};
+use crate::attr_reader::{AttrReader, ColumnReader, RowStoreReader};
 use crate::filter_plan::{self, FilterPlan, FilterPlanTrace, total_live_rows};
 use crate::fts_index::FtsIndex;
 
@@ -372,17 +373,114 @@ impl AttrAccs {
         Ok(())
     }
 
-    // ---- Strategy 3: forward `AttrReader` pass -------------------------------------------
+    // ---- Strategy 3: forward `ColumnReader` (sealed) + `RowStoreReader` fallback pass ----
 
     fn accumulate_rows(&mut self, env: &FacetEnv<'_>, sorted_rows: &[RowId]) -> Result<()> {
         if self.accs.is_empty() || sorted_rows.is_empty() {
             return Ok(());
         }
-        let reader = RowStoreReader::new(env.storage);
+        let col_reader = ColumnReader::new(env.storage, env.schema);
         let mut key_buf: Vec<u8> = Vec::with_capacity(32);
         let mut elems: Vec<Vec<u8>> = Vec::new();
-        reader.read_rows(sorted_rows, &mut |_, view| {
-            for acc in &mut self.accs {
+        let mut need_row_store = vec![false; sorted_rows.len()];
+        let mut row_store_attrs = vec![false; self.accs.len()];
+
+        for (ai, acc) in self.accs.iter_mut().enumerate() {
+            let mut col_rows: Vec<usize> = Vec::new();
+            let mut block_keys: Vec<(SegmentId, AttrId, u32)> = Vec::new();
+            for (ri, &row) in sorted_rows.iter().enumerate() {
+                if col_reader.segment_has_columns(row.seg(), acc.attr_id) {
+                    col_rows.push(ri);
+                    let k = (row.seg(), acc.attr_id, row.block_idx());
+                    if block_keys.last().copied() != Some(k) {
+                        block_keys.push(k);
+                    }
+                } else {
+                    need_row_store[ri] = true;
+                    row_store_attrs[ai] = true;
+                }
+            }
+            if col_rows.is_empty() {
+                continue;
+            }
+            let block_slices = env
+                .storage
+                .multi_get_column_blocks_pinned(&block_keys, true)?;
+            let mut block_views: HashMap<(SegmentId, u32), Option<ColumnBlockView<'_>>> =
+                HashMap::with_capacity(block_keys.len());
+            for (&(seg, _, block), opt_slice) in block_keys.iter().zip(block_slices.iter()) {
+                let parsed = opt_slice
+                    .as_ref()
+                    .map(|s| ColumnBlockView::parse(s))
+                    .transpose()?;
+                block_views.insert((seg, block), parsed);
+            }
+
+            let is_array = acc.array_ranges.is_empty()
+                && matches!(
+                    env.schema.get_by_id(acc.attr_id).map(|e| e.attr_type),
+                    Some(
+                        AttributeType::IntArray
+                            | AttributeType::UintArray
+                            | AttributeType::StringArray
+                    )
+                );
+            let collect_elems = !acc.array_ranges.is_empty() || is_array;
+
+            for ri in col_rows {
+                let row = sorted_rows[ri];
+                let Some(Some(view)) = block_views.get(&(row.seg(), row.block_idx())) else {
+                    continue;
+                };
+                let slot = row.slot();
+                if !view.is_present(slot) {
+                    continue;
+                }
+                acc.present += 1;
+                if !collect_elems {
+                    if acc.need_values {
+                        view.for_each_encoded_value(slot, &mut key_buf, |enc| {
+                            bump(&mut acc.values, enc, 1);
+                        })?;
+                    }
+                    continue;
+                }
+                elems.clear();
+                view.for_each_encoded_value(slot, &mut key_buf, |enc| {
+                    elems.push(enc.to_vec());
+                })?;
+                for ar in &mut acc.array_ranges {
+                    for (b, r) in ar.ranges.iter().enumerate() {
+                        if elems.iter().any(|e| r.contains(e)) {
+                            ar.counts[b] += 1;
+                        }
+                    }
+                }
+                if acc.need_values {
+                    elems.sort_unstable();
+                    elems.dedup();
+                    for e in &elems {
+                        bump(&mut acc.values, e, 1);
+                    }
+                }
+            }
+        }
+
+        let fallback_rows: Vec<RowId> = sorted_rows
+            .iter()
+            .zip(need_row_store.iter())
+            .filter_map(|(&r, &need)| need.then_some(r))
+            .collect();
+        if fallback_rows.is_empty() {
+            return Ok(());
+        }
+
+        let reader = RowStoreReader::new(env.storage);
+        reader.read_rows(&fallback_rows, &mut |row, view| {
+            for (ai, acc) in self.accs.iter_mut().enumerate() {
+                if !row_store_attrs[ai] || col_reader.segment_has_columns(row.seg(), acc.attr_id) {
+                    continue;
+                }
                 let Some(field) = view.get_raw_field(acc.attr_id)? else {
                     continue;
                 };

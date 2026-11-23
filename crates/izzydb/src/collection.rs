@@ -18,7 +18,8 @@ use izzydb_core::rowset::RowSet;
 use izzydb_core::schema::{AttributeValue, Attributes, CollectionConfig, CollectionSchema, ColumnStorage};
 use izzydb_fts::Bm25Result;
 use izzydb_storage::codec::{
-    Manifest, RowView, decode_row_attributes, decode_row_entries, encode_row,
+    Manifest, RowView, SEG_FLAG_HAS_COLUMNS, SegmentState, decode_row_attributes,
+    decode_row_entries, encode_row,
 };
 use izzydb_storage::node::{AnnMeta, PackedInternalNode, decode_f32_slice};
 use izzydb_storage::{SegmentTableSnapshot, Storage, TxContext};
@@ -197,7 +198,7 @@ impl Collection {
         };
 
         let storage = Arc::new(storage);
-        let segments = SegmentStore::new(config.segment.seal_rows);
+        let segments = SegmentStore::new(config.segment.seal_rows, config.segment.defer_column_build);
         let (ann, internal_cache, leaf_parent) = match (&config.vector, &ann_meta) {
             (Some(vcfg), Some(meta)) => {
                 let ann = AnnIndex::new(vcfg.clone(), meta.rabitq_seed)?;
@@ -289,7 +290,7 @@ impl Collection {
             self.manifest.clone(),
             self.ann_meta.clone(),
         );
-        self.segments.seal(&mut tx, open_seg, &hooks)?;
+        self.segments.seal(&mut tx, &self.schema, open_seg, &hooks)?;
         let (manifest, ann_meta) = tx.commit()?;
         self.manifest = manifest;
         self.ann_meta = ann_meta;
@@ -726,9 +727,40 @@ impl Collection {
         )
     }
 
-    /// Run background maintenance (ANN vacuum when stale ratio exceeds threshold; Phase 9 adds compaction).
+    /// Run background maintenance (build deferred `cf_columns` for sealed segments, ANN vacuum
+    /// when stale ratio exceeds threshold; Phase 9 adds compaction).
     pub fn maintenance(&mut self, opts: MaintenanceOptions) -> Result<MaintenanceStats> {
         let mut stats = MaintenanceStats::default();
+        let pending_column_segs: Vec<SegmentId> = {
+            let snap = self.storage.segment_snapshot();
+            let mut segs: Vec<SegmentId> = snap
+                .segments
+                .iter()
+                .filter(|(_, e)| {
+                    e.meta.state == SegmentState::Sealed
+                        && (e.meta.flags & SEG_FLAG_HAS_COLUMNS) == 0
+                })
+                .map(|(&seg, _)| seg)
+                .collect();
+            segs.sort_unstable();
+            segs
+        };
+        if !pending_column_segs.is_empty() {
+            let mut tx = TxContext::new(
+                &self.storage,
+                &mut self.internal_cache,
+                &mut self.leaf_parent,
+                self.manifest.clone(),
+                self.ann_meta.clone(),
+            );
+            for seg in pending_column_segs {
+                crate::columns::build_segment_columns_in_tx(&mut tx, &self.schema, seg)?;
+                stats.columns_built += 1;
+            }
+            let (manifest, ann_meta) = tx.commit()?;
+            self.manifest = manifest;
+            self.ann_meta = ann_meta;
+        }
         if let Some(ref meta) = self.ann_meta {
             let total = meta.num_vectors + meta.stale_rows;
             if total > 0 && (meta.stale_rows as f64 / total as f64) > opts.vacuum_stale_ratio {
@@ -1200,7 +1232,7 @@ fn upsert_one_in_tx(
     for hook in hooks {
         hook.on_insert(tx, schema, new_row, &new_view, prepared_vec, prev_row)?;
     }
-    segments.maybe_seal(tx, hooks)?;
+    segments.maybe_seal(tx, schema, hooks)?;
     Ok(true)
 }
 
@@ -1286,6 +1318,6 @@ fn apply_patch_in_tx(
             Some(old_row),
         )?;
     }
-    segments.maybe_seal(tx, hooks)?;
+    segments.maybe_seal(tx, schema, hooks)?;
     Ok(true)
 }

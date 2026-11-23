@@ -88,6 +88,7 @@ impl Default for MaintenanceOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MaintenanceStats {
     pub vacuum: Option<VacuumStats>,
+    pub columns_built: usize,
 }
 
 /// Summary of a child node passed during root creation, parent attachment, and redistribution.

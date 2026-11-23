@@ -35,11 +35,15 @@ pub(crate) trait RowIndexHook {
 /// Write-path manager for append-only segments, id map, and tombstones.
 pub(crate) struct SegmentStore {
     pub(crate) seal_rows: u32,
+    pub(crate) defer_column_build: bool,
 }
 
 impl SegmentStore {
-    pub(crate) fn new(seal_rows: u32) -> Self {
-        Self { seal_rows }
+    pub(crate) fn new(seal_rows: u32, defer_column_build: bool) -> Self {
+        Self {
+            seal_rows,
+            defer_column_build,
+        }
     }
 
     /// Allocate the next [`RowId`] in the open segment (creating one if none / sealed).
@@ -113,6 +117,7 @@ impl SegmentStore {
     pub(crate) fn maybe_seal(
         &self,
         tx: &mut TxContext<'_>,
+        schema: &CollectionSchema,
         hooks: &[&dyn RowIndexHook],
     ) -> Result<Option<SegmentId>> {
         let Some(seg) = tx.manifest().open_segment else {
@@ -124,16 +129,17 @@ impl SegmentStore {
             )));
         };
         if meta.row_count >= self.seal_rows {
-            self.seal(tx, seg, hooks)?;
+            self.seal(tx, schema, seg, hooks)?;
             return Ok(Some(seg));
         }
         Ok(None)
     }
 
-    /// Unconditionally seal `seg` and invoke `on_seal` hooks.
+    /// Unconditionally seal `seg`, build columns unless `defer_column_build`, and invoke `on_seal` hooks.
     pub(crate) fn seal(
         &self,
         tx: &mut TxContext<'_>,
+        schema: &CollectionSchema,
         seg: SegmentId,
         hooks: &[&dyn RowIndexHook],
     ) -> Result<()> {
@@ -150,6 +156,9 @@ impl SegmentStore {
         meta.sealed_seq = tx.storage().latest_sequence_number();
         tx.put_seg_meta(seg, meta);
         tx.manifest_mut().open_segment = None;
+        if !self.defer_column_build {
+            crate::columns::build_segment_columns_in_tx(tx, schema, seg)?;
+        }
         for hook in hooks {
             hook.on_seal(tx, seg)?;
         }

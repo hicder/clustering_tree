@@ -10,7 +10,7 @@ use izzydb_core::config::{
 use izzydb_core::error::{Result, TreeError};
 
 use crate::codec::{
-    ATTR_COUNT_TAG, Manifest, SegPosting, SegmentMeta, SegmentState, ZoneEntry,
+    ATTR_COUNT_TAG, Manifest, SegPosting, SegmentMeta, SegmentState, ZoneEntry, column_key,
     encode_fts_term_id_prefix, encode_roaring_bitmap, fts_chunk_key_coord, split_posting_key_parts,
 };
 use crate::node::{AnnMeta, PackedInternalNode, PackedLeafNode, decode_f32_into};
@@ -51,6 +51,7 @@ pub struct TxContext<'a> {
     dirty_fts_postings: BTreeMap<(TermId, RowBlock), Option<Vec<u8>>>,
     dirty_fts_positions: BTreeMap<(TermId, RowBlock), Option<Vec<u8>>>,
     dirty_fts_doc_lens: BTreeMap<(AttrId, RowBlock), Option<Vec<u8>>>,
+    dirty_columns: BTreeMap<[u8; 10], Vec<u8>>,
 }
 
 impl<'a> TxContext<'a> {
@@ -90,6 +91,7 @@ impl<'a> TxContext<'a> {
             dirty_fts_postings: BTreeMap::new(),
             dirty_fts_positions: BTreeMap::new(),
             dirty_fts_doc_lens: BTreeMap::new(),
+            dirty_columns: BTreeMap::new(),
         }
     }
 
@@ -268,6 +270,61 @@ impl<'a> TxContext<'a> {
 
     pub fn delete_row(&mut self, row: RowId) {
         self.dirty_rows.insert(row, None);
+    }
+
+    pub fn put_column_block(
+        &mut self,
+        seg: SegmentId,
+        attr_id: AttrId,
+        block: u32,
+        bytes: Vec<u8>,
+    ) {
+        self.dirty_columns.insert(column_key(seg, attr_id, block), bytes);
+    }
+
+    /// Visit every live (non-tombstoned, non-deleted) row in `seg` in ascending `RowId` order,
+    /// overlaying uncommitted `dirty_rows` and `dirty_seg_deletes` inside this transaction.
+    pub fn visit_segment_live_rows_in_tx(
+        &self,
+        seg: SegmentId,
+        mut visit: impl FnMut(RowId, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let mut last_db_row: Option<RowId> = None;
+        let snap = self.storage.segments.snapshot();
+        let deleted_bm = self
+            .dirty_seg_deletes
+            .get(&seg)
+            .or_else(|| snap.get(seg).and_then(|e| e.deleted.as_deref()));
+
+        self.storage.visit_segment_rows(seg, |row, db_bytes| {
+            last_db_row = Some(row);
+            if deleted_bm.is_some_and(|bm| bm.contains(row.local())) {
+                return Ok(());
+            }
+            if let Some(opt) = self.dirty_rows.get(&row) {
+                if let Some(bytes) = opt {
+                    visit(row, bytes)?;
+                }
+            } else {
+                visit(row, db_bytes)?;
+            }
+            Ok(())
+        })?;
+
+        let start_dirty = match last_db_row {
+            Some(r) => RowId::new(seg, r.local().saturating_add(1)),
+            None => RowId::new(seg, 0),
+        };
+        let end_dirty = RowId::new(seg, u32::MAX);
+        for (&row, opt) in self.dirty_rows.range(start_dirty..=end_dirty) {
+            if deleted_bm.is_some_and(|bm| bm.contains(row.local())) {
+                continue;
+            }
+            if let Some(bytes) = opt {
+                visit(row, bytes)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn set_row_doc_id(&mut self, row: RowId, doc_id: DocId) -> Result<()> {
@@ -618,6 +675,7 @@ impl<'a> TxContext<'a> {
         self.stage_postings_and_zones(&mut batch)?;
         self.stage_attr_counts(&mut batch)?;
         self.stage_fts_writes(&mut batch);
+        self.stage_columns(&mut batch);
 
         self.storage.write_batch(batch)?;
 
@@ -794,6 +852,12 @@ impl<'a> TxContext<'a> {
                 Some(bytes) => batch.put_fts_doc_len(attr_id, block, bytes),
                 None => batch.delete_fts_doc_len(attr_id, block),
             }
+        }
+    }
+
+    fn stage_columns(&self, batch: &mut StorageBatch<'_>) {
+        for (key, bytes) in &self.dirty_columns {
+            batch.put_column_block(key, bytes);
         }
     }
 

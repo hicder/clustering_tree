@@ -13,17 +13,19 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
-use izzydb_core::config::{AttrId, DocId, RowId};
+use izzydb_core::config::{AttrId, DocId, ROW_BLOCK_SIZE, RowId, SegmentId, for_each_set_bit_256};
 use izzydb_core::error::Result;
 use izzydb_core::filter::Filter;
 use izzydb_core::rank::{DecayMode, OrderBySpec, RankBy, eval_decay, eval_saturate};
 use izzydb_core::rowset::RowSet;
 use izzydb_core::schema::{AttributeType, CollectionSchema, ScalarValue};
+use izzydb_core::simd::{batch_eval_decay, batch_eval_saturate};
 use izzydb_fts::{Bm25Result, RankModifier};
 use izzydb_storage::SegmentTableSnapshot;
 use izzydb_storage::codec::{RowView, decode_scalar_val_bytes, ordered_type_tag};
+use izzydb_storage::column::ColumnBlockView;
 
-use crate::attr_reader::{AttrReader, RowStoreReader};
+use crate::attr_reader::{AttrReader, ColumnReader, RowStoreReader};
 use crate::collection::Collection;
 use crate::filter_plan::{self, FilterPlan, FilterPlanTrace};
 use crate::fts_index::LivenessMaskProvider;
@@ -224,6 +226,100 @@ impl Node {
                 acc
             }
         })
+    }
+
+    fn has_filter_node(&self) -> bool {
+        match self {
+            Node::Filter(_) => true,
+            Node::Sum(c) | Node::Max(c) | Node::Product(c) => {
+                c.iter().any(Node::has_filter_node)
+            }
+            _ => false,
+        }
+    }
+
+    fn collect_numeric_attrs(&self, out: &mut Vec<AttrId>) {
+        match self {
+            Node::Attr { id, .. } | Node::Sat { id, .. } | Node::Decay { id, .. } => {
+                if !out.contains(id) {
+                    out.push(*id);
+                }
+            }
+            Node::Sum(c) | Node::Max(c) | Node::Product(c) => {
+                for n in c {
+                    n.collect_numeric_attrs(out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn eval_from_cols(
+        &self,
+        row_idx: usize,
+        row_id: RowId,
+        attrs: &[AttrId],
+        cols: &[Vec<Option<f64>>],
+        lex: &[f32],
+    ) -> f32 {
+        let lookup = |id: AttrId| -> Option<f64> {
+            let pos = attrs.iter().position(|&a| a == id)?;
+            cols[pos][row_idx]
+        };
+        match self {
+            Node::Const(c) => *c,
+            Node::Lex(i) => lex.get(*i).copied().unwrap_or(0.0),
+            Node::Filter(_) => unreachable!("eval_from_cols called with Filter node"),
+            Node::RowSet(set) => {
+                if set.contains(row_id) {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            Node::Attr { id, missing } => match lookup(*id) {
+                Some(v) => clamp_f32(v),
+                None => *missing,
+            },
+            Node::Sat {
+                id,
+                midpoint,
+                exponent,
+                missing,
+            } => match lookup(*id) {
+                Some(v) => eval_saturate(v, *midpoint, *exponent),
+                None => *missing,
+            },
+            Node::Decay {
+                id,
+                origin,
+                midpoint,
+                exponent,
+                mode,
+                missing,
+            } => match lookup(*id) {
+                Some(v) => eval_decay(v, *origin, *midpoint, *exponent, *mode),
+                None => *missing,
+            },
+            Node::Sum(c) => c
+                .iter()
+                .map(|n| n.eval_from_cols(row_idx, row_id, attrs, cols, lex))
+                .sum(),
+            Node::Max(c) => c
+                .iter()
+                .map(|n| n.eval_from_cols(row_idx, row_id, attrs, cols, lex))
+                .fold(0.0f32, f32::max),
+            Node::Product(c) => {
+                let mut acc = 1.0f32;
+                for n in c {
+                    acc *= n.eval_from_cols(row_idx, row_id, attrs, cols, lex);
+                    if acc == 0.0 {
+                        break;
+                    }
+                }
+                acc
+            }
+        }
     }
 
     /// Superset [`RowSet`] of rows with score `> 0`, or `None` when not restricted to lexical matches.
@@ -845,21 +941,280 @@ impl Collection {
         if rowset.is_empty() {
             return Ok(());
         }
-        let reader = RowStoreReader::new(&self.storage);
+        let col_reader = ColumnReader::new(&self.storage, &self.schema);
+        let row_reader = RowStoreReader::new(&self.storage);
         let mut lex_scores = vec![0.0f32; lex_maps.len()];
         let mut batch: Vec<RowId> = Vec::with_capacity(SCAN_BATCH);
 
+        let no_filter = !node.has_filter_node();
+        let mut ref_attrs = Vec::new();
+        if no_filter {
+            node.collect_numeric_attrs(&mut ref_attrs);
+        }
+
         for &(seg, ref bm) in rowset.segments() {
+            let seg_columnar =
+                no_filter && ref_attrs.iter().all(|&a| col_reader.segment_has_columns(seg, a));
+            if seg_columnar
+                && lex_maps.is_empty()
+                && let Some(block_eval) = Self::as_single_block_simd_leaf(node)
+            {
+                self.scan_segment_simd_blocks(seg, bm, block_eval, sink)?;
+                continue;
+            }
+            if seg_columnar && !ref_attrs.is_empty() {
+                batch.clear();
+                let mut col_bufs: Vec<Vec<Option<f64>>> = vec![Vec::new(); ref_attrs.len()];
+                for local in bm.iter() {
+                    batch.push(RowId::new(seg, local));
+                    if batch.len() >= SCAN_BATCH {
+                        self.eval_batch_columnar(
+                            &col_reader,
+                            node,
+                            &ref_attrs,
+                            &mut col_bufs,
+                            &batch,
+                            lex_maps,
+                            &mut lex_scores,
+                            sink,
+                        )?;
+                        batch.clear();
+                    }
+                }
+                if !batch.is_empty() {
+                    self.eval_batch_columnar(
+                        &col_reader,
+                        node,
+                        &ref_attrs,
+                        &mut col_bufs,
+                        &batch,
+                        lex_maps,
+                        &mut lex_scores,
+                        sink,
+                    )?;
+                }
+                continue;
+            }
+
             for local in bm.iter() {
                 batch.push(RowId::new(seg, local));
                 if batch.len() >= SCAN_BATCH {
-                    self.eval_batch(&reader, node, &batch, lex_maps, &mut lex_scores, sink)?;
+                    self.eval_batch(&row_reader, node, &batch, lex_maps, &mut lex_scores, sink)?;
                     batch.clear();
                 }
             }
+            if !batch.is_empty() {
+                self.eval_batch(&row_reader, node, &batch, lex_maps, &mut lex_scores, sink)?;
+                batch.clear();
+            }
         }
-        if !batch.is_empty() {
-            self.eval_batch(&reader, node, &batch, lex_maps, &mut lex_scores, sink)?;
+        Ok(())
+    }
+
+    fn as_single_block_simd_leaf(node: &Node) -> Option<(AttrId, SimdLeafOp)> {
+        match node {
+            Node::Sat {
+                id,
+                midpoint,
+                exponent,
+                missing,
+            } => Some((
+                *id,
+                SimdLeafOp::Saturate {
+                    weight: 1.0,
+                    midpoint: *midpoint,
+                    exponent: *exponent,
+                    missing: *missing,
+                },
+            )),
+            Node::Decay {
+                id,
+                origin,
+                midpoint,
+                exponent,
+                mode,
+                missing,
+            } => Some((
+                *id,
+                SimdLeafOp::Decay {
+                    weight: 1.0,
+                    origin: *origin,
+                    midpoint: *midpoint,
+                    exponent: *exponent,
+                    mode: *mode,
+                    missing: *missing,
+                },
+            )),
+            Node::Product(ch) if ch.len() == 2 => match (&ch[0], &ch[1]) {
+                (
+                    Node::Const(w),
+                    Node::Sat {
+                        id,
+                        midpoint,
+                        exponent,
+                        missing,
+                    },
+                ) => Some((
+                    *id,
+                    SimdLeafOp::Saturate {
+                        weight: *w,
+                        midpoint: *midpoint,
+                        exponent: *exponent,
+                        missing: *missing,
+                    },
+                )),
+                (
+                    Node::Const(w),
+                    Node::Decay {
+                        id,
+                        origin,
+                        midpoint,
+                        exponent,
+                        mode,
+                        missing,
+                    },
+                ) => Some((
+                    *id,
+                    SimdLeafOp::Decay {
+                        weight: *w,
+                        origin: *origin,
+                        midpoint: *midpoint,
+                        exponent: *exponent,
+                        mode: *mode,
+                        missing: *missing,
+                    },
+                )),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn scan_segment_simd_blocks(
+        &self,
+        seg: SegmentId,
+        bm: &roaring::RoaringBitmap,
+        (attr_id, op): (AttrId, SimdLeafOp),
+        sink: &mut dyn FnMut(RowId, DocId, f32),
+    ) -> Result<()> {
+        let mut by_block: Vec<(u32, [u64; 4])> = Vec::new();
+        for local in bm.iter() {
+            let blk = local >> 8;
+            let slot = (local & 0xFF) as usize;
+            if let Some(last) = by_block.last_mut()
+                && last.0 == blk
+            {
+                last.1[slot >> 6] |= 1u64 << (slot & 63);
+            } else {
+                let mut m = [0u64; 4];
+                m[slot >> 6] |= 1u64 << (slot & 63);
+                by_block.push((blk, m));
+            }
+        }
+        let keys: Vec<(SegmentId, AttrId, u32)> = by_block
+            .iter()
+            .map(|&(blk, _)| (seg, attr_id, blk))
+            .collect();
+        let slices = self.storage.multi_get_column_blocks_pinned(&keys, true)?;
+
+        let mut f64_buf = [0.0f64; ROW_BLOCK_SIZE];
+        let mut out_scores = [0.0f32; ROW_BLOCK_SIZE];
+        let mut pos_rows: Vec<RowId> = Vec::with_capacity(ROW_BLOCK_SIZE);
+        let mut pos_scores: Vec<f32> = Vec::with_capacity(ROW_BLOCK_SIZE);
+
+        for ((blk, req_mask), opt_slice) in by_block.into_iter().zip(slices.iter()) {
+            let present_mask = match opt_slice {
+                Some(slice) => ColumnBlockView::parse(slice)?.decode_numeric_f64_block(&mut f64_buf),
+                None => {
+                    f64_buf.fill(0.0);
+                    [0u64; 4]
+                }
+            };
+            let missing_val = match op {
+                SimdLeafOp::Saturate {
+                    midpoint,
+                    exponent,
+                    missing,
+                    ..
+                } => {
+                    batch_eval_saturate(
+                        &f64_buf,
+                        &present_mask,
+                        midpoint,
+                        exponent,
+                        missing,
+                        &mut out_scores,
+                    );
+                    missing
+                }
+                SimdLeafOp::Decay {
+                    origin,
+                    midpoint,
+                    exponent,
+                    mode,
+                    missing,
+                    ..
+                } => {
+                    batch_eval_decay(
+                        &f64_buf,
+                        &present_mask,
+                        origin,
+                        midpoint,
+                        exponent,
+                        mode,
+                        missing,
+                        &mut out_scores,
+                    );
+                    missing
+                }
+            };
+            let _ = missing_val;
+            let weight = match op {
+                SimdLeafOp::Saturate { weight, .. } | SimdLeafOp::Decay { weight, .. } => weight,
+            };
+            pos_rows.clear();
+            pos_scores.clear();
+            for_each_set_bit_256(&req_mask, |slot| {
+                let s = out_scores[slot as usize] * weight;
+                if s > 0.0 && !s.is_nan() {
+                    pos_rows.push(RowId::new(seg, (blk << 8) | (slot as u32)));
+                    pos_scores.push(s.min(f32::MAX));
+                }
+            });
+            if !pos_rows.is_empty() {
+                let doc_ids = RowResolver::resolve_all(&self.storage, &pos_rows)?;
+                for ((&r, doc_id), &s) in pos_rows.iter().zip(doc_ids).zip(&pos_scores) {
+                    sink(r, doc_id, s);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn eval_batch_columnar(
+        &self,
+        reader: &ColumnReader<'_>,
+        node: &Node,
+        attrs: &[AttrId],
+        col_bufs: &mut [Vec<Option<f64>>],
+        batch: &[RowId],
+        lex_maps: &[HashMap<DocId, f32>],
+        lex_scores: &mut [f32],
+        sink: &mut dyn FnMut(RowId, DocId, f32),
+    ) -> Result<()> {
+        for (&attr_id, buf) in attrs.iter().zip(col_bufs.iter_mut()) {
+            reader.read_numeric_batch(attr_id, batch, buf)?;
+        }
+        let doc_ids = RowResolver::resolve_all(&self.storage, batch)?;
+        for (idx, (&row, doc_id)) in batch.iter().zip(doc_ids).enumerate() {
+            for (s, m) in lex_scores.iter_mut().zip(lex_maps) {
+                *s = m.get(&doc_id).copied().unwrap_or(0.0);
+            }
+            let score = node.eval_from_cols(idx, row, attrs, col_bufs, lex_scores);
+            if score > 0.0 && !score.is_nan() {
+                sink(row, doc_id, score.min(f32::MAX));
+            }
         }
         Ok(())
     }
@@ -1092,4 +1447,22 @@ fn eval_value(node: &Node, leaf: &Node, v: f64) -> f32 {
         }
         _ => leaf_score,
     }
+}
+
+#[derive(Clone, Copy)]
+enum SimdLeafOp {
+    Saturate {
+        weight: f32,
+        midpoint: f64,
+        exponent: f64,
+        missing: f32,
+    },
+    Decay {
+        weight: f32,
+        origin: f64,
+        midpoint: f64,
+        exponent: f64,
+        mode: DecayMode,
+        missing: f32,
+    },
 }

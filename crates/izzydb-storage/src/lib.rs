@@ -1,8 +1,11 @@
 //! RocksDB-backed packed node storage, binary codecs, and transaction overlay for `izzydb`.
 
 pub mod codec;
+pub mod column;
 pub mod node;
 pub mod storage;
+
+pub use column::{ColumnBlockBuilder, ColumnBlockView};
 
 pub use node::{
     AnnMeta, LeafNodeView, PackedInternalNode, PackedLeafNode, TreeMeta, borrow_f32_slice,

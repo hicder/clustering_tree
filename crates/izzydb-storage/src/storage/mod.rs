@@ -24,9 +24,10 @@ use izzydb_fts::TermRecord;
 
 use crate::codec::{
     ATTR_COUNT_TAG, FTS_DOC_LEN_TAG, INTERNAL_NODE_TAG, Manifest, SEG_DELETES_TAG, SEG_META_TAG,
-    SegPosting, SegmentMeta, ZONE_TAG, ZoneEntry, decode_doc_id_block, decode_fts_block_key,
-    decode_roaring_bitmap, decode_row_key, doc_id_block_key, encode_attr_prefix,
-    encode_fts_term_id_prefix, fts_block_key_coord, row_key, split_posting_key,
+    SegPosting, SegmentMeta, ZONE_TAG, ZoneEntry, column_key, decode_doc_id_block,
+    decode_fts_block_key, decode_roaring_bitmap, decode_row_key, doc_id_block_key,
+    encode_attr_prefix, encode_fts_term_id_prefix, fts_block_key_coord, row_key,
+    split_posting_key,
 };
 use crate::node::{AnnMeta, PackedInternalNode, PackedLeafNode, decode_f32_slice};
 
@@ -572,6 +573,41 @@ impl Storage {
         sorted_rows: &[RowId],
     ) -> Result<Vec<Option<DBPinnableSlice<'_>>>> {
         self.batched_multi_get_row_pinned(CF_ROWS, sorted_rows, true)
+    }
+
+    pub fn get_column_block_pinned(
+        &self,
+        seg: SegmentId,
+        attr_id: AttrId,
+        block: u32,
+    ) -> Result<Option<DBPinnableSlice<'_>>> {
+        let cf = self.cf(CF_COLUMNS)?;
+        self.db
+            .get_pinned_cf(cf, column_key(seg, attr_id, block))
+            .map_err(map_db_err)
+    }
+
+    /// Batch pinned `multi_get` against `cf_columns` for `(seg, attr_id, block)` keys.
+    /// When `sorted_input` is true, `keys` must be in ascending `(seg, attr_id, block)` order.
+    pub fn multi_get_column_blocks_pinned(
+        &self,
+        keys: &[(SegmentId, AttrId, u32)],
+        sorted_input: bool,
+    ) -> Result<Vec<Option<DBPinnableSlice<'_>>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cf = self.cf(CF_COLUMNS)?;
+        let raw_keys: Vec<[u8; 10]> = keys
+            .iter()
+            .map(|&(seg, attr_id, block)| column_key(seg, attr_id, block))
+            .collect();
+        let results = self.db.batched_multi_get_cf(cf, raw_keys.iter(), sorted_input);
+        let mut out = Vec::with_capacity(keys.len());
+        for res in results {
+            out.push(res.map_err(map_db_err)?);
+        }
+        Ok(out)
     }
 
     pub fn get_vector(&self, row: RowId) -> Result<Option<Vec<f32>>> {

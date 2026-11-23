@@ -27,7 +27,7 @@ use izzydb_storage::codec::{
     SegPostingView, decode_scalar_val_bytes, ordered_type_tag,
 };
 
-use crate::attr_reader::{AttrReader, RowStoreReader};
+use crate::attr_reader::{AttrReader, ColumnReader};
 use crate::collection::Collection;
 use crate::facet::Population;
 use crate::filter_plan::{self, FilterPlan, FilterPlanTrace};
@@ -158,7 +158,7 @@ impl Collection {
         }
 
         if results.len() < top_k {
-            let reader = RowStoreReader::new(&self.storage);
+            let reader = ColumnReader::new(&self.storage, &self.schema);
             self.stream_value_groups(primary, &pop, &mut |value, group_rows| {
                 let remaining = top_k - results.len();
                 if order_by.len() == 1 {
@@ -242,7 +242,7 @@ impl Collection {
         rows: &[RowId],
         limit: usize,
     ) -> Result<Vec<(DocId, Vec<ScalarValue>)>> {
-        let reader = RowStoreReader::new(&self.storage);
+        let reader = ColumnReader::new(&self.storage, &self.schema);
         sort_rows_with_reader(&self.storage, &self.schema, &reader, order_by, rows, limit)
     }
 

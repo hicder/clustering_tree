@@ -428,6 +428,8 @@ pub struct AttributeConfig {
     pub filterable: bool,
     pub full_text_search: Option<FullTextSearchConfig>,
     pub storage: ColumnStorage,
+    /// Opt non-filterable inline strings / string arrays into sealed-segment `cf_columns`.
+    pub column: bool,
 }
 
 impl AttributeConfig {
@@ -439,6 +441,7 @@ impl AttributeConfig {
             filterable: true,
             full_text_search: None,
             storage: ColumnStorage::Inline,
+            column: false,
         }
     }
 
@@ -457,6 +460,12 @@ impl AttributeConfig {
     /// Set whether this attribute is stored inline or as a detached column.
     pub fn storage(mut self, storage: ColumnStorage) -> Self {
         self.storage = storage;
+        self
+    }
+
+    /// Opt an inline attribute into sealed-segment columnar storage (`cf_columns`).
+    pub fn with_column(mut self, column: bool) -> Self {
+        self.column = column;
         self
     }
 }
@@ -508,6 +517,25 @@ impl CollectionConfig {
             filterable,
             full_text_search: None,
             storage: ColumnStorage::Inline,
+            column: false,
+        });
+        self
+    }
+
+    pub fn with_column_attribute(
+        mut self,
+        name: impl Into<String>,
+        attr_type: AttributeType,
+        filterable: bool,
+        column: bool,
+    ) -> Self {
+        self.attributes.push(AttributeConfig {
+            name: name.into(),
+            attr_type,
+            filterable,
+            full_text_search: None,
+            storage: ColumnStorage::Inline,
+            column,
         });
         self
     }
@@ -524,6 +552,7 @@ impl CollectionConfig {
             filterable,
             full_text_search: None,
             storage: ColumnStorage::Detached,
+            column: false,
         });
         self
     }
@@ -546,6 +575,7 @@ impl CollectionConfig {
             filterable,
             full_text_search: Some(fts),
             storage: ColumnStorage::Inline,
+            column: false,
         });
         self
     }
@@ -735,6 +765,26 @@ pub struct SchemaEntry {
     pub filterable: bool,
     pub full_text_search: Option<FullTextSearchConfig>,
     pub storage: ColumnStorage,
+    pub column: bool,
+}
+
+impl SchemaEntry {
+    /// Returns `true` if this attribute is stored in `ColumnBlock`s (`cf_columns` for sealed
+    /// inline segments, or `cf_detached` for detached columns).
+    #[inline]
+    pub fn is_columnar(&self) -> bool {
+        self.storage == ColumnStorage::Detached
+            || (self.storage == ColumnStorage::Inline
+                && (self.filterable
+                    || self.column
+                    || matches!(
+                        self.attr_type,
+                        AttributeType::Bool
+                            | AttributeType::Int
+                            | AttributeType::Uint
+                            | AttributeType::Float
+                    )))
+    }
 }
 
 /// Persistent collection schema registry mapping attribute names to monotonic `AttrId`s.
@@ -782,6 +832,7 @@ impl CollectionSchema {
             filterable: attr.filterable,
             full_text_search: attr.full_text_search.clone(),
             storage: attr.storage,
+            column: attr.column,
         });
         self.by_name.insert(attr.name.clone(), idx);
         self.by_id.insert(id, idx);
@@ -822,6 +873,13 @@ impl CollectionSchema {
                         field: "attribute_storage",
                         expected: format!("{}:{:?}", existing.name, existing.storage),
                         actual: format!("{}:{:?}", attr.name, attr.storage),
+                    });
+                }
+                if existing.column != attr.column {
+                    return Err(TreeError::ConfigMismatch {
+                        field: "attribute_column",
+                        expected: format!("{}:{}", existing.name, existing.column),
+                        actual: format!("{}:{}", attr.name, attr.column),
                     });
                 }
                 if existing.full_text_search != attr.full_text_search {
@@ -933,7 +991,7 @@ impl CollectionSchema {
         for entry in &self.entries {
             buf.extend_from_slice(&entry.id.to_le_bytes());
             buf.push(entry.attr_type.as_u8());
-            buf.push(u8::from(entry.filterable));
+            buf.push(u8::from(entry.filterable) | (u8::from(entry.column) << 1));
             buf.push(entry.storage.as_u8());
             match &entry.full_text_search {
                 Some(fts) => {
@@ -979,7 +1037,14 @@ impl CollectionSchema {
             }
             let id = u16::from_le_bytes(bytes[off..off + 2].try_into().unwrap());
             let attr_type = AttributeType::from_u8(bytes[off + 2])?;
-            let filterable = decode_bool_byte(bytes[off + 3], "schema filterable")?;
+            let flag_byte = bytes[off + 3];
+            if flag_byte > 3 {
+                return Err(TreeError::CorruptedData(format!(
+                    "invalid schema attribute flags: {flag_byte}"
+                )));
+            }
+            let filterable = (flag_byte & 1) != 0;
+            let column = (flag_byte & 2) != 0;
             let storage = ColumnStorage::from_u8(bytes[off + 4])?;
             let has_fts = decode_bool_byte(bytes[off + 5], "schema has_fts")?;
             off += 6;
@@ -1022,6 +1087,7 @@ impl CollectionSchema {
                 filterable,
                 full_text_search,
                 storage,
+                column,
             });
         }
         if off != bytes.len() {

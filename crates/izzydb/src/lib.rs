@@ -16,6 +16,8 @@ pub(crate) mod attr_reader;
 pub mod attr_index;
 /// Seal-time and maintenance transposition into `cf_columns`.
 pub(crate) mod columns;
+/// Segment compaction, forwarding remap, and orphan retirement.
+pub mod compaction;
 /// Detached columns (`cf_detached`, whole-column ingest/publish, point overwrites).
 pub mod detached;
 /// Exact faceting engine over `RowSet` populations and global counts.
@@ -43,6 +45,7 @@ pub use attr_index::AttributeIndex;
 pub use collection::{
     Collection, Document, DocumentPatch, HybridSearchOptions, HybridSearchResult, SearchResult,
 };
+pub use compaction::{CompactionHookStage, CompactionOptions, CompactionPolicy, CompactionStats};
 pub use detached::{
     DetachedBuildStats, DetachedDuplicatePolicy, DetachedIngestBuilder, DetachedJob,
     DetachedPublishStats, DetachedWriteMode,

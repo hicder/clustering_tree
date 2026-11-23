@@ -166,6 +166,10 @@ impl<'a> StorageBatch<'a> {
         self.put_cf(CF_VECTORS, &row_key(row), &encode_f32_slice(vec));
     }
 
+    pub fn put_vector_bytes(&mut self, row: RowId, bytes: &[u8]) {
+        self.put_cf(CF_VECTORS, &row_key(row), bytes);
+    }
+
     pub fn delete_vector(&mut self, row: RowId) {
         self.delete_cf(CF_VECTORS, &row_key(row));
     }

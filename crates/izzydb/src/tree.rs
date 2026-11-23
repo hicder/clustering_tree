@@ -73,6 +73,7 @@ pub struct MaintenanceOptions {
     /// Trigger `vacuum_ann` when `stale_rows / (num_vectors + stale_rows) > vacuum_stale_ratio`.
     pub vacuum_stale_ratio: f64,
     pub vacuum_budget: VacuumBudget,
+    pub compaction: crate::compaction::CompactionOptions,
 }
 
 impl Default for MaintenanceOptions {
@@ -80,6 +81,7 @@ impl Default for MaintenanceOptions {
         Self {
             vacuum_stale_ratio: 0.2,
             vacuum_budget: VacuumBudget::unlimited(),
+            compaction: crate::compaction::CompactionOptions::default(),
         }
     }
 }
@@ -90,6 +92,7 @@ pub struct MaintenanceStats {
     pub vacuum: Option<VacuumStats>,
     pub columns_built: usize,
     pub detached_rebuilt: usize,
+    pub compaction: crate::compaction::CompactionStats,
 }
 
 /// Summary of a child node passed during root creation, parent attachment, and redistribution.

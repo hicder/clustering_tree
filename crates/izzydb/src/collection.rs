@@ -25,6 +25,9 @@ use izzydb_storage::node::{AnnMeta, PackedInternalNode, decode_f32_slice};
 use izzydb_storage::{SegmentTableSnapshot, Storage, TxContext};
 
 use crate::attr_index::AttributeIndex;
+use crate::compaction::{
+    self, CompactionHookStage, CompactionOptions, CompactionStats,
+};
 use crate::detached::{
     self, DetachedIngestBuilder, DetachedJob, DetachedPublishStats,
 };
@@ -756,12 +759,13 @@ impl Collection {
         Ok(results)
     }
 
-    /// Incrementally vacuum stale ANN slots and merge/rebalance underflowing leaves up to `budget`.
+    /// Incrementally vacuum stale ANN slots and merge/rebalance underflowing leaves up to `budget`,
+    /// retiring any `Forwarding` segments whose forwarding epoch has completed.
     pub fn vacuum_ann(&mut self, budget: VacuumBudget) -> Result<VacuumStats> {
         let Some(ref ann) = self.ann else {
             return Ok(VacuumStats::default());
         };
-        vacuum_ann_storage(
+        let stats = vacuum_ann_storage(
             &self.storage,
             ann,
             &mut self.manifest,
@@ -769,11 +773,33 @@ impl Collection {
             &mut self.internal_cache,
             &mut self.leaf_parent,
             budget,
-        )
+        )?;
+        let _ = compaction::retire_eligible_forwarding_segments(self)?;
+        Ok(stats)
     }
 
-    /// Run background maintenance (build deferred `cf_columns` for sealed segments, ANN vacuum
-    /// when stale ratio exceeds threshold; Phase 9 adds compaction).
+    /// Merge eligible sealed segments (high tombstone ratio or undersized), forward RowIds,
+    /// sweep ANN references, and retire obsolete segments.
+    pub fn compact(&mut self, opts: CompactionOptions) -> Result<CompactionStats> {
+        compaction::run_compact(self, opts, &mut |_| Ok(()))
+    }
+
+    /// Test-only compaction entrypoint invoking `hook` at each phase boundary.
+    #[doc(hidden)]
+    pub fn compact_with_hook<F>(
+        &mut self,
+        opts: CompactionOptions,
+        hook: &mut F,
+    ) -> Result<CompactionStats>
+    where
+        F: FnMut(CompactionHookStage) -> Result<()>,
+    {
+        compaction::run_compact(self, opts, hook)
+    }
+
+    /// Run background maintenance: build deferred `cf_columns`, vacuum ANN if stale ratio exceeds
+    /// threshold, compact eligible segments, rebuild fragmented detached columns, and tighten FTS
+    /// stats when segments were forwarded/retired.
     pub fn maintenance(&mut self, opts: MaintenanceOptions) -> Result<MaintenanceStats> {
         let mut stats = MaintenanceStats::default();
         let pending_column_segs: Vec<SegmentId> = {
@@ -810,6 +836,17 @@ impl Collection {
             let total = meta.num_vectors + meta.stale_rows;
             if total > 0 && (meta.stale_rows as f64 / total as f64) > opts.vacuum_stale_ratio {
                 stats.vacuum = Some(self.vacuum_ann(opts.vacuum_budget)?);
+            }
+        }
+        let has_pending_detached = self
+            .storage
+            .all_detached_metas()?
+            .into_iter()
+            .any(|(_, m)| m.pending_gen != 0);
+        if !has_pending_detached {
+            stats.compaction = self.compact(opts.compaction)?;
+            if stats.compaction.segments_forwarded > 0 || stats.compaction.segments_retired > 0 {
+                self.compact_fts_stats()?;
             }
         }
         stats.detached_rebuilt = detached::rebuild_fragmented_detached_columns(self)?;

@@ -11,10 +11,10 @@ use izzydb_core::config::{
 use izzydb_core::error::{Result, TreeError};
 
 use crate::codec::{
-    ATTR_COUNT_TAG, DETACHED_COUNT_TAG, DETACHED_OVERWRITTEN_TAG, DetachedMeta, Manifest,
-    SegPosting, SegmentMeta, SegmentState, ZoneEntry, column_key, detached_count_suffix,
-    detached_gen_bounds, detached_key, encode_fts_term_id_prefix, encode_roaring_bitmap,
-    fts_chunk_key_coord, split_posting_key_parts,
+    ATTR_COUNT_TAG, DETACHED_COUNT_TAG, DETACHED_OVERWRITTEN_TAG, DetachedMeta, FTS_DOC_LEN_TAG,
+    Manifest, SegPosting, SegmentMeta, SegmentState, ZONE_TAG, ZoneEntry, column_key,
+    detached_count_suffix, detached_gen_bounds, detached_key, encode_fts_term_id_prefix,
+    encode_roaring_bitmap, fts_chunk_key_coord, split_posting_key_parts,
 };
 use crate::node::{AnnMeta, PackedInternalNode, PackedLeafNode, decode_f32_into};
 
@@ -22,7 +22,8 @@ use super::batch::StorageBatch;
 use super::segments::SegmentEntry;
 use super::types::map_db_err;
 use super::{
-    CF_ATTR_POSTINGS, CF_DETACHED, CF_DETACHED_POSTINGS, CF_FTS_SKIPS, Storage,
+    CF_ATTR_POSTINGS, CF_COLUMNS, CF_DETACHED, CF_DETACHED_POSTINGS, CF_FTS_SKIPS,
+    CF_ROW_DOC_IDS, CF_ROWS, CF_VECTORS, Storage,
 };
 
 /// Read-your-own-writes transaction overlay across segment store, id map, ANN tree,
@@ -64,6 +65,7 @@ pub struct TxContext<'a> {
     dirty_detached_count_deltas: BTreeMap<Vec<u8>, i64>,
     dirty_detached_overwritten: BTreeMap<(AttrId, ColumnGen, SegmentId), RoaringBitmap>,
     retire_detached_gens: Vec<(AttrId, ColumnGen)>,
+    retire_segments: Vec<(SegmentId, Vec<(AttrId, ColumnGen)>, Vec<AttrId>)>,
 }
 
 impl<'a> TxContext<'a> {
@@ -111,6 +113,7 @@ impl<'a> TxContext<'a> {
             dirty_detached_count_deltas: BTreeMap::new(),
             dirty_detached_overwritten: BTreeMap::new(),
             retire_detached_gens: Vec::new(),
+            retire_segments: Vec::new(),
         }
     }
 
@@ -215,6 +218,22 @@ impl<'a> TxContext<'a> {
         self.dirty_dropped_segments.as_mut().unwrap().insert(seg);
         self.dirty_seg_meta.insert(seg, None);
         self.dirty_seg_deletes.remove(&seg);
+    }
+
+    /// Fully retire a `Forwarding` segment: mark dropped in `\x01dropped_segments`, delete
+    /// `0x10`/`0x11` metadata, and issue `DeleteRange` over every segment-major keyspace.
+    pub fn retire_segment(
+        &mut self,
+        seg: SegmentId,
+        detached_gens: Vec<(AttrId, ColumnGen)>,
+        fts_attrs: Vec<AttrId>,
+    ) {
+        self.mark_segment_dropped(seg);
+        for &(attr_id, col_gen) in &detached_gens {
+            self.dirty_detached_overwritten
+                .insert((attr_id, col_gen, seg), RoaringBitmap::new());
+        }
+        self.retire_segments.push((seg, detached_gens, fts_attrs));
     }
 
     /// Resolve a [`RowId`] against uncommitted `TxContext` mutations and the base `SegmentTable`,
@@ -1074,16 +1093,86 @@ impl<'a> TxContext<'a> {
                 batch.put_detached_overwritten(attr_id, col_gen, seg, &encode_roaring_bitmap(bm)?);
             }
         }
+        for &(seg, ref detached_gens, ref fts_attrs) in &self.retire_segments {
+            if let Some(next_seg) = seg.checked_add(1) {
+                let lo = seg.to_be_bytes();
+                let hi = next_seg.to_be_bytes();
+                for cf_name in [CF_ROWS, CF_ROW_DOC_IDS, CF_VECTORS, CF_COLUMNS] {
+                    batch.delete_range_cf(cf_name, &lo, &hi);
+                }
+                let mut zlo = [0u8; 5];
+                zlo[0] = ZONE_TAG;
+                zlo[1..5].copy_from_slice(&lo);
+                let mut zhi = [0u8; 5];
+                zhi[0] = ZONE_TAG;
+                zhi[1..5].copy_from_slice(&hi);
+                batch.delete_range_default(&zlo, &zhi);
+
+                for &(attr_id, col_gen) in detached_gens {
+                    let a = attr_id.to_be_bytes();
+                    let g = col_gen.to_be_bytes();
+                    let mut dlo = [0u8; 10];
+                    dlo[0..2].copy_from_slice(&a);
+                    dlo[2..6].copy_from_slice(&g);
+                    dlo[6..10].copy_from_slice(&lo);
+                    let mut dhi = dlo;
+                    dhi[6..10].copy_from_slice(&hi);
+                    batch.delete_range_cf(CF_DETACHED, &dlo, &dhi);
+                }
+
+                for &attr_id in fts_attrs {
+                    let a = attr_id.to_be_bytes();
+                    let mut flo = [0u8; 7];
+                    flo[0] = FTS_DOC_LEN_TAG;
+                    flo[1..3].copy_from_slice(&a);
+                    flo[3..7].copy_from_slice(&lo);
+                    let mut fhi = flo;
+                    fhi[3..7].copy_from_slice(&hi);
+                    batch.delete_range_default(&flo, &fhi);
+                }
+            }
+        }
         Ok(())
     }
 
     fn flush_caches_after_commit(&mut self) {
+        if !self.dirty_detached_meta.is_empty() {
+            let mut rguard = self
+                .storage
+                .retired_detached
+                .write()
+                .expect("retired_detached poisoned");
+            let mut next_map = (**rguard).clone();
+            for (&attr_id, meta) in &self.dirty_detached_meta {
+                if meta.retired_below > 0 {
+                    next_map.insert(attr_id, meta.retired_below);
+                }
+            }
+            *rguard = Arc::new(next_map);
+        }
+
         if let Some(dropped) = self.dirty_dropped_segments.take() {
             *self
                 .storage
                 .dropped_segments
                 .write()
                 .expect("dropped_segments poisoned") = Arc::new(dropped);
+        }
+
+        if !self.retire_segments.is_empty() {
+            let mut zguard = self
+                .storage
+                .zone_cache
+                .write()
+                .expect("zone_cache poisoned");
+            if let Some(ref mut table_arc) = *zguard {
+                let map = Arc::make_mut(table_arc);
+                for seg_map in map.values_mut() {
+                    for &(seg, _, _) in &self.retire_segments {
+                        seg_map.remove(&seg);
+                    }
+                }
+            }
         }
 
         if !self.dirty_seg_meta.is_empty() || !self.dirty_seg_deletes.is_empty() {

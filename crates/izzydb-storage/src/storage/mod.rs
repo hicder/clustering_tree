@@ -5,10 +5,13 @@ pub mod tx;
 pub mod types;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use roaring::RoaringBitmap;
+use rocksdb::compaction_filter::{CompactionFilter, Decision};
+use rocksdb::compaction_filter_factory::{CompactionFilterContext, CompactionFilterFactory};
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DB, DBCompressionType,
     DBPinnableSlice, DEFAULT_COLUMN_FAMILY_NAME, Direction, IngestExternalFileOptions,
@@ -26,10 +29,10 @@ use izzydb_fts::TermRecord;
 use crate::codec::{
     ATTR_COUNT_TAG, DETACHED_COUNT_TAG, DETACHED_META_TAG, DETACHED_OVERWRITTEN_TAG, DetachedMeta,
     FTS_DOC_LEN_TAG, INTERNAL_NODE_TAG, Manifest, SEG_DELETES_TAG, SEG_META_TAG, SegPosting,
-    SegmentMeta, ZONE_TAG, ZoneEntry, column_key, decode_doc_id_block, decode_fts_block_key,
-    decode_roaring_bitmap, decode_row_key, detached_count_suffix, detached_key,
-    detached_meta_key, detached_overwritten_key, detached_posting_prefix, doc_id_block_key,
-    encode_attr_prefix, encode_fts_term_id_prefix, fts_block_key_coord, row_key,
+    SegmentMeta, SegmentState, ZONE_TAG, ZoneEntry, column_key, decode_doc_id_block,
+    decode_fts_block_key, decode_roaring_bitmap, decode_row_key, detached_count_suffix,
+    detached_key, detached_meta_key, detached_overwritten_key, detached_posting_prefix,
+    doc_id_block_key, encode_attr_prefix, encode_fts_term_id_prefix, fts_block_key_coord, row_key,
     split_detached_posting_key, split_posting_key,
 };
 use crate::node::{AnnMeta, PackedInternalNode, PackedLeafNode, decode_f32_slice};
@@ -150,6 +153,7 @@ pub struct Storage {
     pub(super) rabitq_words: usize,
     pub(super) segments: SegmentTable,
     pub(super) dropped_segments: Arc<RwLock<Arc<RoaringBitmap>>>,
+    pub(super) retired_detached: Arc<RwLock<Arc<HashMap<AttrId, ColumnGen>>>>,
     pub(super) doc_id_block_cache: RwLock<DocIdBlockCache>,
     pub(super) zone_cache: RwLock<Option<ZoneTable>>,
     pub(super) fts_doc_lens_cache: RwLock<HashMap<AttrId, DocLenBlockTable>>,
@@ -248,6 +252,7 @@ impl Storage {
 
         storage.load_segment_state()?;
         storage.recover_pending_detached()?;
+        storage.recover_building_segments()?;
         Ok((storage, manifest, ann_meta))
     }
 
@@ -257,6 +262,9 @@ impl Storage {
         db_opts.create_missing_column_families(true);
         db_opts.set_db_write_buffer_size(DB_WRITE_BUFFER_BYTES);
 
+        let dropped_segments = Arc::new(RwLock::new(Arc::new(RoaringBitmap::new())));
+        let retired_detached = Arc::new(RwLock::new(Arc::new(HashMap::new())));
+
         let mut cf_names = Vec::with_capacity(1 + ALL_DATA_CF_NAMES.len());
         cf_names.push(DEFAULT_COLUMN_FAMILY_NAME);
         cf_names.extend_from_slice(&ALL_DATA_CF_NAMES);
@@ -265,7 +273,11 @@ impl Storage {
         for name in cf_names {
             cf_descriptors.push(ColumnFamilyDescriptor::new(
                 name,
-                cf_options_for(name, block_cache)?,
+                cf_options_with_filters(
+                    name,
+                    block_cache,
+                    Some((&dropped_segments, &retired_detached)),
+                )?,
             ));
         }
 
@@ -283,7 +295,8 @@ impl Storage {
             padded_dim,
             rabitq_words,
             segments: SegmentTable::new(SegmentTableSnapshot::default()),
-            dropped_segments: Arc::new(RwLock::new(Arc::new(RoaringBitmap::new()))),
+            dropped_segments,
+            retired_detached,
             doc_id_block_cache: RwLock::new(DocIdBlockCache::new(DOC_ID_BLOCK_CACHE_CAP)),
             zone_cache: RwLock::new(None),
             fts_doc_lens_cache: RwLock::new(HashMap::new()),
@@ -500,12 +513,16 @@ impl Storage {
     fn recover_pending_detached(&self) -> Result<()> {
         let metas = self.all_detached_metas()?;
         let mut to_fix = Vec::new();
+        let mut retired_map = HashMap::with_capacity(metas.len());
         for (attr_id, mut meta) in metas {
             if meta.pending_gen != 0 {
                 meta.retired_below = meta.retired_below.max(meta.pending_gen.saturating_add(1));
                 meta.pending_gen = 0;
                 meta.built_against_watermark = RowId(0);
-                to_fix.push((attr_id, meta));
+                to_fix.push((attr_id, meta.clone()));
+            }
+            if meta.retired_below > 0 {
+                retired_map.insert(attr_id, meta.retired_below);
             }
         }
         if !to_fix.is_empty() {
@@ -515,7 +532,98 @@ impl Storage {
             }
             self.write_batch_sync(batch)?;
         }
+        *self
+            .retired_detached
+            .write()
+            .expect("retired_detached poisoned") = Arc::new(retired_map);
         Ok(())
+    }
+
+    /// Discard any `SegmentState::Building` segments left by a crash mid-compaction.
+    fn recover_building_segments(&self) -> Result<()> {
+        let snap = self.segments.snapshot();
+        let building: Vec<SegmentId> = snap
+            .segments
+            .iter()
+            .filter_map(|(&seg, e)| (e.meta.state == SegmentState::Building).then_some(seg))
+            .collect();
+        if building.is_empty() {
+            return Ok(());
+        }
+        let mut dropped = (*self.dropped_segments_snapshot()).clone();
+        let mut batch = self.new_batch();
+        for &seg in &building {
+            dropped.insert(seg);
+            batch.delete_seg_meta(seg);
+            batch.delete_seg_deletes(seg);
+            if let Some(next_seg) = seg.checked_add(1) {
+                let lo = seg.to_be_bytes();
+                let hi = next_seg.to_be_bytes();
+                for cf_name in [CF_ROWS, CF_ROW_DOC_IDS, CF_VECTORS, CF_COLUMNS] {
+                    batch.delete_range_cf(cf_name, &lo, &hi);
+                }
+                let mut zlo = [0u8; 5];
+                zlo[0] = ZONE_TAG;
+                zlo[1..5].copy_from_slice(&lo);
+                let mut zhi = [0u8; 5];
+                zhi[0] = ZONE_TAG;
+                zhi[1..5].copy_from_slice(&hi);
+                batch.delete_range_default(&zlo, &zhi);
+            }
+        }
+        batch.put_dropped_segments(&crate::codec::encode_roaring_bitmap(&dropped)?);
+        self.write_batch_sync(batch)?;
+
+        self.segments.mutate_and_publish(|s| {
+            for seg in &building {
+                s.segments.remove(seg);
+            }
+        });
+        *self
+            .dropped_segments
+            .write()
+            .expect("dropped_segments poisoned") = Arc::new(dropped);
+        Ok(())
+    }
+
+    /// Trigger RocksDB manual compaction across `default` and all data CFs (reclaiming
+    /// tombstones, range deletes, and compaction-filtered orphaned segment/generation keys).
+    pub fn compact_range_all(&self) -> Result<()> {
+        self.db.compact_range(None::<&[u8]>, None::<&[u8]>);
+        for cf_name in ALL_DATA_CF_NAMES {
+            let cf = self.cf(cf_name)?;
+            self.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+        }
+        Ok(())
+    }
+
+    /// Count physical keys currently stored in `cf_name` matching `pred` (test / diagnostics).
+    pub fn count_keys_in_cf(
+        &self,
+        cf_name: Option<&str>,
+        mut pred: impl FnMut(&[u8]) -> bool,
+    ) -> Result<usize> {
+        let mut count = 0usize;
+        match cf_name {
+            None => {
+                for item in self.db.iterator(IteratorMode::Start) {
+                    let (k, _) = item.map_err(map_db_err)?;
+                    if pred(&k) {
+                        count += 1;
+                    }
+                }
+            }
+            Some(name) => {
+                let cf = self.cf(name)?;
+                for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+                    let (k, _) = item.map_err(map_db_err)?;
+                    if pred(&k) {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Ok(count)
     }
 
     pub fn get_detached_meta(&self, attr_id: AttrId) -> Result<Option<DetachedMeta>> {
@@ -1790,26 +1898,204 @@ pub fn default_sst_block_cache() -> Cache {
 }
 
 pub fn cf_options_for(cf_name: &str, block_cache: &Cache) -> Result<Options> {
-    match cf_name {
+    cf_options_with_filters(cf_name, block_cache, None)
+}
+
+type FilterHandles<'a> = (
+    &'a Arc<RwLock<Arc<RoaringBitmap>>>,
+    &'a Arc<RwLock<Arc<HashMap<AttrId, ColumnGen>>>>,
+);
+
+#[derive(Clone, Copy)]
+enum OrphanFilterKind {
+    DefaultCf,
+    LeadingSeg,
+    AttrPostings,
+    DetachedBlocks,
+    DetachedPostings,
+    FtsTermSeg,
+}
+
+struct OrphanCompactionFilter {
+    kind: OrphanFilterKind,
+    dropped: Arc<RoaringBitmap>,
+    retired_detached: Arc<HashMap<AttrId, ColumnGen>>,
+}
+
+impl CompactionFilter for OrphanCompactionFilter {
+    fn filter(&mut self, _level: u32, key: &[u8], _value: &[u8]) -> Decision {
+        let remove = match self.kind {
+            OrphanFilterKind::LeadingSeg => {
+                key.len() >= 4
+                    && self
+                        .dropped
+                        .contains(SegmentId::from_be_bytes([key[0], key[1], key[2], key[3]]))
+            }
+            OrphanFilterKind::AttrPostings => split_posting_key(key)
+                .map(|(_, seg)| self.dropped.contains(seg))
+                .unwrap_or(false),
+            OrphanFilterKind::DetachedBlocks => {
+                if key.len() != 14 {
+                    false
+                } else {
+                    let attr_id = AttrId::from_be_bytes([key[0], key[1]]);
+                    let col_gen = ColumnGen::from_be_bytes([key[2], key[3], key[4], key[5]]);
+                    let seg = SegmentId::from_be_bytes([key[6], key[7], key[8], key[9]]);
+                    self.retired_detached
+                        .get(&attr_id)
+                        .is_some_and(|&r| col_gen < r)
+                        || self.dropped.contains(seg)
+                }
+            }
+            OrphanFilterKind::DetachedPostings => {
+                if key.len() < 11 {
+                    false
+                } else {
+                    let attr_id = AttrId::from_be_bytes([key[0], key[1]]);
+                    let col_gen = ColumnGen::from_be_bytes([key[2], key[3], key[4], key[5]]);
+                    let retired = self
+                        .retired_detached
+                        .get(&attr_id)
+                        .is_some_and(|&r| col_gen < r);
+                    retired
+                        || split_detached_posting_key(key)
+                            .map(|(_, seg)| self.dropped.contains(seg))
+                            .unwrap_or(false)
+                }
+            }
+            OrphanFilterKind::FtsTermSeg => {
+                key.len() >= 8
+                    && self
+                        .dropped
+                        .contains(SegmentId::from_be_bytes([key[4], key[5], key[6], key[7]]))
+            }
+            OrphanFilterKind::DefaultCf => match key.first().copied() {
+                Some(FTS_DOC_LEN_TAG) => {
+                    key.len() >= 7
+                        && self
+                            .dropped
+                            .contains(SegmentId::from_be_bytes([key[3], key[4], key[5], key[6]]))
+                }
+                Some(DETACHED_COUNT_TAG) => {
+                    if key.len() < 7 {
+                        false
+                    } else {
+                        let attr_id = AttrId::from_be_bytes([key[1], key[2]]);
+                        let col_gen = ColumnGen::from_be_bytes([key[3], key[4], key[5], key[6]]);
+                        self.retired_detached
+                            .get(&attr_id)
+                            .is_some_and(|&r| col_gen < r)
+                    }
+                }
+                Some(ZONE_TAG) => {
+                    key.len() >= 5
+                        && self
+                            .dropped
+                            .contains(SegmentId::from_be_bytes([key[1], key[2], key[3], key[4]]))
+                }
+                Some(DETACHED_OVERWRITTEN_TAG) => {
+                    if key.len() != 11 {
+                        false
+                    } else {
+                        let attr_id = AttrId::from_be_bytes([key[1], key[2]]);
+                        let col_gen = ColumnGen::from_be_bytes([key[3], key[4], key[5], key[6]]);
+                        let seg = SegmentId::from_be_bytes([key[7], key[8], key[9], key[10]]);
+                        self.retired_detached
+                            .get(&attr_id)
+                            .is_some_and(|&r| col_gen < r)
+                            || self.dropped.contains(seg)
+                    }
+                }
+                _ => false,
+            },
+        };
+        if remove {
+            Decision::Remove
+        } else {
+            Decision::Keep
+        }
+    }
+
+    fn name(&self) -> &CStr {
+        c"izzydb_orphan_filter"
+    }
+}
+
+struct OrphanCompactionFilterFactory {
+    kind: OrphanFilterKind,
+    dropped: Arc<RwLock<Arc<RoaringBitmap>>>,
+    retired_detached: Arc<RwLock<Arc<HashMap<AttrId, ColumnGen>>>>,
+}
+
+impl CompactionFilterFactory for OrphanCompactionFilterFactory {
+    type Filter = OrphanCompactionFilter;
+
+    fn create(&mut self, _context: CompactionFilterContext) -> Self::Filter {
+        OrphanCompactionFilter {
+            kind: self.kind,
+            dropped: Arc::clone(&*self.dropped.read().expect("dropped_segments poisoned")),
+            retired_detached: Arc::clone(
+                &*self
+                    .retired_detached
+                    .read()
+                    .expect("retired_detached poisoned"),
+            ),
+        }
+    }
+
+    fn name(&self) -> &CStr {
+        c"izzydb_orphan_filter_factory"
+    }
+}
+
+fn cf_options_with_filters(
+    cf_name: &str,
+    block_cache: &Cache,
+    filters: Option<FilterHandles<'_>>,
+) -> Result<Options> {
+    let mut opts = match cf_name {
         DEFAULT_COLUMN_FAMILY_NAME | CF_ID_MAP | CF_ROWS | CF_COLUMNS | CF_DETACHED => {
-            Ok(point_lookup_cf_opts(block_cache, false))
+            point_lookup_cf_opts(block_cache, false)
         }
         CF_ROW_DOC_IDS | CF_VECTORS | CF_LEAF_ENTRIES => {
-            Ok(point_lookup_cf_opts(block_cache, true))
+            point_lookup_cf_opts(block_cache, true)
         }
-        CF_ATTR_POSTINGS => Ok(prefix_cf_opts(block_cache, ATTR_POSTING_PREFIX_LEN, true)),
-        CF_DETACHED_POSTINGS => Ok(prefix_cf_opts(
-            block_cache,
-            DETACHED_POSTING_PREFIX_LEN,
-            true,
-        )),
-        CF_FTS_TERMS => Ok(prefix_cf_opts(block_cache, 2, false)),
-        CF_FTS_SKIPS | CF_FTS_POSTINGS => Ok(prefix_cf_opts(block_cache, 4, true)),
-        CF_FTS_POSITIONS => Ok(prefix_cf_opts(block_cache, 4, false)),
-        other => Err(TreeError::InvalidConfig(format!(
-            "unknown column family '{other}'"
-        ))),
+        CF_ATTR_POSTINGS => prefix_cf_opts(block_cache, ATTR_POSTING_PREFIX_LEN, true),
+        CF_DETACHED_POSTINGS => {
+            prefix_cf_opts(block_cache, DETACHED_POSTING_PREFIX_LEN, true)
+        }
+        CF_FTS_TERMS => prefix_cf_opts(block_cache, 2, false),
+        CF_FTS_SKIPS | CF_FTS_POSTINGS => prefix_cf_opts(block_cache, 4, true),
+        CF_FTS_POSITIONS => prefix_cf_opts(block_cache, 4, false),
+        other => {
+            return Err(TreeError::InvalidConfig(format!(
+                "unknown column family '{other}'"
+            )));
+        }
+    };
+
+    if let Some((dropped, retired_detached)) = filters {
+        let kind = match cf_name {
+            DEFAULT_COLUMN_FAMILY_NAME => Some(OrphanFilterKind::DefaultCf),
+            CF_ROWS | CF_ROW_DOC_IDS | CF_VECTORS | CF_COLUMNS => Some(OrphanFilterKind::LeadingSeg),
+            CF_ATTR_POSTINGS => Some(OrphanFilterKind::AttrPostings),
+            CF_DETACHED => Some(OrphanFilterKind::DetachedBlocks),
+            CF_DETACHED_POSTINGS => Some(OrphanFilterKind::DetachedPostings),
+            CF_FTS_SKIPS | CF_FTS_POSTINGS | CF_FTS_POSITIONS => {
+                Some(OrphanFilterKind::FtsTermSeg)
+            }
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            opts.set_compaction_filter_factory(OrphanCompactionFilterFactory {
+                kind,
+                dropped: Arc::clone(dropped),
+                retired_detached: Arc::clone(retired_detached),
+            });
+        }
     }
+
+    Ok(opts)
 }
 
 fn point_lookup_cf_opts(block_cache: &Cache, disable_compression: bool) -> Options {

@@ -38,7 +38,9 @@ pub trait Liveness {
     /// is live. Returns `None` when `seg` is visible, has no deletions, and the entire block is within
     /// `row_count` (fast path: all 256 slots are live).
     fn block_live_mask(&self, seg: SegmentId, block: u32) -> Option<[u64; 4]> {
-        let count = self.segment_row_count(seg)?;
+        let Some(count) = self.segment_row_count(seg) else {
+            return Some([0u64; 4]);
+        };
         let base = block.saturating_mul(ROW_BLOCK_SIZE as u32);
         if base >= count {
             return Some([0u64; 4]);

@@ -22,7 +22,8 @@ use izzydb_storage::node::{AnnMeta, PackedInternalNode, decode_f32_slice};
 use izzydb_storage::{SegmentTableSnapshot, Storage, TxContext};
 
 use crate::attr_index::AttributeIndex;
-use crate::filter_plan::{self, FilterPlanTrace};
+use crate::filter_plan::{self, FilterPlan, FilterPlanTrace};
+use crate::fts_index::{FtsIndex, LivenessMaskProvider};
 use crate::search;
 use crate::segments::{RowIndexHook, RowResolver, SegmentStore};
 use crate::tree::{
@@ -162,6 +163,7 @@ pub struct Collection {
     pub(crate) ann_meta: Option<AnnMeta>,
     pub(crate) ann: Option<AnnIndex>,
     pub(crate) attr_index: AttributeIndex,
+    pub(crate) fts_index: FtsIndex,
     pub(crate) internal_cache: HashMap<NodeId, PackedInternalNode>,
     pub(crate) leaf_parent: HashMap<NodeId, NodeId>,
 }
@@ -210,6 +212,7 @@ impl Collection {
             ann_meta,
             ann,
             attr_index: AttributeIndex,
+            fts_index: FtsIndex::new(),
             internal_cache,
             leaf_parent,
         })
@@ -275,7 +278,7 @@ impl Collection {
         let Some(open_seg) = self.manifest.open_segment else {
             return Ok(None);
         };
-        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index);
+        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index, &self.fts_index);
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -302,7 +305,7 @@ impl Collection {
         let prepared_vec = self.prepare_optional_vector(embedding)?;
         let new_row_bytes = encode_row(&self.schema, &attributes, prepared_vec.is_some())?;
 
-        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index);
+        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index, &self.fts_index);
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -342,7 +345,7 @@ impl Collection {
             prepared.push((doc.id, pvec, row_bytes));
         }
 
-        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index);
+        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index, &self.fts_index);
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -378,7 +381,7 @@ impl Collection {
         self.reject_detached_attributes(&patch.attributes)?;
         let prepared_vec = self.prepare_optional_vector(patch.embedding.as_deref())?;
 
-        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index);
+        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index, &self.fts_index);
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -424,7 +427,7 @@ impl Collection {
             }
         }
 
-        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index);
+        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index, &self.fts_index);
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -456,7 +459,7 @@ impl Collection {
 
     /// Delete a document atomically. Returns `true` if `id` existed.
     pub fn delete(&mut self, id: DocId) -> Result<bool> {
-        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index);
+        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index, &self.fts_index);
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -501,7 +504,7 @@ impl Collection {
             return Ok(0);
         }
 
-        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index);
+        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index, &self.fts_index);
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -662,6 +665,7 @@ impl Collection {
                 ann_meta,
                 &ann.quantizer,
                 &self.schema,
+                &self.fts_index,
                 query,
                 opts,
                 f,
@@ -734,7 +738,12 @@ impl Collection {
     /// Resolve all live `DocId`s matching `filter`, sorted ascending.
     pub fn resolve_filter_doc_ids(&self, filter: &Filter) -> Result<Vec<DocId>> {
         filter.validate(&self.schema)?;
-        let rowset = filter_plan::materialize_filter(&self.storage, &self.schema, filter)?;
+        let rowset = filter_plan::materialize_filter(
+            &self.storage,
+            &self.schema,
+            filter,
+            &self.fts_index,
+        )?;
         let rows: Vec<RowId> = rowset.iter().collect();
         let mut doc_ids = RowResolver::resolve_all(&self.storage, &rows)?;
         doc_ids.sort_unstable();
@@ -756,7 +765,7 @@ impl Collection {
 
         let matched = doc_ids.len() as u64;
         for chunk in doc_ids.chunks(512) {
-            let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index);
+            let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index, &self.fts_index);
             let mut tx = TxContext::new(
                 &self.storage,
                 &mut self.internal_cache,
@@ -801,36 +810,216 @@ impl Collection {
         Ok(total_deleted)
     }
 
+    /// Recompute exact live `TermStats` (`doc_freq`, `max_tf`, `min_dl_over_tf`) across all FTS
+    /// terms by scanning live posting slots against `SegmentTableSnapshot`.
     pub fn compact_fts_stats(&mut self) -> Result<()> {
-        Err(TreeError::Unsupported("v3: phase 5".into()))
+        let mut tx = TxContext::new(
+            &self.storage,
+            &mut self.internal_cache,
+            &mut self.leaf_parent,
+            self.manifest.clone(),
+            self.ann_meta.clone(),
+        );
+        let updated = self.fts_index.compact_term_stats(&self.storage, &mut tx)?;
+        if updated > 0 {
+            let (manifest, ann_meta) = tx.commit()?;
+            self.manifest = manifest;
+            self.ann_meta = ann_meta;
+        }
+        Ok(())
     }
 
     pub fn query_bm25(
         &self,
-        _rank_by: &RankBy,
-        _filter: Option<&Filter>,
-        _top_k: usize,
+        rank_by: &RankBy,
+        filter: Option<&Filter>,
+        top_k: usize,
     ) -> Result<Vec<Bm25Result>> {
-        Err(TreeError::Unsupported("v3: phase 5".into()))
+        rank_by.validate(&self.schema)?;
+        if !rank_by.is_pure_lexical() {
+            return Err(TreeError::Unsupported(
+                "v3: phase 6 (non-lexical RankBy)".into(),
+            ));
+        }
+        if let Some(f) = filter {
+            f.validate(&self.schema)?;
+        }
+        if top_k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let snap = self.storage.segment_snapshot();
+        match filter {
+            None => {
+                let mask = LivenessMaskProvider {
+                    snap: &snap,
+                    filter: None,
+                };
+                self.fts_index.query_bm25(
+                    &self.storage,
+                    &self.schema,
+                    rank_by,
+                    top_k,
+                    Some(&mask),
+                    None,
+                )
+            }
+            Some(f) => {
+                let mut trace = FilterPlanTrace::default();
+                let plan = filter_plan::plan_filter_with_trace(
+                    &self.storage,
+                    &self.schema,
+                    f,
+                    &self.fts_index,
+                    &mut trace,
+                )?;
+                match plan {
+                    FilterPlan::Empty => Ok(Vec::new()),
+                    FilterPlan::All => {
+                        let mask = LivenessMaskProvider {
+                            snap: &snap,
+                            filter: None,
+                        };
+                        self.fts_index.query_bm25(
+                            &self.storage,
+                            &self.schema,
+                            rank_by,
+                            top_k,
+                            Some(&mask),
+                            None,
+                        )
+                    }
+                    FilterPlan::Materialized(rs) => {
+                        if rs.is_empty() {
+                            return Ok(Vec::new());
+                        }
+                        let mask = LivenessMaskProvider {
+                            snap: &snap,
+                            filter: Some(&rs),
+                        };
+                        self.fts_index.query_bm25(
+                            &self.storage,
+                            &self.schema,
+                            rank_by,
+                            top_k,
+                            Some(&mask),
+                            None,
+                        )
+                    }
+                    FilterPlan::Lazy { residual, seed } => {
+                        let mask = LivenessMaskProvider {
+                            snap: &snap,
+                            filter: seed.as_ref(),
+                        };
+                        let mut lazy = |row: RowId| -> Result<bool> {
+                            let Some(slice) = self.storage.get_row_bytes_pinned(row)? else {
+                                return Ok(false);
+                            };
+                            let view = RowView::parse(&slice)?;
+                            view.matches_filter(
+                                &self.schema,
+                                &residual,
+                                &mut |kind, attr, query, last_as_prefix, val| {
+                                    self.fts_index.matches_fts_attr(
+                                        &self.schema,
+                                        kind,
+                                        attr,
+                                        query,
+                                        last_as_prefix,
+                                        val,
+                                    )
+                                },
+                            )
+                        };
+                        self.fts_index.query_bm25(
+                            &self.storage,
+                            &self.schema,
+                            rank_by,
+                            top_k,
+                            Some(&mask),
+                            Some(&mut lazy),
+                        )
+                    }
+                }
+            }
+        }
     }
 
     pub fn query(
         &self,
-        _rank_by: &RankBy,
-        _filter: Option<&Filter>,
-        _top_k: usize,
+        rank_by: &RankBy,
+        filter: Option<&Filter>,
+        top_k: usize,
     ) -> Result<Vec<Bm25Result>> {
-        Err(TreeError::Unsupported("v3: phase 5".into()))
+        self.query_bm25(rank_by, filter, top_k)
     }
 
     pub fn hybrid_search(
         &self,
-        _query_vec: &[f32],
-        _rank_by: &RankBy,
-        _opts: HybridSearchOptions,
-        _filter: Option<&Filter>,
+        query_vec: &[f32],
+        rank_by: &RankBy,
+        opts: HybridSearchOptions,
+        filter: Option<&Filter>,
     ) -> Result<Vec<HybridSearchResult>> {
-        Err(TreeError::Unsupported("v3: phase 6".into()))
+        opts.validate()?;
+        rank_by.validate(&self.schema)?;
+        if !rank_by.is_pure_lexical() {
+            return Err(TreeError::Unsupported(
+                "v3: phase 6 (non-lexical RankBy)".into(),
+            ));
+        }
+        if let Some(f) = filter {
+            f.validate(&self.schema)?;
+        }
+        if self.ann.is_none() || self.ann_meta.is_none() {
+            return Err(TreeError::InvalidConfig(
+                "collection has no vector index".into(),
+            ));
+        }
+        if opts.k == 0 {
+            return Ok(Vec::new());
+        }
+
+        let vec_hits = self.search(query_vec, opts.vector_search, filter)?;
+        let bm25_k = opts
+            .bm25_candidates
+            .unwrap_or_else(|| opts.k.saturating_mul(2).max(20));
+        let bm25_hits = self.query_bm25(rank_by, filter, bm25_k)?;
+
+        let mut by_doc: HashMap<DocId, (f32, Option<usize>, Option<usize>)> =
+            HashMap::with_capacity(vec_hits.len() + bm25_hits.len());
+
+        for (idx, hit) in vec_hits.iter().enumerate() {
+            let rank = idx + 1;
+            let contrib = opts.vector_weight / (opts.rrf_k + rank as f32);
+            let entry = by_doc.entry(hit.id).or_insert((0.0, None, None));
+            entry.0 += contrib;
+            entry.1 = Some(rank);
+        }
+        for (idx, hit) in bm25_hits.iter().enumerate() {
+            let rank = idx + 1;
+            let contrib = opts.bm25_weight / (opts.rrf_k + rank as f32);
+            let entry = by_doc.entry(hit.id).or_insert((0.0, None, None));
+            entry.0 += contrib;
+            entry.2 = Some(rank);
+        }
+
+        let mut results: Vec<HybridSearchResult> = by_doc
+            .into_iter()
+            .map(|(id, (score, vector_rank, bm25_rank))| HybridSearchResult {
+                id,
+                score,
+                vector_rank,
+                bm25_rank,
+            })
+            .collect();
+        results.sort_unstable_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        results.truncate(opts.k);
+        Ok(results)
     }
 
     pub fn order_by(
@@ -887,12 +1076,14 @@ impl Collection {
 fn collect_hooks<'a>(
     ann: Option<&'a AnnIndex>,
     attr_index: &'a AttributeIndex,
+    fts_index: &'a FtsIndex,
 ) -> Vec<&'a dyn RowIndexHook> {
-    let mut hooks: Vec<&'a dyn RowIndexHook> = Vec::with_capacity(2);
+    let mut hooks: Vec<&'a dyn RowIndexHook> = Vec::with_capacity(3);
     if let Some(a) = ann {
         hooks.push(a);
     }
     hooks.push(attr_index);
+    hooks.push(fts_index);
     hooks
 }
 

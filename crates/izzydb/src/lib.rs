@@ -11,12 +11,12 @@ pub mod collection;
 /// Segment store, row allocation, sealing, and `RowId -> DocId` resolution.
 pub mod segments;
 
-// Legacy/unported v2 modules compiled out progressively as Phases 5-11 land.
+// Legacy/unported v2 modules compiled out progressively as Phases 6-11 land.
 /// Per-segment inverted attribute index.
 pub mod attr_index;
 /// `RowSet` filter planner, cardinality estimation, and zone pruning.
 pub mod filter_plan;
-#[cfg(any())]
+/// Full-text inverted index and Block-Max MAXSCORE engine.
 pub mod fts_index;
 /// SPFresh LIRE boundary-vector reassignment.
 pub mod lire;
@@ -38,6 +38,7 @@ pub use collection::{
     Collection, Document, DocumentPatch, HybridSearchOptions, HybridSearchResult, SearchResult,
 };
 pub use filter_plan::{FilterPlanTrace, FilteredSearchRegime};
+pub use fts_index::{FtsIndex, LivenessMaskProvider};
 pub use config::{
     AttrId, ColumnGen, DEFAULT_SEAL_ROWS, DistanceMetric, DocId, LocalId, MAX_SEGMENT_ROWS,
     NodeId, ROW_BLOCK_SIZE, RowBlock, RowId, SegmentConfig, SegmentId, SkipChunk, TermId,

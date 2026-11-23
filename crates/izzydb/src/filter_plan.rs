@@ -6,7 +6,7 @@ use roaring::RoaringBitmap;
 
 use izzydb_core::config::{AttrId, RowId, SegmentId};
 use izzydb_core::error::{Result, TreeError};
-use izzydb_core::filter::Filter;
+use izzydb_core::filter::{Filter, FtsPredicateKind, TokenQuery};
 use izzydb_core::rowset::{Liveness, RowSet};
 use izzydb_core::schema::{CollectionSchema, ScalarValue};
 use izzydb_storage::codec::{
@@ -14,6 +14,8 @@ use izzydb_storage::codec::{
     encode_present_attr_key, encode_scalar_attr_key, encode_str_ordered, ordered_type_tag,
 };
 use izzydb_storage::{SegmentTableSnapshot, Storage, ZoneTable};
+
+use crate::fts_index::FtsIndex;
 
 const DEFAULT_MIN_MATERIALIZE_LIMIT: u64 = 65_536;
 
@@ -71,15 +73,16 @@ pub(crate) fn default_materialize_limit(live_rows: u64) -> u64 {
     DEFAULT_MIN_MATERIALIZE_LIMIT.max(live_rows / 8)
 }
 
-/// Plan `filter` into [`FilterPlan`] using `0x06` counts and cached `0x12` zone maps.
+/// Plan `filter` into [`FilterPlan`] using `0x06` counts, FTS term stats, and cached `0x12` zone maps.
 #[allow(dead_code)]
 pub(crate) fn plan_filter(
     storage: &Storage,
     schema: &CollectionSchema,
     filter: &Filter,
+    fts: &FtsIndex,
 ) -> Result<(FilterPlan, u64)> {
     let mut trace = FilterPlanTrace::default();
-    let plan = plan_filter_with_trace(storage, schema, filter, &mut trace)?;
+    let plan = plan_filter_with_trace(storage, schema, filter, fts, &mut trace)?;
     Ok((plan, trace.estimated_cardinality))
 }
 
@@ -88,6 +91,7 @@ pub(crate) fn plan_filter_with_trace(
     storage: &Storage,
     schema: &CollectionSchema,
     filter: &Filter,
+    fts: &FtsIndex,
     trace: &mut FilterPlanTrace,
 ) -> Result<FilterPlan> {
     filter.validate(schema)?;
@@ -105,6 +109,7 @@ pub(crate) fn plan_filter_with_trace(
     let mut ctx = PlanCtx {
         storage,
         schema,
+        fts,
         snap: &snap,
         zones: &zones,
         live_rows,
@@ -138,16 +143,18 @@ pub(crate) fn materialize_filter(
     storage: &Storage,
     schema: &CollectionSchema,
     filter: &Filter,
+    fts: &FtsIndex,
 ) -> Result<RowSet> {
     let mut trace = FilterPlanTrace::default();
-    let plan = plan_filter_with_trace(storage, schema, filter, &mut trace)?;
-    materialize_plan(storage, schema, plan)
+    let plan = plan_filter_with_trace(storage, schema, filter, fts, &mut trace)?;
+    materialize_plan(storage, schema, fts, plan)
 }
 
 /// Materialize an already-planned [`FilterPlan`] into an exact live [`RowSet`].
 pub(crate) fn materialize_plan(
     storage: &Storage,
     schema: &CollectionSchema,
+    fts: &FtsIndex,
     plan: FilterPlan,
 ) -> Result<RowSet> {
     let snap = storage.segment_snapshot();
@@ -156,7 +163,7 @@ pub(crate) fn materialize_plan(
         FilterPlan::Empty => Ok(RowSet::empty()),
         FilterPlan::Materialized(rs) => Ok(rs),
         FilterPlan::Lazy { residual, seed } => {
-            materialize_lazy(storage, schema, &snap, &residual, seed.as_ref())
+            materialize_lazy(storage, schema, fts, &snap, &residual, seed.as_ref())
         }
     }
 }
@@ -165,11 +172,11 @@ pub(crate) fn materialize_plan(
 pub(crate) fn materialize_lazy(
     storage: &Storage,
     schema: &CollectionSchema,
+    fts: &FtsIndex,
     snap: &SegmentTableSnapshot,
     residual: &Filter,
     seed: Option<&RowSet>,
 ) -> Result<RowSet> {
-    reject_fts_in_filter(residual)?;
     let mut matched_rows: Vec<RowId> = Vec::new();
     match seed {
         Some(seed_rs) => {
@@ -195,7 +202,9 @@ pub(crate) fn materialize_lazy(
                         TreeError::InvariantViolation(format!("row {row:?} missing in cf_rows"))
                     })?;
                     let view = RowView::parse(slice)?;
-                    if view.matches_filter(schema, residual, &mut |_, _, _, _, _| false)? {
+                    if view.matches_filter(schema, residual, &mut |kind, attr, query, last_as_prefix, val| {
+                        fts.matches_fts_attr(schema, kind, attr, query, last_as_prefix, val)
+                    })? {
                         matched_rows.push(row);
                     }
                 }
@@ -211,7 +220,9 @@ pub(crate) fn materialize_lazy(
                         return Ok(());
                     }
                     let view = RowView::parse(bytes)?;
-                    if view.matches_filter(schema, residual, &mut |_, _, _, _, _| false)? {
+                    if view.matches_filter(schema, residual, &mut |kind, attr, query, last_as_prefix, val| {
+                        fts.matches_fts_attr(schema, kind, attr, query, last_as_prefix, val)
+                    })? {
                         bm.insert(row.local());
                     }
                     Ok(())
@@ -223,22 +234,6 @@ pub(crate) fn materialize_lazy(
             Ok(RowSet::from_sorted_segs(segs))
         }
     }
-}
-
-fn reject_fts_in_filter(filter: &Filter) -> Result<()> {
-    match filter {
-        Filter::And(ch) | Filter::Or(ch) => {
-            for c in ch {
-                reject_fts_in_filter(c)?;
-            }
-        }
-        Filter::Not(c) => reject_fts_in_filter(c)?,
-        f if f.as_fts_predicate().is_some() => {
-            return Err(TreeError::Unsupported("v3: phase 5 (FTS filter)".into()));
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +278,13 @@ enum CompiledNode {
         hi: Option<(ScalarValue, bool)>,
         orig: Filter,
     },
+    Fts {
+        kind: FtsPredicateKind,
+        attr: String,
+        query: TokenQuery,
+        last_as_prefix: bool,
+        orig: Filter,
+    },
     And(Vec<CompiledNode>, Filter),
     Or(Vec<CompiledNode>, Filter),
     Not(Box<CompiledNode>, Filter),
@@ -300,6 +302,7 @@ impl CompiledNode {
             | Self::IsNull { orig, .. }
             | Self::IsNotNull { orig, .. }
             | Self::Range { orig, .. }
+            | Self::Fts { orig, .. }
             | Self::And(_, orig)
             | Self::Or(_, orig)
             | Self::Not(_, orig) => orig,
@@ -308,8 +311,14 @@ impl CompiledNode {
 }
 
 fn compile_expr(filter: &Filter) -> Result<CompiledNode> {
-    if filter.as_fts_predicate().is_some() {
-        return Err(TreeError::Unsupported("v3: phase 5 (FTS filter)".into()));
+    if let Some((kind, attr, query, last_as_prefix)) = filter.as_fts_predicate() {
+        return Ok(CompiledNode::Fts {
+            kind,
+            attr: attr.to_string(),
+            query: query.clone(),
+            last_as_prefix,
+            orig: filter.clone(),
+        });
     }
     Ok(match filter {
         Filter::Eq(attr, val) => {
@@ -518,9 +527,7 @@ fn compile_expr(filter: &Filter) -> Result<CompiledNode> {
             other => CompiledNode::Not(Box::new(other), filter.clone()),
         },
         other => {
-            if other.as_fts_predicate().is_some() {
-                return Err(TreeError::Unsupported("v3: phase 5 (FTS filter)".into()));
-            }
+            let _ = other;
             unreachable!("all Filter variants handled")
         }
     })
@@ -577,6 +584,7 @@ fn cmp_scalar_ordered(a: &ScalarValue, b: &ScalarValue) -> std::cmp::Ordering {
 struct PlanCtx<'a> {
     storage: &'a Storage,
     schema: &'a CollectionSchema,
+    fts: &'a FtsIndex,
     snap: &'a SegmentTableSnapshot,
     zones: &'a ZoneTable,
     live_rows: u64,
@@ -588,6 +596,21 @@ fn estimate_node(ctx: &PlanCtx<'_>, node: &CompiledNode) -> Result<u64> {
     match node {
         CompiledNode::All => Ok(ctx.live_rows),
         CompiledNode::Empty => Ok(0),
+        CompiledNode::Fts {
+            kind,
+            attr,
+            query,
+            last_as_prefix,
+            ..
+        } => ctx.fts.estimate_fts_predicate(
+            ctx.storage,
+            ctx.schema,
+            *kind,
+            attr,
+            query,
+            *last_as_prefix,
+            ctx.live_rows,
+        ),
         CompiledNode::Eq { attr, val, .. } | CompiledNode::Contains { attr, val, .. } => {
             if matches!(val, ScalarValue::Float(v) if v.is_nan()) {
                 return Ok(0);
@@ -855,6 +878,41 @@ fn eval_plan(ctx: &mut PlanCtx<'_>, node: &CompiledNode) -> Result<(FilterPlan, 
                 return Ok((FilterPlan::Empty, 0));
             }
             let rs = load_postings_range(ctx, attr_id, tag, lo_bytes.as_ref(), hi_bytes.as_ref())?;
+            let actual = rs.len();
+            if actual == 0 {
+                Ok((FilterPlan::Empty, 0))
+            } else {
+                Ok((FilterPlan::Materialized(rs), actual))
+            }
+        }
+        CompiledNode::Fts {
+            kind,
+            attr,
+            query,
+            last_as_prefix,
+            orig,
+        } => {
+            let est = estimate_node(ctx, node)?;
+            if est == 0 {
+                return Ok((FilterPlan::Empty, 0));
+            }
+            if est > ctx.materialize_limit {
+                return Ok((
+                    FilterPlan::Lazy {
+                        residual: orig.clone(),
+                        seed: None,
+                    },
+                    est,
+                ));
+            }
+            let rs = ctx.fts.eval_fts_predicate(
+                ctx.storage,
+                ctx.schema,
+                *kind,
+                attr,
+                query,
+                *last_as_prefix,
+            )?;
             let actual = rs.len();
             if actual == 0 {
                 Ok((FilterPlan::Empty, 0))

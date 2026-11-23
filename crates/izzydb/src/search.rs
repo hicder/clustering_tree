@@ -18,6 +18,7 @@ use izzydb_storage::node::{AnnMeta, LeafNodeView, PackedInternalNode};
 use izzydb_storage::{DBPinnableSlice, SegmentTableSnapshot, Storage, TxContext};
 
 use crate::filter_plan::{self, FilterPlan, FilterPlanTrace, FilteredSearchRegime};
+use crate::fts_index::FtsIndex;
 use crate::simd::{self, LeafCandidate};
 
 /// Parameters controlling quantized vector search, optional full-vector reranking, and filtered expansion.
@@ -322,6 +323,7 @@ pub fn search_filtered(
     meta: &AnnMeta,
     quantizer: &RabitqQuantizer,
     schema: &CollectionSchema,
+    fts_index: &FtsIndex,
     query: &[f32],
     opts: SearchOptions,
     filter: &Filter,
@@ -335,6 +337,7 @@ pub fn search_filtered(
         meta,
         quantizer,
         schema,
+        fts_index,
         query,
         opts,
         filter,
@@ -351,6 +354,7 @@ pub fn search_filtered_with_trace(
     meta: &AnnMeta,
     quantizer: &RabitqQuantizer,
     schema: &CollectionSchema,
+    fts_index: &FtsIndex,
     query: &[f32],
     opts: SearchOptions,
     filter: &Filter,
@@ -369,7 +373,7 @@ pub fn search_filtered_with_trace(
         return Ok(Vec::new());
     }
 
-    let plan = filter_plan::plan_filter_with_trace(storage, schema, filter, trace)?;
+    let plan = filter_plan::plan_filter_with_trace(storage, schema, filter, fts_index, trace)?;
     let total_leaves = leaf_parent.len().max(1);
 
     match plan {
@@ -413,6 +417,7 @@ pub fn search_filtered_with_trace(
                     meta,
                     quantizer,
                     schema,
+                    fts_index,
                     &q,
                     opts,
                     None,
@@ -431,6 +436,7 @@ pub fn search_filtered_with_trace(
                 let exact_rs = filter_plan::materialize_lazy(
                     storage,
                     schema,
+                    fts_index,
                     &snap,
                     &residual,
                     Some(seed_rs),
@@ -458,6 +464,7 @@ pub fn search_filtered_with_trace(
                 meta,
                 quantizer,
                 schema,
+                fts_index,
                 &q,
                 opts,
                 Some(&residual),
@@ -651,6 +658,7 @@ fn search_post_filter(
     meta: &AnnMeta,
     quantizer: &RabitqQuantizer,
     schema: &CollectionSchema,
+    fts_index: &FtsIndex,
     q: &[f32],
     opts: SearchOptions,
     residual: Option<&Filter>,
@@ -791,7 +799,9 @@ fn search_post_filter(
                         TreeError::InvariantViolation(format!("row {row:?} missing in cf_rows"))
                     })?;
                     let view = RowView::parse(slice)?;
-                    if view.matches_filter(schema, res_filter, &mut |_, _, _, _, _| false)? {
+                    if view.matches_filter(schema, res_filter, &mut |kind, attr, query, last_as_prefix, val| {
+                        fts_index.matches_fts_attr(schema, kind, attr, query, last_as_prefix, val)
+                    })? {
                         verified.push(cand);
                     }
                 }

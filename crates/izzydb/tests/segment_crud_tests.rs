@@ -1,7 +1,7 @@
 use izzydb::{
     AttributeType, AttributeValue, Attributes, Collection, CollectionConfig, DistanceMetric,
-    Document, DocumentPatch, FacetSpec, Filter, HybridSearchOptions, OrderBySpec, RankBy,
-    SearchOptions, SortDirection, TreeConfig, TreeError, VectorFacetScope,
+    Document, DocumentPatch, FacetSpec, Filter, FullTextSearchConfig, HybridSearchOptions,
+    OrderBySpec, RankBy, SearchOptions, SortDirection, TreeConfig, TreeError, VectorFacetScope,
 };
 use izzydb_storage::codec::SegmentState;
 use tempfile::TempDir;
@@ -303,11 +303,13 @@ fn test_vectorless_collection_and_unsupported_stubs() {
     let dir = TempDir::new().unwrap();
     let cfg = CollectionConfig::without_vectors()
         .with_seal_rows(8)
-        .with_attribute("title", AttributeType::String, true);
+        .with_attribute("title", AttributeType::String, true)
+        .with_fts_attribute("body", AttributeType::String, false, FullTextSearchConfig::default());
     let mut col = Collection::open(dir.path(), cfg).unwrap();
 
     let mut attrs = Attributes::new();
     attrs.insert("title".into(), "hello".into());
+    attrs.insert("body".into(), "hello vectorless world".into());
     col.upsert(1, None, attrs.clone()).unwrap();
     assert!(matches!(
         col.upsert(2, Some(&[1.0, 2.0]), attrs),
@@ -324,28 +326,27 @@ fn test_vectorless_collection_and_unsupported_stubs() {
         col.search(&[0.0], SearchOptions::new(5, 4), Some(&Filter::Eq("title".into(), "hello".into()))),
         Err(TreeError::InvalidConfig(_))
     ));
-    // Unported APIs return Unsupported("v3: phase N")
     // Attribute filters work on vectorless collections
     assert_eq!(
         col.resolve_filter_doc_ids(&Filter::Eq("title".into(), "hello".into()))
             .unwrap(),
         vec![1]
     );
-    // Unported APIs return Unsupported("v3: phase N")
+    // FTS queries work on vectorless collections
+    let bm25_hits = col.query_bm25(&RankBy::bm25("body", "hello"), None, 5).unwrap();
+    assert_eq!(bm25_hits.len(), 1);
+    assert_eq!(bm25_hits[0].id, 1);
     assert!(matches!(
-        col.query_bm25(&RankBy::bm25("title", "hello"), None, 5),
-        Err(TreeError::Unsupported(_))
+        col.hybrid_search(&[0.0], &RankBy::bm25("body", "hello"), HybridSearchOptions::new(5, SearchOptions::new(5, 4)), None),
+        Err(TreeError::InvalidConfig(_))
     ));
+    // Unported APIs return Unsupported("v3: phase N")
     assert!(matches!(
         col.order_by(&[OrderBySpec::asc("title")], None, 5),
         Err(TreeError::Unsupported(_))
     ));
     assert!(matches!(
         col.facet(None, &[FacetSpec::terms("title")]),
-        Err(TreeError::Unsupported(_))
-    ));
-    assert!(matches!(
-        col.hybrid_search(&[0.0], &RankBy::bm25("title", "hello"), HybridSearchOptions::new(5, SearchOptions::new(5, 4)), None),
         Err(TreeError::Unsupported(_))
     ));
     assert!(matches!(

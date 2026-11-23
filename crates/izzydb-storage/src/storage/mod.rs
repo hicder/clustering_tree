@@ -24,9 +24,9 @@ use izzydb_fts::TermRecord;
 
 use crate::codec::{
     ATTR_COUNT_TAG, FTS_DOC_LEN_TAG, INTERNAL_NODE_TAG, Manifest, SEG_DELETES_TAG, SEG_META_TAG,
-    SegPosting, SegmentMeta, ZONE_TAG, ZoneEntry, decode_doc_id_block, decode_roaring_bitmap,
-    decode_row_key, doc_id_block_key, encode_attr_prefix, fts_block_key_coord, row_key,
-    split_posting_key,
+    SegPosting, SegmentMeta, ZONE_TAG, ZoneEntry, decode_doc_id_block, decode_fts_block_key,
+    decode_roaring_bitmap, decode_row_key, doc_id_block_key, encode_attr_prefix,
+    encode_fts_term_id_prefix, fts_block_key_coord, row_key, split_posting_key,
 };
 use crate::node::{AnnMeta, PackedInternalNode, PackedLeafNode, decode_f32_slice};
 
@@ -950,6 +950,36 @@ impl Storage {
         let cf = self.cf(CF_FTS_POSTINGS)?;
         let key = fts_block_key_coord(term_id, block_id);
         self.db.get_pinned_cf(cf, key).map_err(map_db_err)
+    }
+
+    pub fn all_fts_terms(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_cf(CF_FTS_TERMS, |k| Ok(k.to_vec()), |v| Ok(v.to_vec()))
+    }
+
+    pub fn visit_fts_postings_for_term(
+        &self,
+        term_id: TermId,
+        mut visit: impl FnMut(RowBlock, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let cf = self.cf(CF_FTS_POSTINGS)?;
+        let prefix = encode_fts_term_id_prefix(term_id);
+        let mut ro = ReadOptions::default();
+        ro.set_prefix_same_as_start(true);
+        let iter = self
+            .db
+            .iterator_cf_opt(cf, ro, IteratorMode::From(&prefix, Direction::Forward));
+        for item in iter {
+            let (k, v) = item.map_err(map_db_err)?;
+            if k.len() != 12 || k[0..4] != prefix {
+                break;
+            }
+            let (tid, block) = decode_fts_block_key(&k)?;
+            if tid != term_id {
+                break;
+            }
+            visit(block, &v)?;
+        }
+        Ok(())
     }
 
     pub fn get_fts_position_bytes(&self, key: &[u8; 12]) -> Result<Option<Vec<u8>>> {

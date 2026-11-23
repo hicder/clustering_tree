@@ -126,8 +126,8 @@ impl DocIdBlockCache {
     }
 
     fn insert(&mut self, key: (SegmentId, u32), val: Arc<[DocId; ROW_BLOCK_SIZE]>) {
-        if self.map.contains_key(&key) {
-            self.map.insert(key, val);
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.map.entry(key) {
+            e.insert(val);
             return;
         }
         if self.map.len() >= self.cap
@@ -894,7 +894,7 @@ impl Storage {
         if reverse {
             iter.seek_to_last();
         } else {
-            iter.seek(&prefix);
+            iter.seek(prefix);
         }
         while let Some((k, v)) = iter.item() {
             if !k.starts_with(&prefix) {
@@ -993,6 +993,7 @@ impl Storage {
 
     /// Take a point-in-time RocksDB snapshot and read `(Manifest, SegmentTableSnapshot, cf_id_map)`
     /// at that exact snapshot (used by `DetachedIngest::build`).
+    #[allow(clippy::type_complexity)]
     pub fn snapshot_id_map_and_state(
         &self,
     ) -> Result<(Manifest, SegmentTableSnapshot, Vec<(DocId, RowId)>)> {
@@ -1013,7 +1014,7 @@ impl Storage {
             ro.set_snapshot(&snap);
             ro.set_iterate_range(PrefixRange(&[SEG_META_TAG][..]));
             let mut it = self.db.raw_iterator_opt(ro);
-            it.seek(&[SEG_META_TAG]);
+            it.seek([SEG_META_TAG]);
             while let Some((k, v)) = it.item() {
                 let seg = decode_u32_key(&k[1..])?;
                 entries.insert(
@@ -1032,7 +1033,7 @@ impl Storage {
             ro.set_snapshot(&snap);
             ro.set_iterate_range(PrefixRange(&[SEG_DELETES_TAG][..]));
             let mut it = self.db.raw_iterator_opt(ro);
-            it.seek(&[SEG_DELETES_TAG]);
+            it.seek([SEG_DELETES_TAG]);
             while let Some((k, v)) = it.item() {
                 let seg = decode_u32_key(&k[1..])?;
                 let bm = decode_roaring_bitmap(v)?;
@@ -1430,7 +1431,7 @@ impl Storage {
         if reverse {
             iter.seek_to_last();
         } else {
-            iter.seek(&prefix);
+            iter.seek(prefix);
         }
         while let Some((k, v)) = iter.item() {
             if !k.starts_with(&prefix) {
@@ -1802,6 +1803,19 @@ impl Storage {
             })?;
             Ok(RowId::from_be_bytes(arr))
         })
+    }
+
+    pub fn visit_cf_raw(
+        &self,
+        cf_name: &str,
+        mut visit: impl FnMut(&[u8], &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let cf = self.cf(cf_name)?;
+        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (k, v) = item.map_err(map_db_err)?;
+            visit(&k, &v)?;
+        }
+        Ok(())
     }
 
     fn scan_cf<K, V>(

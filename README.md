@@ -2,9 +2,10 @@
 
 An embedded, RocksDB-backed hybrid search engine in Rust for vector, full-text, and filtered queries.
 
-- **Vector search:** Mutable clustering tree with RaBitQ quantization and optional exact reranking.
-- **Attribute filtering:** Typed document schemas with cluster-aware inverted indexes, compact per-leaf posting bitsets, cached per-leaf min/max zone maps for range pruning, and zero-copy lazy document evaluation.
-- **Full-text & hybrid:** Block-Max MAXSCORE BM25 with out-of-line skip metadata, inline rare-term postings, stemming, phrase matching, and Reciprocal Rank Fusion hybrid search.
+- **Segmented storage:** Append-only segments (`RowId = (SegmentId, LocalId)`) with copy-on-write updates, background compaction + rank-based forwarding, lazy ANN vacuuming, and RocksDB compaction filters.
+- **Vector search (optional):** Mutable global clustering tree over `RowId`s with RaBitQ quantization and optional exact reranking — or create a vectorless collection with `CollectionConfig::without_vectors()`.
+- **Attribute filtering & detached columns:** Typed `Inline` and `Detached` attribute schemas with value-major per-segment inverted indexes, exact live counts, per-segment zone maps, zero-copy lazy row evaluation, and lock-free whole-column detached replacement (`> 1M rows/s` build, `< 20 ms` publish).
+- **Full-text & hybrid:** Segment-keyed Block-Max MAXSCORE BM25 with out-of-line skip metadata, inline rare-term postings, stemming, phrase matching, and Reciprocal Rank Fusion hybrid search.
 - **Ranking, boosting & sorting:** Composable scoring expressions (filter boosts, saturation and decay attribute signals, additive and multiplicative combinators) and multi-key attribute sorting with index-order top-k early termination.
 - **Faceting:** Exact terms, ranges, stats, and histogram facets over filter, BM25, vector, and hybrid queries, with multi-select (disjunctive) faceting and O(values) unfiltered counts from maintained per-value counters.
 - **Persistent & accelerated:** Atomic RocksDB batch commits and runtime-dispatched SIMD (`x86_64` AVX2/AVX-512, `aarch64` NEON).
@@ -15,8 +16,8 @@ An embedded, RocksDB-backed hybrid search engine in Rust for vector, full-text, 
 - [`izzydb-fts`](crates/izzydb-fts) — text analyzer, 256-doc SoA posting/position blocks, and Block-Max MAXSCORE BM25 execution.
 - [`izzydb-rabitq`](crates/izzydb-rabitq) — 1-bit RaBitQ quantization, randomized FWHT rotation, and SIMD popcount leaf scoring.
 - [`izzydb-storage`](crates/izzydb-storage) — packed node/metadata codecs and RocksDB storage/transaction layer.
-- [`izzydb`](crates/izzydb) — `Collection` and `ClusteringTree` indexes, filtered & unfiltered vector search, BM25 & hybrid search, SPFresh LIRE reassignment, and structural invariant verification.
-- [`izzydb-bulk`](crates/izzydb-bulk) — parallel offline Parquet bulk importer (`bulk_import`, `build_ssts`, `ingest_ssts`, and the `izzydb-import` CLI) building sorted external SSTs for zero-WAL ingestion into empty collections.
+- [`izzydb`](crates/izzydb) — `Collection` (segments, compaction, detached columns, filtered & unfiltered vector search, BM25 & hybrid search, SPFresh LIRE reassignment, and structural invariant verification).
+- [`izzydb-bulk`](crates/izzydb-bulk) — parallel offline Parquet bulk importer and appender (`bulk_import`, `bulk_append`, `build_ssts`, `ingest_ssts`, and the `izzydb-import` CLI with `import`, `append`, and `columns`) building sorted external SSTs.
 
 ## Quick Start
 
@@ -69,7 +70,7 @@ attrs.insert(
     "Lightweight waterproof trail running shoe with high-traction sole.".into(),
 );
 attrs.insert("keywords".into(), vec!["gore-tex".to_string(), "vibram".to_string()].into());
-col.upsert(1, &vec![0.1; 128], attrs)?;
+col.upsert(1, Some(&vec![0.1; 128]), attrs)?;
 
 let query = vec![0.1_f32; 128];
 
@@ -254,9 +255,9 @@ let resp = col.hybrid_search_with_facets(
 )?;
 ```
 
-## Bulk Import (`izzydb-bulk`)
+## Bulk Import & Append (`izzydb-bulk`)
 
-For loading large Parquet datasets into an empty or fresh `izzydb` collection without per-row WAL/memtable/compaction overhead, `izzydb-bulk` builds the clustering tree, RaBitQ leaf codes, forward docs, attribute indexes, and FTS inverted indexes offline as sorted external RocksDB SST files (`SstFileWriter`) and ingests them via `ingest_external_file_cf_opts`:
+For loading Parquet datasets without per-row WAL/memtable/compaction overhead, `izzydb-bulk` builds sealed segments, columnar blocks, attribute/FTS indexes, and the optional global ANN tree offline as sorted external RocksDB SST files (`SstFileWriter`) and ingests them via `ingest_external_file_cf_opts`. It supports initial imports (`bulk_import`), populating new segments into existing collections (`bulk_append`), and whole-column detached Parquet refreshes (`izzydb-import columns`):
 
 ```rust
 use std::path::PathBuf;
@@ -269,37 +270,51 @@ let cfg = BulkImportConfig::new(col_cfg, "id", "vector", "/tmp/bulk_work")
     .with_fill_factor(0.75);
 
 let report = bulk_import("/tmp/my_collection", &[PathBuf::from("data.parquet")], cfg, None)?;
-println!("Imported {} docs into {} leaves", report.docs_imported, report.leaves);
+println!("Imported {} docs across {} segments ({} leaves)", report.docs_imported, report.segments_created, report.leaves);
 ```
 
-You can also split SST generation and ingestion across machines with `build_ssts` and `ingest_ssts`, or use the `izzydb-import` CLI (`cargo run --release -p izzydb-bulk --bin izzydb-import -- --help`). See [Bulk Import Architecture](docs/architecture/bulk-import.md) for details on the pipeline and crash-safe marker protocol.
+You can also split SST generation and ingestion across machines with `build_ssts` and `ingest_ssts`, or use the `izzydb-import` CLI (`cargo run --release -p izzydb-bulk --bin izzydb-import -- import|append|columns --help`). See [Bulk Import Architecture](docs/architecture/bulk-import.md) for details on the pipeline and crash-safe marker protocol.
 
 ## Documentation
 
-- **[User Guide](docs/guide/README.md)** — task-oriented walkthrough: getting started, schema, documents, vector/filtered/full-text/hybrid search, ranking & boosting, faceting, bulk import, and operations.
+- **[User Guide](docs/guide/README.md)** — task-oriented walkthrough: getting started, schema, documents, vector/filtered/full-text/hybrid search, ranking & boosting, faceting, bulk import/append, operations & maintenance, and [Detached Columns](docs/guide/12-detached-columns.md).
 
 ### Architecture & Performance
 
-- [Key & Binary Encoding](docs/architecture/key-encoding.md) — RocksDB column families, big-endian key formats, packed SoA node/vector layouts, and RaBitQ bit-packing.
-- [Index Path](docs/architecture/index-path.md) — write path, RocksDB layout, RaBitQ quantization, splits, merges, and LIRE.
-- [Search Path](docs/architecture/search-path.md) — beam traversal, asymmetric 4-bit RaBitQ `popcount` scanning, cluster-aware filtering, and full-vector reranking.
-- [Filtering & Inverted Index](docs/architecture/filtering-and-inverted-index.md) — schema & filter semantics, order-preserving cluster-first encodings, `AttrZoneMap` range pruning, slot-indexed `local_id == slot` lifecycle, and filtered execution.
-- [Full-Text Search Architecture](docs/architecture/fts-architecture.md) — `FtsIndex`, `TermRecord` inline rare terms, `cf_fts_skips`, v3 256-doc posting blocks, Block-Max MAXSCORE BM25, FTS filters, and hybrid RRF.
-- [SIMD Block-Max MAXSCORE & Data Layout](docs/architecture/blockmax-simd.md) — 256-slot block geometry, out-of-line `DocLenBlock` & `SkipBlock`, v3 Sparse/Dense posting layouts, `min_dl_over_tf` bounds, and runtime-dispatched SIMD kernels.
-- [Bulk Import Architecture](docs/architecture/bulk-import.md) — offline Parquet scan, skeleton training, external merge-sorting, SST emission, and marker-protected ingestion.
+- [Key & Binary Encoding](docs/architecture/key-encoding.md) — v3 RocksDB column families, `RowId` / segment keys, `RowView` v3, `ColumnBlock`, `SegPosting`, and RaBitQ leaf layouts.
+- [Segments, Compaction & Vacuum](docs/architecture/segments-and-compaction.md) — append-only segment states, CoW updates, rank-based `RowId` forwarding, `vacuum_ann`, and compaction filters.
+- [Detached Columns](docs/architecture/detached-columns.md) — out-of-row generational columnar storage, lock-free `detached_ingest`, atomic `< 20 ms` publish, and `0x14` overwritten sets.
+- [Index Path](docs/architecture/index-path.md) — `SegmentStore`, `AnnIndex`, `AttributeIndex`, and `FtsIndex` atomic write coordination.
+- [Search Path](docs/architecture/search-path.md) — five-regime `FilterPlan` planner (`ExactScan`, `MaskedTraversal`, `PostFilter`), beam traversal, and `RowResolver` output.
+- [Filtering & Inverted Index](docs/architecture/filtering-and-inverted-index.md) — `Inline`/`Detached` schemas, value-major per-segment postings, `0x06`/`0x07` live counts, `0x12` zone maps, and faceting.
+- [Full-Text Search Architecture](docs/architecture/fts-architecture.md) — segment-keyed `(seg, block)` FTS blocks, `TermRecord` v4, Block-Max MAXSCORE BM25, and hybrid RRF.
+- [SIMD Block-Max MAXSCORE & Data Layout](docs/architecture/blockmax-simd.md) — 256-slot block geometry, `DocLenBlock` & `SkipBlock`, v3 Sparse/Dense posting layouts, and runtime-dispatched SIMD kernels.
+- [Bulk Import & Append Architecture](docs/architecture/bulk-import.md) — offline Parquet scan, skeleton training, `bulk_import`, `bulk_append`, and `izzydb-import` subcommands.
+- [Segmented Storage v3 Performance Report](docs/perf/2026-11-23-segmented-storage-v3.md) — `master` vs. `segments-v3` release comparison across ANN, filtering, BM25, faceting, bulk import, churn, and detached ingest.
 - [ANN Latency Optimization](docs/perf/2026-11-20-latency-optimization.md) — packed node blobs, internal node cache, single-FWHT query path, and SIMD RaBitQ scoring.
 - [SIMD Block-Max MAXSCORE](docs/perf/2026-11-21-simd-maxscore.md) — out-of-line `DocLenBlock`, v2 TF-only Sparse/Dense posting blocks, `min_dl_over_tf` bounds, and runtime-dispatched FTS SIMD kernels.
+
+## Breaking Changes (v3 Segmented Storage)
+
+- **On-disk format incompatible with v2:** databases must be recreated or re-imported.
+- **Optional embeddings & vectorless collections:** `Collection::upsert` and `Document.embedding` take/return `Option` embeddings (`Some(&vec)` / `Option<Vec<f32>>`); use `CollectionConfig::without_vectors()` and `BulkImportConfig::new_vectorless` when vectors are omitted.
+- **Search tuning knob:** `SearchOptions::with_exhaustive_cluster_threshold` is replaced by `SearchOptions::with_exact_scan_threshold` (default `4_096` vector rows).
+- **Bulk CLI subcommands:** `izzydb-import` now takes a subcommand: `izzydb-import import`, `izzydb-import append`, or `izzydb-import columns`.
+- **`ClusteringTree` standalone removal:** collection APIs live on `Collection`; ANN indexing is coordinated internally as a secondary index over `RowId`s.
 
 ## Tests & Benchmarks
 
 ```bash
-cargo test
+cargo test --workspace
 cargo run --release -p izzydb-bench --bin recall_bench
 cargo run --release -p izzydb-bench --bin filtered_bench
 cargo run --release -p izzydb-bench --bin fts_bench
+cargo run --release -p izzydb-bench --bin rank_bench
 cargo run --release -p izzydb-bench --bin facet_bench
 cargo run --release -p izzydb-bench --bin encoding_bench
 cargo run --release -p izzydb-bench --bin bulk_import_bench
+cargo run --release -p izzydb-bench --bin churn_bench
+cargo run --release -p izzydb-bench --bin detached_bench
 ```
 
 ## License

@@ -696,8 +696,8 @@ impl<'a> SegPostingView<'a> {
                     )));
                 }
                 let mut prev: Option<u32> = None;
-                for chunk in rest.chunks_exact(4) {
-                    let v = u32::from_le_bytes(chunk.try_into().unwrap());
+                for &chunk in rest.as_chunks::<4>().0 {
+                    let v = u32::from_le_bytes(chunk);
                     if let Some(p) = prev
                         && v <= p
                     {
@@ -721,8 +721,8 @@ impl<'a> SegPostingView<'a> {
     pub fn or_into(&self, dst: &mut RoaringBitmap) -> Result<()> {
         match *self {
             Self::Sparse(slice) => {
-                for chunk in slice.chunks_exact(4) {
-                    dst.insert(u32::from_le_bytes(chunk.try_into().unwrap()));
+                for &chunk in slice.as_chunks::<4>().0 {
+                    dst.insert(u32::from_le_bytes(chunk));
                 }
             }
             Self::Roaring(slice) => {
@@ -746,8 +746,8 @@ impl<'a> SegPostingView<'a> {
         match *self {
             Self::Sparse(slice) => {
                 let mut cnt = 0u64;
-                for chunk in slice.chunks_exact(4) {
-                    if mask.contains(u32::from_le_bytes(chunk.try_into().unwrap())) {
+                for &chunk in slice.as_chunks::<4>().0 {
+                    if mask.contains(u32::from_le_bytes(chunk)) {
                         cnt += 1;
                     }
                 }
@@ -762,8 +762,8 @@ impl<'a> SegPostingView<'a> {
     pub fn or_into_masked(&self, mask: &RoaringBitmap, dst: &mut RoaringBitmap) -> Result<()> {
         match *self {
             Self::Sparse(slice) => {
-                for chunk in slice.chunks_exact(4) {
-                    let v = u32::from_le_bytes(chunk.try_into().unwrap());
+                for &chunk in slice.as_chunks::<4>().0 {
+                    let v = u32::from_le_bytes(chunk);
                     if mask.contains(v) {
                         dst.insert(v);
                     }
@@ -810,8 +810,8 @@ pub fn decode_doc_id_block(bytes: &[u8]) -> Result<Box<[DocId; ROW_BLOCK_SIZE]>>
         out.copy_from_slice(src);
         return Ok(out);
     }
-    for (dst, chunk) in out.iter_mut().zip(bytes.chunks_exact(8)) {
-        *dst = u64::from_le_bytes(chunk.try_into().unwrap());
+    for (dst, &chunk) in out.iter_mut().zip(bytes.as_chunks::<8>().0) {
+        *dst = u64::from_le_bytes(chunk);
     }
     Ok(out)
 }
@@ -1714,8 +1714,8 @@ impl<'a> RowFieldRef<'a> {
                 let len = r.read_u32_le("cf_rows int array len")? as usize;
                 let body = r.read_bytes(len * 8, "cf_rows int array")?;
                 r.expect_eof("cf_rows int array")?;
-                for c in body.chunks_exact(8) {
-                    f(RawScalar::Int(i64::from_le_bytes(c.try_into().unwrap())));
+                for &c in body.as_chunks::<8>().0 {
+                    f(RawScalar::Int(i64::from_le_bytes(c)));
                 }
             }
             Self::UintArray(payload) => {
@@ -1723,8 +1723,8 @@ impl<'a> RowFieldRef<'a> {
                 let len = r.read_u32_le("cf_rows uint array len")? as usize;
                 let body = r.read_bytes(len * 8, "cf_rows uint array")?;
                 r.expect_eof("cf_rows uint array")?;
-                for c in body.chunks_exact(8) {
-                    f(RawScalar::Uint(u64::from_le_bytes(c.try_into().unwrap())));
+                for &c in body.as_chunks::<8>().0 {
+                    f(RawScalar::Uint(u64::from_le_bytes(c)));
                 }
             }
         }
@@ -1834,8 +1834,8 @@ fn raw_contains_scalar(kind: u8, payload: &[u8], target: &ScalarValue) -> Result
             if payload.len() != 4 + arr_len * 8 {
                 return Err(TreeError::CorruptedData("cf_rows int array".into()));
             }
-            for chunk in payload[4..].chunks_exact(8) {
-                if i64::from_le_bytes(chunk.try_into().unwrap()) == *t {
+            for &chunk in payload[4..].as_chunks::<8>().0 {
+                if i64::from_le_bytes(chunk) == *t {
                     return Ok(true);
                 }
             }
@@ -1849,8 +1849,8 @@ fn raw_contains_scalar(kind: u8, payload: &[u8], target: &ScalarValue) -> Result
             if payload.len() != 4 + arr_len * 8 {
                 return Err(TreeError::CorruptedData("cf_rows uint array".into()));
             }
-            for chunk in payload[4..].chunks_exact(8) {
-                if u64::from_le_bytes(chunk.try_into().unwrap()) == *t {
+            for &chunk in payload[4..].as_chunks::<8>().0 {
+                if u64::from_le_bytes(chunk) == *t {
                     return Ok(true);
                 }
             }
@@ -1929,8 +1929,10 @@ fn decode_payload_value(kind: u8, payload: &[u8]) -> Result<AttributeValue> {
             let body = r.read_bytes(len * 8, "cf_rows int array")?;
             r.expect_eof("cf_rows int array")?;
             let arr = body
-                .chunks_exact(8)
-                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&c| i64::from_le_bytes(c))
                 .collect();
             Ok(AttributeValue::IntArray(arr))
         }
@@ -1940,8 +1942,10 @@ fn decode_payload_value(kind: u8, payload: &[u8]) -> Result<AttributeValue> {
             let body = r.read_bytes(len * 8, "cf_rows uint array")?;
             r.expect_eof("cf_rows uint array")?;
             let arr = body
-                .chunks_exact(8)
-                .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&c| u64::from_le_bytes(c))
                 .collect();
             Ok(AttributeValue::UintArray(arr))
         }

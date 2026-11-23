@@ -639,8 +639,10 @@ impl PackedLeafNode {
             read_u32_le(view.code_popcounts_bytes, padded_slots)?
         } else {
             view.code_popcounts_bytes
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]) as u32)
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| u16::from_le_bytes(c) as u32)
                 .collect()
         };
         Ok(Self {
@@ -788,15 +790,18 @@ impl<'a> LeafNodeView<'a> {
         let words = self.mask_word_count();
         dst.clear();
         dst.reserve(words);
-        for chunk in self.live_mask_bytes.chunks_exact(8) {
-            dst.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+        for &chunk in self.live_mask_bytes.as_chunks::<8>().0 {
+            dst.push(u64::from_le_bytes(chunk));
         }
     }
 
     #[inline]
     pub fn and_live_mask_into(&self, words_buf: &mut [u64]) {
-        for (dst, chunk) in words_buf.iter_mut().zip(self.live_mask_bytes.chunks_exact(8)) {
-            *dst &= u64::from_le_bytes(chunk.try_into().unwrap());
+        for (dst, &chunk) in words_buf
+            .iter_mut()
+            .zip(self.live_mask_bytes.as_chunks::<8>().0)
+        {
+            *dst &= u64::from_le_bytes(chunk);
         }
     }
 

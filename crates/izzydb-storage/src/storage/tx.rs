@@ -65,6 +65,7 @@ pub struct TxContext<'a> {
     dirty_detached_count_deltas: BTreeMap<Vec<u8>, i64>,
     dirty_detached_overwritten: BTreeMap<(AttrId, ColumnGen, SegmentId), RoaringBitmap>,
     retire_detached_gens: Vec<(AttrId, ColumnGen)>,
+    #[allow(clippy::type_complexity)]
     retire_segments: Vec<(SegmentId, Vec<(AttrId, ColumnGen)>, Vec<AttrId>)>,
 }
 

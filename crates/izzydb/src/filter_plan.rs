@@ -577,8 +577,9 @@ fn compile_expr(filter: &Filter) -> Result<CompiledNode> {
                 return Ok(CompiledNode::All);
             }
             let mut compiled_children = Vec::new();
-            let mut ranges_by_attr: BTreeMap<String, (Option<(ScalarValue, bool)>, Option<(ScalarValue, bool)>, Vec<Filter>)> =
-                BTreeMap::new();
+            type RangeAccumulator =
+                BTreeMap<String, (Option<(ScalarValue, bool)>, Option<(ScalarValue, bool)>, Vec<Filter>)>;
+            let mut ranges_by_attr: RangeAccumulator = BTreeMap::new();
             for ch in children {
                 let c = compile_expr(ch)?;
                 match c {
@@ -1305,12 +1306,14 @@ fn finalize_seg_map(
     RowSet::from_sorted_segs(pairs).and_live(snap)
 }
 
+type EncodedBounds = (AttrId, u8, Option<(Vec<u8>, bool)>, Option<(Vec<u8>, bool)>);
+
 fn encode_range_bounds(
     schema: &CollectionSchema,
     attr: &str,
     lo: Option<&(ScalarValue, bool)>,
     hi: Option<&(ScalarValue, bool)>,
-) -> Result<(AttrId, u8, Option<(Vec<u8>, bool)>, Option<(Vec<u8>, bool)>)> {
+) -> Result<EncodedBounds> {
     let entry = schema
         .get_by_name(attr)
         .ok_or_else(|| TreeError::InvalidFilter(format!("unknown attribute '{attr}'")))?;

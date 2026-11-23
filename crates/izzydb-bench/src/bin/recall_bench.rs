@@ -57,7 +57,8 @@ fn run_bench(name: &str, data: &[Vec<f32>], queries: &[Vec<f32>], enable_lire: b
     let mut tree = ClusteringTree::open(dir.path(), cfg).unwrap();
     let t0 = Instant::now();
     for (i, v) in data.iter().enumerate() {
-        tree.add_leaf(i as DocId, v).unwrap();
+        tree.insert_row(izzydb::RowId::new(0, i as izzydb::LocalId), v)
+            .unwrap();
     }
     let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let stats = tree.verify_invariants().unwrap();
@@ -93,7 +94,7 @@ fn run_bench(name: &str, data: &[Vec<f32>], queries: &[Vec<f32>], enable_lire: b
             let res = tree.search(q, 10, beam).unwrap();
             q_hits += res
                 .iter()
-                .filter(|&&(id, _)| ground_truth[qi].contains(&id))
+                .filter(|&&(row, _)| ground_truth[qi].contains(&(row.local() as DocId)))
                 .count();
         }
         let q_us = sq.elapsed().as_secs_f64() * 1e6 / queries.len() as f64;
@@ -105,7 +106,7 @@ fn run_bench(name: &str, data: &[Vec<f32>], queries: &[Vec<f32>], enable_lire: b
             let res = tree.search_with_rerank(q, 10, beam, 100).unwrap();
             r_hits += res
                 .iter()
-                .filter(|&&(id, _)| ground_truth[qi].contains(&id))
+                .filter(|&&(row, _)| ground_truth[qi].contains(&(row.local() as DocId)))
                 .count();
         }
         let r_us = sr.elapsed().as_secs_f64() * 1e6 / queries.len() as f64;

@@ -92,8 +92,25 @@ pub struct DetachedJob {
     pub(crate) cols: Vec<DetachedColPlan>,
     pub(crate) mode: DetachedWriteMode,
     pub(crate) watermark: RowId,
+    pub(crate) snap_open_end: Option<(SegmentId, u32)>,
+    pub(crate) snap_next_segment_id: SegmentId,
     pub(crate) deleted_at_snapshot: BTreeMap<SegmentId, Option<RoaringBitmap>>,
     pub(crate) sorted_input: Vec<(DocId, Vec<AttributeValue>)>,
+}
+
+impl DetachedJob {
+    #[inline]
+    fn snapshot_limit_local(&self, seg: SegmentId, row_count: u32) -> u32 {
+        if seg >= self.snap_next_segment_id {
+            0
+        } else if let Some((open_seg, open_rows)) = self.snap_open_end
+            && seg == open_seg
+        {
+            open_rows.min(row_count)
+        } else {
+            row_count
+        }
+    }
 }
 
 /// Builder for staging an atomic whole-column detached ingest on `&Collection`.
@@ -241,12 +258,13 @@ impl<'a> DetachedIngestBuilder<'a> {
             id_map.sort_unstable_by_key(|&(doc_id, _)| doc_id);
         }
 
-        let watermark = match manifest.open_segment {
-            Some(seg) => {
-                let rows = seg_snap.get(seg).map(|e| e.meta.row_count).unwrap_or(0);
-                RowId::new(seg, rows)
-            }
-            None => RowId::new(manifest.next_segment_id, 0),
+        let snap_open_end = manifest
+            .open_segment
+            .map(|seg| (seg, seg_snap.get(seg).map(|e| e.meta.row_count).unwrap_or(0)));
+        let snap_next_segment_id = manifest.next_segment_id;
+        let watermark = match snap_open_end {
+            Some((seg, rows)) => RowId::new(seg, rows),
+            None => RowId::new(snap_next_segment_id, 0),
         };
 
         let mut deleted_at_snapshot: BTreeMap<SegmentId, Option<RoaringBitmap>> = BTreeMap::new();
@@ -373,6 +391,8 @@ impl<'a> DetachedIngestBuilder<'a> {
             cols: col_plans,
             mode: self.mode,
             watermark,
+            snap_open_end,
+            snap_next_segment_id,
             deleted_at_snapshot,
             sorted_input,
         })
@@ -552,21 +572,17 @@ pub(crate) fn publish_detached_job(
     }
 
     let snap = coll.storage().segment_snapshot();
-    // 1. Identify rows `< watermark` that became deleted between snapshot S and now.
+    // 1. Identify rows existing at snapshot S that became deleted before publish.
     let mut post_delete_rows: Vec<RowId> = Vec::new();
     for (&seg, snap_entry) in &snap.segments {
-        if seg > job.watermark.seg() {
-            break;
+        let limit_local = job.snapshot_limit_local(seg, snap_entry.meta.row_count);
+        if limit_local == 0 {
+            continue;
         }
         let Some(ref deleted_now) = snap_entry.deleted else {
             continue;
         };
         let deleted_then = job.deleted_at_snapshot.get(&seg).and_then(|o| o.as_ref());
-        let limit_local = if seg == job.watermark.seg() {
-            job.watermark.local()
-        } else {
-            snap_entry.meta.row_count
-        };
         for local in deleted_now.iter() {
             if local >= limit_local {
                 break;
@@ -577,20 +593,13 @@ pub(crate) fn publish_detached_job(
         }
     }
 
-    // 2. Identify live rows `>= watermark` created by writes after snapshot S.
+    // 2. Identify live rows allocated after snapshot S.
     let mut tail_rows: Vec<RowId> = Vec::new();
     for seg in snap.visible_segments() {
-        if seg < job.watermark.seg() {
-            continue;
-        }
         let Some(entry) = snap.get(seg) else {
             continue;
         };
-        let start_local = if seg == job.watermark.seg() {
-            job.watermark.local()
-        } else {
-            0
-        };
+        let start_local = job.snapshot_limit_local(seg, entry.meta.row_count);
         if start_local >= entry.meta.row_count {
             continue;
         }
@@ -1644,6 +1653,11 @@ pub(crate) fn block_slot_matches_any_encoded(
     Ok(matched)
 }
 
+pub(crate) type OverwrittenTrueValues = (
+    BTreeMap<SegmentId, RoaringBitmap>,
+    BTreeMap<Vec<u8>, BTreeMap<SegmentId, RoaringBitmap>>,
+);
+
 /// Collect corrected detached value -> `(SegmentId -> RoaringBitmap)` overlay for `0x14` rows
 /// across all segments for `(entry, col_gen)` (used by `order_by` streaming when `0x14` non-empty).
 pub(crate) fn collect_overwritten_true_values(
@@ -1651,10 +1665,7 @@ pub(crate) fn collect_overwritten_true_values(
     snap: &SegmentTableSnapshot,
     entry: &SchemaEntry,
     col_gen: ColumnGen,
-) -> Result<(
-    BTreeMap<SegmentId, RoaringBitmap>,
-    BTreeMap<Vec<u8>, BTreeMap<SegmentId, RoaringBitmap>>,
-)> {
+) -> Result<OverwrittenTrueValues> {
     let ow_list = storage.all_detached_overwritten(entry.id, col_gen)?;
     let mut ow_live_by_seg: BTreeMap<SegmentId, RoaringBitmap> = BTreeMap::new();
     let mut true_val_by_seg: BTreeMap<Vec<u8>, BTreeMap<SegmentId, RoaringBitmap>> =

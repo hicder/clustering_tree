@@ -146,9 +146,9 @@ impl ColumnBlockBuilder {
             by_slot[*slot as usize] = Some(val);
         }
         let mut builder = Self::new(attr_type);
-        for slot_idx in 0..ROW_BLOCK_SIZE {
+        for (slot_idx, slot_val) in by_slot.iter().enumerate() {
             let slot = slot_idx as u8;
-            if let Some(new_val) = by_slot[slot_idx] {
+            if let Some(new_val) = slot_val {
                 if !matches!(new_val, AttributeValue::Null) {
                     builder.set_attr_value(slot, new_val)?;
                 }

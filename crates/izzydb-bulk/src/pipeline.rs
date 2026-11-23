@@ -201,6 +201,14 @@ fn read_doc_bytes<'a>(docs_idx: &[u8], docs_shards: &'a [MappedFile], row: u32) 
     &shard[entry.offset as usize..entry.offset as usize + entry.len as usize]
 }
 
+pub type EmptyImportEmitResult = (
+    BTreeMap<String, Vec<SstFileInfo>>,
+    Manifest,
+    Option<AnnMeta>,
+    u32,
+    u64,
+);
+
 /// Emit all RocksDB SSTs for an empty-target `bulk_import`.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_empty_import_ssts(
@@ -219,7 +227,7 @@ pub fn emit_empty_import_ssts(
     target_sst_bytes: u64,
     memory_budget_bytes: usize,
     pool: &rayon::ThreadPool,
-) -> Result<(BTreeMap<String, Vec<SstFileInfo>>, Manifest, Option<AnnMeta>, u32, u64)> {
+) -> Result<EmptyImportEmitResult> {
     let block_cache = default_sst_block_cache();
     let n_docs = staged.docs_imported as usize;
     let seal_rows = seg_cfg.seal_rows as usize;
@@ -554,8 +562,8 @@ pub fn emit_segment_range_ssts(
     let seg_ranges: Vec<(u32, u32)> = (0..num_segs)
         .step_by(segs_per_worker)
         .map(|s| {
-            let s_u32 = s as u32;
-            let e_u32 = (s as u32 + segs_per_worker as u32).min(num_segs);
+            let s_u32 = s;
+            let e_u32 = (s + segs_per_worker as u32).min(num_segs);
             (s_u32, e_u32)
         })
         .collect();
@@ -916,7 +924,7 @@ pub fn emit_segment_range_ssts(
                                         continue;
                                     }
                                     if let Some(analyzed) = fts_analyzers[f_idx]
-                                        .analyze_attribute_value(&val, &mut fts_buf)?
+                                        .analyze_attribute_value(val, &mut fts_buf)?
                                     {
                                         accum.fts_stats[f_idx].doc_count += 1;
                                         accum.fts_stats[f_idx].total_tokens +=
@@ -1371,6 +1379,9 @@ fn collect_summed_counts(sorter: ExternalSorter<CountDeltaItem>) -> Result<Vec<(
     Ok(out)
 }
 
+type KvEmitFn<'a> = &'a mut dyn FnMut(&[u8], &[u8]) -> Result<()>;
+type TermDeltaFn<'a> = &'a mut dyn FnMut(FtsTermAppendDelta) -> Result<()>;
+
 #[allow(clippy::too_many_arguments)]
 fn emit_fts_streams_inner(
     iter: &mut crate::common::sorter::SortedIter<FtsPostingItem>,
@@ -1378,11 +1389,11 @@ fn emit_fts_streams_inner(
     existing_terms: &HashMap<(AttrId, String), TermRecord>,
     next_term_id_init: u32,
     is_append_mode: bool,
-    emit_new_term: &mut dyn FnMut(&[u8], &[u8]) -> Result<()>,
-    emit_updated_term: &mut dyn FnMut(FtsTermAppendDelta) -> Result<()>,
-    emit_skip: &mut dyn FnMut(&[u8], &[u8]) -> Result<()>,
-    emit_posting: &mut dyn FnMut(&[u8], &[u8]) -> Result<()>,
-    emit_position: &mut dyn FnMut(&[u8], &[u8]) -> Result<()>,
+    emit_new_term: KvEmitFn<'_>,
+    emit_updated_term: TermDeltaFn<'_>,
+    emit_skip: KvEmitFn<'_>,
+    emit_posting: KvEmitFn<'_>,
+    emit_position: KvEmitFn<'_>,
 ) -> Result<u32> {
     let mut next_term_id = next_term_id_init;
 
@@ -1407,7 +1418,7 @@ fn emit_fts_streams_inner(
     let flush_skip_chunk = |term_id: TermId,
                             chunk_opt: &mut Option<izzydb::config::SkipChunk>,
                             bounds: &mut Vec<(u8, u32, f32)>,
-                            emit_skip: &mut dyn FnMut(&[u8], &[u8]) -> Result<()>|
+                            emit_skip: KvEmitFn<'_>|
      -> Result<()> {
         if let Some(chunk) = chunk_opt.take()
             && !bounds.is_empty()
@@ -1434,9 +1445,9 @@ fn emit_fts_streams_inner(
                        cur_skip_bounds: &mut Vec<(u8, u32, f32)>,
                        total_df: u64,
                        is_last_block: bool,
-                       emit_skip: &mut dyn FnMut(&[u8], &[u8]) -> Result<()>,
-                       emit_posting: &mut dyn FnMut(&[u8], &[u8]) -> Result<()>,
-                       emit_position: &mut dyn FnMut(&[u8], &[u8]) -> Result<()>|
+                       emit_skip: KvEmitFn<'_>,
+                       emit_posting: KvEmitFn<'_>,
+                       emit_position: KvEmitFn<'_>|
      -> Result<()> {
         let Some(rblk) = rblk_opt.take() else {
             return Ok(());
@@ -1495,8 +1506,8 @@ fn emit_fts_streams_inner(
                        is_existing: bool,
                        stats: TermStats,
                        deferred: &mut Option<(RowBlock, Vec<u8>, u32, f32)>,
-                       emit_new_term: &mut dyn FnMut(&[u8], &[u8]) -> Result<()>,
-                       emit_updated_term: &mut dyn FnMut(FtsTermAppendDelta) -> Result<()>|
+                       emit_new_term: KvEmitFn<'_>,
+                       emit_updated_term: TermDeltaFn<'_>|
      -> Result<()> {
         let tk = encode_fts_term_key(attr_id, token);
         if is_existing {

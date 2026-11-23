@@ -16,8 +16,8 @@ Values inside predicates are `ScalarValue`s; use `.into()` from `&str`, `String`
 
 ## Requirements
 
-- Attributes used in scalar/array predicates must be declared `filterable = true`.
-- Attributes used in token predicates (`ContainsAllTokens`, …) must have a full-text config.
+- Attributes used in scalar/array predicates must be declared `filterable = true` (works for both **inline** and **detached** attributes).
+- Attributes used in token predicates (`ContainsAllTokens`, …) must have a full-text config (inline attributes only).
 - Filters are validated against the schema before they run; unknown attributes, type mismatches, and unsupported combinations return `TreeError::InvalidFilter`.
 
 ## Predicate reference
@@ -128,8 +128,9 @@ let ids = col.resolve_filter_doc_ids(&f)?;   // also validates the filter
 
 ## Performance tips
 
-- Filters on `filterable` attributes are answered from inverted indexes organized **by cluster**, so vector search can skip clusters that contain no matches, and range predicates are pruned using per-cluster min/max values.
-- Mixed filters are fine: `And`/`Or`/`Not` may combine attribute and token predicates freely.
+- Filters on `filterable` attributes are answered from value-major **per-segment** inverted postings (`cf_attr_postings` / `cf_detached_postings`), global exact live counts (`0x06` / `0x07`), and per-segment min/max zone maps (`0x12`).
+- Selective filters ($\le$ `exact_scan_threshold`, default `4,096`) automatically switch vector search to exact distance scoring (`ExactScan`) for 100% exact recall; broader filters prune ANN search via candidate bitmaps or lazy `RowView` evaluation.
+- Mixed filters are fine: `And`/`Or`/`Not` may combine inline attribute, detached attribute, and FTS token predicates freely.
 - If you filter on the same text pattern constantly, consider a derived `filterable` attribute (a `category` or tag array) instead of a token predicate.
 
 [`Filter`]: ../../crates/izzydb-core/src/filter.rs

@@ -1,60 +1,49 @@
-# Bulk Import Architecture (`izzydb-bulk`)
+# Bulk Import & Append Architecture (`izzydb-bulk`)
 
-This document describes the offline Parquet bulk importer ([`crates/izzydb-bulk`](../../crates/izzydb-bulk)) and its external SST ingestion protocol into `izzydb`.
+This document describes the offline Parquet bulk importer, **populated-target appender (`bulk_append`)**, and detached column ingestion CLI in [`crates/izzydb-bulk`](../../crates/izzydb-bulk).
 
-## 1. Overview & Empty-Target Scope
+Implementation sources:
+- Orchestrator (`bulk_import`, `build_ssts`, `ingest_ssts`, `bulk_append`): [`crates/izzydb-bulk/src/lib.rs`](../../crates/izzydb-bulk/src/lib.rs)
+- Parallel Parquet scanner & detached scanner: [`crates/izzydb-bulk/src/common/parquet_reader.rs`](../../crates/izzydb-bulk/src/common/parquet_reader.rs)
+- Segment SST emitters: [`crates/izzydb-bulk/src/pipeline.rs`](../../crates/izzydb-bulk/src/pipeline.rs)
+- ANN tree builder over `RowId`s: [`crates/izzydb-bulk/src/tree_builder.rs`](../../crates/izzydb-bulk/src/tree_builder.rs)
+- SST bundle manifest v2 (`SST_BUNDLE_FORMAT_VERSION = 2`): [`crates/izzydb-bulk/src/common/sst.rs`](../../crates/izzydb-bulk/src/common/sst.rs)
+- CLI (`izzydb-import import | append | columns`): [`crates/izzydb-bulk/src/bin/izzydb-import.rs`](../../crates/izzydb-bulk/src/bin/izzydb-import.rs)
 
-Calling `Collection::upsert` row-by-row runs a full RocksDB `WriteBatch` transaction, clustering-tree traversal, RaBitQ re-encoding, and read-modify-write attribute/FTS aggregation per document. `izzydb-bulk` replaces that with an offline multi-phase pipeline that builds sorted, non-overlapping RocksDB SST files via `SstFileWriter` and links them straight into the bottommost level via `DB::ingest_external_file_cf_opts`.
+---
 
-Because internal identifiers (`NodeId`, `LocalId`, `FtsDocId`, `TermId`) and aggregate payloads (`TermRecord` stats, `cf_attr_clusters` bitmaps, `default[0x06]` counts, `AttrZoneMap`, `FtsMeta`) are dense or read-modify-write, **v1 requires an empty target** (either a non-existent path or an existing collection with `num_vectors == 0` and no attribute/FTS state). Populated targets fail immediately with `TreeError::InvalidConfig`.
+## 1. Empty Import (`bulk_import`, `build_ssts`, `ingest_ssts`)
 
-## 2. Multi-Phase Offline Pipeline
+Because v3 rows live in independent sealed segments and secondary indexes use `RowId = (seg, local)` coordinates, `bulk_import` partitions imported rows directly into sealed segments sized by `SegmentConfig.seal_rows` (default `65,536`):
 
-1. **Phase 0 (Prepare & Validation):**
-   - Validates `CollectionConfig`, `BulkImportConfig` (`fill_factor`, `target_sst_bytes`, column names), and builds `CollectionSchema` and `RabitqQuantizer`.
-   - Rejects non-empty targets before any write.
-   - Checks `st_dev` between `work_dir` and `target` so `ingest_ssts` uses `move_files = true` (hard-linking) on the same filesystem and falls back to copying across filesystems.
-2. **Phase 1 (Parallel Parquet Scan & Stage):**
-   - Projects only `id_column`, `vector_column`, and mapped schema attribute columns via `ProjectionMask::roots`.
-   - Decodes Arrow batches across `(file_idx, row_group_idx)` tasks in parallel (`rayon`), validates vectors/attributes with `prepare_vector` and `CollectionSchema::validate_attributes`, and stages:
-     - `vectors.bin` (fixed-stride `[f32; dim]` LE, mmapped later),
-     - `doc_ids_by_row.bin` (`[u64; R]` LE),
-     - `docs_shard_*.bin` + `docs.idx` (v2 encoded forward attributes),
-     - `(doc_id, row)` pairs into an LZ4-framed `ExternalSorter`.
-   - Merges sorted `(doc_id, row)` pairs to enforce `DuplicatePolicy::Error` or `DuplicatePolicy::LastWins` (keeping the highest `(file_idx, row_in_file)`), emitting `rows_by_doc_id.bin`.
-3. **Phase 2 (Train Tree Skeleton):**
-   - Draws a uniform sample of up to `min(train_sample, N)` live vectors (capped to respect `memory_budget_bytes`).
-   - Recursively bisects the sample using `izzydb_core::kmeans::balanced_two_means` until projected cluster sizes fall to `<= fill_factor * max_leaf_size`, then groups leaf centroids bottom-up into a uniform-depth internal hierarchy with fanouts in `[min_internal_fanout, max_internal_fanout]` (root in `[2, max_internal_fanout]`).
-4. **Phase 3 (Assign & Repair):**
-   - Routes every live vector through the skeleton in parallel using `izzydb::search::route_to_leaf_with` (`insert_beam_width`).
-   - Repairs oversize leaves (`> max_leaf_size`) via `balanced_two_means`, merges/rebalances undersize leaves (`< min_leaf_size`), repairs internal node fanouts bottom-up, and recomputes exact leaf and internal centroids.
-   - Assigns BFS `NodeId`s (`root_id = 1`, internal nodes contiguous, leaves contiguous), dense slots `0..n`, and leaf-major `fts_doc_id`s (`0..N` when FTS is enabled), persisting `placement.bin`.
-5. **Phase 4 (Emit Pass A — Leaf-Major):**
-   - Parallel over disjoint contiguous leaf-ID ranges:
-     - Writes `cf_leaf_entries` SSTs directly in ascending `leaf_id` order using `PackedLeafNode::from_entries`.
-     - Extracts filterable attribute index keys (`cf_attr_postings` sorter, `cf_attr_clusters` + `default[0x06]` counts sorter, and per-leaf `AttrZoneMap` bounds).
-     - Runs `FtsAnalyzer::analyze_attribute_value` to record per-attribute document lengths (`fts_dls`) and emit `(attr_id, token, fts_doc_id, tf, positions)` to the FTS sorter.
-6. **Phase 5 (Emit Pass B — `DocId` Order):**
-   - Parallel over disjoint `doc_id` ranges from `rows_by_doc_id.bin`, writing `cf_docs`, `cf_vectors`, and `cf_doc_loc` SSTs directly in ascending `doc_id` order.
-7. **Phase 6 (Finish Sorted CFs & `default` CF):**
-   - Streams sorted `cf_attr_postings` and `cf_attr_clusters` (`RoaringBitmap::from_sorted_iter`, spilling summed global counts for `default[0x06]`).
-   - Streams sorted FTS postings in `(attr_id, token, fts_doc_id)` order, assigning monotonic `TermId`s, building v3 `PackedPostingBlock`s, `PackedPositionBlock`s, `SkipBlock` chunks, and inline `TermRecord`s (`doc_freq <= 8` on 1 block).
-   - Writes `default` CF in strict key-tag order: `\x01attr_counts_v1`, `\x01fts_meta`, `\x01schema`, `\x01tree_meta`, `0x02` internal nodes, `0x03` attribute zones, `0x04` FTS reverse blocks, `0x05` FTS doc lengths, and `0x06` global attribute counts.
+1. **Phase 0 (Prepare & Validate):** Validates `CollectionConfig` (supporting both vectored and **vectorless** collections via `CollectionConfig::without_vectors()`), `BulkImportConfig`, target emptiness, and `work_dir` filesystem device (`move_files = true` hard-links when on the same filesystem).
+2. **Phase 1 (Parallel Parquet Scan & Stage):** Projects `id_column`, optional `vector_column`, inline attributes, and any detached attributes via `rayon`:
+   - Writes `vectors.bin` (if `has_vectors`), `doc_ids_by_row.bin`, `docs_shard_*.bin` + `docs.idx` (v3 `RowView`), and staged detached attribute blocks when present.
+   - Deduplicates `(doc_id, row)` via external LZ4-framed sorting under `DuplicatePolicy::{Error, LastWins}` and assigns sequential `(seg, local)` `RowId`s across new sealed segments.
+3. **Phase 2 (Optional ANN Build):** When `has_vectors` is true, trains the clustering skeleton via `balanced_two_means`, routes all vectors in parallel, assigns BFS `NodeId`s, and records `RowId`s (`VecEntry { row_id, vec_idx }`) directly into `PackedLeafNode` v3 leaves (`cf_leaf_entries`) and internal nodes (`default[0x02]`).
+4. **Phase 3 (Emit Segment SSTs):** Streams sorted SSTs directly in segment/column-family order:
+   - `cf_rows`, `cf_row_doc_ids`, `cf_vectors`, `cf_columns` (sealed inline columnar blocks built directly), `cf_id_map`, `cf_attr_postings` (`SegPosting`, value-major), `cf_detached` / `cf_detached_postings`, FTS CFs (`cf_fts_terms` v4, `cf_fts_skips`, `cf_fts_postings`, `cf_fts_positions`), and `default` (`\x01schema` v4, `\x01manifest`, `\x01ann_meta`, `\x01fts_meta` v4, `0x02`, `0x05`, `0x06`, `0x07`, `0x11` sealed `SegmentMeta`, `0x12` zones, `0x13` `DetachedMeta`).
+5. **Phase 4 (Crash-Safe Ingest):** Brackets multi-CF `ingest_external_file_cf_opts` with `default[b"\x01bulk_import_v3"]` (`sync = true`), ingesting all data CFs before `default`, then clearing the marker.
 
-## 3. SST Options Parity & Crash-Safe Marker Protocol
+---
 
-Every `SstSink` uses `izzydb_storage::cf_options_for` so prefix extractors, Bloom filters, and `DBCompressionType::None` settings on zero-copy CFs match live `Storage::open` column families exactly.
+## 2. Populated-Target Bulk Append (`bulk_append`)
 
-Because `rocksdb` 0.23 exposes per-CF `ingest_external_file_cf_opts` rather than atomic multi-CF `IngestExternalFiles`, `ingest_ssts` brackets ingestion with a WAL-synced marker in `default`:
+Segmented v3 storage enables **`bulk_append(target, files, config, progress)`** onto an **already-populated** collection without rewriting existing segments:
 
-1. `Storage::open_for_bulk_ingest(target, &tree_config)` verifies the target has no pending marker and is empty.
-2. `storage.put_bulk_import_marker(build_id)` writes `default[b"\x01bulk_import_v1"]` with `sync = true` (and deletes any empty initial root leaf `1`).
-3. All data CFs (`cf_vectors`, `cf_docs`, `cf_doc_loc`, `cf_leaf_entries`, `cf_attr_clusters`, `cf_attr_postings`, `cf_fts_positions`, `cf_fts_postings`, `cf_fts_skips`, `cf_fts_terms`) are ingested first.
-4. `default` (containing `tree_meta`, `schema`, `fts_meta`, internal nodes, zones, rev blocks, doc lengths, and counts) is ingested last (`allow_global_seqno = true` handles overlap with the marker range).
-5. `storage.clear_bulk_import_marker()` deletes `b"\x01bulk_import_v1"` with `sync = true`.
+1. **Pre-flight & Open:** Opens the existing `Collection` (verifying no incomplete `\x01bulk_import_v3` marker and matching schema).
+2. **Scan & Assign New Segments:** Scans the Parquet input and assigns fresh sealed segment IDs strictly starting at `Manifest.next_segment_id`, writing new non-overlapping segments via `emit_segment_range_ssts` (note: `cf_attr_postings` global SST keys are disjoint or merged cleanly by `seg`, while existing `0x06` / `0x07` counts and FTS terms with colliding tokens are reconciled transactionally).
+3. **Overlap / Replacement Handling:** For any incoming `DocId` already present in `cf_id_map`, marks the previous `old_row` tombstoned (`Collection::with_bulk_tx` / `delete_row_for_replace`) in one atomic transaction (`docs_replaced`).
+4. **Global ANN Strategy:**
+   - **Incremental insertion** (when appended rows are a fraction of existing collection size): inserts new vectors into the existing `AnnIndex` (`rebuilt_ann_tree = false`).
+   - **Threshold tree rebuild** (`rebuilt_ann_tree = true`): when appended vectors exceed existing live vectors (or tree was empty), trains/rebuilds the global ANN tree across all live vectors atomically via `replace_ann_tree`.
+5. **Recovery & Safety:** `bulk_append_with_hook` verifies clean recovery before commit. If a crash occurs after `\x01bulk_import_v3` ingestion starts, `Storage::open` rejects opening with `CorruptedData`.
 
-If a crash occurs between steps 2 and 5, `Storage::open` and `Collection::open` detect `b"\x01bulk_import_v1"` and fail with `TreeError::CorruptedData("incomplete bulk import; delete the database directory and re-run")`.
+---
 
-## 4. Split Build & Ingest (`build_ssts` / `ingest_ssts`)
+## 3. CLI Subcommands (`izzydb-import`)
 
-`build_ssts` writes an `SstBundle` directory with `manifest.json` (format version, `CollectionConfig` hash, `dim`, `metric`, encoded `CollectionSchema`, `TreeMeta`, and per-CF SST paths). `ingest_ssts` validates the manifest against the target configuration before ingesting.
+`izzydb-import` provides three subcommands:
+- `izzydb-import import`: populate a new/empty collection (vectored with `--dim`, or vectorless when `--dim` is omitted).
+- `izzydb-import append`: bulk-append Parquet files as new sealed segments into an existing collection.
+- `izzydb-import columns`: scan `--columns col1 col2 ...` from Parquet and ingest into existing documents via `Collection::detached_ingest` + `publish_detached` (`--mode replace|merge`).

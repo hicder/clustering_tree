@@ -64,7 +64,7 @@ fn gen_attrs(rng: &mut SmallRng, i: u64) -> Attributes {
     let mut a = Attributes::new();
     let cats = ["red", "green", "blue", "a\0b", "héllo", "a\u{1F600}"];
     if rng.random_bool(0.85) {
-        let c = if i % 97 == 0 {
+        let c = if i.is_multiple_of(97) {
             "rare".to_string()
         } else {
             cats[rng.random_range(0..cats.len())].to_string()
@@ -137,9 +137,12 @@ fn populate(col: &mut Collection, n: u64, seed: u64) -> Model {
 // ------------------------------------------------------------------------------------------
 
 fn norm(v: ScalarValue) -> ScalarValue {
-    match v {
-        ScalarValue::Float(f) if f == 0.0 => ScalarValue::Float(0.0),
-        o => o,
+    if let ScalarValue::Float(f) = v
+        && f == 0.0
+    {
+        ScalarValue::Float(0.0)
+    } else {
+        v
     }
 }
 
@@ -801,7 +804,9 @@ fn test_facet_edge_values_exact() {
     col.verify_ann_invariants().unwrap();
 }
 
-fn bm25_cases() -> Vec<(&'static str, RankBy, Box<dyn Fn(&str) -> bool>)> {
+type Bm25PredCase = (&'static str, RankBy, Box<dyn Fn(&str) -> bool>);
+
+fn bm25_cases() -> Vec<Bm25PredCase> {
     let has = |w: &'static str| move |b: &str| b.split_whitespace().any(|t| t == w);
     let has_prefix = |p: &'static str| move |b: &str| b.split_whitespace().any(|t| t.starts_with(p));
     vec![

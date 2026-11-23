@@ -431,13 +431,14 @@ fn test_vectors_only_recall_parity_and_invariants() {
     // Build bulk-imported collection.
     let bulk_dir = dir.path().join("bulk");
     let work_dir = dir.path().join("work");
-    let bcfg = BulkImportConfig::new(cfg.clone(), "id", "vector", &work_dir);
+    let bcfg = BulkImportConfig::new(cfg.clone(), "id", "vector", &work_dir).with_verify_after(true);
     let report = bulk_import(&bulk_dir, &[pq_path], bcfg, None).unwrap();
     assert_eq!(report.docs_imported, n as u64);
     assert_eq!(report.rows_read, n as u64);
     assert_eq!(report.duplicates_dropped, 0);
 
     let bulk_col = Collection::open(&bulk_dir, cfg).unwrap();
+    bulk_col.verify_invariants().unwrap();
 
     // Compare recall@10 against ground truth.
     let mut oracle_hits = 0usize;
@@ -500,7 +501,8 @@ fn test_full_parity_attributes_facets_fts_and_parquet_edge_cases() {
     let bcfg = BulkImportConfig::new(cfg.clone(), "id", "vector", &work_dir)
         .with_target_sst_bytes(16 * 1024)
         .with_memory_budget_bytes(1024 * 1024)
-        .with_threads(2);
+        .with_threads(2)
+        .with_verify_after(true);
 
     let phases = std::sync::Mutex::new(Vec::new());
     let progress_cb = |p: izzydb_bulk::Progress| phases.lock().unwrap().push(p.phase);
@@ -516,6 +518,7 @@ fn test_full_parity_attributes_facets_fts_and_parquet_edge_cases() {
     assert!(!phases.lock().unwrap().is_empty());
 
     let bulk_col = Collection::open(&bulk_dir, cfg).unwrap();
+    bulk_col.verify_invariants().unwrap();
 
     // Check every document's stored vector & attributes match oracle.
     for r in &rows {
@@ -1052,6 +1055,7 @@ fn test_bulk_append_equivalence_overlapping_ids_and_ann_strategies() {
     assert!(rep_c.rebuilt_ann_tree);
 
     let bulk_col = Collection::open(&bulk_dir, cfg).unwrap();
+    bulk_col.verify_invariants().unwrap();
     assert_eq!(bulk_col.len(), oracle.len());
 
     // Document-for-document equality.

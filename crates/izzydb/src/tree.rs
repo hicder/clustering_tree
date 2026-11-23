@@ -420,8 +420,8 @@ fn leaf_view_has_stale_or_forwarded(
     seg_snap: &SegmentTableSnapshot,
     dropped: &roaring::RoaringBitmap,
 ) -> bool {
-    for (w_idx, chunk) in view.live_mask_bytes.chunks_exact(8).enumerate() {
-        let mut word = u64::from_le_bytes(chunk.try_into().unwrap());
+    for (w_idx, &chunk) in view.live_mask_bytes.as_chunks::<8>().0.iter().enumerate() {
+        let mut word = u64::from_le_bytes(chunk);
         while word != 0 {
             let b = word.trailing_zeros() as usize;
             word &= word - 1;

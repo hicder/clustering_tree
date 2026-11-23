@@ -1242,7 +1242,15 @@ impl Collection {
     }
 
     pub fn verify_invariants(&self) -> Result<CollectionStats> {
-        Err(TreeError::Unsupported("v3: phase 11".into()))
+        crate::verify::verify_collection_invariants(
+            &self.storage,
+            &self.internal_cache,
+            &self.leaf_parent,
+            &self.manifest,
+            self.ann_meta.as_ref(),
+            &self.config,
+            &self.schema,
+        )
     }
 
     #[doc(hidden)]

@@ -227,10 +227,12 @@ where
         let _ = target_seg;
     }
 
-    if stats.segments_forwarded > 0 && coll.ann.is_some() {
+    if stats.segments_forwarded > 0
+        && let Some(ref ann) = coll.ann
+    {
         let vac = vacuum_ann_storage(
             &coll.storage,
-            coll.ann.as_ref().unwrap(),
+            ann,
             &mut coll.manifest,
             &mut coll.ann_meta,
             &mut coll.internal_cache,

@@ -38,7 +38,7 @@ pub mod search;
 pub mod simd;
 /// Global ANN clustering tree over `RowId`s.
 pub mod tree;
-#[cfg(any())]
+/// Exhaustive storage-format invariant verifier.
 pub mod verify;
 
 pub use attr_index::AttributeIndex;

@@ -587,7 +587,7 @@ fn bulk_append_checked(
     let t0 = Instant::now();
     let mut col = Collection::open(target, config.collection.clone())?;
     let schema = col.schema().clone();
-    let seg_cfg = col.collection_config().segment.clone();
+    let seg_cfg = col.collection_config().segment;
     let seal_rows = seg_cfg.seal_rows as usize;
     let has_vectors = config.collection.vector.is_some();
 

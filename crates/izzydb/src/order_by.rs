@@ -320,9 +320,11 @@ impl Collection {
                 }
             };
 
+            type FlushGroupFn<'a> =
+                &'a mut dyn FnMut(&[u8], BTreeMap<SegmentId, RoaringBitmap>, &SegmentTableSnapshot) -> Result<bool>;
             let flush_ow_before = |target_val: Option<&[u8]>,
                                    ow_true_vals: &mut BTreeMap<Vec<u8>, BTreeMap<SegmentId, RoaringBitmap>>,
-                                   flush_group: &mut dyn FnMut(&[u8], BTreeMap<SegmentId, RoaringBitmap>, &SegmentTableSnapshot) -> Result<bool>|
+                                   flush_group: FlushGroupFn<'_>|
              -> Result<bool> {
                 loop {
                     let next_key = if reverse {

@@ -195,12 +195,14 @@ fn encode_staged_doc(
     Ok(out)
 }
 
+pub type DecodedStagedDoc<'a> = (&'a [u8], Vec<(AttrId, AttributeValue)>);
+
 /// Split staged document bytes into `(cf_rows_bytes, optional_detached_pairs)`.
 #[inline]
-pub fn decode_staged_doc<'a>(
-    bytes: &'a [u8],
+pub fn decode_staged_doc(
+    bytes: &[u8],
     schema_has_detached: bool,
-) -> Result<(&'a [u8], Vec<(AttrId, AttributeValue)>)> {
+) -> Result<DecodedStagedDoc<'_>> {
     if !schema_has_detached {
         return Ok((bytes, Vec::new()));
     }

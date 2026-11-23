@@ -348,11 +348,7 @@ fn test_vectorless_collection_and_unsupported_stubs() {
         col.search_with_facets(&[0.0], SearchOptions::new(5, 4), None, &[], VectorFacetScope::TopK),
         Err(TreeError::InvalidConfig(_))
     ));
-    // Unported APIs return Unsupported("v3: phase N")
-    assert!(matches!(
-        col.verify_invariants(),
-        Err(TreeError::Unsupported(_))
-    ));
+    col.verify_invariants().unwrap();
     let _ = SortDirection::Asc;
 }
 

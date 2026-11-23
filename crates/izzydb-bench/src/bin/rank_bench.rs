@@ -60,7 +60,7 @@ fn main() {
         a.insert("created".into(), AttributeValue::Int(rng.random_range(0..1_000_000)));
         a.insert("popularity".into(), AttributeValue::Uint(rng.random_range(0..100_000)));
         a.insert("cat".into(), format!("c{}", rng.random_range(0..20)).into());
-        col.upsert(id, &v, a).unwrap();
+        col.upsert(id, Some(&v), a).unwrap();
     }
     println!("indexed {n} docs in {:.0}ms", t0.elapsed().as_secs_f64() * 1e3);
 

@@ -407,6 +407,7 @@ impl FtsIndex {
     }
 
     /// Estimate live cardinality of an FTS predicate from `TermRecord.stats.doc_freq`.
+    #[allow(clippy::too_many_arguments)]
     pub fn estimate_fts_predicate(
         &self,
         storage: &Storage,
@@ -1393,10 +1394,7 @@ fn eval_all_tokens_blocks(
     };
 
     let mut results = Vec::new();
-    'block_loop: loop {
-        let Some(mut target) = cursors[0].1.current_block_id() else {
-            break;
-        };
+    'block_loop: while let Some(mut target) = cursors[0].1.current_block_id() {
 
         loop {
             let mut all_match = true;

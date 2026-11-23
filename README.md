@@ -2,12 +2,12 @@
 
 An embedded, RocksDB-backed hybrid search engine in Rust for vector, full-text, and filtered queries.
 
-- **Vector search:** Mutable ~100x-fanout clustering tree (inspired by turbopuffer ANN v3 and SPFresh LIRE) with 1-bit RaBitQ quantization (8-wide SIMD-tiled codes, pre-stored popcounts) and optional exact reranking.
-- **Attribute filtering:** Typed document schemas with cluster-aware inverted indexes (`cf_attr_clusters`, cluster-first `cf_attr_postings` with compact `LeafPosting` bitsets, cached per-leaf `AttrZoneMap`s) and zero-copy `DocView` lazy evaluation.
-- **Full-text & hybrid:** `TermId`-indexed Block-Max MAXSCORE BM25 with out-of-line `cf_fts_skips`, inline rare-term postings, stemming, phrase matching, and Reciprocal Rank Fusion (`hybrid_search`).
-- **Ranking, boosting & sorting:** Composable `RankBy` scoring expressions (filter boosts, `saturate` / `decay` attribute signals, additive and multiplicative combinators) and multi-key `OrderBySpec` attribute sorting (`query_ordered`) with index-order `top_k` early termination.
-- **Faceting:** Exact `Terms`, `Ranges`, `Stats`, and `Histogram` facets over filter, BM25, vector, and hybrid queries, with multi-select (disjunctive) faceting and O(values) unfiltered counts from maintained per-value counters.
-- **Persistent & accelerated:** Atomic RocksDB `WriteBatch` commits and runtime-dispatched SIMD (`x86_64` AVX2/AVX-512, `aarch64` NEON).
+- **Vector search:** Mutable clustering tree with RaBitQ quantization and optional exact reranking.
+- **Attribute filtering:** Typed document schemas with cluster-aware inverted indexes, compact per-leaf posting bitsets, cached per-leaf min/max zone maps for range pruning, and zero-copy lazy document evaluation.
+- **Full-text & hybrid:** Block-Max MAXSCORE BM25 with out-of-line skip metadata, inline rare-term postings, stemming, phrase matching, and Reciprocal Rank Fusion hybrid search.
+- **Ranking, boosting & sorting:** Composable scoring expressions (filter boosts, saturation and decay attribute signals, additive and multiplicative combinators) and multi-key attribute sorting with index-order top-k early termination.
+- **Faceting:** Exact terms, ranges, stats, and histogram facets over filter, BM25, vector, and hybrid queries, with multi-select (disjunctive) faceting and O(values) unfiltered counts from maintained per-value counters.
+- **Persistent & accelerated:** Atomic RocksDB batch commits and runtime-dispatched SIMD (`x86_64` AVX2/AVX-512, `aarch64` NEON).
 
 ## Workspace Crates
 

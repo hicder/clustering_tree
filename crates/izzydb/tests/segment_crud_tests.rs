@@ -325,10 +325,13 @@ fn test_vectorless_collection_and_unsupported_stubs() {
         Err(TreeError::InvalidConfig(_))
     ));
     // Unported APIs return Unsupported("v3: phase N")
-    assert!(matches!(
-        col.resolve_filter_doc_ids(&Filter::Eq("title".into(), "hello".into())),
-        Err(TreeError::Unsupported(_))
-    ));
+    // Attribute filters work on vectorless collections
+    assert_eq!(
+        col.resolve_filter_doc_ids(&Filter::Eq("title".into(), "hello".into()))
+            .unwrap(),
+        vec![1]
+    );
+    // Unported APIs return Unsupported("v3: phase N")
     assert!(matches!(
         col.query_bm25(&RankBy::bm25("title", "hello"), None, 5),
         Err(TreeError::Unsupported(_))

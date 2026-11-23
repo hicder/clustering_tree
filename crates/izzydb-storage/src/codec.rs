@@ -1281,6 +1281,11 @@ impl<'a> RowView<'a> {
     }
 
     #[inline]
+    pub fn raw_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    #[inline]
     pub fn has_vector(&self) -> bool {
         (self.flags & ROW_FLAG_HAS_VECTOR) != 0
     }

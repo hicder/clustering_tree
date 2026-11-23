@@ -21,6 +21,8 @@ use izzydb_storage::codec::{
 use izzydb_storage::node::{AnnMeta, PackedInternalNode, decode_f32_slice};
 use izzydb_storage::{SegmentTableSnapshot, Storage, TxContext};
 
+use crate::attr_index::AttributeIndex;
+use crate::filter_plan::{self, FilterPlanTrace};
 use crate::search;
 use crate::segments::{RowIndexHook, RowResolver, SegmentStore};
 use crate::tree::{
@@ -159,6 +161,7 @@ pub struct Collection {
     pub(crate) manifest: Manifest,
     pub(crate) ann_meta: Option<AnnMeta>,
     pub(crate) ann: Option<AnnIndex>,
+    pub(crate) attr_index: AttributeIndex,
     pub(crate) internal_cache: HashMap<NodeId, PackedInternalNode>,
     pub(crate) leaf_parent: HashMap<NodeId, NodeId>,
 }
@@ -206,6 +209,7 @@ impl Collection {
             manifest,
             ann_meta,
             ann,
+            attr_index: AttributeIndex,
             internal_cache,
             leaf_parent,
         })
@@ -271,7 +275,7 @@ impl Collection {
         let Some(open_seg) = self.manifest.open_segment else {
             return Ok(None);
         };
-        let hooks = collect_hooks(self.ann.as_ref());
+        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index);
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -298,7 +302,7 @@ impl Collection {
         let prepared_vec = self.prepare_optional_vector(embedding)?;
         let new_row_bytes = encode_row(&self.schema, &attributes, prepared_vec.is_some())?;
 
-        let hooks = collect_hooks(self.ann.as_ref());
+        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index);
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -338,7 +342,7 @@ impl Collection {
             prepared.push((doc.id, pvec, row_bytes));
         }
 
-        let hooks = collect_hooks(self.ann.as_ref());
+        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index);
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -374,7 +378,7 @@ impl Collection {
         self.reject_detached_attributes(&patch.attributes)?;
         let prepared_vec = self.prepare_optional_vector(patch.embedding.as_deref())?;
 
-        let hooks = collect_hooks(self.ann.as_ref());
+        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index);
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -420,7 +424,7 @@ impl Collection {
             }
         }
 
-        let hooks = collect_hooks(self.ann.as_ref());
+        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index);
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -452,7 +456,7 @@ impl Collection {
 
     /// Delete a document atomically. Returns `true` if `id` existed.
     pub fn delete(&mut self, id: DocId) -> Result<bool> {
-        let hooks = collect_hooks(self.ann.as_ref());
+        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index);
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -497,7 +501,7 @@ impl Collection {
             return Ok(0);
         }
 
-        let hooks = collect_hooks(self.ann.as_ref());
+        let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index);
         let mut tx = TxContext::new(
             &self.storage,
             &mut self.internal_cache,
@@ -622,23 +626,49 @@ impl Collection {
         opts: SearchOptions,
         filter: Option<&Filter>,
     ) -> Result<Vec<SearchResult>> {
+        let mut trace = FilterPlanTrace::default();
+        self.search_with_trace(query, opts, filter, &mut trace)
+    }
+
+    pub fn search_with_trace(
+        &self,
+        query: &[f32],
+        opts: SearchOptions,
+        filter: Option<&Filter>,
+        trace: &mut FilterPlanTrace,
+    ) -> Result<Vec<SearchResult>> {
         let (Some(ann), Some(ann_meta)) = (&self.ann, &self.ann_meta) else {
             return Err(TreeError::InvalidConfig(
                 "collection has no vector index".into(),
             ));
         };
-        if filter.is_some() {
-            return Err(TreeError::Unsupported("v3: phase 4".into()));
-        }
-        let row_hits = search::search(
-            &self.storage,
-            &self.internal_cache,
-            ann_meta,
-            &ann.quantizer,
-            query,
-            opts,
-            &ann.config,
-        )?;
+        let row_hits = match filter {
+            None => {
+                trace.regime = Some(filter_plan::FilteredSearchRegime::Unfiltered);
+                search::search(
+                    &self.storage,
+                    &self.internal_cache,
+                    ann_meta,
+                    &ann.quantizer,
+                    query,
+                    opts,
+                    &ann.config,
+                )?
+            }
+            Some(f) => search::search_filtered_with_trace(
+                &self.storage,
+                &self.internal_cache,
+                &self.leaf_parent,
+                ann_meta,
+                &ann.quantizer,
+                &self.schema,
+                query,
+                opts,
+                f,
+                &ann.config,
+                trace,
+            )?,
+        };
         if row_hits.is_empty() {
             return Ok(Vec::new());
         }
@@ -701,16 +731,74 @@ impl Collection {
         }
     }
 
-    pub fn resolve_filter_doc_ids(&self, _filter: &Filter) -> Result<Vec<DocId>> {
-        Err(TreeError::Unsupported("v3: phase 4".into()))
+    /// Resolve all live `DocId`s matching `filter`, sorted ascending.
+    pub fn resolve_filter_doc_ids(&self, filter: &Filter) -> Result<Vec<DocId>> {
+        filter.validate(&self.schema)?;
+        let rowset = filter_plan::materialize_filter(&self.storage, &self.schema, filter)?;
+        let rows: Vec<RowId> = rowset.iter().collect();
+        let mut doc_ids = RowResolver::resolve_all(&self.storage, &rows)?;
+        doc_ids.sort_unstable();
+        Ok(doc_ids)
     }
 
-    pub fn update_by_filter(&mut self, _filter: &Filter, _patch: &DocumentPatch) -> Result<u64> {
-        Err(TreeError::Unsupported("v3: phase 4".into()))
+    /// Patch every document matching `filter` over a point-in-time snapshot, chunked at 512 docs
+    /// to avoid the Halloween problem when patches preserve filter membership.
+    pub fn update_by_filter(&mut self, filter: &Filter, patch: &DocumentPatch) -> Result<u64> {
+        filter.validate(&self.schema)?;
+        self.schema.validate_attributes(&patch.attributes)?;
+        self.reject_detached_attributes(&patch.attributes)?;
+        let prepared_vec = self.prepare_optional_vector(patch.embedding.as_deref())?;
+
+        let doc_ids = self.resolve_filter_doc_ids(filter)?;
+        if doc_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let matched = doc_ids.len() as u64;
+        for chunk in doc_ids.chunks(512) {
+            let hooks = collect_hooks(self.ann.as_ref(), &self.attr_index);
+            let mut tx = TxContext::new(
+                &self.storage,
+                &mut self.internal_cache,
+                &mut self.leaf_parent,
+                self.manifest.clone(),
+                self.ann_meta.clone(),
+            );
+            let mut any_changed = false;
+            for &id in chunk {
+                if apply_patch_in_tx(
+                    &self.segments,
+                    &self.schema,
+                    &mut tx,
+                    id,
+                    prepared_vec.as_deref(),
+                    &patch.attributes,
+                    &hooks,
+                )? {
+                    any_changed = true;
+                }
+            }
+            if any_changed {
+                let (manifest, ann_meta) = tx.commit()?;
+                self.manifest = manifest;
+                self.ann_meta = ann_meta;
+            }
+        }
+        Ok(matched)
     }
 
-    pub fn delete_by_filter(&mut self, _filter: &Filter) -> Result<u64> {
-        Err(TreeError::Unsupported("v3: phase 4".into()))
+    /// Delete every document matching `filter` over a point-in-time snapshot, chunked at 512 docs.
+    pub fn delete_by_filter(&mut self, filter: &Filter) -> Result<u64> {
+        filter.validate(&self.schema)?;
+        let doc_ids = self.resolve_filter_doc_ids(filter)?;
+        if doc_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut total_deleted = 0u64;
+        for chunk in doc_ids.chunks(512) {
+            total_deleted += self.delete_batch(chunk)?;
+        }
+        Ok(total_deleted)
     }
 
     pub fn compact_fts_stats(&mut self) -> Result<()> {
@@ -796,11 +884,15 @@ impl Collection {
     }
 }
 
-fn collect_hooks<'a>(ann: Option<&'a AnnIndex>) -> Vec<&'a dyn RowIndexHook> {
-    let mut hooks: Vec<&'a dyn RowIndexHook> = Vec::with_capacity(1);
+fn collect_hooks<'a>(
+    ann: Option<&'a AnnIndex>,
+    attr_index: &'a AttributeIndex,
+) -> Vec<&'a dyn RowIndexHook> {
+    let mut hooks: Vec<&'a dyn RowIndexHook> = Vec::with_capacity(2);
     if let Some(a) = ann {
         hooks.push(a);
     }
+    hooks.push(attr_index);
     hooks
 }
 

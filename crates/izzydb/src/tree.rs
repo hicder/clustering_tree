@@ -527,7 +527,10 @@ pub(crate) fn insert_in_tx(
         let new_centroid = leaf.centroid.clone();
         tx.put_leaf_node(target_leaf, leaf);
 
-        if let Some(pid) = parent_id {
+        let root_id = tx.ann_meta().unwrap().root_id;
+        if target_leaf != root_id && new_count < config.min_leaf_size {
+            handle_underflow(tx, target_leaf, config, quantizer)?;
+        } else if let Some(pid) = parent_id {
             propagate_centroid_upward(
                 tx,
                 target_leaf,

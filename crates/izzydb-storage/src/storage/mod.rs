@@ -24,8 +24,9 @@ use izzydb_fts::TermRecord;
 
 use crate::codec::{
     ATTR_COUNT_TAG, FTS_DOC_LEN_TAG, INTERNAL_NODE_TAG, Manifest, SEG_DELETES_TAG, SEG_META_TAG,
-    SegPosting, SegmentMeta, ZONE_TAG, ZoneEntry, decode_doc_id_block,
-    decode_roaring_bitmap, doc_id_block_key, fts_block_key_coord, row_key,
+    SegPosting, SegmentMeta, ZONE_TAG, ZoneEntry, decode_doc_id_block, decode_roaring_bitmap,
+    decode_row_key, doc_id_block_key, encode_attr_prefix, fts_block_key_coord, row_key,
+    split_posting_key,
 };
 use crate::node::{AnnMeta, PackedInternalNode, PackedLeafNode, decode_f32_slice};
 
@@ -724,6 +725,80 @@ impl Storage {
             out.push(res.map_err(map_db_err)?);
         }
         Ok(out)
+    }
+
+    pub fn visit_attr_postings_for_value(
+        &self,
+        attr_key: &[u8],
+        mut visit: impl FnMut(SegmentId, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        debug_assert!(attr_key.len() >= 3);
+        let cf = self.cf(CF_ATTR_POSTINGS)?;
+        let mut ro = ReadOptions::default();
+        ro.set_prefix_same_as_start(true);
+        let iter = self
+            .db
+            .iterator_cf_opt(cf, ro, IteratorMode::From(attr_key, Direction::Forward));
+        for item in iter {
+            let (k, v) = item.map_err(map_db_err)?;
+            let (prefix, seg) = split_posting_key(&k)?;
+            if prefix != attr_key {
+                break;
+            }
+            visit(seg, &v)?;
+        }
+        Ok(())
+    }
+
+    pub fn visit_attr_postings_range(
+        &self,
+        attr_id: AttrId,
+        type_tag: u8,
+        start_val: &[u8],
+        mut visit: impl FnMut(&[u8], SegmentId, &[u8]) -> Result<bool>,
+    ) -> Result<()> {
+        let cf = self.cf(CF_ATTR_POSTINGS)?;
+        let prefix = encode_attr_prefix(attr_id, type_tag);
+        let mut seek_key = Vec::with_capacity(prefix.len() + start_val.len());
+        seek_key.extend_from_slice(&prefix);
+        seek_key.extend_from_slice(start_val);
+        let mut ro = ReadOptions::default();
+        ro.set_prefix_same_as_start(true);
+        let iter = self
+            .db
+            .iterator_cf_opt(cf, ro, IteratorMode::From(&seek_key, Direction::Forward));
+        for item in iter {
+            let (k, v) = item.map_err(map_db_err)?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            let (val_prefix, seg) = split_posting_key(&k)?;
+            if !visit(&val_prefix[3..], seg, &v)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn visit_segment_rows(
+        &self,
+        seg: SegmentId,
+        mut visit: impl FnMut(RowId, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let cf = self.cf(CF_ROWS)?;
+        let start = row_key(RowId::new(seg, 0));
+        let iter = self
+            .db
+            .iterator_cf(cf, IteratorMode::From(&start, Direction::Forward));
+        for item in iter {
+            let (k, v) = item.map_err(map_db_err)?;
+            let row = decode_row_key(&k)?;
+            if row.seg() != seg {
+                break;
+            }
+            visit(row, &v)?;
+        }
+        Ok(())
     }
 
     /// Cached per-segment zone map entries (`default[0x12]`).

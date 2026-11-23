@@ -41,6 +41,7 @@ pub(crate) fn run_lire_in_tx(
     while !pending_lire.is_empty() || !maintenance.is_empty() {
         while let Some(pair) = pending_lire.pop_front() {
             if lire_rounds >= MAX_LIRE_ROUNDS {
+                pending_lire.clear();
                 break;
             }
             lire_rounds += 1;

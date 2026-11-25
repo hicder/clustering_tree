@@ -485,51 +485,46 @@ pub(super) fn search_post_filter(
 
         if let Some(res_filter) = residual {
             batch_cands.sort_unstable_by(cmp_cand_dist_id);
-            let kth_cutoff = if verified.len() >= target {
-                select_top_k(&mut verified, target, cmp_cand_dist_id);
-                Some(verified[target - 1].dist)
-            } else {
-                None
-            };
-            let check_limit = match kth_cutoff {
-                Some(cut) => batch_cands.partition_point(|c| c.dist <= cut),
-                None => batch_cands.len(),
-            };
-            let to_check = &batch_cands[..check_limit];
-            let mut row_pairs: Vec<(RowId, LeafCandidate)> =
-                to_check.iter().map(|&c| (RowId(c.doc_id), c)).collect();
-            row_pairs.sort_unstable_by_key(|&(r, _)| r);
-            row_pairs.dedup_by_key(|(r, _)| *r);
-            for chunk in row_pairs.chunks(128) {
-                let rows: Vec<RowId> = chunk.iter().map(|&(r, _)| r).collect();
-                if crate::detached::filter_mentions_detached(schema, res_filter) {
-                    let flags = crate::detached::filter_rows_mixed_batch(
-                        storage, schema, fts_index, res_filter, &rows,
-                    )?;
-                    for (&(_, cand), ok) in chunk.iter().zip(flags) {
-                        if ok {
-                            verified.push(cand);
-                        }
+            let mut chunk_buf: Vec<(RowId, LeafCandidate)> = Vec::new();
+            let mut rows_buf: Vec<RowId> = Vec::new();
+            let mut i = 0usize;
+            while i < batch_cands.len() {
+                let remaining_end = if verified.len() >= target {
+                    select_top_k(&mut verified, target, cmp_cand_dist_id);
+                    let cut = verified[target - 1];
+                    if cmp_cand_dist_id(&batch_cands[i], &cut).is_gt() {
+                        break;
                     }
+                    i + batch_cands[i..].partition_point(|c| cmp_cand_dist_id(c, &cut).is_le())
                 } else {
-                    let slices = storage.multi_get_row_bytes_pinned(&rows)?;
-                    for (&(row, cand), opt_slice) in chunk.iter().zip(slices.iter()) {
-                        let slice = opt_slice.as_ref().ok_or_else(|| {
-                            TreeError::InvariantViolation(format!("row {row:?} missing in cf_rows"))
-                        })?;
-                        let view = RowView::parse(slice)?;
-                        if view.matches_filter(
-                            schema,
-                            res_filter,
-                            &mut |kind, attr, query, last_as_prefix, val| {
-                                fts_index
-                                    .matches_fts_attr(schema, kind, attr, query, last_as_prefix, val)
-                            },
-                        )? {
-                            verified.push(cand);
-                        }
-                    }
-                }
+                    batch_cands.len()
+                };
+
+                let need = target.saturating_sub(verified.len()).max(1);
+                let chunk_len = ((need as f64 / selectivity) * 1.2).ceil() as usize;
+                let chunk_len = chunk_len.clamp(32, 512).min(remaining_end - i);
+
+                chunk_buf.clear();
+                chunk_buf.extend(
+                    batch_cands[i..i + chunk_len]
+                        .iter()
+                        .map(|&c| (RowId(c.doc_id), c)),
+                );
+                chunk_buf.sort_unstable_by_key(|&(r, _)| r);
+                chunk_buf.dedup_by_key(|(r, _)| *r);
+                rows_buf.clear();
+                rows_buf.extend(chunk_buf.iter().map(|&(r, _)| r));
+
+                verify_chunk(
+                    storage,
+                    schema,
+                    fts_index,
+                    res_filter,
+                    &chunk_buf,
+                    &rows_buf,
+                    &mut verified,
+                )?;
+                i += chunk_len;
             }
         } else {
             verified.extend_from_slice(&batch_cands);
@@ -555,6 +550,45 @@ pub(super) fn search_post_filter(
         dim,
         config.metric,
     )
+}
+
+fn verify_chunk(
+    storage: &Storage,
+    schema: &CollectionSchema,
+    fts_index: &FtsIndex,
+    res_filter: &Filter,
+    chunk: &[(RowId, LeafCandidate)],
+    rows: &[RowId],
+    verified: &mut Vec<LeafCandidate>,
+) -> Result<()> {
+    if crate::detached::filter_mentions_detached(schema, res_filter) {
+        let flags = crate::detached::filter_rows_mixed_batch(
+            storage, schema, fts_index, res_filter, rows,
+        )?;
+        for (&(_, cand), ok) in chunk.iter().zip(flags) {
+            if ok {
+                verified.push(cand);
+            }
+        }
+    } else {
+        let slices = storage.multi_get_row_bytes_pinned(rows)?;
+        for (&(row, cand), opt_slice) in chunk.iter().zip(slices.iter()) {
+            let slice = opt_slice.as_ref().ok_or_else(|| {
+                TreeError::InvariantViolation(format!("row {row:?} missing in cf_rows"))
+            })?;
+            let view = RowView::parse(slice)?;
+            if view.matches_filter(
+                schema,
+                res_filter,
+                &mut |kind, attr, query, last_as_prefix, val| {
+                    fts_index.matches_fts_attr(schema, kind, attr, query, last_as_prefix, val)
+                },
+            )? {
+                verified.push(cand);
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn expand_internal_node_unpruned(

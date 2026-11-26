@@ -11,7 +11,7 @@ use izzydb_storage::column::ColumnBlockBuilder;
 
 static FORCE_ROW_FALLBACK: AtomicBool = AtomicBool::new(false);
 
-/// Test-only switch to force `ColumnReader` / batch readers to fall back to `cf_rows`.
+/// Test and benchmark switch to force inline column readers to fall back to `cf_rows`.
 #[doc(hidden)]
 pub fn set_force_column_row_fallback(force: bool) {
     FORCE_ROW_FALLBACK.store(force, Ordering::Relaxed);

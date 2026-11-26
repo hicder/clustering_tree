@@ -15,7 +15,7 @@ use arrow_schema::{DataType, Field, Schema};
 use izzydb::metric::{l2_squared, prepare_vector};
 use izzydb::{
     AttributeType, Collection, CollectionConfig, DistanceMetric, DocId, Filter, SearchOptions,
-    TreeConfig,
+    TreeConfig, set_force_column_row_fallback,
 };
 use izzydb_bulk::{BulkImportConfig, bulk_import};
 use parquet::arrow::ArrowWriter;
@@ -277,6 +277,10 @@ fn compute_ground_truth(
             if dataset.score[i] < 10.0 {
                 push_top_k(&mut heaps[3], 10, item);
             }
+            // Case 6: broad range, large enough to exercise residual verification.
+            if dataset.score[i] < 60.0 {
+                push_top_k(&mut heaps[6], 10, item);
+            }
             // Case 4: Eq(mod100=7)
             if dataset.mod100[i] == 7 {
                 push_top_k(&mut heaps[4], 10, item);
@@ -331,6 +335,9 @@ fn main() {
             }
             "--direct-io" => {
                 direct_io = true;
+            }
+            "--force-row-fallback" => {
+                set_force_column_row_fallback(true);
             }
             "--rows" => {
                 i += 1;
@@ -428,6 +435,7 @@ fn run_bench(
             "90% Not(Eq(mod10=3))",
             Some(Filter::Not(Box::new(Filter::Eq("mod10".into(), 3u64.into())))),
         ),
+        ("60% Lt(score<60)", Some(Filter::Lt("score".into(), 60.0f64.into()))),
     ];
 
     let opts = SearchOptions::new(10, 16).with_rerank(200);

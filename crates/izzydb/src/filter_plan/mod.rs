@@ -7,6 +7,7 @@ mod estimate;
 mod postings;
 
 use columnar::*;
+pub(crate) use columnar::ColumnFilter;
 use compile::*;
 use estimate::*;
 use postings::*;

@@ -1,10 +1,11 @@
 //! Columnar block filter evaluation.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
 use roaring::RoaringBitmap;
 
-use izzydb_core::config::{AttrId, SegmentId, for_each_set_bit_256};
+use izzydb_core::config::{AttrId, RowId, SegmentId, for_each_set_bit_256};
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::filter::Filter;
 use izzydb_core::schema::{CollectionSchema, ColumnStorage, ScalarValue};
@@ -16,6 +17,91 @@ use izzydb_storage::{SegmentTableSnapshot, Storage};
 
 use crate::columns::force_row_fallback_enabled;
 
+pub(crate) struct ColumnFilter<'a> {
+    schema: &'a CollectionSchema,
+    filter: &'a Filter,
+    attrs: Vec<AttrId>,
+}
+
+impl<'a> ColumnFilter<'a> {
+    pub(crate) fn new(schema: &'a CollectionSchema, filter: &'a Filter) -> Option<Self> {
+        if force_row_fallback_enabled() || !filter_is_columnar_scalar_only(schema, filter) {
+            return None;
+        }
+        let mut attrs = Vec::new();
+        collect_filter_attr_ids(schema, filter, &mut attrs);
+        attrs.sort_unstable();
+        (!attrs.is_empty()).then_some(Self {
+            schema,
+            filter,
+            attrs,
+        })
+    }
+
+    /// Evaluate candidates sorted by RowId. Missing results need row-store verification.
+    pub(crate) fn match_candidates(
+        &self,
+        storage: &Storage,
+        snap: &SegmentTableSnapshot,
+        rows: &[RowId],
+    ) -> Result<Option<Vec<Option<bool>>>> {
+        let mut blocks: Vec<(SegmentId, u32, Range<usize>)> = Vec::new();
+        let mut column_rows = 0;
+        let mut offset = 0;
+        for segment_rows in rows.chunk_by(|a, b| a.seg() == b.seg()) {
+            let seg = segment_rows[0].seg();
+            let mut start = offset;
+            offset += segment_rows.len();
+            let Some(entry) = snap.get(seg) else {
+                continue;
+            };
+            if entry.meta.state != SegmentState::Sealed
+                || entry.meta.flags & SEG_FLAG_HAS_COLUMNS == 0
+            {
+                continue;
+            }
+            column_rows += segment_rows.len();
+            for block_rows in segment_rows.chunk_by(|a, b| a.block_idx() == b.block_idx()) {
+                let end = start + block_rows.len();
+                blocks.push((seg, block_rows[0].block_idx(), start..end));
+                start = end;
+            }
+        }
+
+        // One row lookup supplies all attributes. Compare logical key counts before choosing columns.
+        let key_count = blocks.len() * self.attrs.len();
+        if key_count == 0 || key_count > column_rows {
+            return Ok(None);
+        }
+        let keys: Vec<_> = blocks
+            .iter()
+            .flat_map(|&(seg, block, _)| self.attrs.iter().map(move |&attr| (seg, attr, block)))
+            .collect();
+        let slices = storage.multi_get_column_blocks_pinned(&keys, self.attrs.len() == 1)?;
+        let mut matches = vec![None; rows.len()];
+        let mut views = HashMap::with_capacity(self.attrs.len());
+        for ((_, _, indices), block_slices) in
+            blocks.into_iter().zip(slices.chunks_exact(self.attrs.len()))
+        {
+            for (&attr, slice) in self.attrs.iter().zip(block_slices) {
+                let view = slice
+                    .as_ref()
+                    .map(|s| ColumnBlockView::parse(s))
+                    .transpose()?;
+                views.insert(attr, view);
+            }
+            for i in indices {
+                matches[i] = Some(eval_column_filter_block(
+                    self.schema,
+                    self.filter,
+                    &views,
+                    rows[i].slot(),
+                )?);
+            }
+        }
+        Ok(Some(matches))
+    }
+}
 
 
 pub(super) fn filter_is_columnar_scalar_only(schema: &CollectionSchema, filter: &Filter) -> bool {
@@ -271,4 +357,63 @@ pub(super) fn try_eval_column_filter_segment(
     }
 
     Ok(Some(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AttributeType, Attributes, Collection, CollectionConfig, Document};
+
+    #[test]
+    fn candidate_filter_batches_blocks_and_leaves_open_rows_for_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CollectionConfig::without_vectors()
+            .with_seal_rows(512)
+            .with_attribute("score", AttributeType::Float, true)
+            .with_attribute("enabled", AttributeType::Bool, true);
+        let mut collection = Collection::open(dir.path(), config).unwrap();
+        let docs: Vec<_> = (0..=512)
+            .map(|id| {
+                let mut attributes = Attributes::new();
+                // Every score in the second block is null, so that score block has no key.
+                if id < 256 {
+                    attributes.insert("score".into(), (id as f64).into());
+                }
+                attributes.insert("enabled".into(), (id % 2 == 0).into());
+                Document {
+                    id,
+                    embedding: None,
+                    attributes,
+                }
+            })
+            .collect();
+        collection.upsert_batch(&docs).unwrap();
+
+        let filter = Filter::And(vec![
+            Filter::Eq("enabled".into(), true.into()),
+            Filter::Not(Box::new(Filter::Gte("score".into(), 100.0.into()))),
+        ]);
+        let column_filter = ColumnFilter::new(&collection.schema, &filter).unwrap();
+        let snap = collection.segment_snapshot();
+        let rows = [
+            RowId::new(0, 0),
+            RowId::new(0, 100),
+            RowId::new(0, 256),
+            RowId::new(0, 257),
+            RowId::new(1, 0),
+        ];
+        assert_eq!(
+            column_filter
+                .match_candidates(&collection.storage, &snap, &rows)
+                .unwrap(),
+            Some(vec![Some(true), Some(false), Some(true), Some(false), None]),
+        );
+        let sparse_rows = [rows[0], rows[2]];
+        assert_eq!(
+            column_filter
+                .match_candidates(&collection.storage, &snap, &sparse_rows)
+                .unwrap(),
+            None,
+        );
+    }
 }

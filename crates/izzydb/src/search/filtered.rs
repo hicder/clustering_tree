@@ -14,7 +14,7 @@ use izzydb_rabitq::{
 use izzydb_storage::codec::RowView;
 use izzydb_storage::node::{AnnMeta, LeafNodeView, PackedInternalNode};
 use izzydb_storage::{SegmentTableSnapshot, Storage};
-use crate::filter_plan::{self, FilterPlan, FilterPlanTrace, FilteredSearchRegime};
+use crate::filter_plan::{self, ColumnFilter, FilterPlan, FilterPlanTrace, FilteredSearchRegime};
 use crate::fts_index::FtsIndex;
 use crate::simd::LeafCandidate;
 
@@ -427,6 +427,11 @@ pub(super) fn search_post_filter(
     let mut batch_leaves: Vec<NodeId> = Vec::new();
     let mut batch_cands: Vec<LeafCandidate> = Vec::new();
     let mut mask_buf: Vec<u64> = Vec::new();
+    let column_filter = if posting_membership.is_none() {
+        residual.and_then(|filter| ColumnFilter::new(schema, filter))
+    } else {
+        None
+    };
 
     while probed_leaves < max_expanded && !heap.is_empty() {
         let take_limit = batch_target.min(max_expanded - probed_leaves);
@@ -523,15 +528,32 @@ pub(super) fn search_post_filter(
                 rows_buf.clear();
                 rows_buf.extend(chunk_buf.iter().map(|&(r, _)| r));
 
-                verify_chunk(
-                    storage,
-                    schema,
-                    fts_index,
-                    res_filter,
-                    &chunk_buf,
-                    &rows_buf,
-                    &mut verified,
-                )?;
+                if let Some(filter) = &column_filter
+                    && let Some(matches) = filter.match_candidates(storage, &seg_snap, &rows_buf)?
+                {
+                    let mut matches = matches.into_iter();
+                    chunk_buf.retain(|&(_, candidate)| match matches.next().unwrap() {
+                        Some(true) => {
+                            verified.push(candidate);
+                            false
+                        }
+                        Some(false) => false,
+                        None => true,
+                    });
+                    rows_buf.clear();
+                    rows_buf.extend(chunk_buf.iter().map(|&(r, _)| r));
+                }
+                if !chunk_buf.is_empty() {
+                    verify_chunk(
+                        storage,
+                        schema,
+                        fts_index,
+                        res_filter,
+                        &chunk_buf,
+                        &rows_buf,
+                        &mut verified,
+                    )?;
+                }
                 i += chunk_len;
             }
         } else {

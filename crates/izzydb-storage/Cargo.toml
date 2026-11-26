@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "RocksDB-backed packed node storage and atomic transaction context for izzydb"
 
+[features]
+io-uring = ["rocksdb/io-uring"]
+
 [dependencies]
 bytemuck.workspace = true
 izzydb-codec.workspace = true

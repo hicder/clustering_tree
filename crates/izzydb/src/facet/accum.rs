@@ -67,9 +67,28 @@ impl ScanSel {
     }
 }
 
+/// One bucket of a range facet, with its bounds encoded as ordered value bytes.
+///
+/// Stored values are compared as raw bytes. The encoding preserves order, so
+/// [`EncRange::contains`] can test a value without decoding it.
+///
+/// # Example
+///
+/// The bucket `10 <= price < 20` on an int attribute becomes:
+///
+/// ```text
+/// EncRange {
+///     lo: Some((encode_bound(10), true)),  // inclusive
+///     hi: Some((encode_bound(20), false)), // exclusive
+/// }
+/// ```
+///
+/// This contains the encodings of 10 and 19, but not those of 9 or 20.
 #[derive(Debug, Clone)]
 pub(super) struct EncRange {
+    /// Lower bound as `(encoded_value, is_inclusive)`. `None` means no lower bound.
     pub(super) lo: Option<(Vec<u8>, bool)>,
+    /// Upper bound as `(encoded_value, is_inclusive)`. `None` means no upper bound.
     pub(super) hi: Option<(Vec<u8>, bool)>,
 }
 
@@ -94,33 +113,138 @@ impl EncRange {
     }
 }
 
+/// Running bucket counts for one range facet on an array attribute.
+///
+/// A range facet on a scalar attribute can be computed at the end by summing the
+/// per-value counts that fall in each bucket. That does not work for arrays,
+/// because one document can have several elements in the same bucket and would
+/// be counted once per element. This type counts each document at most once per
+/// bucket. A document can still count in more than one bucket.
+///
+/// # Example
+///
+/// With buckets `[0, 10)` and `[10, 20)` over these documents:
+///
+/// ```text
+/// doc A: sizes = [1, 2, 15]
+/// doc B: sizes = [3]
+/// ```
+///
+/// `counts` ends as `[2, 1]`. A matches the first bucket through both 1 and 2,
+/// but is counted there once. Summing per-value counts would give 3.
 pub(super) struct ArrayRangeAcc {
+    /// The facet's buckets, in the order the request listed them.
     pub(super) ranges: Vec<EncRange>,
+    /// Matching document count per bucket. `counts[i]` belongs to `ranges[i]`.
     pub(super) counts: Vec<u64>,
-    /// Per-segment union of matching local ids (`seg_idx -> bucket_idx -> bitmap`).
+    /// Temporary state for the posting-list strategy
+    /// (`segment id -> bucket index -> bitmap of matching local ids`).
+    ///
+    /// Postings are visited one element value at a time. OR-ing them into a
+    /// bitmap removes documents that match a bucket through several values.
+    /// After the scan, each bitmap's size is added to `counts`. The row-by-row
+    /// pass does not use this field; it increments `counts` directly.
     pub(super) scratch: BTreeMap<SegmentId, Vec<RoaringBitmap>>,
 }
 
+/// Accumulator for one attribute, shared by every facet on that attribute.
+///
+/// It records both what has to be collected and what has been collected so far,
+/// so each attribute is read only once however many facets use it. A counting
+/// strategy (global counts, forward row pass or posting intersection) fills it,
+/// and finalization turns it into facet results.
+///
+/// # Example
+///
+/// A terms facet and a stats facet on `price`, where the stats facet also sets
+/// `include_missing`, share one `AttrAcc` with `need_values = true`,
+/// `need_present = true` and `sel = ScanSel::Full`. If 3 documents are counted,
+/// with prices 5, 5 and none, it ends with:
+///
+/// ```text
+/// values  = { encode_bound(5) => 2 }
+/// present = 2   // so the missing count is 3 - 2 = 1
+/// ```
 pub(super) struct AttrAcc {
+    /// Schema id of the attribute being counted.
     pub(super) attr_id: AttrId,
+    /// Codec tag for the attribute's value type (the element type for arrays).
+    /// Used to scan storage keys and to decode the bytes in `values`.
     pub(super) type_tag: u8,
+    /// Whether any facet needs per-value counts. This is true for terms, stats,
+    /// histogram and scalar range facets. Array range facets use `array_ranges`
+    /// instead.
     pub(super) need_values: bool,
+    /// Whether any facet sets `include_missing`, and so needs `present`.
     pub(super) need_present: bool,
+    /// The part of the value space to scan, merged from what each facet needs.
+    /// It limits the global-count and posting scans. The forward row pass does
+    /// not apply it, so finalization still filters by prefix and range.
     pub(super) sel: ScanSel,
+    /// Document count per encoded value. For arrays, each element is a separate
+    /// value, and repeats within one document count once.
     pub(super) values: HashMap<Vec<u8>, u64>,
+    /// Number of counted documents that have this attribute. The missing count
+    /// is the population total minus this. Only rely on it when `need_present`
+    /// is true, because not every strategy fills it otherwise.
     pub(super) present: u64,
+    /// One entry for each range facet on this attribute, if it is an array.
+    /// Empty otherwise.
     pub(super) array_ranges: Vec<ArrayRangeAcc>,
 }
 
+/// Tells finalization where to find the data for one requested facet.
+///
+/// Accumulators are shared per attribute but results are produced per facet, so
+/// each facet needs a pointer back to its data.
+///
+/// # Example
+///
+/// For a range facet that is the second one on the array attribute `sizes`,
+/// where `sizes` owns the first accumulator:
+///
+/// ```text
+/// FacetPlan {
+///     acc_idx: 0,
+///     array_range: Some(1),
+///     attr_type: AttributeType::IntArray,
+/// }
+/// ```
+///
+/// Its bucket counts are in `accs[0].array_ranges[1].counts`.
 pub(super) struct FacetPlan {
+    /// Index into [`AttrAccs::accs`] of this facet's attribute accumulator.
     pub(super) acc_idx: usize,
+    /// For a range facet on an array attribute, the index into that
+    /// accumulator's [`AttrAcc::array_ranges`]. `None` for all other facets.
     pub(super) array_range: Option<usize>,
+    /// Schema type of the attribute. Currently used by a debug assertion that
+    /// stats facets are numeric.
     pub(super) attr_type: AttributeType,
 }
 
+/// All accumulation state for a group of facets computed over the same documents.
+///
+/// Created by [`AttrAccs::build`], filled by one of the counting strategies, then
+/// turned into results by `finalize_into`.
+///
+/// # Example
+///
+/// If `build` is given `idxs = [0, 2, 3]`, and those specs are terms on `color`,
+/// stats on `price` and terms on `price`:
+///
+/// ```text
+/// accs      = [color, price]  // one per distinct attribute
+/// plans     = [acc_idx 0, acc_idx 1, acc_idx 1]
+/// spec_idxs = [0, 2, 3]
+/// ```
 pub(super) struct AttrAccs {
+    /// One accumulator per distinct attribute, in order of first use.
     pub(super) accs: Vec<AttrAcc>,
+    /// One plan per facet in this group.
     pub(super) plans: Vec<FacetPlan>,
+    /// Each facet's position in the full spec list. `spec_idxs[i]` goes with
+    /// `plans[i]`, and says which output slot receives that facet's result.
     pub(super) spec_idxs: Vec<usize>,
 }
 

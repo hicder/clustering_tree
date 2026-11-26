@@ -304,6 +304,7 @@ fn main() {
     let mut only_case: Option<String> = None;
     let mut duration_secs: Option<u64> = None;
     let mut generate_only = false;
+    let mut direct_io = false;
     let mut rows = DEFAULT_ROWS;
 
     let mut i = 1;
@@ -327,6 +328,9 @@ fn main() {
             }
             "--generate-only" => {
                 generate_only = true;
+            }
+            "--direct-io" => {
+                direct_io = true;
             }
             "--rows" => {
                 i += 1;
@@ -361,6 +365,7 @@ fn main() {
     let mut tree_cfg = TreeConfig::new(DIM, DistanceMetric::L2Squared);
     tree_cfg.enable_lire = true;
     let cfg = CollectionConfig::new(tree_cfg)
+        .with_direct_io(direct_io)
         .with_attribute("mod100", AttributeType::Uint, true)
         .with_attribute("mod10", AttributeType::Uint, true)
         .with_attribute("even", AttributeType::Bool, true)

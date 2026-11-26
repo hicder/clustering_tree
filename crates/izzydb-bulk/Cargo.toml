@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Parallel offline Parquet bulk importer for izzydb via external RocksDB SST ingestion"
 
+[features]
+io-uring = ["izzydb/io-uring", "izzydb-storage/io-uring", "rocksdb/io-uring"]
+
 [[bin]]
 name = "izzydb-import"
 path = "src/bin/izzydb-import.rs"

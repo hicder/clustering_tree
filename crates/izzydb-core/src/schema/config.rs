@@ -89,6 +89,8 @@ pub struct CollectionConfig {
     pub vector: Option<TreeConfig>,
     pub segment: SegmentConfig,
     pub attributes: Vec<AttributeConfig>,
+    /// Bypass the OS page cache using `O_DIRECT` for RocksDB SST reads and flush/compaction I/O.
+    pub direct_io: bool,
 }
 
 impl CollectionConfig {
@@ -97,6 +99,7 @@ impl CollectionConfig {
             vector: Some(tree),
             segment: SegmentConfig::default(),
             attributes: Vec::new(),
+            direct_io: false,
         }
     }
 
@@ -105,7 +108,13 @@ impl CollectionConfig {
             vector: None,
             segment: SegmentConfig::default(),
             attributes: Vec::new(),
+            direct_io: false,
         }
+    }
+
+    pub fn with_direct_io(mut self, direct_io: bool) -> Self {
+        self.direct_io = direct_io;
+        self
     }
 
     pub fn with_seal_rows(mut self, seal_rows: u32) -> Self {

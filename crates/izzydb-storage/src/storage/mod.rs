@@ -170,7 +170,7 @@ impl Storage {
         config.validate()?;
         let block_cache = default_sst_block_cache();
         let dim = config.vector.as_ref().map_or(0, |v| v.dim);
-        let storage = Self::open_raw(path, dim, &block_cache)?;
+        let storage = Self::open_raw(path, dim, &block_cache, config.direct_io)?;
 
         if storage.has_bulk_import_marker()? {
             return Err(TreeError::CorruptedData(
@@ -257,11 +257,20 @@ impl Storage {
         Ok((storage, manifest, ann_meta))
     }
 
-    fn open_raw(path: impl AsRef<Path>, dim: usize, block_cache: &Cache) -> Result<Self> {
+    fn open_raw(
+        path: impl AsRef<Path>,
+        dim: usize,
+        block_cache: &Cache,
+        direct_io: bool,
+    ) -> Result<Self> {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
         db_opts.set_db_write_buffer_size(DB_WRITE_BUFFER_BYTES);
+        if direct_io {
+            db_opts.set_use_direct_reads(true);
+            db_opts.set_use_direct_io_for_flush_and_compaction(true);
+        }
 
         let dropped_segments = Arc::new(RwLock::new(Arc::new(RoaringBitmap::new())));
         let retired_detached = Arc::new(RwLock::new(Arc::new(HashMap::new())));
@@ -339,7 +348,7 @@ impl Storage {
         config.validate()?;
         let block_cache = default_sst_block_cache();
         let dim = config.vector.as_ref().map_or(0, |v| v.dim);
-        let storage = Self::open_raw(path, dim, &block_cache)?;
+        let storage = Self::open_raw(path, dim, &block_cache, config.direct_io)?;
 
         if storage.has_bulk_import_marker()? {
             return Err(TreeError::CorruptedData(

@@ -6,6 +6,9 @@ license.workspace = true
 description = "Benchmarks for izzydb"
 publish = false
 
+[features]
+io-uring = ["izzydb/io-uring", "izzydb-bulk/io-uring"]
+
 [dependencies]
 arrow-array = "55.2"
 arrow-schema = "55.2"

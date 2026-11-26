@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::{self, File};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -436,25 +437,45 @@ fn run_bench(
             {
                 continue;
             }
-            let _ = col.search(&queries[0], opts, filter.as_ref()).unwrap();
+            let mut result_hash = DefaultHasher::new();
+            for q in &queries {
+                let results = col.search(q, opts, filter.as_ref()).unwrap();
+                results.len().hash(&mut result_hash);
+                for result in results {
+                    result.id.hash(&mut result_hash);
+                    result.distance.to_bits().hash(&mut result_hash);
+                }
+            }
             let start = Instant::now();
             let deadline = std::time::Duration::from_secs(secs);
-            let mut count = 0usize;
+            let mut latencies = Vec::new();
             while start.elapsed() < deadline {
                 for q in &queries {
+                    let query_start = Instant::now();
                     let res = col.search(q, opts, filter.as_ref()).unwrap();
                     std::hint::black_box(res);
-                    count += 1;
+                    latencies.push(query_start.elapsed());
                     if start.elapsed() >= deadline {
                         break;
                     }
                 }
             }
             let elapsed = start.elapsed().as_secs_f64();
+            let count = latencies.len();
+            latencies.sort_unstable();
+            let percentile_us = |p: usize| {
+                count
+                    .checked_mul(p)
+                    .and_then(|n| n.div_ceil(100).checked_sub(1))
+                    .map_or(f64::NAN, |i| latencies[i].as_secs_f64() * 1e6)
+            };
             let avg_us = elapsed * 1e6 / count as f64;
             let qps = count as f64 / elapsed;
+            let p50 = percentile_us(50);
+            let p99 = percentile_us(99);
+            let hash = result_hash.finish();
             println!(
-                "{label:22} -> queries={count}, elapsed={elapsed:.2}s, avg_latency={avg_us:.1}us, qps={qps:.1}"
+                "{label:22} -> queries={count}, elapsed={elapsed:.2}s, avg_latency={avg_us:.1}us, p50={p50:.1}us, p99={p99:.1}us, qps={qps:.1}, result_hash={hash:016x}"
             );
         }
         return;

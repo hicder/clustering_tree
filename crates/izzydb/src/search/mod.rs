@@ -3,6 +3,7 @@
 mod ann;
 mod filtered;
 mod options;
+mod postings;
 mod route;
 mod score;
 

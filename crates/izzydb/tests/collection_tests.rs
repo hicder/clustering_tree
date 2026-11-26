@@ -1153,6 +1153,58 @@ fn test_planner_regimes_exact_masked_and_post_filter() {
 }
 
 #[test]
+fn test_broad_equality_search_with_missing_values_and_replaced_rows() {
+    let dir = TempDir::new().unwrap();
+    let cfg = small_collection_config(4, DistanceMetric::L2Squared, false).with_seal_rows(66_000);
+    let mut col = Collection::open(dir.path(), cfg).unwrap();
+    let active = Attributes::from([("active".into(), true.into())]);
+    let docs: Vec<_> = (0..66_000)
+        .map(|id| izzydb::Document {
+            id,
+            embedding: (id < 4).then(|| vec![id as f32, 0.0, 0.0, 0.0]),
+            attributes: active.clone(),
+        })
+        .collect();
+    col.upsert_batch(&docs).unwrap();
+    col.upsert(66_000, Some(&[4.0, 0.0, 0.0, 0.0]), Attributes::new())
+        .unwrap();
+    col.upsert(
+        66_001,
+        Some(&[5.0, 0.0, 0.0, 0.0]),
+        Attributes::from([("active".into(), AttributeValue::Null)]),
+    )
+    .unwrap();
+    col.upsert(
+        1,
+        Some(&[1.0, 0.0, 0.0, 0.0]),
+        Attributes::from([("active".into(), false.into())]),
+    )
+    .unwrap();
+    assert!(col.delete(0).unwrap());
+
+    for (filter, expected) in [
+        (Filter::Eq("active".into(), true.into()), vec![2, 3]),
+        (
+            Filter::NotEq("active".into(), false.into()),
+            vec![2, 3, 66_000, 66_001],
+        ),
+        (Filter::NotEq("active".into(), izzydb::ScalarValue::Null), vec![1, 2, 3]),
+    ] {
+        let mut trace = FilterPlanTrace::default();
+        let hits = col
+            .search_with_trace(
+                &[0.0; 4],
+                SearchOptions::new(5, 8).with_rerank(8),
+                Some(&filter),
+                &mut trace,
+            )
+            .unwrap();
+        assert!(trace.is_lazy);
+        assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), expected);
+    }
+}
+
+#[test]
 fn test_tombstone_heavy_postings_and_counts_exact() {
     let dir = TempDir::new().unwrap();
     let cfg = small_collection_config(4, DistanceMetric::L2Squared, false).with_seal_rows(50);

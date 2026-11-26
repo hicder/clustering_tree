@@ -18,6 +18,7 @@ use crate::filter_plan::{self, FilterPlan, FilterPlanTrace, FilteredSearchRegime
 use crate::fts_index::FtsIndex;
 use crate::simd::LeafCandidate;
 
+use super::postings::PostingMembership;
 use super::*;
 
 /// Filtered approximate nearest neighbor search using the v3 `RowSet` planner:
@@ -376,6 +377,10 @@ pub(super) fn search_post_filter(
     total_leaves: usize,
     config: &TreeConfig,
 ) -> Result<Vec<(RowId, f32)>> {
+    let mut posting_membership = match residual {
+        Some(filter) => PostingMembership::for_filter(schema, filter)?,
+        None => None,
+    };
     let dim = config.dim;
     let padded_dim = quantizer.padded_dim();
     let rabitq_words = quantizer.num_words();
@@ -483,7 +488,10 @@ pub(super) fn search_post_filter(
             resolve_and_dedup_forwarded(&seg_snap, &dropped, &mut batch_cands);
         }
 
-        if let Some(res_filter) = residual {
+        if let Some(postings) = &mut posting_membership {
+            postings.retain_matches(storage, &mut batch_cands)?;
+            verified.extend_from_slice(&batch_cands);
+        } else if let Some(res_filter) = residual {
             batch_cands.sort_unstable_by(cmp_cand_dist_id);
             let mut chunk_buf: Vec<(RowId, LeafCandidate)> = Vec::new();
             let mut rows_buf: Vec<RowId> = Vec::new();

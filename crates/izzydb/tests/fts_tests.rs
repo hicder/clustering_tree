@@ -1399,4 +1399,62 @@ fn test_fts_parallel_multi_segment_parity_and_ties() {
             );
         }
     }
+
+    drop(col);
+
+    // Verify reopening with explicit fts_parallel_segments values (1, 2, 4) yields identical results.
+    let base_cfg = CollectionConfig::without_vectors()
+        .with_segment_config(SegmentConfig {
+            seal_rows: 64,
+            ..SegmentConfig::default()
+        })
+        .with_attribute("bucket", AttributeType::Uint, true)
+        .with_fts_attribute("body", AttributeType::String, false, FullTextSearchConfig::default());
+
+    assert!(base_cfg.clone().with_fts_parallel_segments(0).validate().is_err());
+
+    for shards in [1usize, 2, 4] {
+        let reopened = Collection::open(
+            dir.path(),
+            base_cfg.clone().with_fts_parallel_segments(shards),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.collection_config().fts_parallel_segments,
+            Some(shards)
+        );
+        for (rank_by, filter) in &queries {
+            let got = reopened.query_bm25(rank_by, filter.as_ref(), 15).unwrap();
+            let expected = brute_force_bm25_eval(
+                &oracle,
+                reopened.schema(),
+                rank_by,
+                filter.as_ref(),
+                &fts_helper,
+                15,
+            );
+            assert_eq!(got.len(), expected.len(), "shards={shards} len mismatch");
+            for (g, e) in got.iter().zip(expected.iter()) {
+                assert!(
+                    (g.score - e.score).abs() <= 1e-4,
+                    "shards={shards} score mismatch for doc {} vs {}: {} vs {}",
+                    g.id,
+                    e.id,
+                    g.score,
+                    e.score
+                );
+                if g.id != e.id {
+                    // Only 1-ULP floating-point ties from SIMD FMA / clause accumulation order may swap adjacent IDs.
+                    assert!(
+                        (g.score - e.score).abs() <= 1e-5,
+                        "shards={shards} id mismatch for {rank_by:?}: {} ({}) vs {} ({})",
+                        g.id,
+                        g.score,
+                        e.id,
+                        e.score
+                    );
+                }
+            }
+        }
+    }
 }

@@ -84,13 +84,28 @@ impl AttributeConfig {
 }
 
 /// Top-level configuration for opening or creating a [`Collection`](crate::Collection) (in `izzydb`).
+///
+/// Controls vector tree geometry, segment sealing thresholds, attribute/FTS schema, RocksDB I/O
+/// mode, and FTS query concurrency.
+///
+/// ```text
+/// let cfg = CollectionConfig::without_vectors()
+///     .with_fts_attribute("body", AttributeType::String, false, FullTextSearchConfig::default())
+///     .with_fts_parallel_segments(4);
+/// ```
 #[derive(Debug, Clone)]
 pub struct CollectionConfig {
+    /// Optional RaBitQ vector clustering tree configuration (`None` for vectorless collections).
     pub vector: Option<TreeConfig>,
+    /// Segment sealing and column transposition lifecycle settings.
     pub segment: SegmentConfig,
+    /// Schema definitions for indexed, filterable, column, and full-text attributes.
     pub attributes: Vec<AttributeConfig>,
     /// Bypass the OS page cache using `O_DIRECT` for RocksDB SST reads and flush/compaction I/O.
     pub direct_io: bool,
+    /// Maximum number of segment shards executed in parallel during FTS MAXSCORE queries
+    /// (`None` uses all Rayon threads; `Some(1)` runs single-threaded across all segments).
+    pub fts_parallel_segments: Option<usize>,
 }
 
 impl CollectionConfig {
@@ -100,6 +115,7 @@ impl CollectionConfig {
             segment: SegmentConfig::default(),
             attributes: Vec::new(),
             direct_io: false,
+            fts_parallel_segments: None,
         }
     }
 
@@ -109,11 +125,20 @@ impl CollectionConfig {
             segment: SegmentConfig::default(),
             attributes: Vec::new(),
             direct_io: false,
+            fts_parallel_segments: None,
         }
     }
 
     pub fn with_direct_io(mut self, direct_io: bool) -> Self {
         self.direct_io = direct_io;
+        self
+    }
+
+    /// Cap the number of segment shards executed in parallel for FTS MAXSCORE queries.
+    ///
+    /// Pass `1` to force single-threaded MAXSCORE across all segments.
+    pub fn with_fts_parallel_segments(mut self, parallel_segments: usize) -> Self {
+        self.fts_parallel_segments = Some(parallel_segments);
         self
     }
 
@@ -207,6 +232,11 @@ impl CollectionConfig {
             tree.validate()?;
         }
         self.segment.validate()?;
+        if self.fts_parallel_segments == Some(0) {
+            return Err(TreeError::InvalidConfig(
+                "fts_parallel_segments must be >= 1".into(),
+            ));
+        }
         let mut seen = HashSet::with_capacity(self.attributes.len());
         for attr in &self.attributes {
             if attr.name.is_empty() {

@@ -50,8 +50,35 @@ pub fn execute_rank_by_with<S: FtsPostingSource>(
     rank_by: &RankBy,
     top_k: usize,
     block_mask: Option<&dyn BlockMaskProvider>,
+    lazy_filter: Option<&mut dyn FnMut(RowId) -> Result<bool>>,
+    modifier: Option<RankModifier<'_>>,
+    buffer: &mut ReusableBuffer,
+) -> Result<Vec<Bm25Result>> {
+    execute_rank_by_with_shards(
+        source,
+        schema,
+        rank_by,
+        top_k,
+        block_mask,
+        lazy_filter,
+        modifier,
+        None,
+        buffer,
+    )
+}
+
+/// [`execute_rank_by_with`] with an explicit cap on parallel segment shards (`None` uses all
+/// Rayon worker threads; `Some(1)` forces single-threaded execution).
+#[allow(clippy::too_many_arguments)]
+pub fn execute_rank_by_with_shards<S: FtsPostingSource>(
+    source: &S,
+    schema: &CollectionSchema,
+    rank_by: &RankBy,
+    top_k: usize,
+    block_mask: Option<&dyn BlockMaskProvider>,
     mut lazy_filter: Option<&mut dyn FnMut(RowId) -> Result<bool>>,
     modifier: Option<RankModifier<'_>>,
+    max_shards: Option<usize>,
     buffer: &mut ReusableBuffer,
 ) -> Result<Vec<Bm25Result>> {
     rank_by.validate(schema)?;
@@ -85,9 +112,11 @@ pub fn execute_rank_by_with<S: FtsPostingSource>(
         return Ok(Vec::new());
     }
 
+    let shard_budget = max_shards.unwrap_or_else(rayon::current_num_threads);
     if lazy_filter.is_none()
         && rescore_fn.is_none()
-        && let Some(ranges) = source.segment_ranges(rayon::current_num_threads())
+        && shard_budget > 1
+        && let Some(ranges) = source.segment_ranges(shard_budget)
         && ranges.len() >= 2
     {
         plan.prewarm_doc_lens(source)?;
@@ -471,6 +500,56 @@ pub(super) fn collect_block_candidates(
     });
 }
 
+/// Ensure every entry in `heap` tied at `theta` has a resolved `doc_id` so `TopKEntry::cmp`
+/// evicts by largest `DocId` rather than `RowId`. Returns `true` if `heap` remains at `top_k`.
+fn ensure_theta_tie_doc_ids<S: FtsPostingSource>(
+    source: &S,
+    heap: &mut BinaryHeap<TopKEntry>,
+    theta: f32,
+    top_k: usize,
+) -> Result<bool> {
+    let mut missing_needed = false;
+    let mut tie_count = 0usize;
+    for e in heap.iter() {
+        if e.score == theta {
+            tie_count += 1;
+            if e.doc_id.is_none() {
+                missing_needed = true;
+            }
+        }
+    }
+    if !missing_needed || tie_count == 0 {
+        return Ok(heap.len() == top_k);
+    }
+    let mut entries: Vec<TopKEntry> = heap.drain().collect();
+    let missing: Vec<RowId> = entries
+        .iter()
+        .filter(|e| e.score == theta && e.doc_id.is_none())
+        .map(|e| e.row_id)
+        .collect();
+    let fetched = source.multi_get_doc_ids(&missing)?;
+    let mut idx_map = HashMap::with_capacity(missing.len());
+    for (rid, did) in missing.into_iter().zip(fetched) {
+        if let Some(d) = did {
+            idx_map.insert(rid, d);
+        }
+    }
+    entries.retain_mut(|e| {
+        if e.score == theta && e.doc_id.is_none() {
+            if let Some(&d) = idx_map.get(&e.row_id) {
+                e.doc_id = Some(d);
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        }
+    });
+    *heap = BinaryHeap::from(entries);
+    Ok(heap.len() == top_k)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn insert_candidates_into_heap<'r, S: FtsPostingSource>(
     source: &S,
@@ -522,6 +601,18 @@ pub(super) fn insert_candidates_into_heap<'r, S: FtsPostingSource>(
                 theta = heap.peek().unwrap().score;
             }
         } else if s > theta {
+            let has_multi_ties = heap.iter().filter(|e| e.score == theta).take(2).count() > 1;
+            if has_multi_ties && !ensure_theta_tie_doc_ids(source, heap, theta, top_k)? {
+                heap.push(TopKEntry {
+                    score: s,
+                    row_id,
+                    doc_id: None,
+                });
+                if heap.len() == top_k {
+                    theta = heap.peek().unwrap().score;
+                }
+                continue;
+            }
             heap.pop();
             heap.push(TopKEntry {
                 score: s,
@@ -545,16 +636,19 @@ pub(super) fn insert_candidates_into_heap<'r, S: FtsPostingSource>(
                     None => continue,
                 }
             };
-            let mut root = heap.pop().unwrap();
-            let root_doc_id = match root.doc_id {
-                Some(id) => id,
-                None => {
-                    let fetched = source.multi_get_doc_ids(&[root.row_id])?;
-                    let id = fetched[0].unwrap_or(DocId::MAX);
-                    root.doc_id = Some(id);
-                    id
+            if !ensure_theta_tie_doc_ids(source, heap, theta, top_k)? {
+                heap.push(TopKEntry {
+                    score: s,
+                    row_id,
+                    doc_id: Some(new_doc_id),
+                });
+                if heap.len() == top_k {
+                    theta = heap.peek().unwrap().score;
                 }
-            };
+                continue;
+            }
+            let root = heap.pop().unwrap();
+            let root_doc_id = root.doc_id.unwrap_or(DocId::MAX);
             if new_doc_id < root_doc_id {
                 heap.push(TopKEntry {
                     score: s,

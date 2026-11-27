@@ -1,6 +1,6 @@
 use izzydb_core::config::{FTS_BLOCK_SIZE, for_each_set_bit_256};
 
-use crate::block::{IntWidth, read_tf_at};
+use crate::block::{IntWidth, TfEncoding, read_tf_enc_at};
 
 use super::SimdTier;
 
@@ -35,35 +35,42 @@ pub(super) fn prepare_dl_norm_256_scalar(
 
 #[inline]
 pub(super) fn accumulate_dense_256_scalar(
-    width: IntWidth,
+    tf_enc: TfEncoding,
     tfs_bytes: &[u8],
     num_scale: f32,
     dl_norm: &[f32; FTS_BLOCK_SIZE],
     bitmap: &[u64; 4],
     scores: &mut [f32; FTS_BLOCK_SIZE],
 ) {
-    accumulate_active_bits_scalar(width, tfs_bytes, num_scale, dl_norm, bitmap, scores);
+    accumulate_active_bits_scalar(tf_enc, tfs_bytes, num_scale, dl_norm, bitmap, scores);
 }
 
 #[inline]
 pub(super) fn accumulate_active_bits_scalar(
-    width: IntWidth,
+    tf_enc: TfEncoding,
     tfs_bytes: &[u8],
     num_scale: f32,
     dl_norm: &[f32; FTS_BLOCK_SIZE],
     active: &[u64; 4],
     scores: &mut [f32; FTS_BLOCK_SIZE],
 ) {
+    if tf_enc == TfEncoding::TfOne {
+        for_each_set_bit_256(active, |slot| {
+            let idx = slot as usize;
+            scores[idx] += num_scale / (1.0 + dl_norm[idx]);
+        });
+        return;
+    }
     for_each_set_bit_256(active, |slot| {
         let idx = slot as usize;
-        let tf_f = read_tf_at(width, tfs_bytes, idx) as f32;
+        let tf_f = read_tf_enc_at(tf_enc, tfs_bytes, idx) as f32;
         scores[idx] += (num_scale * tf_f) / (tf_f + dl_norm[idx]);
     });
 }
 
 #[inline]
 pub(super) fn accumulate_sparse_scalar(
-    width: IntWidth,
+    tf_enc: TfEncoding,
     slots: &[u8],
     tfs_bytes: &[u8],
     num_scale: f32,
@@ -71,8 +78,33 @@ pub(super) fn accumulate_sparse_scalar(
     scores: &mut [f32; FTS_BLOCK_SIZE],
     touched: &mut [u64; 4],
 ) {
-    match width {
-        IntWidth::U8 => {
+    match tf_enc {
+        TfEncoding::TfOne => {
+            for &slot in slots {
+                let idx = slot as usize;
+                scores[idx] += num_scale / (1.0 + dl_norm[idx]);
+                touched[(slot >> 6) as usize] |= 1u64 << (slot & 63);
+            }
+        }
+        TfEncoding::U2 => {
+            for (i, &slot) in slots.iter().enumerate() {
+                let tf_f =
+                    ((((tfs_bytes[i >> 2] >> ((i & 3) * 2)) & 0x03) + 1) as u32) as f32;
+                let idx = slot as usize;
+                scores[idx] += (num_scale * tf_f) / (tf_f + dl_norm[idx]);
+                touched[(slot >> 6) as usize] |= 1u64 << (slot & 63);
+            }
+        }
+        TfEncoding::U4 => {
+            for (i, &slot) in slots.iter().enumerate() {
+                let tf_f =
+                    ((((tfs_bytes[i >> 1] >> ((i & 1) * 4)) & 0x0F) + 1) as u32) as f32;
+                let idx = slot as usize;
+                scores[idx] += (num_scale * tf_f) / (tf_f + dl_norm[idx]);
+                touched[(slot >> 6) as usize] |= 1u64 << (slot & 63);
+            }
+        }
+        TfEncoding::U8 => {
             for (i, &slot) in slots.iter().enumerate() {
                 let tf_f = tfs_bytes[i] as f32;
                 let idx = slot as usize;
@@ -80,7 +112,7 @@ pub(super) fn accumulate_sparse_scalar(
                 touched[(slot >> 6) as usize] |= 1u64 << (slot & 63);
             }
         }
-        IntWidth::U16 => {
+        TfEncoding::U16 => {
             for (i, &slot) in slots.iter().enumerate() {
                 let off = i * 2;
                 let tf_f = u16::from_le_bytes([tfs_bytes[off], tfs_bytes[off + 1]]) as f32;
@@ -89,7 +121,7 @@ pub(super) fn accumulate_sparse_scalar(
                 touched[(slot >> 6) as usize] |= 1u64 << (slot & 63);
             }
         }
-        IntWidth::U32 => {
+        TfEncoding::U32 => {
             for (i, &slot) in slots.iter().enumerate() {
                 let off = i * 4;
                 let tf_f = u32::from_le_bytes(tfs_bytes[off..off + 4].try_into().unwrap()) as f32;

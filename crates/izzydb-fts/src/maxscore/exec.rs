@@ -1,8 +1,10 @@
-//! Block-Max MAXSCORE execution.
+//! Block-Max MAXSCORE execution (single-threaded and segment-parallel).
 
 use std::collections::{BinaryHeap, HashMap};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use alyze::analyze::ReusableBuffer;
+use rayon::prelude::*;
 
 use izzydb_core::config::{
     DocId, FTS_BLOCK_SIZE, RowBlock, RowId, for_each_set_bit_256,
@@ -78,32 +80,84 @@ pub fn execute_rank_by_with<S: FtsPostingSource>(
     };
 
     let tier = SimdTier::detect();
-    let mut dl_cache = DlNormCache::new();
-    let mut clauses = Vec::new();
-    {
-        let mut ctx = CompileContext {
-            source,
-            schema,
-            meta: &meta,
-            buffer,
-            dl_cache: &mut dl_cache,
-        };
-        compile_clauses(&mut ctx, &rank_by, mult_ub, &mut clauses)?;
-    }
-    if clauses.is_empty() {
+    let plan = compile_plan(source, schema, &meta, &rank_by, mult_ub, buffer)?;
+    if plan.clauses.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Sort clauses ascending by global upper bound `term_max` for MAXSCORE partitioning.
-    clauses.sort_by(|a, b| a.term_max.total_cmp(&b.term_max));
-    let n_clauses = clauses.len();
-    let mut prefix_max_sum = Vec::with_capacity(n_clauses);
-    let mut acc = 0.0f64;
-    for c in &clauses {
-        acc += c.term_max as f64;
-        prefix_max_sum.push(acc as f32);
+    if lazy_filter.is_none()
+        && rescore_fn.is_none()
+        && let Some(ranges) = source.segment_ranges(rayon::current_num_threads())
+        && ranges.len() >= 2
+    {
+        plan.prewarm_doc_lens(source)?;
+        let shared_theta = AtomicU32::new(0);
+        let shard_heaps: Vec<BinaryHeap<TopKEntry>> = ranges
+            .par_iter()
+            .map(|&(seg_start, seg_end)| -> Result<BinaryHeap<TopKEntry>> {
+                let (mut clauses, prefix_max_sum) =
+                    plan.instantiate(source, Some((seg_start, seg_end)))?;
+                if clauses.is_empty() {
+                    return Ok(BinaryHeap::new());
+                }
+                let mut dl_cache = DlNormCache::from_specs(&plan.dl_specs);
+                run_shard(
+                    source,
+                    &mut clauses,
+                    &prefix_max_sum,
+                    &mut dl_cache,
+                    top_k,
+                    add_ub,
+                    block_mask,
+                    &mut None,
+                    None,
+                    Some(&shared_theta),
+                    tier,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let merged = merge_shard_heaps(source, shard_heaps, top_k)?;
+        return resolve_and_sort_results(source, merged);
     }
 
+    let (mut clauses, prefix_max_sum) = plan.instantiate(source, None)?;
+    if clauses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut dl_cache = DlNormCache::from_specs(&plan.dl_specs);
+    let heap = run_shard(
+        source,
+        &mut clauses,
+        &prefix_max_sum,
+        &mut dl_cache,
+        top_k,
+        add_ub,
+        block_mask,
+        &mut lazy_filter,
+        rescore_fn.as_deref_mut(),
+        None,
+        tier,
+    )?;
+
+    resolve_and_sort_results(source, heap)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_shard<'a, 'r, S: FtsPostingSource>(
+    source: &'a S,
+    clauses: &mut [Clause<'a, S>],
+    prefix_max_sum: &[f32],
+    dl_cache: &mut DlNormCache<'a, S>,
+    top_k: usize,
+    add_ub: f32,
+    block_mask: Option<&dyn BlockMaskProvider>,
+    lazy_filter: &mut Option<&mut dyn FnMut(RowId) -> Result<bool>>,
+    mut rescore: Option<&mut (dyn FnMut(RowId, f32) -> Result<f32> + 'r)>,
+    shared_theta: Option<&AtomicU32>,
+    tier: SimdTier,
+) -> Result<BinaryHeap<TopKEntry>> {
+    let n_clauses = clauses.len();
     let mut essential_start: usize = 0;
     let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(top_k + 1);
     let mut theta: f32 = 0.0;
@@ -114,6 +168,29 @@ pub fn execute_rank_by_with<S: FtsPostingSource>(
     let mut non_ess_ubs: Vec<f32> = Vec::with_capacity(n_clauses);
 
     while let Some(block_id) = next_essential_block(&clauses[essential_start..]) {
+        let non_ess_ub = if essential_start > 0 {
+            prefix_max_sum[essential_start - 1]
+        } else {
+            0.0
+        };
+        let global_theta = shared_theta.map_or(0.0, |st| f32::from_bits(st.load(Ordering::Relaxed)));
+        let eff_theta = theta.max(global_theta);
+        let prune_theta = if eff_theta > add_ub {
+            eff_theta - add_ub
+        } else {
+            0.0
+        };
+
+        // Chunk-level skip when only one essential clause remains.
+        if essential_start + 1 == n_clauses
+            && prune_theta > 0.0
+            && let Some((chunk, chunk_ub)) = clauses[essential_start].single_chunk_upper_bound()
+            && ub_below_threshold(chunk_ub + non_ess_ub, prune_theta)
+        {
+            clauses[essential_start].seek_past_single_chunk(chunk)?;
+            continue;
+        }
+
         let allowed_mask = match block_mask {
             Some(mp) => match mp.mask(block_id) {
                 Some([0, 0, 0, 0]) => {
@@ -125,15 +202,8 @@ pub fn execute_rank_by_with<S: FtsPostingSource>(
             None => None,
         };
 
-        let non_ess_ub = if essential_start > 0 {
-            prefix_max_sum[essential_start - 1]
-        } else {
-            0.0
-        };
-
         // Block-Max skip pruning BEFORE reading any posting blocks or doc_len blocks.
         // Lexical-scale pruning threshold: a doc needs `L * mult_ub + add_ub > theta`.
-        let prune_theta = if theta > add_ub { theta - add_ub } else { 0.0 };
         if prune_theta > 0.0
             && essential_block_pruned(&clauses[essential_start..], block_id, non_ess_ub, prune_theta)
         {
@@ -147,7 +217,7 @@ pub fn execute_rank_by_with<S: FtsPostingSource>(
         touched = [0u64; 4];
         for c in &mut clauses[essential_start..] {
             if c.next_block_id() == Some(block_id) {
-                c.accumulate_block(block_id, &mut scores, &mut touched, &mut dl_cache, source, tier)?;
+                c.accumulate_block(block_id, &mut scores, &mut touched, dl_cache, source, tier)?;
                 c.advance_past(block_id)?;
             }
         }
@@ -170,7 +240,7 @@ pub fn execute_rank_by_with<S: FtsPostingSource>(
                 prune_theta,
                 &mut scores,
                 &mut non_ess_ubs,
-                &mut dl_cache,
+                dl_cache,
                 source,
                 tier,
             )?
@@ -178,7 +248,7 @@ pub fn execute_rank_by_with<S: FtsPostingSource>(
 
         // SIMD threshold filtering for top-k candidates.
         if active_mask != [0u64; 4] {
-            let cand_thresh = if heap.len() < top_k {
+            let cand_thresh = if heap.len() < top_k && global_theta == 0.0 {
                 f32::MIN_POSITIVE
             } else {
                 prune_theta.max(f32::MIN_POSITIVE)
@@ -192,17 +262,30 @@ pub fn execute_rank_by_with<S: FtsPostingSource>(
                         &candidates,
                         top_k,
                         theta,
+                        global_theta,
                         &mut heap,
-                        &mut lazy_filter,
-                        rescore_fn.as_deref_mut(),
+                        lazy_filter,
+                        rescore.as_deref_mut(),
                     )?;
+                    if let Some(st) = shared_theta
+                        && heap.len() == top_k
+                        && theta > global_theta
+                    {
+                        st.fetch_max(theta.to_bits(), Ordering::Relaxed);
+                    }
                 }
             }
         }
 
         // Dynamically shrink essential set as theta rises.
-        let prune_theta = if theta > add_ub { theta - add_ub } else { 0.0 };
-        if heap.len() == top_k && prune_theta > 0.0 {
+        let global_theta = shared_theta.map_or(0.0, |st| f32::from_bits(st.load(Ordering::Relaxed)));
+        let eff_theta = theta.max(global_theta);
+        let prune_theta = if eff_theta > add_ub {
+            eff_theta - add_ub
+        } else {
+            0.0
+        };
+        if (heap.len() == top_k || global_theta > 0.0) && prune_theta > 0.0 {
             while essential_start < n_clauses
                 && ub_below_threshold(prefix_max_sum[essential_start], prune_theta)
             {
@@ -214,7 +297,63 @@ pub fn execute_rank_by_with<S: FtsPostingSource>(
         }
     }
 
-    resolve_and_sort_results(source, heap)
+    Ok(heap)
+}
+
+fn merge_shard_heaps<S: FtsPostingSource>(
+    source: &S,
+    shard_heaps: Vec<BinaryHeap<TopKEntry>>,
+    top_k: usize,
+) -> Result<BinaryHeap<TopKEntry>> {
+    let mut all_entries: Vec<TopKEntry> = Vec::new();
+    for h in shard_heaps {
+        all_entries.extend(h.into_iter());
+    }
+    if all_entries.len() <= top_k {
+        return Ok(all_entries.into_iter().collect());
+    }
+    all_entries.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let cutoff = all_entries[top_k - 1].score;
+    let first_tie = all_entries[..top_k]
+        .iter()
+        .position(|e| e.score == cutoff)
+        .unwrap_or(top_k - 1);
+    let last_tie = all_entries[top_k..]
+        .iter()
+        .rposition(|e| e.score == cutoff)
+        .map_or(top_k - 1, |pos| top_k + pos);
+
+    let mut out: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(top_k);
+    for e in all_entries.drain(..first_tie) {
+        out.push(e);
+    }
+    let remaining_slots = top_k - out.len();
+    let tie_count = last_tie - first_tie + 1;
+    let mut ties: Vec<TopKEntry> = all_entries.drain(..tie_count).collect();
+    let missing_rows: Vec<RowId> = ties
+        .iter()
+        .filter(|e| e.doc_id.is_none())
+        .map(|e| e.row_id)
+        .collect();
+    if !missing_rows.is_empty() {
+        let fetched = source.multi_get_doc_ids(&missing_rows)?;
+        let map: HashMap<RowId, DocId> = missing_rows
+            .into_iter()
+            .zip(fetched)
+            .filter_map(|(rid, did)| did.map(|d| (rid, d)))
+            .collect();
+        for e in &mut ties {
+            if e.doc_id.is_none() {
+                e.doc_id = map.get(&e.row_id).copied();
+            }
+        }
+    }
+    ties.retain(|e| e.doc_id.is_some());
+    ties.sort_by_key(|e| e.doc_id.unwrap());
+    for e in ties.into_iter().take(remaining_slots) {
+        out.push(e);
+    }
+    Ok(out)
 }
 
 #[inline]
@@ -332,11 +471,13 @@ pub(super) fn collect_block_candidates(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn insert_candidates_into_heap<'r, S: FtsPostingSource>(
     source: &S,
     candidates: &[(f32, RowId)],
     top_k: usize,
     mut theta: f32,
+    floor_theta: f32,
     heap: &mut BinaryHeap<TopKEntry>,
     lazy_filter: &mut Option<&mut dyn FnMut(RowId) -> Result<bool>>,
     mut rescore: Option<&mut (dyn FnMut(RowId, f32) -> Result<f32> + 'r)>,
@@ -366,6 +507,10 @@ pub(super) fn insert_candidates_into_heap<'r, S: FtsPostingSource>(
             }
             None => s,
         };
+
+        if floor_theta > 0.0 && s < floor_theta {
+            continue;
+        }
 
         if heap.len() < top_k {
             heap.push(TopKEntry {
@@ -452,16 +597,18 @@ pub(super) fn resolve_and_sort_results<S: FtsPostingSource>(
             }
         }
     }
+    entries.retain(|e| e.doc_id.is_some());
+    entries.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.doc_id.unwrap().cmp(&b.doc_id.unwrap()))
+    });
 
-    let mut results: Vec<Bm25Result> = entries
+    Ok(entries
         .into_iter()
-        .filter_map(|e| {
-            e.doc_id.map(|id| Bm25Result {
-                id,
-                score: e.score,
-            })
+        .map(|e| Bm25Result {
+            id: e.doc_id.unwrap(),
+            score: e.score,
         })
-        .collect();
-    results.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
-    Ok(results)
+        .collect())
 }

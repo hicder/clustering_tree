@@ -6,13 +6,85 @@ use izzydb_core::error::{Result, TreeError};
 
 use super::*;
 
-/// Compact integer width tag shared by `PackedPostingBlock` (`tf`), `DocLenBlock` (`dl`), and `SkipBlock` (`max_tf`).
+/// Compact integer width tag shared by `PackedPostingBlock` (v3 `tf`), `DocLenBlock` (`dl`), and `SkipBlock`/`FtsChunk` (`max_tf`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum IntWidth {
     U8 = 0,
     U16 = 1,
     U32 = 2,
+}
+
+/// Term-frequency payload encoding within a posting block (`PostingBlockView`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TfEncoding {
+    /// Every posting in the block has `tf == 1` (zero TF payload bytes).
+    TfOne = 0,
+    /// Packed 2-bit `tf - 1` (`1 <= tf <= 4`), 4 values per byte LSB-first.
+    U2 = 1,
+    /// Packed 4-bit `tf - 1` (`1 <= tf <= 16`), 2 values per byte LSB-first.
+    U4 = 2,
+    /// Unsigned 8-bit `tf` (`u8`).
+    U8 = 3,
+    /// Little-endian 16-bit `tf` (`u16`).
+    U16 = 4,
+    /// Little-endian 32-bit `tf` (`u32`).
+    U32 = 5,
+}
+
+impl TfEncoding {
+    #[inline]
+    pub fn from_tag(tag: u8) -> Result<Self> {
+        match tag {
+            0 => Ok(Self::TfOne),
+            1 => Ok(Self::U2),
+            2 => Ok(Self::U4),
+            3 => Ok(Self::U8),
+            4 => Ok(Self::U16),
+            5 => Ok(Self::U32),
+            other => Err(TreeError::CorruptedData(format!(
+                "unknown TfEncoding tag: {other}"
+            ))),
+        }
+    }
+
+    #[inline]
+    pub const fn from_int_width(w: IntWidth) -> Self {
+        match w {
+            IntWidth::U8 => Self::U8,
+            IntWidth::U16 => Self::U16,
+            IntWidth::U32 => Self::U32,
+        }
+    }
+
+    #[inline]
+    pub fn select(min_tf: u32, max_tf: u32) -> Self {
+        if min_tf >= 1 {
+            if max_tf <= 1 {
+                return Self::TfOne;
+            }
+            if max_tf <= 4 {
+                return Self::U2;
+            }
+            if max_tf <= 16 {
+                return Self::U4;
+            }
+        }
+        Self::from_int_width(IntWidth::min_for_max(max_tf))
+    }
+
+    #[inline]
+    pub const fn payload_len(self, count: usize) -> usize {
+        match self {
+            Self::TfOne => 0,
+            Self::U2 => count.div_ceil(4),
+            Self::U4 => count.div_ceil(2),
+            Self::U8 => count,
+            Self::U16 => count * 2,
+            Self::U32 => count * 4,
+        }
+    }
 }
 
 impl IntWidth {

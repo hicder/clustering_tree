@@ -1,12 +1,11 @@
 //! Storage-backed FTS posting source and liveness mask provider.
 
-
-
-use izzydb_core::config::{AttrId, DocId, RowBlock, RowId, TermId};
+use izzydb_core::config::{AttrId, DocId, RowBlock, RowId, SegmentId, SkipChunk, TermId};
 use izzydb_core::error::Result;
 use izzydb_core::rowset::{Liveness, RowSet};
 use izzydb_fts::{
-    BlockMaskProvider, FtsDocLenCursor, FtsMeta, FtsPostingSource, FtsSkipCursor, TermRecord,
+    BlockMaskProvider, FtsDocLenCursor, FtsMeta, FtsPostingSource, FtsSkipCursor,
+    PostingBlockView, TermRecord,
 };
 use izzydb_storage::codec::{
     decode_fts_term_key, encode_fts_term_key,
@@ -14,8 +13,6 @@ use izzydb_storage::codec::{
 use izzydb_storage::{
     DBPinnableSlice, RocksDocLenCursor, RocksSkipCursor, SegmentTableSnapshot, Storage,
 };
-
-
 
 /// Combines segment-level liveness (`SegmentTableSnapshot`) with an optional pushed-down
 /// filter [`RowSet`] for Block-Max MAXSCORE block masking.
@@ -68,13 +65,18 @@ impl FtsSkipCursor for StorageSkipCursor<'_> {
     }
 
     #[inline]
+    fn current_chunk_bounds(&self) -> Option<(SkipChunk, u32, f32)> {
+        self.0.current_chunk_bounds()
+    }
+
+    #[inline]
     fn inline_posting_bytes(&self) -> Option<&[u8]> {
         self.0.inline_posting_bytes()
     }
 
     #[inline]
-    fn current_posting_bytes(&mut self) -> Result<Option<&[u8]>> {
-        self.0.current_posting_bytes()
+    fn current_posting_view(&mut self) -> Result<Option<PostingBlockView<'_>>> {
+        self.0.current_posting_view()
     }
 
     #[inline]
@@ -85,6 +87,11 @@ impl FtsSkipCursor for StorageSkipCursor<'_> {
     #[inline]
     fn seek_block(&mut self, target: RowBlock) -> Result<()> {
         self.0.seek_block(target)
+    }
+
+    #[inline]
+    fn seek_past_chunk(&mut self, chunk: SkipChunk) -> Result<()> {
+        self.0.seek_past_chunk(chunk)
     }
 }
 
@@ -186,6 +193,52 @@ impl FtsPostingSource for StorageFtsSource<'_> {
         Ok(self
             .storage
             .open_fts_skip_cursors(&records)?
+            .into_iter()
+            .map(StorageSkipCursor)
+            .collect())
+    }
+
+    fn segment_ranges(&self, max_shards: usize) -> Option<Vec<(SegmentId, SegmentId)>> {
+        if max_shards <= 1 {
+            return None;
+        }
+        let snap = self.storage.segment_snapshot();
+        let visible: Vec<SegmentId> = snap
+            .segments
+            .iter()
+            .filter_map(|(&seg, entry)| entry.is_visible().then_some(seg))
+            .collect();
+        if visible.len() < 4 {
+            return None;
+        }
+        let num_shards = max_shards.min(visible.len() / 2);
+        if num_shards < 2 {
+            return None;
+        }
+        let chunk_size = visible.len().div_ceil(num_shards);
+        let chunks: Vec<&[SegmentId]> = visible.chunks(chunk_size).collect();
+        let mut ranges = Vec::with_capacity(chunks.len());
+        for (i, ch) in chunks.iter().enumerate() {
+            let start = ch[0];
+            let end = if i + 1 < chunks.len() {
+                chunks[i + 1][0]
+            } else {
+                ch.last().copied().unwrap().saturating_add(1)
+            };
+            ranges.push((start, end));
+        }
+        Some(ranges)
+    }
+
+    fn open_skip_cursors_in_range<'a>(
+        &'a self,
+        records: &[TermRecord],
+        seg_start: SegmentId,
+        seg_end: SegmentId,
+    ) -> Result<Vec<Self::SkipCursor<'a>>> {
+        Ok(self
+            .storage
+            .open_fts_skip_cursors_in_range(records, seg_start, seg_end)?
             .into_iter()
             .map(StorageSkipCursor)
             .collect())

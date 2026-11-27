@@ -402,15 +402,17 @@ pub(super) fn bulk_append_checked(
                     if let Some(tbytes) = tx.get_fts_term_bytes(&delta.term_key)? {
                         let mut rec = TermRecord::decode(&tbytes)?;
                         if let Some((old_ib_id, old_ib_bytes)) = rec.inline_block.take() {
-                            let hdr = PostingBlockHeader::parse(&old_ib_bytes)?;
-                            tx.put_fts_posting_bytes(rec.term_id, old_ib_id, old_ib_bytes);
+                            let pblk = PackedPostingBlock::decode(&old_ib_bytes)?;
                             let chunk = old_ib_id.chunk();
-                            let mut skip = match tx.get_fts_skip_bytes(rec.term_id, chunk)? {
-                                Some(sb) => SkipBlock::decode(&sb)?,
-                                None => SkipBlock::default(),
-                            };
-                            skip.upsert(old_ib_id.rel_block(), hdr.max_tf, hdr.min_dl_over_tf);
-                            tx.put_fts_skip_bytes(rec.term_id, chunk, skip.encode());
+                            let existing = tx.get_fts_skip_bytes(rec.term_id, chunk)?;
+                            let new_chunk = FtsChunk::upsert_block(
+                                existing.as_deref(),
+                                old_ib_id.rel_block(),
+                                pblk.max_tf,
+                                pblk.min_dl_over_tf,
+                                &pblk.encode_compact(),
+                            )?;
+                            tx.put_fts_skip_bytes(rec.term_id, chunk, new_chunk);
                         }
                         rec.stats.doc_freq += delta.add_doc_freq;
                         rec.stats.max_tf = rec.stats.max_tf.max(delta.max_tf);

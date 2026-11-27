@@ -26,7 +26,7 @@ use izzydb::schema::{
 };
 use izzydb::storage::{
     CF_ATTR_POSTINGS, CF_COLUMNS, CF_DETACHED,
-    CF_DETACHED_POSTINGS, CF_FTS_POSITIONS, CF_FTS_POSTINGS, CF_FTS_SKIPS, CF_FTS_TERMS,
+    CF_DETACHED_POSTINGS, CF_FTS_POSITIONS, CF_FTS_SKIPS, CF_FTS_TERMS,
     CF_ID_MAP, CF_ROW_DOC_IDS, CF_ROWS, CF_VECTORS, cf_options_for, default_sst_block_cache, doc_key,
 };
 use izzydb_storage::column::ColumnBlockBuilder;
@@ -726,12 +726,6 @@ pub fn emit_segment_range_ssts(
                 memory_budget_bytes / 4,
                 1,
             )?;
-            let postings_sorter = ExternalSorter::<KvItem>::new(
-                "fts_postings_append",
-                stage_dir.join("runs_fts_postings_kv"),
-                memory_budget_bytes / 4,
-                1,
-            )?;
             let positions_sorter = ExternalSorter::<KvItem>::new(
                 "fts_positions_append",
                 stage_dir.join("runs_fts_positions"),
@@ -739,7 +733,6 @@ pub fn emit_segment_range_ssts(
                 1,
             )?;
             let mut skips_shard = skips_sorter.shard();
-            let mut postings_shard = postings_sorter.shard();
             let mut positions_shard = positions_sorter.shard();
             let mut new_terms = Vec::new();
             let mut upd_terms = Vec::new();
@@ -765,12 +758,6 @@ pub fn emit_segment_range_ssts(
                     })
                 },
                 &mut |k, v| {
-                    postings_shard.push(KvItem {
-                        key: k.to_vec(),
-                        val: v.to_vec(),
-                    })
-                },
-                &mut |k, v| {
                     positions_shard.push(KvItem {
                         key: k.to_vec(),
                         val: v.to_vec(),
@@ -778,20 +765,14 @@ pub fn emit_segment_range_ssts(
                 },
             )?;
             skips_shard.finish()?;
-            postings_shard.finish()?;
             positions_shard.finish()?;
 
             let skips_files =
                 emit_sorted_kv_sst(bundle_dir, CF_FTS_SKIPS, target_sst_bytes, skips_sorter)?;
-            let postings_files =
-                emit_sorted_kv_sst(bundle_dir, CF_FTS_POSTINGS, target_sst_bytes, postings_sorter)?;
             let positions_files =
                 emit_sorted_kv_sst(bundle_dir, CF_FTS_POSITIONS, target_sst_bytes, positions_sorter)?;
             if !skips_files.is_empty() {
                 cf_files.insert(CF_FTS_SKIPS.to_owned(), skips_files);
-            }
-            if !postings_files.is_empty() {
-                cf_files.insert(CF_FTS_POSTINGS.to_owned(), postings_files);
             }
             if !positions_files.is_empty() {
                 cf_files.insert(CF_FTS_POSITIONS.to_owned(), positions_files);
@@ -800,7 +781,6 @@ pub fn emit_segment_range_ssts(
         } else {
             let terms_opts = cf_options_for(CF_FTS_TERMS, &block_cache)?;
             let skips_opts = cf_options_for(CF_FTS_SKIPS, &block_cache)?;
-            let postings_opts = cf_options_for(CF_FTS_POSTINGS, &block_cache)?;
             let positions_opts = cf_options_for(CF_FTS_POSITIONS, &block_cache)?;
 
             let mut terms_sink = SstSink::new(
@@ -816,13 +796,6 @@ pub fn emit_segment_range_ssts(
                 &skips_opts,
                 target_sst_bytes,
                 format!("{CF_FTS_SKIPS}/part-00"),
-            );
-            let mut postings_sink = SstSink::new(
-                bundle_dir.to_path_buf(),
-                CF_FTS_POSTINGS,
-                &postings_opts,
-                target_sst_bytes,
-                format!("{CF_FTS_POSTINGS}/part-00"),
             );
             let mut positions_sink = SstSink::new(
                 bundle_dir.to_path_buf(),
@@ -841,22 +814,17 @@ pub fn emit_segment_range_ssts(
                 &mut |k, v| terms_sink.put(k, v),
                 &mut |_| Ok(()),
                 &mut |k, v| skips_sink.put(k, v),
-                &mut |k, v| postings_sink.put(k, v),
                 &mut |k, v| positions_sink.put(k, v),
             )?;
 
             let tf = terms_sink.finish()?;
             let sf = skips_sink.finish()?;
-            let pf = postings_sink.finish()?;
             let posf = positions_sink.finish()?;
             if !tf.is_empty() {
                 cf_files.insert(CF_FTS_TERMS.to_owned(), tf);
             }
             if !sf.is_empty() {
                 cf_files.insert(CF_FTS_SKIPS.to_owned(), sf);
-            }
-            if !pf.is_empty() {
-                cf_files.insert(CF_FTS_POSTINGS.to_owned(), pf);
             }
             if !posf.is_empty() {
                 cf_files.insert(CF_FTS_POSITIONS.to_owned(), posf);

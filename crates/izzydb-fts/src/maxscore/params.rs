@@ -94,7 +94,7 @@ impl PartialOrd for TopKEntry {
 ///
 /// Returning `None` means all 256 slots in the block are allowed (fast path for segments
 /// without tombstones when no filter is active). Returning `Some([0; 4])` skips the block.
-pub trait BlockMaskProvider {
+pub trait BlockMaskProvider: Sync {
     fn mask(&self, block: RowBlock) -> Option<[u64; 4]>;
 }
 

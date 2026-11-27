@@ -1,6 +1,6 @@
 use izzydb_core::config::FTS_BLOCK_SIZE;
 
-use crate::block::IntWidth;
+use crate::block::{IntWidth, TfEncoding, read_tf_enc_at};
 
 use super::scalar::accumulate_sparse_scalar;
 
@@ -59,17 +59,49 @@ pub(super) unsafe fn prepare_dl_norm_256_neon(
 }
 
 #[target_feature(enable = "neon")]
+#[inline]
+unsafe fn load_4_tf_as_f32_neon(
+    tf_enc: TfEncoding,
+    tfs_bytes: &[u8],
+    idx: usize,
+) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    unsafe {
+        match tf_enc {
+            TfEncoding::TfOne => vdupq_n_f32(1.0),
+            TfEncoding::U2 | TfEncoding::U4 => {
+                let vals = [
+                    read_tf_enc_at(tf_enc, tfs_bytes, idx),
+                    read_tf_enc_at(tf_enc, tfs_bytes, idx + 1),
+                    read_tf_enc_at(tf_enc, tfs_bytes, idx + 2),
+                    read_tf_enc_at(tf_enc, tfs_bytes, idx + 3),
+                ];
+                vcvtq_f32_u32(vld1q_u32(vals.as_ptr()))
+            }
+            TfEncoding::U8 => load_4_int_as_f32_neon(IntWidth::U8, tfs_bytes.as_ptr(), idx),
+            TfEncoding::U16 => load_4_int_as_f32_neon(IntWidth::U16, tfs_bytes.as_ptr(), idx),
+            TfEncoding::U32 => load_4_int_as_f32_neon(IntWidth::U32, tfs_bytes.as_ptr(), idx),
+        }
+    }
+}
+
+#[target_feature(enable = "neon")]
 pub(super) unsafe fn accumulate_dense_256_neon(
-    width: IntWidth,
+    tf_enc: TfEncoding,
     tfs_bytes: &[u8],
     num_scale: f32,
     dl_norm: &[f32; FTS_BLOCK_SIZE],
     bitmap: &[u64; 4],
     scores: &mut [f32; FTS_BLOCK_SIZE],
 ) {
+    if matches!(tf_enc, TfEncoding::TfOne | TfEncoding::U2 | TfEncoding::U4) {
+        unsafe {
+            accumulate_dense_masked_neon(tf_enc, tfs_bytes, num_scale, dl_norm, bitmap, scores);
+        }
+        return;
+    }
     use std::arch::aarch64::*;
     let v_scale = vdupq_n_f32(num_scale);
-    let tf_ptr = tfs_bytes.as_ptr();
     let dln_ptr = dl_norm.as_ptr();
     let sc_ptr = scores.as_mut_ptr();
     for (w, &bw) in bitmap.iter().enumerate() {
@@ -80,7 +112,7 @@ pub(super) unsafe fn accumulate_dense_256_neon(
         for chunk in 0..16 {
             let i = base + (chunk << 2);
             unsafe {
-                let v_tf = load_4_int_as_f32_neon(width, tf_ptr, i);
+                let v_tf = load_4_tf_as_f32_neon(tf_enc, tfs_bytes, i);
                 let v_dln = vld1q_f32(dln_ptr.add(i));
                 let v_cur = vld1q_f32(sc_ptr.add(i));
                 let v_new =
@@ -93,7 +125,7 @@ pub(super) unsafe fn accumulate_dense_256_neon(
 
 #[target_feature(enable = "neon")]
 pub(super) unsafe fn accumulate_dense_masked_neon(
-    width: IntWidth,
+    tf_enc: TfEncoding,
     tfs_bytes: &[u8],
     num_scale: f32,
     dl_norm: &[f32; FTS_BLOCK_SIZE],
@@ -105,7 +137,6 @@ pub(super) unsafe fn accumulate_dense_masked_neon(
     let v_zero = vdupq_n_f32(0.0);
     let bit_weights: [u32; 4] = [1, 2, 4, 8];
     let v_bw = unsafe { vld1q_u32(bit_weights.as_ptr()) };
-    let tf_ptr = tfs_bytes.as_ptr();
     let dln_ptr = dl_norm.as_ptr();
     let sc_ptr = scores.as_mut_ptr();
     for (w, &aw) in active.iter().enumerate() {
@@ -120,7 +151,7 @@ pub(super) unsafe fn accumulate_dense_masked_neon(
             }
             let i = base + (chunk << 2);
             unsafe {
-                let v_tf = load_4_int_as_f32_neon(width, tf_ptr, i);
+                let v_tf = load_4_tf_as_f32_neon(tf_enc, tfs_bytes, i);
                 let v_dln = vld1q_f32(dln_ptr.add(i));
                 let v_cur = vld1q_f32(sc_ptr.add(i));
                 let mut v_delta = vdivq_f32(vmulq_f32(v_scale, v_tf), vaddq_f32(v_tf, v_dln));
@@ -136,7 +167,7 @@ pub(super) unsafe fn accumulate_dense_masked_neon(
 
 #[target_feature(enable = "neon")]
 pub(super) unsafe fn accumulate_sparse_neon(
-    width: IntWidth,
+    tf_enc: TfEncoding,
     slots: &[u8],
     tfs_bytes: &[u8],
     num_scale: f32,
@@ -147,7 +178,6 @@ pub(super) unsafe fn accumulate_sparse_neon(
     use std::arch::aarch64::*;
     let n = slots.len();
     let v_scale = vdupq_n_f32(num_scale);
-    let tf_ptr = tfs_bytes.as_ptr();
     let mut i = 0usize;
     while i + 4 <= n {
         let mut dln_buf = [0.0f32; 4];
@@ -156,7 +186,7 @@ pub(super) unsafe fn accumulate_sparse_neon(
         }
         let mut res = [0.0f32; 4];
         unsafe {
-            let v_tf = load_4_int_as_f32_neon(width, tf_ptr, i);
+            let v_tf = load_4_tf_as_f32_neon(tf_enc, tfs_bytes, i);
             let v_dln = vld1q_f32(dln_buf.as_ptr());
             let v_res = vdivq_f32(vmulq_f32(v_scale, v_tf), vaddq_f32(v_tf, v_dln));
             vst1q_f32(res.as_mut_ptr(), v_res);
@@ -169,10 +199,18 @@ pub(super) unsafe fn accumulate_sparse_neon(
         i += 4;
     }
     if i < n {
+        let tail = match tf_enc {
+            TfEncoding::TfOne => &[],
+            TfEncoding::U2 => &tfs_bytes[i >> 2..],
+            TfEncoding::U4 => &tfs_bytes[i >> 1..],
+            TfEncoding::U8 => &tfs_bytes[i..],
+            TfEncoding::U16 => &tfs_bytes[i * 2..],
+            TfEncoding::U32 => &tfs_bytes[i * 4..],
+        };
         accumulate_sparse_scalar(
-            width,
+            tf_enc,
             &slots[i..],
-            &tfs_bytes[i * width.byte_size()..],
+            tail,
             num_scale,
             dl_norm,
             scores,

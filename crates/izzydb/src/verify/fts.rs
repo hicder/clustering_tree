@@ -3,13 +3,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use roaring::RoaringBitmap;
 use izzydb_core::config::{
-    AttrId, DocId, RowBlock, RowId, SegmentId, TermId,
+    AttrId, DocId, RowBlock, RowId, SegmentId, SkipChunk, TermId,
 };
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::schema::{CollectionSchema, ColumnStorage};
 use izzydb_fts::{
-    AttrFtsStats, DocLenBlock, FtsAnalyzer, FtsMeta, INLINE_TERM_MAX_DF, PackedPositionBlock,
-    PackedPostingBlock, PostingBlockHeader, ReusableBuffer, SkipBlock, TermRecord,
+    AttrFtsStats, DocLenBlock, FtsAnalyzer, FtsChunkView, FtsMeta, INLINE_TERM_MAX_DF,
+    PackedPositionBlock, PackedPostingBlock, ReusableBuffer, TermRecord,
     dl_over_tf_lower_bound,
 };
 use izzydb_storage::codec::{
@@ -155,37 +155,37 @@ pub(super) fn verify_fts_invariants(
         }
     }
 
-    // Check FTS terms, skips, postings, positions (filtered to live slots in visible segments).
+    // Check FTS terms, unified chunks in cf_fts_skips, and positions (filtered to live slots in visible segments).
     let disk_terms: HashMap<Vec<u8>, Vec<u8>> = storage.all_fts_terms()?.into_iter().collect();
-    let mut disk_skips: HashMap<(TermId, SegmentId, u32), Vec<u8>> = HashMap::new();
+    let mut disk_chunks_by_tid: HashMap<TermId, BTreeMap<SkipChunk, Vec<u8>>> = HashMap::new();
+    let mut total_disk_postings = 0usize;
     storage.visit_cf_raw(CF_FTS_SKIPS, |k, v| {
         if k.len() != 12 {
-            return Err(TreeError::InvariantViolation("12B skip key expected".into()));
+            return Err(TreeError::InvariantViolation("12B skip chunk key expected".into()));
         }
         let tid = u32::from_be_bytes(k[0..4].try_into().unwrap());
         let seg = SegmentId::from_be_bytes(k[4..8].try_into().unwrap());
         let chunk = u32::from_be_bytes(k[8..12].try_into().unwrap());
         if !dropped.contains(seg) && seg_snap.segments.get(&seg).is_some_and(|e| e.is_visible()) {
-            disk_skips.insert((tid, seg, chunk), v.to_vec());
+            let cv = FtsChunkView::parse(v)?;
+            total_disk_postings += cv.count;
+            disk_chunks_by_tid
+                .entry(tid)
+                .or_default()
+                .insert(SkipChunk::new(seg, chunk), v.to_vec());
         }
         Ok(())
     })?;
 
-    let mut disk_postings_by_tid: HashMap<TermId, BTreeMap<RowBlock, Vec<u8>>> = HashMap::new();
-    let mut total_disk_postings = 0usize;
-    storage.visit_cf_raw(CF_FTS_POSTINGS, |k, v| {
+    storage.visit_cf_raw(CF_FTS_POSTINGS, |k, _| {
         if k.len() != 12 {
             return Err(TreeError::InvariantViolation("12B posting key expected".into()));
         }
-        let tid = u32::from_be_bytes(k[0..4].try_into().unwrap());
         let seg = SegmentId::from_be_bytes(k[4..8].try_into().unwrap());
-        let blk = u32::from_be_bytes(k[8..12].try_into().unwrap());
         if !dropped.contains(seg) && seg_snap.segments.get(&seg).is_some_and(|e| e.is_visible()) {
-            total_disk_postings += 1;
-            disk_postings_by_tid
-                .entry(tid)
-                .or_default()
-                .insert(RowBlock::new(seg, blk), v.to_vec());
+            return Err(TreeError::InvariantViolation(
+                "unexpected visible key in deprecated cf_fts_postings".into(),
+            ));
         }
         Ok(())
     })?;
@@ -267,43 +267,60 @@ pub(super) fn verify_fts_invariants(
                     live_actual_blocks.insert(ib_rblk, live_entries);
                 }
             }
-        } else if let Some(out_blocks) = disk_postings_by_tid.get(&rec.term_id) {
-            for (&rblk, raw_p) in out_blocks {
-                let hdr = PostingBlockHeader::parse(raw_p)?;
-                let chunk = rblk.chunk();
-                let raw_s = disk_skips.get(&(rec.term_id, chunk.seg(), chunk.chunk())).ok_or_else(|| {
-                    TreeError::InvariantViolation(format!(
-                        "missing SkipBlock for tid={} {chunk:?}",
-                        rec.term_id
-                    ))
-                })?;
-                let sb = SkipBlock::decode(raw_s)?;
-                let Some(skip_idx) = sb.rel_block_ids.binary_search(&rblk.rel_block()).ok() else {
-                    return Err(TreeError::InvariantViolation(format!(
-                        "SkipBlock missing rel_block for tid={} {rblk:?}",
-                        rec.term_id
-                    )));
-                };
-                if sb.max_tfs[skip_idx] < hdr.max_tf
-                    || sb.min_dl_over_tfs[skip_idx] > hdr.min_dl_over_tf
+        } else if let Some(chunks) = disk_chunks_by_tid.get(&rec.term_id) {
+            for (&chunk, raw_chunk) in chunks {
+                let cv = FtsChunkView::parse(raw_chunk)?;
+                let mut exp_chunk_max_tf = 0u32;
+                let mut exp_chunk_min_ratio = f32::INFINITY;
+                for i in 0..cv.count {
+                    let rel = cv.rel_block_id(i);
+                    let rblk = chunk.block(rel);
+                    let block_max_tf = cv.max_tf(i);
+                    let block_min_ratio = cv.min_dl_over_tf(i);
+                    exp_chunk_max_tf = exp_chunk_max_tf.max(block_max_tf);
+                    exp_chunk_min_ratio = exp_chunk_min_ratio.min(block_min_ratio);
+
+                    let mut pblk = PackedPostingBlock::decode_compact(
+                        cv.block_bytes(i),
+                        block_max_tf,
+                        block_min_ratio,
+                    )?;
+                    let stored_max_tf = pblk.max_tf;
+                    let stored_min_ratio = pblk.min_dl_over_tf;
+                    pblk.recompute_bounds_with(|slot| {
+                        disk_dls
+                            .get(&(
+                                u16::from_be_bytes([tkey[0], tkey[1]]),
+                                rblk,
+                            ))
+                            .map_or(0, |d| d.get(slot))
+                    });
+                    if stored_max_tf < pblk.max_tf || stored_min_ratio > pblk.min_dl_over_tf {
+                        return Err(TreeError::InvariantViolation(format!(
+                            "FtsChunk block bounds looser/invalid for tid={} {rblk:?}",
+                            rec.term_id
+                        )));
+                    }
+
+                    let base = rblk.block() * 256;
+                    let live_seg = live_by_seg.get(&rblk.seg());
+                    let live_entries: Vec<(u8, u32)> = pblk
+                        .slots
+                        .iter()
+                        .zip(pblk.tfs.iter())
+                        .filter(|&(&s, _)| live_seg.is_some_and(|bm| bm.contains(base + s as u32)))
+                        .map(|(&s, &tf)| (s, tf))
+                        .collect();
+                    if !live_entries.is_empty() {
+                        live_actual_blocks.insert(rblk, live_entries);
+                    }
+                }
+                if cv.chunk_max_tf < exp_chunk_max_tf || cv.chunk_min_dl_over_tf > exp_chunk_min_ratio
                 {
                     return Err(TreeError::InvariantViolation(format!(
-                        "SkipBlock bounds looser than PostingBlockHeader for tid={} {rblk:?}",
+                        "FtsChunk header bounds mismatch for tid={} {chunk:?}",
                         rec.term_id
                     )));
-                }
-                let pblk = PackedPostingBlock::decode(raw_p)?;
-                let base = rblk.block() * 256;
-                let live_seg = live_by_seg.get(&rblk.seg());
-                let live_entries: Vec<(u8, u32)> = pblk
-                    .slots
-                    .iter()
-                    .zip(pblk.tfs.iter())
-                    .filter(|&(&s, _)| live_seg.is_some_and(|bm| bm.contains(base + s as u32)))
-                    .map(|(&s, &tf)| (s, tf))
-                    .collect();
-                if !live_entries.is_empty() {
-                    live_actual_blocks.insert(rblk, live_entries);
                 }
             }
         }

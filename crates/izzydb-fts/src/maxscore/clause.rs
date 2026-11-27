@@ -3,7 +3,7 @@
 
 
 use izzydb_core::config::{
-    FTS_BLOCK_SIZE, RowBlock,
+    FTS_BLOCK_SIZE, RowBlock, SkipChunk,
 };
 use izzydb_core::error::Result;
 
@@ -89,6 +89,22 @@ impl<'a, S: FtsPostingSource + 'a> Clause<'a, S> {
                 })
                 .fold(0.0f32, f32::max),
         }
+    }
+
+    #[inline]
+    pub(super) fn single_chunk_upper_bound(&self) -> Option<(SkipChunk, f32)> {
+        match &self.kind {
+            ClauseKind::Single(t) => t.chunk_upper_bound(),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub(super) fn seek_past_single_chunk(&mut self, chunk: SkipChunk) -> Result<()> {
+        if let ClauseKind::Single(t) = &mut self.kind {
+            t.seek_past_chunk(chunk)?;
+        }
+        Ok(())
     }
 
     pub(super) fn seek_to(&mut self, target: RowBlock) -> Result<()> {

@@ -9,12 +9,12 @@ pub mod simd;
 pub use alyze::analyze::ReusableBuffer;
 pub use analyzer::{AnalyzedDoc, AnalyzedTerm, FtsAnalyzer, QueryToken, STRING_ARRAY_POSITION_GAP};
 pub use block::{
-    AttrFtsStats, DOC_LEN_BLOCK_HEADER_LEN, DocLenBlock, DocLenBlockView, FtsMeta,
-    INLINE_TERM_MAX_DF, IntWidth, POSTING_BLOCK_HEADER_LEN, POSTING_DENSE_THRESHOLD,
-    PackedPositionBlock, PackedPostingBlock, PositionBlockView, PostingBlockHeader,
-    PostingBlockPayload, PostingBlockView, SKIP_BLOCK_HEADER_LEN, SkipBlock, SkipBlockLayout,
-    SkipBlockView,
-    TERM_RECORD_HEADER_LEN, TERM_STATS_LEN, TermRecord, TermStats, dl_over_tf_lower_bound,
+    AttrFtsStats, DOC_LEN_BLOCK_HEADER_LEN, DocLenBlock, DocLenBlockView, FTS_CHUNK_HEADER_LEN,
+    FtsChunk, FtsChunkLayout, FtsChunkView, FtsMeta, INLINE_TERM_MAX_DF, IntWidth,
+    POSTING_BLOCK_HEADER_LEN, POSTING_DENSE_THRESHOLD, PackedPositionBlock, PackedPostingBlock,
+    PositionBlockView, PostingBlockHeader, PostingBlockPayload, PostingBlockView,
+    SKIP_BLOCK_HEADER_LEN, SkipBlock, SkipBlockLayout, SkipBlockView, TERM_RECORD_HEADER_LEN,
+    TERM_STATS_LEN, TermRecord, TermStats, TfEncoding, dl_over_tf_lower_bound,
 };
 pub use bm25::{Bm25TermScorer, bm25_idf, bm25_qtf_norm};
 pub use maxscore::{

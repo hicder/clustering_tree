@@ -17,8 +17,7 @@ use izzydb_core::config::{AttrId, RowBlock};
 use izzydb_core::error::Result;
 use izzydb_core::rowset::Liveness;
 use izzydb_fts::{
-    DocLenBlockView, PackedPostingBlock, ReusableBuffer, TermRecord,
-    dl_over_tf_lower_bound,
+    DocLenBlockView, PostingBlockView, ReusableBuffer, TermRecord, dl_over_tf_lower_bound,
 };
 use izzydb_storage::codec::decode_fts_term_key;
 use izzydb_storage::{
@@ -109,8 +108,7 @@ impl FtsIndex {
             let mut max_tf = 0u32;
             let mut min_ratio = f32::INFINITY;
 
-            let mut accumulate_block = |block_id: RowBlock, pbytes: &[u8]| -> Result<()> {
-                let pblk = PackedPostingBlock::decode(pbytes)?;
+            let mut accumulate_block = |block_id: RowBlock, view: &PostingBlockView<'_>| -> Result<()> {
                 let mask = snap.block_live_mask(block_id.seg(), block_id.block());
                 if mask == Some([0u64; 4]) {
                     return Ok(());
@@ -119,27 +117,28 @@ impl FtsIndex {
                     .seek_block_bytes(block_id)?
                     .map(DocLenBlockView::parse)
                     .transpose()?;
-                for (&slot, &tf) in pblk.slots.iter().zip(pblk.tfs.iter()) {
+                view.for_each_posting(|slot, tf| {
                     if let Some(m) = mask
                         && ((m[(slot as usize) >> 6] >> (slot & 63)) & 1) == 0
                     {
-                        continue;
+                        return;
                     }
                     live_df += 1;
                     max_tf = max_tf.max(tf);
                     let dl = dl_view.as_ref().map_or(tf, |dv| dv.dl(slot));
                     min_ratio = min_ratio.min(dl_over_tf_lower_bound(dl, tf));
-                }
+                });
                 Ok(())
             };
 
             if let Some((ib_id, ref ib_bytes)) = rec.inline_block {
-                accumulate_block(ib_id, ib_bytes)?;
+                let view = PostingBlockView::parse(ib_bytes)?;
+                accumulate_block(ib_id, &view)?;
             } else {
                 let mut cursor = storage.open_fts_skip_cursor(rec.clone())?;
                 while let Some(bid) = cursor.current_block_id() {
-                    if let Some(slice) = storage.get_fts_posting_pinned(rec.term_id, bid)? {
-                        accumulate_block(bid, &slice)?;
+                    if let Some(view) = cursor.current_posting_view()? {
+                        accumulate_block(bid, &view)?;
                     }
                     cursor.next_block()?;
                 }

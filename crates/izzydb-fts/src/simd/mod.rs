@@ -8,7 +8,7 @@ mod x86;
 
 use izzydb_core::config::FTS_BLOCK_SIZE;
 
-use crate::block::{IntWidth, POSTING_DENSE_THRESHOLD, read_tf_at};
+use crate::block::{IntWidth, POSTING_DENSE_THRESHOLD, TfEncoding, read_tf_enc_at};
 
 /// Runtime-detected SIMD execution tier for 256-doc FTS block kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +75,7 @@ pub fn prepare_dl_norm_256(
 #[allow(clippy::too_many_arguments)]
 pub fn accumulate_dense_256(
     tier: SimdTier,
-    width: IntWidth,
+    tf_enc: TfEncoding,
     tfs_bytes: &[u8],
     num_scale: f32,
     dl_norm: &[f32; FTS_BLOCK_SIZE],
@@ -83,7 +83,7 @@ pub fn accumulate_dense_256(
     scores: &mut [f32; FTS_BLOCK_SIZE],
     touched: &mut [u64; 4],
 ) {
-    debug_assert_eq!(tfs_bytes.len(), FTS_BLOCK_SIZE * width.byte_size());
+    debug_assert_eq!(tfs_bytes.len(), tf_enc.payload_len(FTS_BLOCK_SIZE));
     if num_scale <= 0.0 {
         return;
     }
@@ -93,17 +93,17 @@ pub fn accumulate_dense_256(
     match tier {
         #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
         SimdTier::Avx512 => unsafe {
-            x86::accumulate_dense_256_avx512(width, tfs_bytes, num_scale, dl_norm, bitmap, scores)
+            x86::accumulate_dense_256_avx512(tf_enc, tfs_bytes, num_scale, dl_norm, bitmap, scores)
         },
         #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
         SimdTier::Avx2 => unsafe {
-            x86::accumulate_dense_256_avx2(width, tfs_bytes, num_scale, dl_norm, bitmap, scores)
+            x86::accumulate_dense_256_avx2(tf_enc, tfs_bytes, num_scale, dl_norm, bitmap, scores)
         },
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         SimdTier::Neon => unsafe {
-            aarch64::accumulate_dense_256_neon(width, tfs_bytes, num_scale, dl_norm, bitmap, scores)
+            aarch64::accumulate_dense_256_neon(tf_enc, tfs_bytes, num_scale, dl_norm, bitmap, scores)
         },
-        _ => scalar::accumulate_dense_256_scalar(width, tfs_bytes, num_scale, dl_norm, bitmap, scores),
+        _ => scalar::accumulate_dense_256_scalar(tf_enc, tfs_bytes, num_scale, dl_norm, bitmap, scores),
     }
 }
 
@@ -112,7 +112,7 @@ pub fn accumulate_dense_256(
 #[allow(clippy::too_many_arguments)]
 pub fn accumulate_dense_masked_256(
     tier: SimdTier,
-    width: IntWidth,
+    tf_enc: TfEncoding,
     tfs_bytes: &[u8],
     num_scale: f32,
     dl_norm: &[f32; FTS_BLOCK_SIZE],
@@ -120,7 +120,7 @@ pub fn accumulate_dense_masked_256(
     mask: &[u64; 4],
     scores: &mut [f32; FTS_BLOCK_SIZE],
 ) {
-    debug_assert_eq!(tfs_bytes.len(), FTS_BLOCK_SIZE * width.byte_size());
+    debug_assert_eq!(tfs_bytes.len(), tf_enc.payload_len(FTS_BLOCK_SIZE));
     if num_scale <= 0.0 {
         return;
     }
@@ -135,28 +135,28 @@ pub fn accumulate_dense_masked_256(
         return;
     }
     if pop <= 24 {
-        scalar::accumulate_active_bits_scalar(width, tfs_bytes, num_scale, dl_norm, &active, scores);
+        scalar::accumulate_active_bits_scalar(tf_enc, tfs_bytes, num_scale, dl_norm, &active, scores);
         return;
     }
     match tier {
         #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
         SimdTier::Avx512 => unsafe {
             x86::accumulate_dense_masked_avx512(
-                width, tfs_bytes, num_scale, dl_norm, &active, scores,
+                tf_enc, tfs_bytes, num_scale, dl_norm, &active, scores,
             )
         },
         #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
         SimdTier::Avx2 => unsafe {
-            x86::accumulate_dense_masked_avx2(width, tfs_bytes, num_scale, dl_norm, &active, scores)
+            x86::accumulate_dense_masked_avx2(tf_enc, tfs_bytes, num_scale, dl_norm, &active, scores)
         },
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         SimdTier::Neon => unsafe {
             aarch64::accumulate_dense_masked_neon(
-                width, tfs_bytes, num_scale, dl_norm, &active, scores,
+                tf_enc, tfs_bytes, num_scale, dl_norm, &active, scores,
             )
         },
         _ => scalar::accumulate_active_bits_scalar(
-            width, tfs_bytes, num_scale, dl_norm, &active, scores,
+            tf_enc, tfs_bytes, num_scale, dl_norm, &active, scores,
         ),
     }
 }
@@ -166,7 +166,7 @@ pub fn accumulate_dense_masked_256(
 #[allow(clippy::too_many_arguments)]
 pub fn accumulate_sparse(
     tier: SimdTier,
-    width: IntWidth,
+    tf_enc: TfEncoding,
     slots: &[u8],
     tfs_bytes: &[u8],
     num_scale: f32,
@@ -174,27 +174,39 @@ pub fn accumulate_sparse(
     scores: &mut [f32; FTS_BLOCK_SIZE],
     touched: &mut [u64; 4],
 ) {
-    debug_assert_eq!(tfs_bytes.len(), slots.len() * width.byte_size());
+    debug_assert_eq!(tfs_bytes.len(), tf_enc.payload_len(slots.len()));
     if num_scale <= 0.0 || slots.is_empty() {
+        return;
+    }
+    if tf_enc == TfEncoding::TfOne && slots.len() < 16 {
+        scalar::accumulate_sparse_scalar(
+            TfEncoding::TfOne,
+            slots,
+            tfs_bytes,
+            num_scale,
+            dl_norm,
+            scores,
+            touched,
+        );
         return;
     }
     match tier {
         #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
         SimdTier::Avx512 if slots.len() >= 16 => unsafe {
-            x86::accumulate_sparse_avx512(width, slots, tfs_bytes, num_scale, dl_norm, scores, touched)
+            x86::accumulate_sparse_avx512(tf_enc, slots, tfs_bytes, num_scale, dl_norm, scores, touched)
         },
         #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
         SimdTier::Avx2 | SimdTier::Avx512 if slots.len() >= 8 => unsafe {
-            x86::accumulate_sparse_avx2(width, slots, tfs_bytes, num_scale, dl_norm, scores, touched)
+            x86::accumulate_sparse_avx2(tf_enc, slots, tfs_bytes, num_scale, dl_norm, scores, touched)
         },
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         SimdTier::Neon if slots.len() >= 4 => unsafe {
             aarch64::accumulate_sparse_neon(
-                width, slots, tfs_bytes, num_scale, dl_norm, scores, touched,
+                tf_enc, slots, tfs_bytes, num_scale, dl_norm, scores, touched,
             )
         },
         _ => scalar::accumulate_sparse_scalar(
-            width, slots, tfs_bytes, num_scale, dl_norm, scores, touched,
+            tf_enc, slots, tfs_bytes, num_scale, dl_norm, scores, touched,
         ),
     }
 }
@@ -214,7 +226,7 @@ fn mask_pop_le_8(mask: &[u64; 4]) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub fn accumulate_sparse_masked(
     tier: SimdTier,
-    width: IntWidth,
+    tf_enc: TfEncoding,
     slots: &[u8],
     tfs_bytes: &[u8],
     num_scale: f32,
@@ -222,14 +234,23 @@ pub fn accumulate_sparse_masked(
     mask: &[u64; 4],
     scores: &mut [f32; FTS_BLOCK_SIZE],
 ) {
-    debug_assert_eq!(tfs_bytes.len(), slots.len() * width.byte_size());
+    debug_assert_eq!(tfs_bytes.len(), tf_enc.payload_len(slots.len()));
     if num_scale <= 0.0 || slots.is_empty() {
         return;
     }
     if slots.len() < 8 || slots.len() > POSTING_DENSE_THRESHOLD || mask_pop_le_8(mask) {
+        if tf_enc == TfEncoding::TfOne {
+            for &slot in slots {
+                if ((mask[(slot >> 6) as usize] >> (slot & 63)) & 1) != 0 {
+                    let idx = slot as usize;
+                    scores[idx] += num_scale / (1.0 + dl_norm[idx]);
+                }
+            }
+            return;
+        }
         for (i, &slot) in slots.iter().enumerate() {
             if ((mask[(slot >> 6) as usize] >> (slot & 63)) & 1) != 0 {
-                let tf_f = read_tf_at(width, tfs_bytes, i) as f32;
+                let tf_f = read_tf_enc_at(tf_enc, tfs_bytes, i) as f32;
                 let idx = slot as usize;
                 scores[idx] += (num_scale * tf_f) / (tf_f + dl_norm[idx]);
             }
@@ -242,7 +263,7 @@ pub fn accumulate_sparse_masked(
     for (i, &slot) in slots.iter().enumerate() {
         if ((mask[(slot >> 6) as usize] >> (slot & 63)) & 1) != 0 {
             matched_slots[m] = slot;
-            matched_tfs[m] = read_tf_at(width, tfs_bytes, i);
+            matched_tfs[m] = read_tf_enc_at(tf_enc, tfs_bytes, i);
             m += 1;
         }
     }
@@ -372,7 +393,14 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(2026);
         let tiers = available_tiers();
 
-        for (max_dl, max_tf) in [(100u32, 20u32), (10_000, 1_000), (100_000, 100_000)] {
+        for (max_dl, max_tf) in [
+            (100u32, 1u32),
+            (100u32, 4u32),
+            (100u32, 16u32),
+            (100u32, 20u32),
+            (10_000, 1_000),
+            (100_000, 100_000),
+        ] {
             let mut dls = DocLenBlock::default();
             for s in 0..=255u8 {
                 dls.set(s, rng.random_range(1..=max_dl));
@@ -405,7 +433,7 @@ mod tests {
                     }
                 }
 
-                for count in [1usize, 7, 8, 15, 16, 17, 63, 95, 150, 256] {
+                for count in [1usize, 7, 8, 15, 16, 17, 33, 63, 76, 95, 150, 256] {
                     let mut slots: Vec<u8> = (0..=255u8).collect();
                     for i in 0..count {
                         let j = rng.random_range(i..256);
@@ -418,8 +446,12 @@ mod tests {
                     for &s in &slots {
                         blk.upsert(s, rng.random_range(1..=max_tf), &dls);
                     }
-                    let enc = blk.encode();
-                    let view = PostingBlockView::parse(&enc).unwrap();
+                    let enc_v3 = blk.encode();
+                    let enc_compact = blk.encode_compact();
+                    let views = [
+                        PostingBlockView::parse(&enc_v3).unwrap(),
+                        PostingBlockView::parse_compact(&enc_compact).unwrap(),
+                    ];
                     let num_scale = 3.75f32;
 
                     let mask = [
@@ -429,144 +461,148 @@ mod tests {
                         rng.random::<u64>(),
                     ];
 
-                    let mut ref_scores = [0.0f32; 256];
-                    let mut ref_touched = [0u64; 4];
-                    let mut ref_masked = [0.0f32; 256];
-                    match &view.payload {
-                        PostingBlockPayload::Sparse { slots, tfs_bytes } => {
-                            accumulate_sparse(
-                                SimdTier::Scalar,
-                                view.tf_width,
-                                slots,
-                                tfs_bytes,
-                                num_scale,
-                                &ref_dln,
-                                &mut ref_scores,
-                                &mut ref_touched,
-                            );
-                            accumulate_sparse_masked(
-                                SimdTier::Scalar,
-                                view.tf_width,
-                                slots,
-                                tfs_bytes,
-                                num_scale,
-                                &ref_dln,
-                                &mask,
-                                &mut ref_masked,
-                            );
-                        }
-                        PostingBlockPayload::Dense { bitmap, tfs_bytes } => {
-                            accumulate_dense_256(
-                                SimdTier::Scalar,
-                                view.tf_width,
-                                tfs_bytes,
-                                num_scale,
-                                &ref_dln,
-                                bitmap,
-                                &mut ref_scores,
-                                &mut ref_touched,
-                            );
-                            accumulate_dense_masked_256(
-                                SimdTier::Scalar,
-                                view.tf_width,
-                                tfs_bytes,
-                                num_scale,
-                                &ref_dln,
-                                bitmap,
-                                &mask,
-                                &mut ref_masked,
-                            );
-                        }
-                    }
-
-                    let ref_max = max_score_256(SimdTier::Scalar, &ref_scores, &mask);
-                    let ref_ge =
-                        filter_ge_256(SimdTier::Scalar, &ref_scores, &mask, ref_max * 0.5);
-
-                    for &tier in &tiers {
-                        let mut got_scores = [0.0f32; 256];
-                        let mut got_touched = [0u64; 4];
-                        let mut got_masked = [0.0f32; 256];
+                    for view in views {
+                        let mut ref_scores = [0.0f32; 256];
+                        let mut ref_touched = [0u64; 4];
+                        let mut ref_masked = [0.0f32; 256];
                         match &view.payload {
                             PostingBlockPayload::Sparse { slots, tfs_bytes } => {
                                 accumulate_sparse(
-                                    tier,
-                                    view.tf_width,
+                                    SimdTier::Scalar,
+                                    view.tf_enc,
                                     slots,
                                     tfs_bytes,
                                     num_scale,
                                     &ref_dln,
-                                    &mut got_scores,
-                                    &mut got_touched,
+                                    &mut ref_scores,
+                                    &mut ref_touched,
                                 );
                                 accumulate_sparse_masked(
-                                    tier,
-                                    view.tf_width,
+                                    SimdTier::Scalar,
+                                    view.tf_enc,
                                     slots,
                                     tfs_bytes,
                                     num_scale,
                                     &ref_dln,
                                     &mask,
-                                    &mut got_masked,
+                                    &mut ref_masked,
                                 );
                             }
                             PostingBlockPayload::Dense { bitmap, tfs_bytes } => {
                                 accumulate_dense_256(
-                                    tier,
-                                    view.tf_width,
+                                    SimdTier::Scalar,
+                                    view.tf_enc,
                                     tfs_bytes,
                                     num_scale,
                                     &ref_dln,
                                     bitmap,
-                                    &mut got_scores,
-                                    &mut got_touched,
+                                    &mut ref_scores,
+                                    &mut ref_touched,
                                 );
                                 accumulate_dense_masked_256(
-                                    tier,
-                                    view.tf_width,
+                                    SimdTier::Scalar,
+                                    view.tf_enc,
                                     tfs_bytes,
                                     num_scale,
                                     &ref_dln,
                                     bitmap,
                                     &mask,
-                                    &mut got_masked,
+                                    &mut ref_masked,
                                 );
                             }
                         }
 
-                        assert_eq!(got_touched, ref_touched);
-                        for i in 0..256 {
-                            assert!(
-                                (got_scores[i] - ref_scores[i]).abs() <= 1e-6,
-                                "tier={tier:?} count={count} slot={i}: {} vs {}",
-                                got_scores[i],
-                                ref_scores[i]
-                            );
-                            assert!(
-                                (got_masked[i] - ref_masked[i]).abs() <= 1e-6,
-                                "masked tier={tier:?} count={count} slot={i}: {} vs {}",
-                                got_masked[i],
-                                ref_masked[i]
-                            );
-                        }
+                        let ref_max = max_score_256(SimdTier::Scalar, &ref_scores, &mask);
+                        let ref_ge =
+                            filter_ge_256(SimdTier::Scalar, &ref_scores, &mask, ref_max * 0.5);
 
-                        let got_max = max_score_256(tier, &got_scores, &mask);
-                        assert!((got_max - ref_max).abs() <= 1e-6);
-                        let got_ge = filter_ge_256(tier, &got_scores, &mask, ref_max * 0.5);
-                        assert_eq!(got_ge, ref_ge);
+                        for &tier in &tiers {
+                            let mut got_scores = [0.0f32; 256];
+                            let mut got_touched = [0u64; 4];
+                            let mut got_masked = [0.0f32; 256];
+                            match &view.payload {
+                                PostingBlockPayload::Sparse { slots, tfs_bytes } => {
+                                    accumulate_sparse(
+                                        tier,
+                                        view.tf_enc,
+                                        slots,
+                                        tfs_bytes,
+                                        num_scale,
+                                        &ref_dln,
+                                        &mut got_scores,
+                                        &mut got_touched,
+                                    );
+                                    accumulate_sparse_masked(
+                                        tier,
+                                        view.tf_enc,
+                                        slots,
+                                        tfs_bytes,
+                                        num_scale,
+                                        &ref_dln,
+                                        &mask,
+                                        &mut got_masked,
+                                    );
+                                }
+                                PostingBlockPayload::Dense { bitmap, tfs_bytes } => {
+                                    accumulate_dense_256(
+                                        tier,
+                                        view.tf_enc,
+                                        tfs_bytes,
+                                        num_scale,
+                                        &ref_dln,
+                                        bitmap,
+                                        &mut got_scores,
+                                        &mut got_touched,
+                                    );
+                                    accumulate_dense_masked_256(
+                                        tier,
+                                        view.tf_enc,
+                                        tfs_bytes,
+                                        num_scale,
+                                        &ref_dln,
+                                        bitmap,
+                                        &mask,
+                                        &mut got_masked,
+                                    );
+                                }
+                            }
 
-                        let mut dst_max = ref_masked;
-                        let mut ref_dst_max = ref_masked;
-                        merge_max_256(tier, &mut dst_max, &ref_scores);
-                        merge_max_256(SimdTier::Scalar, &mut ref_dst_max, &ref_scores);
-                        assert_eq!(dst_max, ref_dst_max);
+                            assert_eq!(got_touched, ref_touched);
+                            for i in 0..256 {
+                                assert!(
+                                    (got_scores[i] - ref_scores[i]).abs() <= 1e-6,
+                                    "tier={tier:?} tf_enc={:?} count={count} slot={i}: {} vs {}",
+                                    view.tf_enc,
+                                    got_scores[i],
+                                    ref_scores[i]
+                                );
+                                assert!(
+                                    (got_masked[i] - ref_masked[i]).abs() <= 1e-6,
+                                    "masked tier={tier:?} tf_enc={:?} count={count} slot={i}: {} vs {}",
+                                    view.tf_enc,
+                                    got_masked[i],
+                                    ref_masked[i]
+                                );
+                            }
 
-                        let mut dst_add = ref_masked;
-                        let mut ref_dst_add = ref_masked;
-                        merge_add_256(tier, &mut dst_add, &ref_scores);
-                        merge_add_256(SimdTier::Scalar, &mut ref_dst_add, &ref_scores);
-                        for i in 0..256 {
-                            assert!((dst_add[i] - ref_dst_add[i]).abs() <= 1e-6);
+                            let got_max = max_score_256(tier, &got_scores, &mask);
+                            assert!((got_max - ref_max).abs() <= 1e-6);
+                            let got_ge = filter_ge_256(tier, &got_scores, &mask, ref_max * 0.5);
+                            assert_eq!(got_ge, ref_ge);
+
+                            let mut dst_max = ref_masked;
+                            let mut ref_dst_max = ref_masked;
+                            merge_max_256(tier, &mut dst_max, &ref_scores);
+                            merge_max_256(SimdTier::Scalar, &mut ref_dst_max, &ref_scores);
+                            assert_eq!(dst_max, ref_dst_max);
+
+                            let mut dst_add = ref_masked;
+                            let mut ref_dst_add = ref_masked;
+                            merge_add_256(tier, &mut dst_add, &ref_scores);
+                            merge_add_256(SimdTier::Scalar, &mut ref_dst_add, &ref_scores);
+                            for i in 0..256 {
+                                assert!((dst_add[i] - ref_dst_add[i]).abs() <= 1e-6);
+                            }
                         }
                     }
                 }

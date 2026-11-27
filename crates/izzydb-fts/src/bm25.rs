@@ -123,7 +123,7 @@ impl Bm25TermScorer {
             PostingBlockPayload::Dense { bitmap, tfs_bytes } => {
                 accumulate_dense_256(
                     tier,
-                    view.tf_width,
+                    view.tf_enc,
                     tfs_bytes,
                     self.num_scale,
                     dl_norm,
@@ -135,7 +135,7 @@ impl Bm25TermScorer {
             PostingBlockPayload::Sparse { slots, tfs_bytes } => {
                 accumulate_sparse(
                     tier,
-                    view.tf_width,
+                    view.tf_enc,
                     slots,
                     tfs_bytes,
                     self.num_scale,
@@ -164,7 +164,7 @@ impl Bm25TermScorer {
             PostingBlockPayload::Dense { bitmap, tfs_bytes } => {
                 accumulate_dense_masked_256(
                     tier,
-                    view.tf_width,
+                    view.tf_enc,
                     tfs_bytes,
                     self.num_scale,
                     dl_norm,
@@ -176,7 +176,7 @@ impl Bm25TermScorer {
             PostingBlockPayload::Sparse { slots, tfs_bytes } => {
                 accumulate_sparse_masked(
                     tier,
-                    view.tf_width,
+                    view.tf_enc,
                     slots,
                     tfs_bytes,
                     self.num_scale,

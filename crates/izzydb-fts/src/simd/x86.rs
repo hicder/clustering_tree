@@ -1,15 +1,75 @@
 use izzydb_core::config::FTS_BLOCK_SIZE;
 
-use crate::block::IntWidth;
+use crate::block::{IntWidth, TfEncoding};
 
 use super::scalar::{
     accumulate_active_bits_scalar, accumulate_dense_256_scalar, accumulate_sparse_scalar,
     prepare_dl_norm_256_scalar,
 };
 
+#[inline]
+fn tf_tail_slice(tf_enc: TfEncoding, tfs_bytes: &[u8], i: usize) -> &[u8] {
+    match tf_enc {
+        TfEncoding::TfOne => &[],
+        TfEncoding::U2 => &tfs_bytes[i >> 2..],
+        TfEncoding::U4 => &tfs_bytes[i >> 1..],
+        TfEncoding::U8 => &tfs_bytes[i..],
+        TfEncoding::U16 => &tfs_bytes[i * 2..],
+        TfEncoding::U32 => &tfs_bytes[i * 4..],
+    }
+}
+
 // ============================================================================
 // x86_64 AVX-512F implementations
 // ============================================================================
+
+#[target_feature(enable = "avx512f")]
+#[inline]
+unsafe fn load_16_tf_as_f32_avx512(
+    tf_enc: TfEncoding,
+    ptr: *const u8,
+    idx: usize,
+) -> std::arch::x86_64::__m512 {
+    use std::arch::x86_64::*;
+    unsafe {
+        match tf_enc {
+            TfEncoding::TfOne => _mm512_set1_ps(1.0),
+            TfEncoding::U2 => {
+                let packed = std::ptr::read_unaligned(ptr.add(idx >> 2) as *const u32);
+                let v_raw = _mm512_set1_epi32(packed as i32);
+                let shifts = _mm512_setr_epi32(
+                    0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30,
+                );
+                let v_u2 = _mm512_and_epi32(_mm512_srlv_epi32(v_raw, shifts), _mm512_set1_epi32(3));
+                _mm512_cvtepi32_ps(_mm512_add_epi32(v_u2, _mm512_set1_epi32(1)))
+            }
+            TfEncoding::U4 => {
+                let lo = std::ptr::read_unaligned(ptr.add(idx >> 1) as *const u32) as i32;
+                let hi = std::ptr::read_unaligned(ptr.add((idx >> 1) + 4) as *const u32) as i32;
+                let v_raw = _mm512_set_epi32(
+                    hi, hi, hi, hi, hi, hi, hi, hi, lo, lo, lo, lo, lo, lo, lo, lo,
+                );
+                let shifts = _mm512_setr_epi32(
+                    0, 4, 8, 12, 16, 20, 24, 28, 0, 4, 8, 12, 16, 20, 24, 28,
+                );
+                let v_u4 = _mm512_and_epi32(_mm512_srlv_epi32(v_raw, shifts), _mm512_set1_epi32(15));
+                _mm512_cvtepi32_ps(_mm512_add_epi32(v_u4, _mm512_set1_epi32(1)))
+            }
+            TfEncoding::U8 => {
+                let v = _mm_loadu_si128(ptr.add(idx) as *const __m128i);
+                _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(v))
+            }
+            TfEncoding::U16 => {
+                let v = _mm256_loadu_si256(ptr.add(idx * 2) as *const __m256i);
+                _mm512_cvtepi32_ps(_mm512_cvtepu16_epi32(v))
+            }
+            TfEncoding::U32 => {
+                let v = _mm512_loadu_si512(ptr.add(idx * 4) as *const __m512i);
+                _mm512_cvtepu32_ps(v)
+            }
+        }
+    }
+}
 
 #[target_feature(enable = "avx512f")]
 #[inline]
@@ -64,7 +124,7 @@ pub(super) unsafe fn prepare_dl_norm_256_avx512(
 
 #[target_feature(enable = "avx512f")]
 pub(super) unsafe fn accumulate_dense_256_avx512(
-    width: IntWidth,
+    tf_enc: TfEncoding,
     tfs_bytes: &[u8],
     num_scale: f32,
     dl_norm: &[f32; FTS_BLOCK_SIZE],
@@ -76,6 +136,12 @@ pub(super) unsafe fn accumulate_dense_256_avx512(
     let tf_ptr = tfs_bytes.as_ptr();
     let dln_ptr = dl_norm.as_ptr();
     let sc_ptr = scores.as_mut_ptr();
+    if matches!(tf_enc, TfEncoding::TfOne | TfEncoding::U2 | TfEncoding::U4) {
+        unsafe {
+            accumulate_dense_masked_avx512(tf_enc, tfs_bytes, num_scale, dl_norm, bitmap, scores);
+        }
+        return;
+    }
     for (w, &bw) in bitmap.iter().enumerate() {
         if bw == 0 {
             continue;
@@ -84,7 +150,7 @@ pub(super) unsafe fn accumulate_dense_256_avx512(
         for chunk in 0..4 {
             let i = base + (chunk << 4);
             unsafe {
-                let v_tf = load_16_int_as_f32_avx512(width, tf_ptr, i);
+                let v_tf = load_16_tf_as_f32_avx512(tf_enc, tf_ptr, i);
                 let v_dln = _mm512_loadu_ps(dln_ptr.add(i));
                 let v_cur = _mm512_loadu_ps(sc_ptr.add(i));
                 let v_num = _mm512_mul_ps(v_scale, v_tf);
@@ -98,7 +164,7 @@ pub(super) unsafe fn accumulate_dense_256_avx512(
 
 #[target_feature(enable = "avx512f")]
 pub(super) unsafe fn accumulate_dense_masked_avx512(
-    width: IntWidth,
+    tf_enc: TfEncoding,
     tfs_bytes: &[u8],
     num_scale: f32,
     dl_norm: &[f32; FTS_BLOCK_SIZE],
@@ -122,7 +188,7 @@ pub(super) unsafe fn accumulate_dense_masked_avx512(
             }
             let i = base + (chunk << 4);
             unsafe {
-                let v_tf = load_16_int_as_f32_avx512(width, tf_ptr, i);
+                let v_tf = load_16_tf_as_f32_avx512(tf_enc, tf_ptr, i);
                 let v_dln = _mm512_loadu_ps(dln_ptr.add(i));
                 let v_cur = _mm512_loadu_ps(sc_ptr.add(i));
                 let v_delta = _mm512_div_ps(_mm512_mul_ps(v_scale, v_tf), _mm512_add_ps(v_tf, v_dln));
@@ -135,7 +201,7 @@ pub(super) unsafe fn accumulate_dense_masked_avx512(
 
 #[target_feature(enable = "avx512f")]
 pub(super) unsafe fn accumulate_sparse_avx512(
-    width: IntWidth,
+    tf_enc: TfEncoding,
     slots: &[u8],
     tfs_bytes: &[u8],
     num_scale: f32,
@@ -155,7 +221,7 @@ pub(super) unsafe fn accumulate_sparse_avx512(
         }
         let mut res = [0.0f32; 16];
         unsafe {
-            let v_tf = load_16_int_as_f32_avx512(width, tf_ptr, i);
+            let v_tf = load_16_tf_as_f32_avx512(tf_enc, tf_ptr, i);
             let v_dln = _mm512_loadu_ps(dln_buf.as_ptr());
             let v_res = _mm512_div_ps(_mm512_mul_ps(v_scale, v_tf), _mm512_add_ps(v_tf, v_dln));
             _mm512_storeu_ps(res.as_mut_ptr(), v_res);
@@ -169,9 +235,9 @@ pub(super) unsafe fn accumulate_sparse_avx512(
     }
     if i < n {
         accumulate_sparse_scalar(
-            width,
+            tf_enc,
             &slots[i..],
-            &tfs_bytes[i * width.byte_size()..],
+            tf_tail_slice(tf_enc, tfs_bytes, i),
             num_scale,
             dl_norm,
             scores,
@@ -312,6 +378,53 @@ pub(super) unsafe fn merge_add_256_avx512(
 
 #[target_feature(enable = "avx2")]
 #[inline]
+unsafe fn load_8_tf_as_f32_avx2(
+    tf_enc: TfEncoding,
+    ptr: *const u8,
+    idx: usize,
+) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    unsafe {
+        match tf_enc {
+            TfEncoding::TfOne => _mm256_set1_ps(1.0),
+            TfEncoding::U2 => {
+                let packed = std::ptr::read_unaligned(ptr.add(idx >> 2) as *const u16) as i32;
+                let v_raw = _mm256_set1_epi32(packed);
+                let shifts = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+                let v_u2 = _mm256_and_si256(
+                    _mm256_srlv_epi32(v_raw, shifts),
+                    _mm256_set1_epi32(3),
+                );
+                _mm256_cvtepi32_ps(_mm256_add_epi32(v_u2, _mm256_set1_epi32(1)))
+            }
+            TfEncoding::U4 => {
+                let packed = std::ptr::read_unaligned(ptr.add(idx >> 1) as *const u32) as i32;
+                let v_raw = _mm256_set1_epi32(packed);
+                let shifts = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
+                let v_u4 = _mm256_and_si256(
+                    _mm256_srlv_epi32(v_raw, shifts),
+                    _mm256_set1_epi32(15),
+                );
+                _mm256_cvtepi32_ps(_mm256_add_epi32(v_u4, _mm256_set1_epi32(1)))
+            }
+            TfEncoding::U8 => {
+                let v = _mm_loadl_epi64(ptr.add(idx) as *const __m128i);
+                _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(v))
+            }
+            TfEncoding::U16 => {
+                let v = _mm_loadu_si128(ptr.add(idx * 2) as *const __m128i);
+                _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(v))
+            }
+            TfEncoding::U32 => {
+                let v = _mm256_loadu_si256(ptr.add(idx * 4) as *const __m256i);
+                _mm256_cvtepi32_ps(v)
+            }
+        }
+    }
+}
+
+#[target_feature(enable = "avx2")]
+#[inline]
 unsafe fn load_8_int_as_f32_avx2(
     width: IntWidth,
     ptr: *const u8,
@@ -373,15 +486,21 @@ pub(super) unsafe fn prepare_dl_norm_256_avx2(
 
 #[target_feature(enable = "avx2,fma")]
 pub(super) unsafe fn accumulate_dense_256_avx2(
-    width: IntWidth,
+    tf_enc: TfEncoding,
     tfs_bytes: &[u8],
     num_scale: f32,
     dl_norm: &[f32; FTS_BLOCK_SIZE],
     bitmap: &[u64; 4],
     scores: &mut [f32; FTS_BLOCK_SIZE],
 ) {
-    if width == IntWidth::U32 && !slice_u32_fits_i32(tfs_bytes) {
-        accumulate_dense_256_scalar(width, tfs_bytes, num_scale, dl_norm, bitmap, scores);
+    if matches!(tf_enc, TfEncoding::TfOne | TfEncoding::U2 | TfEncoding::U4) {
+        unsafe {
+            accumulate_dense_masked_avx2(tf_enc, tfs_bytes, num_scale, dl_norm, bitmap, scores);
+        }
+        return;
+    }
+    if tf_enc == TfEncoding::U32 && !slice_u32_fits_i32(tfs_bytes) {
+        accumulate_dense_256_scalar(tf_enc, tfs_bytes, num_scale, dl_norm, bitmap, scores);
         return;
     }
     use std::arch::x86_64::*;
@@ -397,7 +516,7 @@ pub(super) unsafe fn accumulate_dense_256_avx2(
         for chunk in 0..8 {
             let i = base + (chunk << 3);
             unsafe {
-                let v_tf = load_8_int_as_f32_avx2(width, tf_ptr, i);
+                let v_tf = load_8_tf_as_f32_avx2(tf_enc, tf_ptr, i);
                 let v_dln = _mm256_loadu_ps(dln_ptr.add(i));
                 let v_cur = _mm256_loadu_ps(sc_ptr.add(i));
                 let v_new = _mm256_add_ps(
@@ -412,15 +531,15 @@ pub(super) unsafe fn accumulate_dense_256_avx2(
 
 #[target_feature(enable = "avx2,fma")]
 pub(super) unsafe fn accumulate_dense_masked_avx2(
-    width: IntWidth,
+    tf_enc: TfEncoding,
     tfs_bytes: &[u8],
     num_scale: f32,
     dl_norm: &[f32; FTS_BLOCK_SIZE],
     active: &[u64; 4],
     scores: &mut [f32; FTS_BLOCK_SIZE],
 ) {
-    if width == IntWidth::U32 && !slice_u32_fits_i32(tfs_bytes) {
-        accumulate_active_bits_scalar(width, tfs_bytes, num_scale, dl_norm, active, scores);
+    if tf_enc == TfEncoding::U32 && !slice_u32_fits_i32(tfs_bytes) {
+        accumulate_active_bits_scalar(tf_enc, tfs_bytes, num_scale, dl_norm, active, scores);
         return;
     }
     use std::arch::x86_64::*;
@@ -441,7 +560,7 @@ pub(super) unsafe fn accumulate_dense_masked_avx2(
             }
             let i = base + (chunk << 3);
             unsafe {
-                let v_tf = load_8_int_as_f32_avx2(width, tf_ptr, i);
+                let v_tf = load_8_tf_as_f32_avx2(tf_enc, tf_ptr, i);
                 let v_dln = _mm256_loadu_ps(dln_ptr.add(i));
                 let v_cur = _mm256_loadu_ps(sc_ptr.add(i));
                 let mut v_delta =
@@ -461,7 +580,7 @@ pub(super) unsafe fn accumulate_dense_masked_avx2(
 
 #[target_feature(enable = "avx2,fma")]
 pub(super) unsafe fn accumulate_sparse_avx2(
-    width: IntWidth,
+    tf_enc: TfEncoding,
     slots: &[u8],
     tfs_bytes: &[u8],
     num_scale: f32,
@@ -469,8 +588,8 @@ pub(super) unsafe fn accumulate_sparse_avx2(
     scores: &mut [f32; FTS_BLOCK_SIZE],
     touched: &mut [u64; 4],
 ) {
-    if width == IntWidth::U32 && !slice_u32_fits_i32(tfs_bytes) {
-        accumulate_sparse_scalar(width, slots, tfs_bytes, num_scale, dl_norm, scores, touched);
+    if tf_enc == TfEncoding::U32 && !slice_u32_fits_i32(tfs_bytes) {
+        accumulate_sparse_scalar(tf_enc, slots, tfs_bytes, num_scale, dl_norm, scores, touched);
         return;
     }
     use std::arch::x86_64::*;
@@ -485,7 +604,7 @@ pub(super) unsafe fn accumulate_sparse_avx2(
         }
         let mut res = [0.0f32; 8];
         unsafe {
-            let v_tf = load_8_int_as_f32_avx2(width, tf_ptr, i);
+            let v_tf = load_8_tf_as_f32_avx2(tf_enc, tf_ptr, i);
             let v_dln = _mm256_loadu_ps(dln_buf.as_ptr());
             let v_res = _mm256_div_ps(_mm256_mul_ps(v_scale, v_tf), _mm256_add_ps(v_tf, v_dln));
             _mm256_storeu_ps(res.as_mut_ptr(), v_res);
@@ -499,9 +618,9 @@ pub(super) unsafe fn accumulate_sparse_avx2(
     }
     if i < n {
         accumulate_sparse_scalar(
-            width,
+            tf_enc,
             &slots[i..],
-            &tfs_bytes[i * width.byte_size()..],
+            tf_tail_slice(tf_enc, tfs_bytes, i),
             num_scale,
             dl_norm,
             scores,

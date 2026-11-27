@@ -1302,3 +1302,101 @@ fn test_fts_inline_term_promotion_across_segments() {
     let bm25 = col.query_bm25(&RankBy::bm25("body", "quasar"), None, 20).unwrap();
     assert_eq!(bm25.len(), rare_ids.len());
 }
+
+#[test]
+fn test_fts_parallel_multi_segment_parity_and_ties() {
+    let dir = TempDir::new().unwrap();
+    let cfg = CollectionConfig::without_vectors()
+        .with_segment_config(SegmentConfig {
+            seal_rows: 64,
+            ..SegmentConfig::default()
+        })
+        .with_attribute("bucket", AttributeType::Uint, true)
+        .with_fts_attribute("body", AttributeType::String, false, FullTextSearchConfig::default());
+
+    let vocab = [
+        "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
+        "lambda", "mu", "nu", "xi", "omicron", "pi", "rho", "sigma", "tau", "upsilon",
+    ];
+    let mut rng = SmallRng::seed_from_u64(90210);
+    let mut oracle: HashMap<DocId, (Vec<f32>, Attributes)> = HashMap::new();
+    let mut col = Collection::open(dir.path(), cfg).unwrap();
+
+    // 450 docs across 8 segments (seal_rows=64) -> triggers parallel segment MAXSCORE (>= 4 segs).
+    for i in 0..450u64 {
+        let id = 10_000 - i * 7;
+        let mut attrs = Attributes::new();
+        attrs.insert("bucket".into(), (i % 4).into());
+        let body = if i % 45 == 0 {
+            // Identical text across multiple segments to exercise cross-shard DocId tie-breaking.
+            "alpha beta gamma delta".to_string()
+        } else {
+            let len = rng.random_range(4..=14);
+            (0..len)
+                .map(|_| vocab[rng.random_range(0..vocab.len())])
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        attrs.insert("body".into(), body.into());
+        col.upsert(id, None, attrs.clone()).unwrap();
+        oracle.insert(id, (Vec::new(), attrs));
+    }
+
+    // Delete a few docs across segments so liveness masks are active on some segments.
+    for i in (0..450u64).step_by(19) {
+        let id = 10_000 - i * 7;
+        col.delete(id).unwrap();
+        oracle.remove(&id);
+    }
+
+    let fts_helper = izzydb::FtsIndex::new();
+    let schema = col.schema();
+    let queries = [
+        (
+            RankBy::bm25("body", "alpha beta gamma delta epsilon zeta eta theta"),
+            None,
+        ),
+        (
+            RankBy::bm25("body", "alpha beta gamma delta"),
+            Some(Filter::Eq("bucket".into(), 0u64.into())),
+        ),
+        (
+            RankBy::bm25_with(
+                "body",
+                "alpha lam",
+                Bm25Overrides::default().with_last_as_prefix(true),
+            ),
+            None,
+        ),
+        (
+            RankBy::Max(vec![
+                RankBy::bm25("body", "alpha kappa"),
+                RankBy::bm25("body", "sigma tau"),
+            ]),
+            None,
+        ),
+    ];
+
+    for (rank_by, filter) in &queries {
+        let got = col.query_bm25(rank_by, filter.as_ref(), 15).unwrap();
+        let expected = brute_force_bm25_eval(
+            &oracle,
+            schema,
+            rank_by,
+            filter.as_ref(),
+            &fts_helper,
+            15,
+        );
+        assert_eq!(got.len(), expected.len(), "len mismatch for {rank_by:?}");
+        for (g, e) in got.iter().zip(expected.iter()) {
+            assert_eq!(g.id, e.id, "id mismatch for {rank_by:?}");
+            assert!(
+                (g.score - e.score).abs() <= 1e-4,
+                "score mismatch for doc {}: {} vs {}",
+                g.id,
+                g.score,
+                e.score
+            );
+        }
+    }
+}

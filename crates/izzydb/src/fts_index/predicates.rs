@@ -8,8 +8,7 @@ use izzydb_core::config::{AttrId, RowBlock, RowId, SegmentId, TermId, for_each_s
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::rowset::{Liveness, RowSet};
 use izzydb_fts::{
-    FtsPostingSource, PositionBlockView,
-    PostingBlockView, QueryToken, TermRecord,
+    FtsChunkView, FtsPostingSource, PositionBlockView, PostingBlockView, QueryToken, TermRecord,
 };
 use izzydb_storage::codec::fts_block_key_coord;
 use izzydb_storage::{
@@ -280,9 +279,8 @@ pub(super) fn eval_any_token_records(
     records: &[TermRecord],
 ) -> Result<RowSet> {
     let mut by_seg: BTreeMap<SegmentId, RoaringBitmap> = BTreeMap::new();
-    let mut add_block = |block_id: RowBlock, bytes: &[u8]| -> Result<()> {
+    let mut add_block = |block_id: RowBlock, view: &PostingBlockView<'_>| -> Result<()> {
         let Some(live_mask) = snap.block_live_mask(block_id.seg(), block_id.block()) else {
-            let view = PostingBlockView::parse(bytes)?;
             let bm = by_seg.entry(block_id.seg()).or_default();
             let base = block_id.block() << 8;
             view.for_each_slot(|slot| {
@@ -294,7 +292,7 @@ pub(super) fn eval_any_token_records(
             return Ok(());
         }
         let mut mask = [0u64; 4];
-        PostingBlockView::parse(bytes)?.or_slots_into_mask(&mut mask);
+        view.or_slots_into_mask(&mut mask);
         for w in 0..4 {
             mask[w] &= live_mask[w];
         }
@@ -313,10 +311,17 @@ pub(super) fn eval_any_token_records(
             continue;
         }
         if let Some((block_id, ref ib_bytes)) = rec.inline_block {
-            add_block(block_id, ib_bytes)?;
+            let view = PostingBlockView::parse(ib_bytes)?;
+            add_block(block_id, &view)?;
         } else {
-            storage.visit_fts_postings_for_term(rec.term_id, |block_id, bytes| {
-                add_block(block_id, bytes)
+            storage.visit_fts_chunks_for_term(rec.term_id, |chunk, chunk_bytes| {
+                let cv = FtsChunkView::parse(chunk_bytes)?;
+                for i in 0..cv.count {
+                    let block_id = chunk.block(cv.rel_block_id(i));
+                    let view = PostingBlockView::parse_compact(cv.block_bytes(i))?;
+                    add_block(block_id, &view)?;
+                }
+                Ok(())
             })?;
         }
     }
@@ -343,10 +348,14 @@ pub(super) fn eval_all_tokens_blocks(
                 let mask = by_block.entry(block_id).or_insert([0u64; 4]);
                 view.or_slots_into_mask(mask);
             } else {
-                storage.visit_fts_postings_for_term(rec.term_id, |block_id, bytes| {
-                    let view = PostingBlockView::parse(bytes)?;
-                    let mask = by_block.entry(block_id).or_insert([0u64; 4]);
-                    view.or_slots_into_mask(mask);
+                storage.visit_fts_chunks_for_term(rec.term_id, |chunk, chunk_bytes| {
+                    let cv = FtsChunkView::parse(chunk_bytes)?;
+                    for i in 0..cv.count {
+                        let block_id = chunk.block(cv.rel_block_id(i));
+                        let view = PostingBlockView::parse_compact(cv.block_bytes(i))?;
+                        let mask = by_block.entry(block_id).or_insert([0u64; 4]);
+                        view.or_slots_into_mask(mask);
+                    }
                     Ok(())
                 })?;
             }
@@ -431,8 +440,8 @@ pub(super) fn eval_all_tokens_blocks(
         if mask != [0u64; 4] {
             for (_, cur) in &mut cursors {
                 let mut cur_mask = [0u64; 4];
-                if let Some(bytes) = cur.current_posting_bytes()? {
-                    PostingBlockView::parse(bytes)?.or_slots_into_mask(&mut cur_mask);
+                if let Some(view) = cur.current_posting_view()? {
+                    view.or_slots_into_mask(&mut cur_mask);
                 }
                 for w in 0..4 {
                     mask[w] &= cur_mask[w];
@@ -452,9 +461,9 @@ pub(super) fn eval_all_tokens_blocks(
                     pcur.seek_block(target)?;
                 }
                 if pcur.current_block_id() == Some(target)
-                    && let Some(bytes) = pcur.current_posting_bytes()?
+                    && let Some(view) = pcur.current_posting_view()?
                 {
-                    PostingBlockView::parse(bytes)?.or_slots_into_mask(&mut prefix_mask);
+                    view.or_slots_into_mask(&mut prefix_mask);
                 }
             }
             for w in 0..4 {

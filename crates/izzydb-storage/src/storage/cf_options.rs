@@ -40,7 +40,7 @@ pub(super) fn cf_options_with_filters(
             prefix_cf_opts(block_cache, DETACHED_POSTING_PREFIX_LEN, true)
         }
         CF_FTS_TERMS => prefix_cf_opts(block_cache, 2, false),
-        CF_FTS_SKIPS | CF_FTS_POSTINGS => prefix_cf_opts(block_cache, 4, true),
+        CF_FTS_SKIPS | CF_FTS_POSTINGS => prefix_cf_opts_no_filter(block_cache, 4, true),
         CF_FTS_POSITIONS => prefix_cf_opts(block_cache, 4, false),
         other => {
             return Err(TreeError::InvalidConfig(format!(
@@ -101,6 +101,25 @@ fn prefix_cf_opts(block_cache: &Cache, prefix_len: usize, disable_compression: b
     bbo.set_block_cache(block_cache);
     bbo.set_bloom_filter(10.0, false);
     bbo.set_whole_key_filtering(true);
+    bbo.set_cache_index_and_filter_blocks(true);
+    bbo.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    opts.set_block_based_table_factory(&bbo);
+    opts
+}
+
+fn prefix_cf_opts_no_filter(
+    block_cache: &Cache,
+    prefix_len: usize,
+    disable_compression: bool,
+) -> Options {
+    let mut opts = Options::default();
+    opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(prefix_len));
+    if disable_compression {
+        opts.set_compression_type(DBCompressionType::None);
+    }
+
+    let mut bbo = BlockBasedOptions::default();
+    bbo.set_block_cache(block_cache);
     bbo.set_cache_index_and_filter_blocks(true);
     bbo.set_pin_l0_filter_and_index_blocks_in_cache(true);
     opts.set_block_based_table_factory(&bbo);

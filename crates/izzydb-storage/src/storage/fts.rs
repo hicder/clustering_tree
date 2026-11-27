@@ -9,14 +9,14 @@ use rocksdb::{
 };
 
 use izzydb_core::config::{
-    AttrId, RowBlock, TermId,
+    AttrId, RowBlock, SegmentId, SkipChunk, TermId,
 };
 use izzydb_core::error::{Result, TreeError};
 use izzydb_fts::TermRecord;
 
 use crate::codec::{
     FTS_DOC_LEN_TAG,
-    decode_fts_block_key, encode_fts_term_id_prefix, fts_block_key_coord,
+    decode_fts_block_key, decode_fts_chunk_key, encode_fts_term_id_prefix, fts_block_key_coord,
 };
 
 
@@ -101,6 +101,35 @@ impl Storage {
         self.scan_cf(CF_FTS_TERMS, |k| Ok(k.to_vec()), |v| Ok(v.to_vec()))
     }
 
+    pub fn visit_fts_chunks_for_term(
+        &self,
+        term_id: TermId,
+        mut visit: impl FnMut(SkipChunk, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let cf = self.cf(CF_FTS_SKIPS)?;
+        let prefix = encode_fts_term_id_prefix(term_id);
+        let mut ro = ReadOptions::default();
+        ro.set_prefix_same_as_start(true);
+        if let Some(next_t) = term_id.checked_add(1) {
+            ro.set_iterate_upper_bound(next_t.to_be_bytes());
+        }
+        let iter = self
+            .db
+            .iterator_cf_opt(cf, ro, IteratorMode::From(&prefix, Direction::Forward));
+        for item in iter {
+            let (k, v) = item.map_err(map_db_err)?;
+            if k.len() != 12 || k[0..4] != prefix {
+                break;
+            }
+            let (tid, chunk) = decode_fts_chunk_key(&k)?;
+            if tid != term_id {
+                break;
+            }
+            visit(chunk, &v)?;
+        }
+        Ok(())
+    }
+
     pub fn visit_fts_postings_for_term(
         &self,
         term_id: TermId,
@@ -155,16 +184,44 @@ impl Storage {
     }
 
     pub fn open_fts_skip_cursor(&self, record: TermRecord) -> Result<RocksSkipCursor<'_>> {
+        self.open_fts_skip_cursor_in_range(record, 0, SegmentId::MAX)
+    }
+
+    pub fn open_fts_skip_cursor_in_range(
+        &self,
+        record: TermRecord,
+        seg_start: SegmentId,
+        seg_end: SegmentId,
+    ) -> Result<RocksSkipCursor<'_>> {
         if let Some((bid, bytes)) = record.inline_block {
-            return RocksSkipCursor::from_inline(&self.db, record.term_id, bid, bytes);
+            return RocksSkipCursor::from_inline(
+                &self.db,
+                record.term_id,
+                bid,
+                bytes,
+                seg_start,
+                seg_end,
+            );
         }
-        RocksSkipCursor::open_out_of_line(&self.db, record.term_id)
+        RocksSkipCursor::open_out_of_line_range(&self.db, record.term_id, seg_start, seg_end)
     }
 
     pub fn open_fts_skip_cursors(&self, records: &[TermRecord]) -> Result<Vec<RocksSkipCursor<'_>>> {
         records
             .iter()
             .map(|r| self.open_fts_skip_cursor(r.clone()))
+            .collect()
+    }
+
+    pub fn open_fts_skip_cursors_in_range(
+        &self,
+        records: &[TermRecord],
+        seg_start: SegmentId,
+        seg_end: SegmentId,
+    ) -> Result<Vec<RocksSkipCursor<'_>>> {
+        records
+            .iter()
+            .map(|r| self.open_fts_skip_cursor_in_range(r.clone(), seg_start, seg_end))
             .collect()
     }
 

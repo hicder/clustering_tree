@@ -1,15 +1,17 @@
 use rocksdb::{DB, DBPinnableSlice, DBRawIteratorWithThreadMode, ReadOptions};
 
-use izzydb_core::config::{RowBlock, SkipChunk, TermId};
+use izzydb_core::config::{RowBlock, SegmentId, SkipChunk, TermId};
 use izzydb_core::error::{Result, TreeError};
-use izzydb_fts::{PostingBlockHeader, SkipBlockLayout, SkipBlockView};
+use izzydb_fts::{
+    FtsChunkLayout, PostingBlockHeader, PostingBlockView,
+};
 
-use crate::codec::{encode_fts_term_id_prefix, fts_block_key_coord, fts_chunk_key_coord};
+use crate::codec::{encode_fts_term_id_prefix, fts_chunk_key, fts_chunk_key_coord};
 
 use super::types::{DocLenBlockTable, map_db_err};
-use super::{CF_FTS_POSTINGS, CF_FTS_SKIPS};
+use super::CF_FTS_SKIPS;
 
-const SEQUENTIAL_POSTING_STEP_LIMIT: usize = 4;
+const SEQUENTIAL_CHUNK_STEP_LIMIT: usize = 4;
 
 enum CursorSource<'a> {
     Inline {
@@ -21,21 +23,38 @@ enum CursorSource<'a> {
 
 struct OutOfLineState<'a> {
     skip_iter: Option<DBRawIteratorWithThreadMode<'a, DB>>,
-    chunk_layout: Option<SkipBlockLayout>,
+    chunk_buf: Vec<u8>,
+    chunk_layout: Option<FtsChunkLayout>,
     chunk: SkipChunk,
     entry_idx: usize,
     entry_count: usize,
-    posting_iter: Option<DBRawIteratorWithThreadMode<'a, DB>>,
-    posting_pos: Option<RowBlock>,
+    seg_start: SegmentId,
+    seg_end: SegmentId,
 }
 
-/// Cursor over a term's Block-Max skip chunks (`cf_fts_skips`, keyed `term_id || seg || chunk`)
-/// or inline posting block, iterating in global [`RowBlock`] order across all segments.
+/// Cursor over a term's unified Block-Max chunks (`cf_fts_skips`, keyed `term_id || seg || chunk`)
+/// or inline posting block, iterating in global [`RowBlock`] order across all (or a range of) segments.
+///
+/// Serves both skip bounds and compact posting payloads directly from the active chunk buffer
+/// without separate `cf_fts_postings` iterator lookups.
+///
+/// ```text
+/// let mut cur = RocksSkipCursor::open_out_of_line_range(&db, term_id, 0, 16)?;
+/// while let Some(bid) = cur.current_block_id() {
+///     let view = cur.current_posting_view()?.unwrap();
+///     cur.next_block()?;
+/// }
+/// ```
 pub struct RocksSkipCursor<'a> {
+    /// Underlying RocksDB instance.
     db: &'a DB,
+    /// Numeric term identifier.
     term_id: TermId,
+    /// Inline posting buffer or out-of-line `cf_fts_skips` chunk iterator.
     source: CursorSource<'a>,
+    /// Current `RowBlock` coordinate (`None` when exhausted).
     current_block: Option<RowBlock>,
+    /// `(max_tf, min_dl_over_tf)` bounds for `current_block`.
     current_bounds: (u32, f32),
 }
 
@@ -45,7 +64,21 @@ impl<'a> RocksSkipCursor<'a> {
         term_id: TermId,
         block_id: RowBlock,
         bytes: Vec<u8>,
+        seg_start: SegmentId,
+        seg_end: SegmentId,
     ) -> Result<Self> {
+        if block_id.seg() < seg_start || block_id.seg() >= seg_end {
+            return Ok(Self {
+                db,
+                term_id,
+                source: CursorSource::Inline {
+                    bytes,
+                    exhausted: true,
+                },
+                current_block: None,
+                current_bounds: (0, f32::INFINITY),
+            });
+        }
         let hdr = PostingBlockHeader::parse(&bytes)?;
         let bounds = (hdr.max_tf, hdr.min_dl_over_tf);
         Ok(Self {
@@ -60,23 +93,31 @@ impl<'a> RocksSkipCursor<'a> {
         })
     }
 
-    pub(super) fn open_out_of_line(db: &'a DB, term_id: TermId) -> Result<Self> {
+    pub(super) fn open_out_of_line_range(
+        db: &'a DB,
+        term_id: TermId,
+        seg_start: SegmentId,
+        seg_end: SegmentId,
+    ) -> Result<Self> {
         let mut cursor = Self {
             db,
             term_id,
             source: CursorSource::OutOfLine(Box::new(OutOfLineState {
                 skip_iter: None,
+                chunk_buf: Vec::new(),
                 chunk_layout: None,
                 chunk: SkipChunk::default(),
                 entry_idx: 0,
                 entry_count: 0,
-                posting_iter: None,
-                posting_pos: None,
+                seg_start,
+                seg_end,
             })),
             current_block: None,
             current_bounds: (0, f32::INFINITY),
         };
-        cursor.seek_skip_iter_prefix()?;
+        if seg_start < seg_end {
+            cursor.seek_skip_iter_prefix()?;
+        }
         Ok(cursor)
     }
 
@@ -91,6 +132,21 @@ impl<'a> RocksSkipCursor<'a> {
     }
 
     #[inline]
+    pub fn current_chunk_bounds(&self) -> Option<(SkipChunk, u32, f32)> {
+        match &self.source {
+            CursorSource::Inline { .. } => None,
+            CursorSource::OutOfLine(state) => {
+                let layout = state.chunk_layout?;
+                Some((
+                    state.chunk,
+                    layout.chunk_max_tf,
+                    layout.chunk_min_dl_over_tf,
+                ))
+            }
+        }
+    }
+
+    #[inline]
     pub fn inline_posting_bytes(&self) -> Option<&[u8]> {
         match &self.source {
             CursorSource::Inline { bytes, exhausted } if !*exhausted => Some(bytes.as_slice()),
@@ -98,45 +154,27 @@ impl<'a> RocksSkipCursor<'a> {
         }
     }
 
-    /// Return the encoded `PackedPostingBlock` bytes for `current_block`, initializing or advancing
-    /// a lazy sequential iterator over `cf_fts_postings` only when called.
-    pub fn current_posting_bytes(&mut self) -> Result<Option<&[u8]>> {
-        let Some(target) = self.current_block else {
+    /// Parse the [`PostingBlockView`] for `current_block` directly from the inline buffer
+    /// or the cached active chunk slice (zero RocksDB calls).
+    #[inline]
+    pub fn current_posting_view(&mut self) -> Result<Option<PostingBlockView<'_>>> {
+        if self.current_block.is_none() {
             return Ok(None);
-        };
-        let term_id = self.term_id;
-        let db = self.db;
-        match &mut self.source {
+        }
+        match &self.source {
             CursorSource::Inline { bytes, exhausted } => {
-                Ok((!*exhausted).then_some(bytes.as_slice()))
+                if *exhausted {
+                    return Ok(None);
+                }
+                Ok(Some(PostingBlockView::parse(bytes.as_slice())?))
             }
             CursorSource::OutOfLine(state) => {
-                let prefix = encode_fts_term_id_prefix(term_id);
-                if let Some(it) = state.posting_iter.as_mut() {
-                    advance_posting_iter_to(it, &mut state.posting_pos, term_id, &prefix, target);
-                } else {
-                    let cf = db.cf_handle(CF_FTS_POSTINGS).ok_or_else(|| {
-                        TreeError::CorruptedData(format!(
-                            "missing column family {CF_FTS_POSTINGS}"
-                        ))
-                    })?;
-                    let mut ro = ReadOptions::default();
-                    ro.set_prefix_same_as_start(true);
-                    let mut it = db.raw_iterator_cf_opt(cf, ro);
-                    it.seek(fts_block_key_coord(term_id, target));
-                    state.posting_pos = iter_block_coord(&it, &prefix);
-                    state.posting_iter = Some(it);
-                }
-                let iter = state
-                    .posting_iter
-                    .as_ref()
-                    .expect("posting_iter initialized");
-                if state.posting_pos == Some(target) {
-                    Ok(iter.value())
-                } else {
-                    iter.status().map_err(map_db_err)?;
-                    Ok(None)
-                }
+                let Some(layout) = state.chunk_layout else {
+                    return Ok(None);
+                };
+                let view = layout.view(&state.chunk_buf);
+                let slice = view.block_bytes(state.entry_idx);
+                Ok(Some(PostingBlockView::parse_compact(slice)?))
             }
         }
     }
@@ -155,8 +193,10 @@ impl<'a> RocksSkipCursor<'a> {
             CursorSource::OutOfLine(state) => {
                 let next_idx = state.entry_idx + 1;
                 if next_idx < state.entry_count {
-                    let view = chunk_view(state.chunk_layout, state.skip_iter.as_ref())
-                        .expect("active skip chunk must have view");
+                    let view = state
+                        .chunk_layout
+                        .expect("active skip chunk must have layout")
+                        .view(&state.chunk_buf);
                     let rel = view.rel_block_id(next_idx);
                     self.current_bounds = (view.max_tf(next_idx), view.min_dl_over_tf(next_idx));
                     self.current_block = Some(state.chunk.block(rel));
@@ -186,32 +226,78 @@ impl<'a> RocksSkipCursor<'a> {
             CursorSource::OutOfLine(state) => {
                 let target_chunk = target.chunk();
                 let target_rel = target.rel_block();
+                if target_chunk.seg() >= state.seg_end {
+                    self.current_block = None;
+                    state.chunk_layout = None;
+                    return Ok(());
+                }
                 if target_chunk == state.chunk {
-                    let view = chunk_view(state.chunk_layout, state.skip_iter.as_ref())
-                        .expect("active skip chunk must have view");
-                    let rel_slice = &view.rel_block_ids[state.entry_idx..];
-                    let pos = rel_slice.partition_point(|&b| b < target_rel);
-                    if pos < rel_slice.len() {
-                        let i = state.entry_idx + pos;
-                        let rel = view.rel_block_id(i);
-                        self.current_bounds = (view.max_tf(i), view.min_dl_over_tf(i));
-                        self.current_block = Some(state.chunk.block(rel));
-                        state.entry_idx = i;
-                        return Ok(());
+                    let view = state
+                        .chunk_layout
+                        .expect("active skip chunk must have layout")
+                        .view(&state.chunk_buf);
+                    let next_idx = state.entry_idx + 1;
+                    if next_idx < state.entry_count {
+                        if view.rel_block_ids[next_idx] >= target_rel {
+                            let rel = view.rel_block_id(next_idx);
+                            self.current_bounds =
+                                (view.max_tf(next_idx), view.min_dl_over_tf(next_idx));
+                            self.current_block = Some(state.chunk.block(rel));
+                            state.entry_idx = next_idx;
+                            return Ok(());
+                        }
+                        let rel_slice = &view.rel_block_ids[next_idx..];
+                        let pos = rel_slice.partition_point(|&b| b < target_rel);
+                        if pos < rel_slice.len() {
+                            let i = next_idx + pos;
+                            let rel = view.rel_block_id(i);
+                            self.current_bounds = (view.max_tf(i), view.min_dl_over_tf(i));
+                            self.current_block = Some(state.chunk.block(rel));
+                            state.entry_idx = i;
+                            return Ok(());
+                        }
                     }
                     state.skip_iter.as_mut().unwrap().next();
                     return self.load_current_chunk(Some((target_chunk, target_rel)));
                 }
 
-                if target_chunk.seg() == state.chunk.seg()
-                    && target_chunk.chunk() == state.chunk.chunk() + 1
-                {
-                    state.skip_iter.as_mut().unwrap().next();
-                    return self.load_current_chunk(Some((target_chunk, target_rel)));
-                }
-                self.seek_skip_iter(target_chunk, target_rel)
+                // Step sequentially first before falling back to RocksDB Seek.
+                state.skip_iter.as_mut().unwrap().next();
+                self.load_current_chunk(Some((target_chunk, target_rel)))
             }
         }
+    }
+
+    #[inline]
+    pub fn seek_past_chunk(&mut self, chunk: SkipChunk) -> Result<()> {
+        let Some(cur) = self.current_block else {
+            return Ok(());
+        };
+        if cur.chunk() != chunk {
+            return Ok(());
+        }
+        match &mut self.source {
+            CursorSource::Inline { exhausted, .. } => {
+                *exhausted = true;
+                self.current_block = None;
+                Ok(())
+            }
+            CursorSource::OutOfLine(state) => {
+                state.skip_iter.as_mut().unwrap().next();
+                self.load_current_chunk(None)
+            }
+        }
+    }
+
+    fn init_read_options(term_id: TermId, seg_end: SegmentId) -> ReadOptions {
+        let mut ro = ReadOptions::default();
+        ro.set_prefix_same_as_start(true);
+        if seg_end < SegmentId::MAX {
+            ro.set_iterate_upper_bound(fts_chunk_key(term_id, seg_end, 0));
+        } else if let Some(next_t) = term_id.checked_add(1) {
+            ro.set_iterate_upper_bound(next_t.to_be_bytes());
+        }
+        ro
     }
 
     fn seek_skip_iter_prefix(&mut self) -> Result<()> {
@@ -221,40 +307,15 @@ impl<'a> RocksSkipCursor<'a> {
             return Ok(());
         };
         state.chunk_layout = None;
-        let prefix = encode_fts_term_id_prefix(term_id);
+        let start_key = fts_chunk_key(term_id, state.seg_start, 0);
         let cf = db.cf_handle(CF_FTS_SKIPS).ok_or_else(|| {
             TreeError::CorruptedData(format!("missing column family {CF_FTS_SKIPS}"))
         })?;
-        let mut ro = ReadOptions::default();
-        ro.set_prefix_same_as_start(true);
+        let ro = Self::init_read_options(term_id, state.seg_end);
         let mut it = db.raw_iterator_cf_opt(cf, ro);
-        it.seek(prefix);
+        it.seek(start_key);
         state.skip_iter = Some(it);
         self.load_current_chunk(None)
-    }
-
-    fn seek_skip_iter(&mut self, seek_chunk: SkipChunk, min_rel: u8) -> Result<()> {
-        let db = self.db;
-        let term_id = self.term_id;
-        let CursorSource::OutOfLine(state) = &mut self.source else {
-            return Ok(());
-        };
-        state.chunk_layout = None;
-        let key = fts_chunk_key_coord(term_id, seek_chunk);
-        match &mut state.skip_iter {
-            Some(it) => it.seek(key),
-            None => {
-                let cf = db.cf_handle(CF_FTS_SKIPS).ok_or_else(|| {
-                    TreeError::CorruptedData(format!("missing column family {CF_FTS_SKIPS}"))
-                })?;
-                let mut ro = ReadOptions::default();
-                ro.set_prefix_same_as_start(true);
-                let mut it = db.raw_iterator_cf_opt(cf, ro);
-                it.seek(key);
-                state.skip_iter = Some(it);
-            }
-        }
-        self.load_current_chunk(Some((seek_chunk, min_rel)))
     }
 
     fn load_current_chunk(&mut self, min_pos: Option<(SkipChunk, u8)>) -> Result<()> {
@@ -267,6 +328,7 @@ impl<'a> RocksSkipCursor<'a> {
             return Ok(());
         };
         let prefix = encode_fts_term_id_prefix(term_id);
+        let mut steps = 0usize;
         loop {
             let Some(k) = iter.key() else {
                 iter.status().map_err(map_db_err)?;
@@ -280,20 +342,34 @@ impl<'a> RocksSkipCursor<'a> {
                 return Ok(());
             }
             let seg = u32::from_be_bytes(k[4..8].try_into().unwrap());
+            if seg >= state.seg_end {
+                self.current_block = None;
+                state.chunk_layout = None;
+                return Ok(());
+            }
             let cid = u32::from_be_bytes(k[8..12].try_into().unwrap());
             let chunk = SkipChunk::new(seg, cid);
             if let Some((target_chunk, _)) = min_pos
                 && chunk < target_chunk
             {
-                iter.next();
+                if steps < SEQUENTIAL_CHUNK_STEP_LIMIT {
+                    iter.next();
+                    steps += 1;
+                } else {
+                    state.chunk_layout = None;
+                    iter.seek(fts_chunk_key_coord(term_id, target_chunk));
+                    steps = 0;
+                }
                 continue;
             }
             let Some(val) = iter.value() else {
                 iter.next();
                 continue;
             };
-            let layout = SkipBlockLayout::parse(val)?;
-            let view = layout.view(val);
+            state.chunk_buf.clear();
+            state.chunk_buf.extend_from_slice(val);
+            let layout = FtsChunkLayout::parse(&state.chunk_buf)?;
+            let view = layout.view(&state.chunk_buf);
             let idx = match min_pos {
                 Some((target_chunk, min_rel)) if chunk == target_chunk && min_rel > 0 => {
                     view.find_ge(min_rel)
@@ -316,58 +392,6 @@ impl<'a> RocksSkipCursor<'a> {
     }
 }
 
-#[inline]
-fn chunk_view<'a>(
-    layout: Option<SkipBlockLayout>,
-    skip_iter: Option<&'a DBRawIteratorWithThreadMode<'a, DB>>,
-) -> Option<SkipBlockView<'a>> {
-    let layout = layout?;
-    let bytes: &[u8] = skip_iter?.value()?;
-    Some(layout.view(bytes))
-}
-
-#[inline]
-fn iter_block_coord(
-    iter: &DBRawIteratorWithThreadMode<'_, DB>,
-    prefix: &[u8; 4],
-) -> Option<RowBlock> {
-    match iter.key() {
-        Some(k) if k.len() == 12 && k[0..4] == *prefix => {
-            let seg = u32::from_be_bytes(k[4..8].try_into().unwrap());
-            let block = u32::from_be_bytes(k[8..12].try_into().unwrap());
-            Some(RowBlock::new(seg, block))
-        }
-        _ => None,
-    }
-}
-
-fn advance_posting_iter_to(
-    iter: &mut DBRawIteratorWithThreadMode<'_, DB>,
-    posting_pos: &mut Option<RowBlock>,
-    term_id: TermId,
-    prefix: &[u8; 4],
-    target: RowBlock,
-) {
-    if !posting_pos.is_some_and(|b| b < target) {
-        return;
-    }
-    let mut cur_bid = *posting_pos;
-    let mut steps = 0usize;
-    while let Some(b) = cur_bid
-        && b < target
-        && steps < SEQUENTIAL_POSTING_STEP_LIMIT
-    {
-        iter.next();
-        steps += 1;
-        cur_bid = iter_block_coord(iter, prefix);
-    }
-    if cur_bid.is_some_and(|b| b < target) {
-        iter.seek(fts_block_key_coord(term_id, target));
-        cur_bid = iter_block_coord(iter, prefix);
-    }
-    *posting_pos = cur_bid;
-}
-
 /// Cached per-attribute cursor over `default[0x05]` document-length blocks.
 pub struct RocksDocLenCursor {
     pub(super) blocks: DocLenBlockTable,
@@ -380,6 +404,5 @@ impl RocksDocLenCursor {
     }
 }
 
-// Keep DBPinnableSlice import used for future chunk-0 fast paths if desired.
 #[allow(dead_code)]
 type _UnusedPin<'a> = DBPinnableSlice<'a>;

@@ -1,5 +1,6 @@
 //! Packed FTS block formats.
 
+mod chunk;
 mod doclen;
 mod meta;
 mod position;
@@ -8,6 +9,7 @@ mod skip;
 #[cfg(test)]
 mod tests;
 
+pub use chunk::*;
 pub use doclen::*;
 pub use meta::*;
 pub use position::*;
@@ -18,10 +20,11 @@ pub use skip::*;
 pub const POSTING_BLOCK_HEADER_LEN: usize = 12;
 pub const DOC_LEN_BLOCK_HEADER_LEN: usize = 4;
 pub const SKIP_BLOCK_HEADER_LEN: usize = 4;
+pub const FTS_CHUNK_HEADER_LEN: usize = 12;
 pub const TERM_STATS_LEN: usize = 16;
 pub const TERM_RECORD_HEADER_LEN: usize = 21;
 
-/// Minimum posting count in a 256-doc block at which posting encoding switches from Sparse to Dense.
+/// Minimum posting count in a 256-doc block at which v3 posting encoding switches from Sparse to Dense.
 pub const POSTING_DENSE_THRESHOLD: usize = 96;
 
 /// Maximum `doc_freq` (within a single block) for inlining a posting block directly inside `TermRecord`.
@@ -32,6 +35,14 @@ const POSTING_VERSION_MASK: u16 = 0xFF00;
 const FLAG_DENSE: u16 = 0x0001;
 const WIDTH_SHIFT: u16 = 1;
 const WIDTH_MASK: u16 = 0x0006;
+
+const COMPACT_FLAG_DENSE: u8 = 0x01;
+const COMPACT_TF_MODE_SHIFT: u8 = 1;
+const COMPACT_TF_MODE_MASK: u8 = 0x0E;
+
+const FTS_CHUNK_VERSION_V4: u8 = 0x40;
+const FTS_CHUNK_VERSION_MASK: u8 = 0xF0;
+const FTS_CHUNK_FLAG_U16_OFFSETS: u8 = 0x01;
 
 const TERM_FLAG_INLINE: u8 = 0x01;
 const POS_FLAG_U32_OFFSETS: u8 = 0x01;

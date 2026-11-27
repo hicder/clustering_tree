@@ -11,6 +11,7 @@ fts-cjk = ["alyze/cjk", "izzydb-core/fts-cjk"]
 [dependencies]
 alyze.workspace = true
 izzydb-core.workspace = true
+rayon = "1.11"
 roaring.workspace = true
 
 [dev-dependencies]

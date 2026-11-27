@@ -150,3 +150,97 @@ fn test_position_block_roundtrip() {
     assert_eq!(view.slot_positions(9).unwrap(), None);
     assert_eq!(PackedPositionBlock::decode(&enc).unwrap(), pblk);
 }
+
+#[test]
+fn test_compact_posting_and_fts_chunk_roundtrip() {
+    let mut dls = DocLenBlock::default();
+    for s in 0..=255u8 {
+        dls.set(s, 10 + (s as u32 % 50));
+    }
+
+    let mut chunks_in: Vec<(u8, u32, f32, Vec<u8>)> = Vec::new();
+    let mut expected_blocks: Vec<(u8, PackedPostingBlock)> = Vec::new();
+
+    // Rel 0: sparse TfOne
+    let b0 = PackedPostingBlock::from_sorted_with_dl(&[(1, 1), (5, 1), (200, 1)], |s| dls.get(s));
+    let c0 = b0.encode_compact();
+    assert_eq!(c0.len(), 4);
+    assert_eq!(
+        PackedPostingBlock::decode_compact(&c0, b0.max_tf, b0.min_dl_over_tf).unwrap(),
+        b0
+    );
+    chunks_in.push((0, b0.max_tf, b0.min_dl_over_tf, c0));
+    expected_blocks.push((0, b0));
+
+    // Rel 2: sparse U2
+    let b2 = PackedPostingBlock::from_sorted_with_dl(&[(2, 2), (7, 4), (19, 1)], |s| dls.get(s));
+    let c2 = b2.encode_compact();
+    assert_eq!(
+        PackedPostingBlock::decode_compact(&c2, b2.max_tf, b2.min_dl_over_tf).unwrap(),
+        b2
+    );
+    chunks_in.push((2, b2.max_tf, b2.min_dl_over_tf, c2));
+    expected_blocks.push((2, b2));
+
+    // Rel 5: dense TfOne (40 slots >= 33)
+    let entries5: Vec<(u8, u32)> = (0..40u8).map(|i| (i * 5, 1)).collect();
+    let b5 = PackedPostingBlock::from_sorted_with_dl(&entries5, |s| dls.get(s));
+    let c5 = b5.encode_compact();
+    assert_eq!(c5.len(), 33);
+    assert_eq!(
+        PackedPostingBlock::decode_compact(&c5, b5.max_tf, b5.min_dl_over_tf).unwrap(),
+        b5
+    );
+    chunks_in.push((5, b5.max_tf, b5.min_dl_over_tf, c5));
+    expected_blocks.push((5, b5));
+
+    // Rel 10: dense U4
+    let entries10: Vec<(u8, u32)> = (0..120u8).map(|i| (i * 2, (i as u32 % 16) + 1)).collect();
+    let b10 = PackedPostingBlock::from_sorted_with_dl(&entries10, |s| dls.get(s));
+    let c10 = b10.encode_compact();
+    assert_eq!(c10.len(), 161);
+    assert_eq!(
+        PackedPostingBlock::decode_compact(&c10, b10.max_tf, b10.min_dl_over_tf).unwrap(),
+        b10
+    );
+    chunks_in.push((10, b10.max_tf, b10.min_dl_over_tf, c10));
+    expected_blocks.push((10, b10));
+
+    let refs: Vec<(u8, u32, f32, &[u8])> = chunks_in
+        .iter()
+        .map(|(r, m, mr, b)| (*r, *m, *mr, b.as_slice()))
+        .collect();
+    let enc = FtsChunk::encode_from_blocks(&refs);
+    let view = FtsChunkView::parse(&enc).unwrap();
+    assert_eq!(view.count, 4);
+    assert_eq!(view.chunk_max_tf, 16);
+    assert_eq!(view.find_ge(3), Some(2));
+    assert_eq!(view.find_exact(5), Some(2));
+    assert_eq!(view.find_exact(6), None);
+
+    for (i, (rel, exp_blk)) in expected_blocks.iter().enumerate() {
+        assert_eq!(view.rel_block_id(i), *rel);
+        let dec = PackedPostingBlock::decode_compact(
+            view.block_bytes(i),
+            view.max_tf(i),
+            view.min_dl_over_tf(i),
+        )
+        .unwrap();
+        assert_eq!(&dec, exp_blk);
+    }
+
+    // Upsert a block in the middle (rel = 3)
+    let b3 = PackedPostingBlock::from_sorted_with_dl(&[(11, 500)], |s| dls.get(s));
+    let enc2 = FtsChunk::upsert_block(
+        Some(&enc),
+        3,
+        b3.max_tf,
+        b3.min_dl_over_tf,
+        &b3.encode_compact(),
+    )
+    .unwrap();
+    let view2 = FtsChunkView::parse(&enc2).unwrap();
+    assert_eq!(view2.count, 5);
+    assert_eq!(view2.chunk_max_tf, 500);
+    assert_eq!(view2.rel_block_ids, &[0, 2, 3, 5, 10]);
+}

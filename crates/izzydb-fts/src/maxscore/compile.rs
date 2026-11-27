@@ -1,11 +1,10 @@
-//! Rank expression compilation into clauses.
+//! Rank expression compilation into reusable query plans and segment-sharded clauses.
 
+use std::collections::HashSet;
 
 use alyze::analyze::ReusableBuffer;
 
-use izzydb_core::config::{
-    AttrId, TermId,
-};
+use izzydb_core::config::{AttrId, SegmentId};
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::rank::RankBy;
 use izzydb_core::schema::CollectionSchema;
@@ -24,20 +23,232 @@ pub(super) fn not_lexical_err() -> TreeError {
     )
 }
 
-pub(super) struct CompileContext<'a, 'b, S: FtsPostingSource + 'a> {
-    pub(super) source: &'a S,
-    pub(super) schema: &'a CollectionSchema,
-    pub(super) meta: &'a FtsMeta,
-    pub(super) buffer: &'b mut ReusableBuffer,
-    pub(super) dl_cache: &'b mut DlNormCache<'a, S>,
+/// Cursor-free compiled term entry produced once per query and instantiated per segment shard.
+///
+/// Captures the resolved [`TermRecord`], precomputed [`Bm25TermScorer`], and interned
+/// doc-length group index so each worker shard opens its own cursors without repeating lookups.
+///
+/// ```text
+/// CompiledTerm { record: rec, scorer: Bm25TermScorer { .. }, dl_group: 0 }
+/// ```
+#[derive(Clone)]
+pub(super) struct CompiledTerm {
+    /// Term dictionary record (`term_id`, stats, optional inline block).
+    pub(super) record: TermRecord,
+    /// Precomputed BM25 term scorer (`num_scale`, `k1_one_minus_b`, `k1_b_over_avgdl`).
+    pub(super) scorer: Bm25TermScorer,
+    /// Index into `CompiledPlan::dl_specs` for this term's attribute and `(k1, b)`.
+    pub(super) dl_group: usize,
 }
 
-/// Compile a `RankBy` AST into flat MAXSCORE clauses (flattening `Sum` and distributing `Product`).
-pub(super) fn compile_clauses<'a, S: FtsPostingSource>(
-    ctx: &mut CompileContext<'a, '_, S>,
+pub(super) enum CompiledClauseKind {
+    Single(CompiledTerm),
+    PrefixMax(Vec<CompiledTerm>),
+    MaxBranches(Vec<Vec<CompiledClause>>),
+}
+
+/// Cursor-free compiled MAXSCORE clause with its global upper bound.
+///
+/// Represents a single term, a prefix-expanded `Max` over terms, or nested `Max` branches
+/// prior to opening segment-scoped skip cursors.
+///
+/// ```text
+/// CompiledClause { term_max: 4.12, kind: CompiledClauseKind::Single(term) }
+/// ```
+pub(super) struct CompiledClause {
+    /// Global BM25 upper bound across all blocks for this clause.
+    pub(super) term_max: f32,
+    /// Structural clause kind (`Single`, `PrefixMax`, or `MaxBranches`).
+    pub(super) kind: CompiledClauseKind,
+}
+
+/// Pre-resolved query plan (`CompiledClause`s and doc-length group specs) ready to instantiate
+/// cursors globally or over disjoint segment ranges.
+///
+/// Built once per query so parallel shards share term dictionary lookups and doc-length prewarming.
+///
+/// ```text
+/// let plan = compile_plan(source, schema, &meta, &rank_by, mult_ub, buffer)?;
+/// ```
+pub(super) struct CompiledPlan {
+    /// Compiled clauses sorted ascending by global `term_max`.
+    pub(super) clauses: Vec<CompiledClause>,
+    /// Interned `(attr_id, c1, c2)` doc-length normalization specs.
+    pub(super) dl_specs: Vec<DlGroupSpec>,
+}
+
+struct CompileContext<'a, 'b, S: FtsPostingSource + 'a> {
+    source: &'a S,
+    schema: &'a CollectionSchema,
+    meta: &'a FtsMeta,
+    buffer: &'b mut ReusableBuffer,
+    dl_specs: &'b mut Vec<DlGroupSpec>,
+}
+
+pub(super) fn compile_plan<S: FtsPostingSource>(
+    source: &S,
+    schema: &CollectionSchema,
+    meta: &FtsMeta,
+    rank_by: &RankBy,
+    weight: f32,
+    buffer: &mut ReusableBuffer,
+) -> Result<CompiledPlan> {
+    let mut dl_specs = Vec::new();
+    let mut clauses = Vec::new();
+    {
+        let mut ctx = CompileContext {
+            source,
+            schema,
+            meta,
+            buffer,
+            dl_specs: &mut dl_specs,
+        };
+        compile_clauses(&mut ctx, rank_by, weight, &mut clauses)?;
+    }
+    clauses.sort_by(|a, b| a.term_max.total_cmp(&b.term_max));
+    Ok(CompiledPlan { clauses, dl_specs })
+}
+
+impl CompiledPlan {
+    /// Pre-warm doc-length block tables on `source` before fanning out to parallel workers.
+    pub(super) fn prewarm_doc_lens<S: FtsPostingSource>(&self, source: &S) -> Result<()> {
+        let mut seen: HashSet<AttrId> = HashSet::new();
+        for spec in &self.dl_specs {
+            if seen.insert(spec.attr_id) {
+                let _ = source.open_doc_len_cursor(spec.attr_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Instantiate live cursors over either the whole corpus (`range = None`) or `[seg_start, seg_end)`.
+    pub(super) fn instantiate<'a, S: FtsPostingSource>(
+        &self,
+        source: &'a S,
+        range: Option<(SegmentId, SegmentId)>,
+    ) -> Result<(Vec<Clause<'a, S>>, Vec<f32>)> {
+        let mut records = Vec::new();
+        collect_records(&self.clauses, &mut records);
+        if records.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let cursors = match range {
+            Some((seg_start, seg_end)) => {
+                source.open_skip_cursors_in_range(&records, seg_start, seg_end)?
+            }
+            None => source.open_skip_cursors(records)?,
+        };
+        let mut cursor_iter = cursors.into_iter();
+        let mut clauses = Vec::with_capacity(self.clauses.len());
+        for cc in &self.clauses {
+            if let Some(c) = build_clause(cc, &mut cursor_iter) {
+                clauses.push(c);
+            }
+        }
+        let mut prefix_max_sum = Vec::with_capacity(clauses.len());
+        let mut acc = 0.0f64;
+        for c in &clauses {
+            acc += c.term_max as f64;
+            prefix_max_sum.push(acc as f32);
+        }
+        Ok((clauses, prefix_max_sum))
+    }
+}
+
+fn collect_records(clauses: &[CompiledClause], out: &mut Vec<TermRecord>) {
+    for c in clauses {
+        match &c.kind {
+            CompiledClauseKind::Single(t) => out.push(t.record.clone()),
+            CompiledClauseKind::PrefixMax(ts) => {
+                for t in ts {
+                    out.push(t.record.clone());
+                }
+            }
+            CompiledClauseKind::MaxBranches(branches) => {
+                for b in branches {
+                    collect_records(b, out);
+                }
+            }
+        }
+    }
+}
+
+fn build_clause<'a, S: FtsPostingSource + 'a>(
+    cc: &CompiledClause,
+    cursors: &mut impl Iterator<Item = S::SkipCursor<'a>>,
+) -> Option<Clause<'a, S>> {
+    match &cc.kind {
+        CompiledClauseKind::Single(t) => {
+            let cursor = cursors.next().expect("cursor count mismatch");
+            cursor.current_block_id()?;
+            Some(Clause {
+                term_max: cc.term_max,
+                kind: ClauseKind::Single(TermStream {
+                    term_id: t.record.term_id,
+                    scorer: t.scorer,
+                    dl_group: t.dl_group,
+                    cursor,
+                }),
+            })
+        }
+        CompiledClauseKind::PrefixMax(ts) => {
+            let mut streams = Vec::with_capacity(ts.len());
+            for t in ts {
+                let cursor = cursors.next().expect("cursor count mismatch");
+                if cursor.current_block_id().is_some() {
+                    streams.push(TermStream {
+                        term_id: t.record.term_id,
+                        scorer: t.scorer,
+                        dl_group: t.dl_group,
+                        cursor,
+                    });
+                }
+            }
+            if streams.is_empty() {
+                None
+            } else if streams.len() == 1 {
+                Some(Clause {
+                    term_max: cc.term_max,
+                    kind: ClauseKind::Single(streams.pop().unwrap()),
+                })
+            } else {
+                Some(Clause {
+                    term_max: cc.term_max,
+                    kind: ClauseKind::PrefixMax(streams),
+                })
+            }
+        }
+        CompiledClauseKind::MaxBranches(branches) => {
+            let mut built_branches = Vec::with_capacity(branches.len());
+            for branch in branches {
+                let mut b = Vec::with_capacity(branch.len());
+                for sub in branch {
+                    if let Some(c) = build_clause(sub, cursors) {
+                        b.push(c);
+                    }
+                }
+                if !b.is_empty() {
+                    built_branches.push(b);
+                }
+            }
+            if built_branches.is_empty() {
+                None
+            } else {
+                Some(Clause {
+                    term_max: cc.term_max,
+                    kind: ClauseKind::MaxBranches(built_branches),
+                })
+            }
+        }
+    }
+}
+
+/// Compile a `RankBy` AST into cursor-free `CompiledClause`s (flattening `Sum` and distributing `Product`).
+fn compile_clauses<S: FtsPostingSource>(
+    ctx: &mut CompileContext<'_, '_, S>,
     expr: &RankBy,
     weight: f32,
-    out: &mut Vec<Clause<'a, S>>,
+    out: &mut Vec<CompiledClause>,
 ) -> Result<()> {
     if weight <= 0.0 {
         return Ok(());
@@ -89,9 +300,9 @@ pub(super) fn compile_clauses<'a, S: FtsPostingSource>(
                 if branches.len() == 1 {
                     out.extend(branches.into_iter().next().unwrap());
                 } else {
-                    out.push(Clause {
+                    out.push(CompiledClause {
                         term_max: max_branch_ub,
-                        kind: ClauseKind::MaxBranches(branches),
+                        kind: CompiledClauseKind::MaxBranches(branches),
                     });
                 }
             }
@@ -140,20 +351,22 @@ pub(super) fn compile_clauses<'a, S: FtsPostingSource>(
                     }
                 }
                 let records = ctx.source.multi_get_term_records(entry.id, &keys)?;
-                let pairs = records.into_iter().zip(qtfs).filter_map(|(r, q)| r.map(|rec| (rec, q)));
-                let streams = build_term_streams(
-                    ctx.source,
-                    ctx.dl_cache,
+                let pairs = records
+                    .into_iter()
+                    .zip(qtfs)
+                    .filter_map(|(r, q)| r.map(|rec| (rec, q)));
+                let terms = build_compiled_terms(
+                    ctx.dl_specs,
                     entry.id,
                     attr_stats,
                     weight,
                     &resolved,
                     pairs,
-                )?;
-                for (ub, stream) in streams {
-                    out.push(Clause {
+                );
+                for (ub, term) in terms {
+                    out.push(CompiledClause {
                         term_max: ub,
-                        kind: ClauseKind::Single(stream),
+                        kind: CompiledClauseKind::Single(term),
                     });
                 }
             }
@@ -163,30 +376,29 @@ pub(super) fn compile_clauses<'a, S: FtsPostingSource>(
                     ctx.source
                         .scan_prefix_terms(entry.id, &prefix, resolved.max_prefix_expansions)?;
                 let pairs = expanded.into_iter().map(|(_, rec)| (rec, 1));
-                let streams_with_ub = build_term_streams(
-                    ctx.source,
-                    ctx.dl_cache,
+                let terms_with_ub = build_compiled_terms(
+                    ctx.dl_specs,
                     entry.id,
                     attr_stats,
                     weight,
                     &resolved,
                     pairs,
-                )?;
-                let max_ub = streams_with_ub
+                );
+                let max_ub = terms_with_ub
                     .iter()
                     .map(|(ub, _)| *ub)
                     .fold(0.0f32, f32::max);
-                let mut streams: Vec<TermStream<'a, S>> =
-                    streams_with_ub.into_iter().map(|(_, s)| s).collect();
-                if streams.len() == 1 {
-                    out.push(Clause {
+                let mut terms: Vec<CompiledTerm> =
+                    terms_with_ub.into_iter().map(|(_, t)| t).collect();
+                if terms.len() == 1 {
+                    out.push(CompiledClause {
                         term_max: max_ub,
-                        kind: ClauseKind::Single(streams.pop().unwrap()),
+                        kind: CompiledClauseKind::Single(terms.pop().unwrap()),
                     });
-                } else if !streams.is_empty() {
-                    out.push(Clause {
+                } else if !terms.is_empty() {
+                    out.push(CompiledClause {
                         term_max: max_ub,
-                        kind: ClauseKind::PrefixMax(streams),
+                        kind: CompiledClauseKind::PrefixMax(terms),
                     });
                 }
             }
@@ -196,17 +408,15 @@ pub(super) fn compile_clauses<'a, S: FtsPostingSource>(
     }
 }
 
-pub(super) fn build_term_streams<'a, S: FtsPostingSource>(
-    source: &'a S,
-    dl_cache: &mut DlNormCache<'a, S>,
+fn build_compiled_terms(
+    dl_specs: &mut Vec<DlGroupSpec>,
     attr_id: AttrId,
     attr_stats: crate::block::AttrFtsStats,
     weight: f32,
     params: &ResolvedBm25Params,
     records: impl Iterator<Item = (TermRecord, u32)>,
-) -> Result<Vec<(f32, TermStream<'a, S>)>> {
-    let mut active_meta: Vec<(TermId, Bm25TermScorer, f32, usize)> = Vec::new();
-    let mut active_recs: Vec<TermRecord> = Vec::new();
+) -> Vec<(f32, CompiledTerm)> {
+    let mut out = Vec::new();
     for (rec, qtf) in records {
         if rec.stats.doc_freq == 0 {
             continue;
@@ -225,27 +435,15 @@ pub(super) fn build_term_streams<'a, S: FtsPostingSource>(
         if ub <= 0.0 {
             continue;
         }
-        let dl_group = dl_cache.intern(attr_id, &scorer);
-        active_meta.push((rec.term_id, scorer, ub, dl_group));
-        active_recs.push(rec);
+        let dl_group = intern_dl_group(dl_specs, attr_id, &scorer);
+        out.push((
+            ub,
+            CompiledTerm {
+                record: rec,
+                scorer,
+                dl_group,
+            },
+        ));
     }
-    if active_recs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let cursors = source.open_skip_cursors(active_recs)?;
-    let mut out = Vec::with_capacity(cursors.len());
-    for ((term_id, scorer, ub, dl_group), cursor) in active_meta.into_iter().zip(cursors) {
-        if cursor.current_block_id().is_some() {
-            out.push((
-                ub,
-                TermStream {
-                    term_id,
-                    scorer,
-                    dl_group,
-                    cursor,
-                },
-            ));
-        }
-    }
-    Ok(out)
+    out
 }

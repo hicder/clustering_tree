@@ -14,8 +14,8 @@ use izzydb_core::error::{Result, TreeError};
 use izzydb_core::rowset::Liveness;
 use izzydb_core::schema::{ColumnStorage, SchemaEntry};
 use izzydb_fts::{
-    DocLenBlock, FtsAnalyzer, INLINE_TERM_MAX_DF, PackedPositionBlock, PackedPostingBlock,
-    PostingBlockHeader, ReusableBuffer, SkipBlock, TermRecord,
+    DocLenBlock, FtsAnalyzer, FtsChunk, INLINE_TERM_MAX_DF, PackedPositionBlock,
+    PackedPostingBlock, PostingBlockHeader, ReusableBuffer, TermRecord,
 };
 use izzydb_storage::codec::{
     RowView, SEG_FLAG_HAS_COLUMNS, SEG_FLAG_HAS_VECTORS, SegPosting, SegmentMeta, SegmentState,
@@ -682,20 +682,21 @@ where
         let mut rec = TermRecord::decode(&rec_bytes)?;
         let tid: TermId = rec.term_id;
 
-        let mut encoded_blocks: Vec<(u32, Vec<u8>)> = Vec::with_capacity(blk_map.len());
+        let mut encoded_blocks: Vec<(u32, PackedPostingBlock)> =
+            Vec::with_capacity(blk_map.len());
         for (blk, pblk) in blk_map {
-            encoded_blocks.push((blk, pblk.encode()));
+            encoded_blocks.push((blk, pblk));
         }
 
         let mut keep_inline = false;
         if let Some((ib_id, ref ib_bytes)) = rec.inline_block {
             if source_set.contains(&ib_id.seg()) {
                 if encoded_blocks.len() == 1 {
-                    let (only_blk, ref only_bytes) = encoded_blocks[0];
-                    let hdr = PostingBlockHeader::parse(only_bytes)?;
+                    let (only_blk, ref only_pblk) = encoded_blocks[0];
+                    let only_bytes = only_pblk.encode();
+                    let hdr = PostingBlockHeader::parse(&only_bytes)?;
                     if (hdr.count as usize) <= INLINE_TERM_MAX_DF {
-                        rec.inline_block =
-                            Some((RowBlock::new(target_seg, only_blk), only_bytes.clone()));
+                        rec.inline_block = Some((RowBlock::new(target_seg, only_blk), only_bytes));
                         tx.put_fts_term_bytes(tk.clone(), rec.encode());
                         keep_inline = true;
                     }
@@ -705,41 +706,38 @@ where
                     tx.put_fts_term_bytes(tk.clone(), rec.encode());
                 }
             } else {
-                // Inline block lives in a non-compacted segment: materialize it to cf_fts_postings + skips.
-                let hdr = PostingBlockHeader::parse(ib_bytes)?;
-                tx.put_fts_posting_bytes(tid, ib_id, ib_bytes.clone());
-                let mut sb = match tx.get_fts_skip_bytes(tid, ib_id.chunk())? {
-                    Some(b) => SkipBlock::decode(&b)?,
-                    None => SkipBlock::default(),
-                };
-                sb.upsert(ib_id.rel_block(), hdr.max_tf, hdr.min_dl_over_tf);
-                tx.put_fts_skip_bytes(tid, ib_id.chunk(), sb.encode());
+                // Inline block lives in a non-compacted segment: materialize it to cf_fts_skips FtsChunk.
+                let pblk = PackedPostingBlock::decode(ib_bytes)?;
+                let chunk = ib_id.chunk();
+                let existing = tx.get_fts_skip_bytes(tid, chunk)?;
+                let new_chunk = FtsChunk::upsert_block(
+                    existing.as_deref(),
+                    ib_id.rel_block(),
+                    pblk.max_tf,
+                    pblk.min_dl_over_tf,
+                    &pblk.encode_compact(),
+                )?;
+                tx.put_fts_skip_bytes(tid, chunk, new_chunk);
                 rec.inline_block = None;
                 tx.put_fts_term_bytes(tk.clone(), rec.encode());
             }
         }
 
         if !keep_inline {
-            let mut by_chunk: BTreeMap<SkipChunk, Vec<(u8, u32, f32)>> = BTreeMap::new();
-            for &(blk, ref bytes) in &encoded_blocks {
+            let mut by_chunk: BTreeMap<SkipChunk, Vec<(u8, u32, f32, Vec<u8>)>> = BTreeMap::new();
+            for &(blk, ref pblk) in &encoded_blocks {
                 let rb = RowBlock::new(target_seg, blk);
-                let hdr = PostingBlockHeader::parse(bytes)?;
-                tx.put_fts_posting_bytes(tid, rb, bytes.clone());
                 by_chunk.entry(rb.chunk()).or_default().push((
                     rb.rel_block(),
-                    hdr.max_tf,
-                    hdr.min_dl_over_tf,
+                    pblk.max_tf,
+                    pblk.min_dl_over_tf,
+                    pblk.encode_compact(),
                 ));
             }
-            for (chunk, entries) in by_chunk {
-                let mut sb = match tx.get_fts_skip_bytes(tid, chunk)? {
-                    Some(b) => SkipBlock::decode(&b)?,
-                    None => SkipBlock::default(),
-                };
-                for (rel, mtf, min_r) in entries {
-                    sb.upsert(rel, mtf, min_r);
-                }
-                tx.put_fts_skip_bytes(tid, chunk, sb.encode());
+            for (chunk, updates) in by_chunk {
+                let existing = tx.get_fts_skip_bytes(tid, chunk)?;
+                let new_chunk = FtsChunk::upsert_blocks(existing.as_deref(), &updates)?;
+                tx.put_fts_skip_bytes(tid, chunk, new_chunk);
             }
         }
 

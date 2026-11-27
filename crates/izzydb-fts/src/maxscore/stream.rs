@@ -3,7 +3,7 @@
 
 
 use izzydb_core::config::{
-    AttrId, FTS_BLOCK_SIZE, RowBlock, TermId,
+    AttrId, FTS_BLOCK_SIZE, RowBlock, SkipChunk, TermId,
 };
 use izzydb_core::error::{Result, TreeError};
 
@@ -14,6 +14,24 @@ use crate::simd::{
 };
 
 use super::*;
+
+/// Specification of a `(attr_id, c1, c2)` doc-length normalization group shared across clauses.
+///
+/// Built once during query compilation so worker shards can construct thread-local [`DlNormCache`]s
+/// without re-compiling query terms.
+///
+/// ```text
+/// DlGroupSpec { attr_id: 1, c1: 0.3, c2: 0.045 }
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub(super) struct DlGroupSpec {
+    /// Indexed text attribute identifier.
+    pub(super) attr_id: AttrId,
+    /// BM25 `k1 * (1.0 - b)`.
+    pub(super) c1: f32,
+    /// BM25 `k1 * b / avgdl`.
+    pub(super) c2: f32,
+}
 
 pub(super) struct DlNormGroup<'a, S: FtsPostingSource + 'a> {
     pub(super) attr_id: AttrId,
@@ -29,28 +47,20 @@ pub(super) struct DlNormCache<'a, S: FtsPostingSource + 'a> {
 }
 
 impl<'a, S: FtsPostingSource + 'a> DlNormCache<'a, S> {
-    pub(super) fn new() -> Self {
-        Self { groups: Vec::new() }
-    }
-
-    pub(super) fn intern(&mut self, attr_id: AttrId, scorer: &Bm25TermScorer) -> usize {
-        let c1 = scorer.k1_one_minus_b;
-        let c2 = scorer.k1_b_over_avgdl;
-        if let Some(pos) = self.groups.iter().position(|g| {
-            g.attr_id == attr_id && g.c1.to_bits() == c1.to_bits() && g.c2.to_bits() == c2.to_bits()
-        }) {
-            return pos;
+    pub(super) fn from_specs(specs: &[DlGroupSpec]) -> Self {
+        Self {
+            groups: specs
+                .iter()
+                .map(|s| DlNormGroup {
+                    attr_id: s.attr_id,
+                    c1: s.c1,
+                    c2: s.c2,
+                    cached_block_id: None,
+                    cursor: None,
+                    dl_norm: [f32::MIN_POSITIVE; FTS_BLOCK_SIZE],
+                })
+                .collect(),
         }
-        let id = self.groups.len();
-        self.groups.push(DlNormGroup {
-            attr_id,
-            c1,
-            c2,
-            cached_block_id: None,
-            cursor: None,
-            dl_norm: [f32::MIN_POSITIVE; FTS_BLOCK_SIZE],
-        });
-        id
     }
 
     #[inline]
@@ -88,6 +98,23 @@ impl<'a, S: FtsPostingSource + 'a> DlNormCache<'a, S> {
     }
 }
 
+pub(super) fn intern_dl_group(
+    specs: &mut Vec<DlGroupSpec>,
+    attr_id: AttrId,
+    scorer: &Bm25TermScorer,
+) -> usize {
+    let c1 = scorer.k1_one_minus_b;
+    let c2 = scorer.k1_b_over_avgdl;
+    if let Some(pos) = specs.iter().position(|g| {
+        g.attr_id == attr_id && g.c1.to_bits() == c1.to_bits() && g.c2.to_bits() == c2.to_bits()
+    }) {
+        return pos;
+    }
+    let id = specs.len();
+    specs.push(DlGroupSpec { attr_id, c1, c2 });
+    id
+}
+
 pub(super) struct TermStream<'a, S: FtsPostingSource + 'a> {
     pub(super) term_id: TermId,
     pub(super) scorer: Bm25TermScorer,
@@ -108,6 +135,12 @@ impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
     }
 
     #[inline]
+    pub(super) fn chunk_upper_bound(&self) -> Option<(SkipChunk, f32)> {
+        let (chunk, max_tf, min_dl_over_tf) = self.cursor.current_chunk_bounds()?;
+        Some((chunk, self.scorer.upper_bound(max_tf, min_dl_over_tf)))
+    }
+
+    #[inline]
     pub(super) fn seek(&mut self, target: RowBlock) -> Result<()> {
         if let Some(cur) = self.cursor.current_block_id()
             && cur < target
@@ -115,6 +148,11 @@ impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
             self.cursor.seek_block(target)?;
         }
         Ok(())
+    }
+
+    #[inline]
+    pub(super) fn seek_past_chunk(&mut self, chunk: SkipChunk) -> Result<()> {
+        self.cursor.seek_past_chunk(chunk)
     }
 
     #[inline]
@@ -136,8 +174,7 @@ impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
         tier: SimdTier,
     ) -> Result<()> {
         let dl_norm = dl_cache.get_or_load(source, tier, self.dl_group, target)?;
-        if let Some(bytes) = self.cursor.current_posting_bytes()? {
-            let view = PostingBlockView::parse(bytes)?;
+        if let Some(view) = self.cursor.current_posting_view()? {
             mode.apply(&self.scorer, tier, &view, dl_norm, scores);
             return Ok(());
         }

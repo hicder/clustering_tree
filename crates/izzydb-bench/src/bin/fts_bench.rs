@@ -1,138 +1,143 @@
-use std::collections::HashMap;
-use std::time::Instant;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-use izzydb::fts::{Bm25TermScorer, FtsAnalyzer, ReusableBuffer, SimdTier};
-use izzydb::{
-    AttributeType, Attributes, Bm25Result, Collection, CollectionConfig, DistanceMetric, DocId,
-    FullTextSearchConfig, RankBy, TreeConfig,
-};
-use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use izzydb::fts::SimdTier;
+use izzydb::{Collection, RankBy};
+use izzydb_bench::{DEFAULT_FTS_PARQUET_PATH, FTS_VOCAB_SIZE, fts_collection_config};
+use izzydb_bulk::{BulkImportConfig, bulk_import};
 use tempfile::TempDir;
 
-fn run_suite(n: usize, vocab_size: usize) {
-    let dim = 32usize;
-    let mut rng = SmallRng::seed_from_u64(42);
-    let vocab: Vec<String> = (0..vocab_size).map(|i| format!("term{i:04}")).collect();
-
-    let dir = TempDir::new().unwrap();
-    let cfg = CollectionConfig::new(TreeConfig::new(dim, DistanceMetric::L2Squared))
-        .with_fts_attribute(
-            "body",
-            AttributeType::String,
-            false,
-            FullTextSearchConfig::default(),
-        );
-    let mut col = Collection::open(dir.path(), cfg).unwrap();
-
-    let mut raw_texts = Vec::with_capacity(n);
-    let t0 = Instant::now();
-    for id in 0..n as DocId {
-        let vec: Vec<f32> = (0..dim).map(|_| rng.random_range(-1.0f32..1.0f32)).collect();
-        let doc_len = rng.random_range(15..=40);
-        let text: String = (0..doc_len)
-            .map(|_| {
-                // Zipf-like skew: favor lower-index terms to generate dense blocks, mix rare terms
-                let idx = if rng.random_bool(0.5) {
-                    rng.random_range(0..50.min(vocab.len()))
-                } else {
-                    rng.random_range(0..vocab.len())
-                };
-                vocab[idx].as_str()
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        let mut attrs = Attributes::new();
-        attrs.insert("body".into(), text.clone().into());
-        col.upsert(id, Some(&vec), attrs).unwrap();
-        raw_texts.push((id, text));
+/// Sends a command to `perf record --control fifo:<ctl>,<ack>` when
+/// `PERF_CTL_FIFO` is set, so profiles cover only the search loop.
+fn perf_ctl(cmd: &str) {
+    use std::io::{Read, Write};
+    let Ok(ctl) = std::env::var("PERF_CTL_FIFO") else {
+        return;
+    };
+    let mut f = fs::OpenOptions::new().write(true).open(&ctl).unwrap();
+    f.write_all(format!("{cmd}\n").as_bytes()).unwrap();
+    if let Ok(ack) = std::env::var("PERF_ACK_FIFO") {
+        let mut buf = [0u8; 5];
+        let _ = fs::File::open(ack).unwrap().read(&mut buf);
     }
-    println!(
-        "\n[n={n}, tier={:?}] Indexed in {:.1}ms",
-        SimdTier::detect(),
-        t0.elapsed().as_secs_f64() * 1000.0
-    );
+}
 
-    let analyzer = FtsAnalyzer::new(FullTextSearchConfig::default());
-    let mut buf = ReusableBuffer::new();
-    let mut analyzed_docs = Vec::with_capacity(n);
-    let mut df_map: HashMap<String, u64> = HashMap::new();
-    let mut total_tokens = 0u64;
-    for (id, text) in &raw_texts {
-        let ad = analyzer.analyze_str(text, &mut buf).unwrap();
-        total_tokens += ad.doc_len as u64;
-        for tok in ad.terms.keys() {
-            *df_map.entry(tok.clone()).or_insert(0) += 1;
-        }
-        analyzed_docs.push((*id, ad));
-    }
+fn run_search_benchmark(col: &Collection, num_docs: u64, runs: usize, only_terms: Option<usize>) {
+    let vocab: Vec<String> = (0..FTS_VOCAB_SIZE).map(|i| format!("term{i:04}")).collect();
+
+    println!("\n[n={num_docs}, tier={:?}, runs={runs}]", SimdTier::detect());
 
     for (label, num_terms) in [
         ("Short 3-term query", 3usize),
         ("Medium 8-term query", 8),
         ("Long 50-term LLM query", 50),
     ] {
+        if only_terms.is_some_and(|n| n != num_terms) {
+            continue;
+        }
         let q_terms: Vec<String> = (0..num_terms)
             .map(|i| vocab[(i * 19 + 5) % vocab.len()].clone())
             .collect();
         let q_str = q_terms.join(" ");
         let rank_by = RankBy::bm25("body", q_str.as_str());
 
-        // Warmup
-        let _ = col.query_bm25(&rank_by, None, 10).unwrap();
+        // Warmup outside timed loop.
+        for _ in 0..5 {
+            let _ = std::hint::black_box(col.query_bm25(&rank_by, None, 10).unwrap());
+        }
 
-        let runs = 25usize;
-        let t_maxscore = Instant::now();
-        let mut last_got = Vec::new();
+        let mut latencies: Vec<Duration> = Vec::with_capacity(runs);
+        let mut hits = 0usize;
+        let mut top_id = None;
+        perf_ctl("enable");
+        let t_total = Instant::now();
         for _ in 0..runs {
-            last_got = col.query_bm25(&rank_by, None, 10).unwrap();
+            let t0 = Instant::now();
+            let res = col.query_bm25(&rank_by, None, 10).unwrap();
+            latencies.push(t0.elapsed());
+            hits = res.len();
+            top_id = res.first().map(|r| (r.id, r.score));
+            std::hint::black_box(&res);
         }
-        let maxscore_us = t_maxscore.elapsed().as_secs_f64() * 1e6 / runs as f64;
+        let total_s = t_total.elapsed().as_secs_f64();
+        perf_ctl("disable");
 
-        let t_exh = Instant::now();
-        let mut last_exh = Vec::new();
-        let exh_runs = if n <= 20_000 { runs } else { 5 };
-        for _ in 0..exh_runs {
-            let mut scores = Vec::with_capacity(n);
-            for (id, ad) in &analyzed_docs {
-                let mut s = 0.0f32;
-                for qt in &q_terms {
-                    if let Some(at) = ad.terms.get(qt) {
-                        let df = df_map[qt];
-                        let scorer = Bm25TermScorer::new(
-                            1.0,
-                            n as u64,
-                            total_tokens,
-                            df,
-                            1,
-                            1.2,
-                            0.75,
-                            8.0,
-                        );
-                        s += scorer.score(at.tf, ad.doc_len);
-                    }
-                }
-                if s > 0.0 {
-                    scores.push(Bm25Result { id: *id, score: s });
-                }
-            }
-            scores.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
-            scores.truncate(10);
-            last_exh = scores;
-        }
-        let exh_us = t_exh.elapsed().as_secs_f64() * 1e6 / exh_runs as f64;
+        latencies.sort_unstable();
+        let sum_us: f64 = latencies.iter().map(|d| d.as_secs_f64() * 1e6).sum();
+        let avg_us = sum_us / runs as f64;
+        let min_us = latencies[0].as_secs_f64() * 1e6;
+        let p50_us = latencies[(runs - 1) * 50 / 100].as_secs_f64() * 1e6;
+        let p95_us = latencies[(runs - 1) * 95 / 100].as_secs_f64() * 1e6;
+        let qps = runs as f64 / total_s;
 
-        assert_eq!(
-            last_got.iter().map(|r| r.id).collect::<Vec<_>>(),
-            last_exh.iter().map(|r| r.id).collect::<Vec<_>>()
-        );
         println!(
-            "  {label:24} -> SIMD-MAXSCORE={maxscore_us:7.1}us, Exhaustive={exh_us:8.1}us ({:.1}x speedup)",
-            exh_us / maxscore_us
+            "  {label:24} -> avg={avg_us:8.1}us, p50={p50_us:8.1}us, p95={p95_us:8.1}us, min={min_us:8.1}us, qps={qps:7.1}, hits={hits}, top={top_id:?}"
         );
     }
 }
 
 fn main() {
-    run_suite(10_000, 1_000);
+    let args: Vec<String> = std::env::args().collect();
+    let mut parquet_path = PathBuf::from(DEFAULT_FTS_PARQUET_PATH);
+    let mut runs = 50usize;
+    let mut only_terms = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--parquet" => {
+                i += 1;
+                parquet_path = PathBuf::from(args.get(i).expect("missing value for --parquet"));
+            }
+            "--runs" => {
+                i += 1;
+                runs = args
+                    .get(i)
+                    .expect("missing value for --runs")
+                    .parse()
+                    .expect("invalid --runs integer");
+            }
+            "--terms" => {
+                i += 1;
+                only_terms = Some(
+                    args.get(i)
+                        .expect("missing value for --terms")
+                        .parse()
+                        .expect("invalid --terms integer"),
+                );
+            }
+            other => panic!("unknown argument: {other}"),
+        }
+        i += 1;
+    }
+
+    if !parquet_path.is_file() {
+        eprintln!(
+            "Parquet file not found at {}; run `cargo run --release -p izzydb-bench --bin fts_bench_gen` first.",
+            parquet_path.display()
+        );
+        return;
+    }
+
+    let cfg = fts_collection_config();
+    let dir = TempDir::new().unwrap();
+    let db_dir = dir.path().join("db");
+    let work_dir = dir.path().join("work");
+    let bcfg = BulkImportConfig::new(cfg.clone(), "id", "vector", &work_dir);
+
+    // Prepare the collection outside search benchmark measurement.
+    let report = bulk_import(&db_dir, std::slice::from_ref(&parquet_path), bcfg, None).unwrap();
+    let _ = fs::remove_dir_all(&work_dir);
+
+    let col = Collection::open(&db_dir, cfg).unwrap();
+    println!(
+        "Prepared collection from {} (docs={}, terms={}, segments={})",
+        parquet_path.display(),
+        report.docs_imported,
+        report.terms,
+        report.segments_created,
+    );
+
+    run_search_benchmark(&col, report.docs_imported, runs, only_terms);
 }

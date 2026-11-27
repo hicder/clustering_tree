@@ -21,7 +21,7 @@ use izzydb::Collection;
 use izzydb::codec::{SegmentMeta, SegmentState};
 use izzydb::config::{AttrId, ColumnGen, DocId, LocalId, NodeId, RowId, SegmentId};
 use izzydb::error::{Result, TreeError};
-use izzydb::fts::{FtsMeta, PostingBlockHeader, SkipBlock, TermRecord};
+use izzydb::fts::{FtsChunk, FtsMeta, PackedPostingBlock, TermRecord};
 use izzydb::node::PackedLeafNode;
 use izzydb::rabitq::{EncodeScratch, RabitqQuantizer};
 use izzydb::schema::{CollectionConfig, CollectionSchema, ColumnStorage};

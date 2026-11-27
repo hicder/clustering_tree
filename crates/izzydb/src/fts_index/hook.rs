@@ -6,9 +6,8 @@ use izzydb_core::config::{RowBlock, RowId, TermId};
 use izzydb_core::error::Result;
 use izzydb_core::schema::{CollectionSchema, ColumnStorage};
 use izzydb_fts::{
-    DocLenBlock,
-    FtsAnalyzer, FtsMeta, INLINE_TERM_MAX_DF,
-    PackedPositionBlock, PackedPostingBlock, PostingBlockHeader, SkipBlock, TermRecord,
+    DocLenBlock, FtsAnalyzer, FtsChunk, FtsChunkView, FtsMeta, INLINE_TERM_MAX_DF,
+    PackedPositionBlock, PackedPostingBlock, PostingBlockHeader, TermRecord,
 };
 use izzydb_storage::codec::{
     RowView, encode_fts_term_key,
@@ -206,16 +205,18 @@ pub(super) fn materialize_inline_block(
     block_id: RowBlock,
     encoded: &[u8],
 ) -> Result<()> {
-    let hdr = PostingBlockHeader::parse(encoded)?;
-    tx.put_fts_posting_bytes(term_id, block_id, encoded.to_vec());
-
+    let pblk = PackedPostingBlock::decode(encoded)?;
+    let compact = pblk.encode_compact();
     let chunk = block_id.chunk();
-    let mut skip_blk = match tx.get_fts_skip_bytes(term_id, chunk)? {
-        Some(sb) => SkipBlock::decode(&sb)?,
-        None => SkipBlock::default(),
-    };
-    skip_blk.upsert(block_id.rel_block(), hdr.max_tf, hdr.min_dl_over_tf);
-    tx.put_fts_skip_bytes(term_id, chunk, skip_blk.encode());
+    let existing = tx.get_fts_skip_bytes(term_id, chunk)?;
+    let new_chunk = FtsChunk::upsert_block(
+        existing.as_deref(),
+        block_id.rel_block(),
+        pblk.max_tf,
+        pblk.min_dl_over_tf,
+        &compact,
+    )?;
+    tx.put_fts_skip_bytes(term_id, chunk, new_chunk);
     Ok(())
 }
 
@@ -227,22 +228,34 @@ pub(super) fn upsert_posting_and_skip(
     tf: u32,
     doc_lens: &DocLenBlock,
 ) -> Result<()> {
-    let mut blk = match tx.get_fts_posting_bytes(term_id, block_id)? {
-        Some(bytes) => PackedPostingBlock::decode(&bytes)?,
+    let chunk = block_id.chunk();
+    let rel = block_id.rel_block();
+    let existing = tx.get_fts_skip_bytes(term_id, chunk)?;
+    let mut blk = match existing.as_deref() {
+        Some(bytes) => {
+            let view = FtsChunkView::parse(bytes)?;
+            if let Some(idx) = view.find_exact(rel) {
+                PackedPostingBlock::decode_compact(
+                    view.block_bytes(idx),
+                    view.max_tf(idx),
+                    view.min_dl_over_tf(idx),
+                )?
+            } else {
+                PackedPostingBlock::default()
+            }
+        }
         None => PackedPostingBlock::default(),
     };
     blk.upsert(slot, tf, doc_lens);
-    let encoded = blk.encode();
-    let hdr = PostingBlockHeader::parse(&encoded)?;
-    tx.put_fts_posting_bytes(term_id, block_id, encoded);
-
-    let chunk = block_id.chunk();
-    let mut skip_blk = match tx.get_fts_skip_bytes(term_id, chunk)? {
-        Some(sb) => SkipBlock::decode(&sb)?,
-        None => SkipBlock::default(),
-    };
-    skip_blk.upsert(block_id.rel_block(), hdr.max_tf, hdr.min_dl_over_tf);
-    tx.put_fts_skip_bytes(term_id, chunk, skip_blk.encode());
+    let compact = blk.encode_compact();
+    let new_chunk = FtsChunk::upsert_block(
+        existing.as_deref(),
+        rel,
+        blk.max_tf,
+        blk.min_dl_over_tf,
+        &compact,
+    )?;
+    tx.put_fts_skip_bytes(term_id, chunk, new_chunk);
     Ok(())
 }
 

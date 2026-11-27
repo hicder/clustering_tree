@@ -23,10 +23,19 @@ fn perf_ctl(cmd: &str) {
     }
 }
 
-fn run_search_benchmark(col: &Collection, num_docs: u64, runs: usize, only_terms: Option<usize>) {
+fn run_search_benchmark(
+    col: &Collection,
+    num_docs: u64,
+    runs: usize,
+    only_terms: Option<usize>,
+    parallel_segments: Option<usize>,
+) {
     let vocab: Vec<String> = (0..FTS_VOCAB_SIZE).map(|i| format!("term{i:04}")).collect();
 
-    println!("\n[n={num_docs}, tier={:?}, runs={runs}]", SimdTier::detect());
+    println!(
+        "\n[n={num_docs}, tier={:?}, runs={runs}, parallel_segments={parallel_segments:?}]",
+        SimdTier::detect()
+    );
 
     for (label, num_terms) in [
         ("Short 3-term query", 3usize),
@@ -82,6 +91,7 @@ fn main() {
     let mut parquet_path = PathBuf::from(DEFAULT_FTS_PARQUET_PATH);
     let mut runs = 50usize;
     let mut only_terms = None;
+    let mut parallel_segments = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -107,6 +117,15 @@ fn main() {
                         .expect("invalid --terms integer"),
                 );
             }
+            "--parallel-segments" => {
+                i += 1;
+                parallel_segments = Some(
+                    args.get(i)
+                        .expect("missing value for --parallel-segments")
+                        .parse()
+                        .expect("invalid --parallel-segments integer"),
+                );
+            }
             other => panic!("unknown argument: {other}"),
         }
         i += 1;
@@ -120,7 +139,10 @@ fn main() {
         return;
     }
 
-    let cfg = fts_collection_config();
+    let mut cfg = fts_collection_config();
+    if let Some(n) = parallel_segments {
+        cfg = cfg.with_fts_parallel_segments(n);
+    }
     let dir = TempDir::new().unwrap();
     let db_dir = dir.path().join("db");
     let work_dir = dir.path().join("work");
@@ -139,5 +161,5 @@ fn main() {
         report.segments_created,
     );
 
-    run_search_benchmark(&col, report.docs_imported, runs, only_terms);
+    run_search_benchmark(&col, report.docs_imported, runs, only_terms, parallel_segments);
 }

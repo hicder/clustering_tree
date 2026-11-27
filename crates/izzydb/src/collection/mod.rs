@@ -86,6 +86,7 @@ impl Collection {
             }
             _ => (None, HashMap::new(), HashMap::new()),
         };
+        let fts_index = FtsIndex::new().with_parallel_segments(config.fts_parallel_segments);
         Ok(Self {
             storage,
             config,
@@ -95,7 +96,7 @@ impl Collection {
             ann_meta,
             ann,
             attr_index: AttributeIndex,
-            fts_index: FtsIndex::new(),
+            fts_index,
             internal_cache,
             leaf_parent,
         })

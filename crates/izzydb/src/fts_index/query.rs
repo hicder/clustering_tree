@@ -10,7 +10,7 @@ use izzydb_core::rowset::RowSet;
 use izzydb_core::schema::{AttributeValue, Attributes, CollectionSchema};
 use izzydb_fts::{
     BlockMaskProvider, Bm25Result, DEFAULT_MAX_PREFIX_EXPANSIONS,
-    FtsAnalyzer, FtsPostingSource, RankModifier, TermRecord, execute_rank_by_with,
+    FtsAnalyzer, FtsPostingSource, RankModifier, TermRecord, execute_rank_by_with_shards,
 };
 use izzydb_storage::{
     SegmentTableSnapshot, Storage,
@@ -57,7 +57,7 @@ impl FtsIndex {
     ) -> Result<Vec<Bm25Result>> {
         let source = StorageFtsSource::new(storage);
         let mut buf = self.acquire_buffer();
-        execute_rank_by_with(
+        execute_rank_by_with_shards(
             &source,
             schema,
             rank_by,
@@ -65,6 +65,7 @@ impl FtsIndex {
             block_mask,
             lazy_filter,
             modifier,
+            self.max_parallel_segments,
             &mut buf,
         )
     }

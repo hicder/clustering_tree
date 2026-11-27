@@ -26,8 +26,18 @@ use izzydb_storage::{
 
 
 /// Inverted full-text index manager operating directly on [`RowId`] / [`RowBlock`] coordinates.
+///
+/// Pools reusable analyzer scratch buffers and configures segment-parallel MAXSCORE sharding
+/// for [`Collection`](crate::Collection) lexical queries.
+///
+/// ```text
+/// let fts = FtsIndex::new().with_parallel_segments(Some(4));
+/// ```
 pub struct FtsIndex {
+    /// Pooled scratch buffers for query and document tokenization.
     buffers: Mutex<Vec<ReusableBuffer>>,
+    /// Optional cap on parallel segment shards for MAXSCORE (`None` uses all Rayon threads).
+    max_parallel_segments: Option<usize>,
 }
 
 struct PooledBuffer<'a> {
@@ -70,7 +80,14 @@ impl FtsIndex {
     pub fn new() -> Self {
         Self {
             buffers: Mutex::new(vec![ReusableBuffer::new()]),
+            max_parallel_segments: None,
         }
+    }
+
+    /// Cap the number of segment shards executed in parallel during MAXSCORE queries.
+    pub fn with_parallel_segments(mut self, parallel_segments: Option<usize>) -> Self {
+        self.max_parallel_segments = parallel_segments;
+        self
     }
 
     fn acquire_buffer(&self) -> PooledBuffer<'_> {

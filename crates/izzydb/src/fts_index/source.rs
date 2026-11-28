@@ -75,6 +75,11 @@ impl FtsSkipCursor for StorageSkipCursor<'_> {
     }
 
     #[inline]
+    fn current_posting_encoded(&mut self) -> Result<Option<izzydb_fts::EncodedPosting<'_>>> {
+        self.0.current_posting_encoded()
+    }
+
+    #[inline]
     fn current_posting_view(&mut self) -> Result<Option<PostingBlockView<'_>>> {
         self.0.current_posting_view()
     }

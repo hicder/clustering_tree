@@ -130,19 +130,40 @@ pub fn execute_rank_by_with_shards<S: FtsPostingSource>(
                     return Ok(BinaryHeap::new());
                 }
                 let mut dl_cache = DlNormCache::from_specs(&plan.dl_specs);
-                run_shard(
-                    source,
-                    &mut clauses,
-                    &prefix_max_sum,
-                    &mut dl_cache,
-                    top_k,
-                    add_ub,
-                    block_mask,
-                    &mut None,
-                    None,
-                    Some(&shared_theta),
-                    tier,
-                )
+                if clauses
+                    .iter()
+                    .all(|c| matches!(c.kind, ClauseKind::Single(_)))
+                {
+                    let mut streams = into_single_streams(clauses)
+                        .expect("all-single plan must convert to term streams");
+                    run_shard_single(
+                        source,
+                        &mut streams,
+                        &prefix_max_sum,
+                        &mut dl_cache,
+                        top_k,
+                        add_ub,
+                        block_mask,
+                        &mut None,
+                        None,
+                        Some(&shared_theta),
+                        tier,
+                    )
+                } else {
+                    run_shard(
+                        source,
+                        &mut clauses,
+                        &prefix_max_sum,
+                        &mut dl_cache,
+                        top_k,
+                        add_ub,
+                        block_mask,
+                        &mut None,
+                        None,
+                        Some(&shared_theta),
+                        tier,
+                    )
+                }
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -155,19 +176,40 @@ pub fn execute_rank_by_with_shards<S: FtsPostingSource>(
         return Ok(Vec::new());
     }
     let mut dl_cache = DlNormCache::from_specs(&plan.dl_specs);
-    let heap = run_shard(
-        source,
-        &mut clauses,
-        &prefix_max_sum,
-        &mut dl_cache,
-        top_k,
-        add_ub,
-        block_mask,
-        &mut lazy_filter,
-        rescore_fn.as_deref_mut(),
-        None,
-        tier,
-    )?;
+    let heap = if clauses
+        .iter()
+        .all(|c| matches!(c.kind, ClauseKind::Single(_)))
+    {
+        let mut streams =
+            into_single_streams(clauses).expect("all-single plan must convert to term streams");
+        run_shard_single(
+            source,
+            &mut streams,
+            &prefix_max_sum,
+            &mut dl_cache,
+            top_k,
+            add_ub,
+            block_mask,
+            &mut lazy_filter,
+            rescore_fn.as_deref_mut(),
+            None,
+            tier,
+        )?
+    } else {
+        run_shard(
+            source,
+            &mut clauses,
+            &prefix_max_sum,
+            &mut dl_cache,
+            top_k,
+            add_ub,
+            block_mask,
+            &mut lazy_filter,
+            rescore_fn,
+            None,
+            tier,
+        )?
+    };
 
     resolve_and_sort_results(source, heap)
 }
@@ -329,6 +371,319 @@ fn run_shard<'a, 'r, S: FtsPostingSource>(
     Ok(heap)
 }
 
+/// Move compiled clauses into plain term streams when every live clause is a single term.
+fn into_single_streams<'a, S: FtsPostingSource + 'a>(
+    clauses: Vec<Clause<'a, S>>,
+) -> Option<Vec<TermStream<'a, S>>> {
+    clauses
+        .into_iter()
+        .map(|c| match c.kind {
+            ClauseKind::Single(t) => Some(t),
+            _ => None,
+        })
+        .collect()
+}
+
+#[inline]
+fn refresh_stream_state<'a, S: FtsPostingSource>(
+    stream: &TermStream<'a, S>,
+    block: &mut Option<RowBlock>,
+    bound: &mut f32,
+) {
+    let cur = stream.current_block_id();
+    *block = cur;
+    *bound = if cur.is_some() {
+        stream.block_upper_bound()
+    } else {
+        0.0
+    };
+}
+
+#[inline]
+fn min_cached_block(blocks: &[Option<RowBlock>]) -> Option<RowBlock> {
+    blocks.iter().filter_map(|b| *b).min()
+}
+
+/// Specialized MAXSCORE loop for plans made up only of single-term clauses.
+///
+/// Caches each stream's current block and Block-Max bound in shard-local arrays so the
+/// next-block scan, bound sum, skip advance, and score pass each touch the essential
+/// clauses once per block instead of re-querying every cursor several times.
+#[allow(clippy::too_many_arguments)]
+fn run_shard_single<'a, 'r, S: FtsPostingSource>(
+    source: &'a S,
+    streams: &mut [TermStream<'a, S>],
+    prefix_max_sum: &[f32],
+    dl_cache: &mut DlNormCache<'a, S>,
+    top_k: usize,
+    add_ub: f32,
+    block_mask: Option<&dyn BlockMaskProvider>,
+    lazy_filter: &mut Option<&mut dyn FnMut(RowId) -> Result<bool>>,
+    mut rescore: Option<&mut (dyn FnMut(RowId, f32) -> Result<f32> + 'r)>,
+    shared_theta: Option<&AtomicU32>,
+    tier: SimdTier,
+) -> Result<BinaryHeap<TopKEntry>> {
+    let n_clauses = streams.len();
+    let mut essential_start: usize = 0;
+    let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(top_k + 1);
+    let mut theta: f32 = 0.0;
+
+    let mut scores = [0.0f32; FTS_BLOCK_SIZE];
+    let mut touched: [u64; 4];
+    let mut candidates: Vec<(f32, RowId)> = Vec::with_capacity(32);
+    let mut non_ess_ubs: Vec<f32> = Vec::with_capacity(n_clauses);
+
+    let mut blocks: Vec<Option<RowBlock>> = Vec::with_capacity(n_clauses);
+    let mut bounds: Vec<f32> = Vec::with_capacity(n_clauses);
+    for stream in streams.iter() {
+        let mut block = None;
+        let mut bound = 0.0;
+        refresh_stream_state(stream, &mut block, &mut bound);
+        blocks.push(block);
+        bounds.push(bound);
+    }
+    let mut matching: Vec<usize> = Vec::with_capacity(n_clauses);
+
+    while let Some(block_id) = min_cached_block(&blocks[essential_start..]) {
+        let non_ess_ub = if essential_start > 0 {
+            prefix_max_sum[essential_start - 1]
+        } else {
+            0.0
+        };
+        let global_theta = shared_theta.map_or(0.0, |st| f32::from_bits(st.load(Ordering::Relaxed)));
+        let eff_theta = theta.max(global_theta);
+        let prune_theta = if eff_theta > add_ub {
+            eff_theta - add_ub
+        } else {
+            0.0
+        };
+
+        // Chunk-level skip when only one essential clause remains.
+        if essential_start + 1 == n_clauses
+            && prune_theta > 0.0
+            && let Some((chunk, chunk_ub)) = streams[essential_start].chunk_upper_bound()
+            && ub_below_threshold(chunk_ub + non_ess_ub, prune_theta)
+        {
+            streams[essential_start].seek_past_chunk(chunk)?;
+            refresh_stream_state(
+                &streams[essential_start],
+                &mut blocks[essential_start],
+                &mut bounds[essential_start],
+            );
+            continue;
+        }
+
+        let allowed_mask = match block_mask {
+            Some(mp) => match mp.mask(block_id) {
+                Some([0, 0, 0, 0]) => {
+                    for i in essential_start..n_clauses {
+                        if blocks[i] == Some(block_id) {
+                            streams[i].advance_past(block_id)?;
+                            refresh_stream_state(&streams[i], &mut blocks[i], &mut bounds[i]);
+                        }
+                    }
+                    continue;
+                }
+                other => other,
+            },
+            None => None,
+        };
+
+        // One pass over the essential clauses finds the matching block and sums its bounds.
+        matching.clear();
+        let mut ess_block_ub = 0.0f64;
+        for i in essential_start..n_clauses {
+            if blocks[i] == Some(block_id) {
+                matching.push(i);
+                ess_block_ub += bounds[i] as f64;
+            }
+        }
+
+        if prune_theta > 0.0
+            && ub_below_threshold((ess_block_ub + non_ess_ub as f64) as f32, prune_theta)
+        {
+            for &i in &matching {
+                streams[i].advance_past(block_id)?;
+                refresh_stream_state(&streams[i], &mut blocks[i], &mut bounds[i]);
+            }
+            continue;
+        }
+
+        scores.fill(0.0);
+        touched = [0u64; 4];
+        for &i in &matching {
+            let stream = &mut streams[i];
+            if !stream.scorer.is_zero() {
+                stream.accumulate_into(
+                    block_id,
+                    AccumMode::Unmasked {
+                        touched: &mut touched,
+                    },
+                    &mut scores,
+                    dl_cache,
+                    source,
+                    tier,
+                )?;
+            }
+            stream.advance_past(block_id)?;
+            refresh_stream_state(&streams[i], &mut blocks[i], &mut bounds[i]);
+        }
+
+        if let Some(mask) = allowed_mask {
+            for w in 0..4 {
+                touched[w] &= mask[w];
+            }
+        }
+
+        let active_mask = if touched == [0u64; 4] || essential_start == 0 {
+            touched
+        } else {
+            eval_non_essential_streams(
+                &mut streams[..essential_start],
+                &mut blocks[..essential_start],
+                &mut bounds[..essential_start],
+                &prefix_max_sum[..essential_start],
+                block_id,
+                touched,
+                non_ess_ub,
+                prune_theta,
+                &mut scores,
+                &mut non_ess_ubs,
+                dl_cache,
+                source,
+                tier,
+            )?
+        };
+
+        if active_mask != [0u64; 4] {
+            let cand_thresh = if heap.len() < top_k && global_theta == 0.0 {
+                f32::MIN_POSITIVE
+            } else {
+                prune_theta.max(f32::MIN_POSITIVE)
+            };
+            let hit_mask = filter_ge_256(tier, &scores, &active_mask, cand_thresh);
+            if hit_mask != [0u64; 4] {
+                collect_block_candidates(block_id, &hit_mask, &scores, &mut candidates);
+                if !candidates.is_empty() {
+                    theta = insert_candidates_into_heap(
+                        source,
+                        &candidates,
+                        top_k,
+                        theta,
+                        global_theta,
+                        &mut heap,
+                        lazy_filter,
+                        rescore.as_deref_mut(),
+                    )?;
+                    if let Some(st) = shared_theta
+                        && heap.len() == top_k
+                        && theta > global_theta
+                    {
+                        st.fetch_max(theta.to_bits(), Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        let global_theta = shared_theta.map_or(0.0, |st| f32::from_bits(st.load(Ordering::Relaxed)));
+        let eff_theta = theta.max(global_theta);
+        let prune_theta = if eff_theta > add_ub {
+            eff_theta - add_ub
+        } else {
+            0.0
+        };
+        if (heap.len() == top_k || global_theta > 0.0) && prune_theta > 0.0 {
+            while essential_start < n_clauses
+                && ub_below_threshold(prefix_max_sum[essential_start], prune_theta)
+            {
+                essential_start += 1;
+            }
+            if essential_start >= n_clauses {
+                break;
+            }
+        }
+    }
+
+    Ok(heap)
+}
+
+/// Single-term counterpart of [`eval_non_essential_clauses`] using cached block/bound arrays.
+#[allow(clippy::too_many_arguments)]
+fn eval_non_essential_streams<'a, S: FtsPostingSource + 'a>(
+    non_essential: &mut [TermStream<'a, S>],
+    blocks: &mut [Option<RowBlock>],
+    bounds: &mut [f32],
+    prefix_max_sum: &[f32],
+    block_id: RowBlock,
+    mut active_mask: [u64; 4],
+    non_ess_ub: f32,
+    theta: f32,
+    scores: &mut [f32; FTS_BLOCK_SIZE],
+    non_ess_ubs: &mut Vec<f32>,
+    dl_cache: &mut DlNormCache<'a, S>,
+    source: &'a S,
+    tier: SimdTier,
+) -> Result<[u64; 4]> {
+    let max_ess = max_score_256(tier, scores, &active_mask);
+    if ub_below_threshold(max_ess + non_ess_ub, theta) {
+        return Ok([0u64; 4]);
+    }
+
+    non_ess_ubs.clear();
+    let mut non_ess_block_ub = 0.0f64;
+    for j in (0..non_essential.len()).rev() {
+        non_essential[j].seek(block_id)?;
+        let cur = non_essential[j].current_block_id();
+        blocks[j] = cur;
+        let ub = if cur == Some(block_id) {
+            non_essential[j].block_upper_bound()
+        } else {
+            0.0
+        };
+        bounds[j] = ub;
+        non_ess_ubs.push(ub);
+        non_ess_block_ub += ub as f64;
+        if theta > 0.0 {
+            let rem_global = if j > 0 { prefix_max_sum[j - 1] } else { 0.0 };
+            let upper = (max_ess as f64 + non_ess_block_ub + rem_global as f64) as f32;
+            if ub_below_threshold(upper, theta) {
+                return Ok([0u64; 4]);
+            }
+        }
+    }
+
+    let tight_ub = (max_ess as f64 + non_ess_block_ub) as f32;
+    let tight_eps = ub_slack(tight_ub);
+    let mut rem_ub = non_ess_block_ub;
+    for (idx, j) in (0..non_essential.len()).rev().enumerate() {
+        let ub_j = non_ess_ubs[idx];
+        if ub_j <= 0.0 {
+            continue;
+        }
+        if theta > 0.0 {
+            let min_needed = (theta - rem_ub as f32) - tight_eps;
+            if min_needed > 0.0 {
+                active_mask = filter_ge_256(tier, scores, &active_mask, min_needed);
+                if active_mask == [0u64; 4] {
+                    break;
+                }
+            }
+        }
+        if blocks[j] == Some(block_id) && !non_essential[j].scorer.is_zero() {
+            non_essential[j].accumulate_into(
+                block_id,
+                AccumMode::Masked { mask: &active_mask },
+                scores,
+                dl_cache,
+                source,
+                tier,
+            )?;
+        }
+        rem_ub = (rem_ub - ub_j as f64).max(0.0);
+    }
+    Ok(active_mask)
+}
+
 fn merge_shard_heaps<S: FtsPostingSource>(
     source: &S,
     shard_heaps: Vec<BinaryHeap<TopKEntry>>,
@@ -336,7 +691,7 @@ fn merge_shard_heaps<S: FtsPostingSource>(
 ) -> Result<BinaryHeap<TopKEntry>> {
     let mut all_entries: Vec<TopKEntry> = Vec::new();
     for h in shard_heaps {
-        all_entries.extend(h.into_iter());
+        all_entries.extend(h);
     }
     if all_entries.len() <= top_k {
         return Ok(all_entries.into_iter().collect());

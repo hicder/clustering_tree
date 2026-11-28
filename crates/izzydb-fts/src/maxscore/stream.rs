@@ -7,7 +7,7 @@ use izzydb_core::config::{
 };
 use izzydb_core::error::{Result, TreeError};
 
-use crate::block::{DocLenBlockView, PostingBlockView};
+use crate::block::{DocLenBlockView, EncodedPosting};
 use crate::bm25::Bm25TermScorer;
 use crate::simd::{
     SimdTier, prepare_dl_norm_256,
@@ -174,9 +174,8 @@ impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
         tier: SimdTier,
     ) -> Result<()> {
         let dl_norm = dl_cache.get_or_load(source, tier, self.dl_group, target)?;
-        if let Some(view) = self.cursor.current_posting_view()? {
-            mode.apply(&self.scorer, tier, &view, dl_norm, scores);
-            return Ok(());
+        if let Some(encoded) = self.cursor.current_posting_encoded()? {
+            return mode.apply_encoded(&self.scorer, tier, encoded, dl_norm, scores);
         }
         let Some(guard) = source.get_posting_block(self.term_id, target)? else {
             return Err(TreeError::CorruptedData(format!(
@@ -184,8 +183,12 @@ impl<'a, S: FtsPostingSource + 'a> TermStream<'a, S> {
                 self.term_id
             )));
         };
-        let view = PostingBlockView::parse(guard.as_ref())?;
-        mode.apply(&self.scorer, tier, &view, dl_norm, scores);
-        Ok(())
+        mode.apply_encoded(
+            &self.scorer,
+            tier,
+            EncodedPosting::Standalone(guard.as_ref()),
+            dl_norm,
+            scores,
+        )
     }
 }

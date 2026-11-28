@@ -7,7 +7,7 @@ use izzydb_core::config::{
 };
 use izzydb_core::error::Result;
 
-use crate::block::{FtsMeta, PostingBlockView, TermRecord};
+use crate::block::{EncodedPosting, FtsMeta, PostingBlockView, TermRecord};
 
 
 /// BM25 search hit returned by `Collection::query_bm25` / `Collection::query`.
@@ -27,6 +27,14 @@ pub trait FtsSkipCursor {
     }
     fn inline_posting_bytes(&self) -> Option<&[u8]>;
     fn current_posting_bytes(&mut self) -> Result<Option<&[u8]>> {
+        Ok(None)
+    }
+    /// Borrow the raw encoded posting payload of the current block without decoding it.
+    ///
+    /// Lets MAXSCORE hand bytes straight to the BM25 kernel dispatcher. Returns `None`
+    /// when the cursor cannot expose an inline payload and the caller must fall back to
+    /// [`FtsPostingSource::get_posting_block`].
+    fn current_posting_encoded(&mut self) -> Result<Option<EncodedPosting<'_>>> {
         Ok(None)
     }
     fn current_posting_view(&mut self) -> Result<Option<PostingBlockView<'_>>> {

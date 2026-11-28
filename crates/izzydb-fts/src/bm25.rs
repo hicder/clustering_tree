@@ -1,6 +1,10 @@
 use izzydb_core::config::FTS_BLOCK_SIZE;
+use izzydb_core::error::Result;
 
-use crate::block::{PostingBlockPayload, PostingBlockView};
+use crate::block::{
+    EncodedPosting, PostingBlockHeader, PostingBlockPayload, PostingBlockView, TfEncoding,
+    parse_compact_payload, parse_standalone_payload,
+};
 use crate::simd::{
     SimdTier, accumulate_dense_256, accumulate_dense_masked_256, accumulate_sparse,
     accumulate_sparse_masked,
@@ -186,5 +190,108 @@ impl Bm25TermScorer {
                 );
             }
         }
+    }
+
+    /// Decode `encoded` at the kernel-selection point and accumulate all posting scores.
+    ///
+    /// Avoids materializing a wide [`PostingBlockView`] between the storage cursor and
+    /// the SIMD kernel, which is the dominant hot path for MAXSCORE execution.
+    #[inline]
+    pub fn accumulate_encoded_simd(
+        &self,
+        tier: SimdTier,
+        encoded: EncodedPosting<'_>,
+        dl_norm: &[f32; FTS_BLOCK_SIZE],
+        scores: &mut [f32; FTS_BLOCK_SIZE],
+        touched: &mut [u64; 4],
+    ) -> Result<()> {
+        if self.is_zero() {
+            return Ok(());
+        }
+        let (tf_enc, payload) = decode_encoded(encoded)?;
+        match payload {
+            PostingBlockPayload::Dense { bitmap, tfs_bytes } => {
+                accumulate_dense_256(
+                    tier,
+                    tf_enc,
+                    tfs_bytes,
+                    self.num_scale,
+                    dl_norm,
+                    &bitmap,
+                    scores,
+                    touched,
+                );
+            }
+            PostingBlockPayload::Sparse { slots, tfs_bytes } => {
+                accumulate_sparse(
+                    tier,
+                    tf_enc,
+                    slots,
+                    tfs_bytes,
+                    self.num_scale,
+                    dl_norm,
+                    scores,
+                    touched,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Masked counterpart of [`Bm25TermScorer::accumulate_encoded_simd`].
+    #[inline]
+    pub fn accumulate_encoded_masked_simd(
+        &self,
+        tier: SimdTier,
+        encoded: EncodedPosting<'_>,
+        dl_norm: &[f32; FTS_BLOCK_SIZE],
+        mask: &[u64; 4],
+        scores: &mut [f32; FTS_BLOCK_SIZE],
+    ) -> Result<()> {
+        if self.is_zero() {
+            return Ok(());
+        }
+        let (tf_enc, payload) = decode_encoded(encoded)?;
+        match payload {
+            PostingBlockPayload::Dense { bitmap, tfs_bytes } => {
+                accumulate_dense_masked_256(
+                    tier,
+                    tf_enc,
+                    tfs_bytes,
+                    self.num_scale,
+                    dl_norm,
+                    &bitmap,
+                    mask,
+                    scores,
+                );
+            }
+            PostingBlockPayload::Sparse { slots, tfs_bytes } => {
+                accumulate_sparse_masked(
+                    tier,
+                    tf_enc,
+                    slots,
+                    tfs_bytes,
+                    self.num_scale,
+                    dl_norm,
+                    mask,
+                    scores,
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validate and decode an [`EncodedPosting`] into kernel-ready slices and encoding.
+#[inline(always)]
+fn decode_encoded<'a>(
+    encoded: EncodedPosting<'a>,
+) -> Result<(TfEncoding, PostingBlockPayload<'a>)> {
+    match encoded {
+        EncodedPosting::Standalone(bytes) => {
+            let header = PostingBlockHeader::parse(bytes)?;
+            parse_standalone_payload(bytes, header)
+        }
+        EncodedPosting::Compact(bytes) => parse_compact_payload(bytes),
     }
 }

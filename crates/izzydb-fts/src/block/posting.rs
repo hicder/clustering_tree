@@ -96,6 +96,235 @@ pub enum PostingBlockPayload<'a> {
     },
 }
 
+/// Borrowed encoded posting payload of a cursor's current block.
+///
+/// Lets the MAXSCORE hot path hand raw bytes straight to the BM25 kernel dispatcher,
+/// which decodes them at the point where it selects the sparse or dense SIMD kernel.
+/// That avoids materializing the wider [`PostingBlockView`] (header, count, and payload
+/// enum) between the storage cursor and the scorer.
+///
+/// Used by `FtsSkipCursor::current_posting_encoded` for both inline standalone blocks
+/// and out-of-line chunk-compact payloads.
+///
+/// ```text
+/// EncodedPosting::Standalone(&bytes[..]) // 12B v3 header + payload
+/// EncodedPosting::Compact(&chunk_payload) // v4 flags + payload
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub enum EncodedPosting<'a> {
+    /// Standalone v3 block including the 12-byte [`PostingBlockHeader`].
+    Standalone(&'a [u8]),
+    /// Compact v4 chunk payload (bounds are stored in the owning `FtsChunk`).
+    Compact(&'a [u8]),
+}
+
+impl<'a> EncodedPosting<'a> {
+    /// Fully parse this encoded payload into a [`PostingBlockView`].
+    #[inline]
+    pub fn parse(self) -> Result<PostingBlockView<'a>> {
+        match self {
+            Self::Standalone(bytes) => PostingBlockView::parse(bytes),
+            Self::Compact(bytes) => PostingBlockView::parse_compact(bytes),
+        }
+    }
+}
+
+#[inline]
+fn payload_count(payload: &PostingBlockPayload<'_>) -> u16 {
+    match payload {
+        PostingBlockPayload::Sparse { slots, .. } => slots.len() as u16,
+        PostingBlockPayload::Dense { bitmap, .. } => {
+            bitmap.iter().map(|w| w.count_ones()).sum::<u32>() as u16
+        }
+    }
+}
+
+/// Decode a validated standalone v3 header's payload without building a full view.
+#[inline(always)]
+pub(crate) fn parse_standalone_payload<'a>(
+    bytes: &'a [u8],
+    header: PostingBlockHeader,
+) -> Result<(TfEncoding, PostingBlockPayload<'a>)> {
+    let tf_width = header.tf_width();
+    let tf_enc = TfEncoding::from_int_width(tf_width);
+    let wbytes = tf_width.byte_size();
+    let payload = if header.is_dense() {
+        let expected = POSTING_BLOCK_HEADER_LEN + 32 + FTS_BLOCK_SIZE * wbytes;
+        if bytes.len() != expected {
+            return Err(TreeError::CorruptedData(format!(
+                "Dense PostingBlock expected {expected} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let bm_bytes = &bytes[POSTING_BLOCK_HEADER_LEN..POSTING_BLOCK_HEADER_LEN + 32];
+        let bitmap = [
+            u64::from_le_bytes(bm_bytes[0..8].try_into().unwrap()),
+            u64::from_le_bytes(bm_bytes[8..16].try_into().unwrap()),
+            u64::from_le_bytes(bm_bytes[16..24].try_into().unwrap()),
+            u64::from_le_bytes(bm_bytes[24..32].try_into().unwrap()),
+        ];
+        let pop: u32 = bitmap.iter().map(|w| w.count_ones()).sum();
+        if pop != header.count as u32 {
+            return Err(TreeError::CorruptedData(format!(
+                "Dense PostingBlock bitmap popcount {pop} != header count {}",
+                header.count
+            )));
+        }
+        PostingBlockPayload::Dense {
+            bitmap,
+            tfs_bytes: &bytes[POSTING_BLOCK_HEADER_LEN + 32..],
+        }
+    } else {
+        let n = header.count as usize;
+        let expected = POSTING_BLOCK_HEADER_LEN + n * wbytes + n;
+        if bytes.len() != expected {
+            return Err(TreeError::CorruptedData(format!(
+                "Sparse PostingBlock expected {expected} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let tfs_start = POSTING_BLOCK_HEADER_LEN;
+        let slots_start = tfs_start + n * wbytes;
+        PostingBlockPayload::Sparse {
+            tfs_bytes: &bytes[tfs_start..slots_start],
+            slots: &bytes[slots_start..],
+        }
+    };
+    Ok((tf_enc, payload))
+}
+
+/// Decode a compact v4 chunk payload without building a full view.
+#[inline(always)]
+pub(crate) fn parse_compact_payload<'a>(
+    bytes: &'a [u8],
+) -> Result<(TfEncoding, PostingBlockPayload<'a>)> {
+    if bytes.is_empty() {
+        return Err(TreeError::CorruptedData(
+            "empty compact posting block".into(),
+        ));
+    }
+    let flags = bytes[0];
+    if (flags & !(COMPACT_FLAG_DENSE | COMPACT_TF_MODE_MASK)) != 0 {
+        return Err(TreeError::CorruptedData(format!(
+            "unknown compact posting flag bits: {flags:#04x}"
+        )));
+    }
+    let dense = (flags & COMPACT_FLAG_DENSE) != 0;
+    let tf_enc = TfEncoding::from_tag((flags & COMPACT_TF_MODE_MASK) >> COMPACT_TF_MODE_SHIFT)?;
+
+    if dense {
+        let tf_len = tf_enc.payload_len(FTS_BLOCK_SIZE);
+        let expected = 1 + 32 + tf_len;
+        if bytes.len() != expected {
+            return Err(TreeError::CorruptedData(format!(
+                "Dense compact PostingBlock expected {expected} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let bm_bytes = &bytes[1..33];
+        let bitmap = [
+            u64::from_le_bytes(bm_bytes[0..8].try_into().unwrap()),
+            u64::from_le_bytes(bm_bytes[8..16].try_into().unwrap()),
+            u64::from_le_bytes(bm_bytes[16..24].try_into().unwrap()),
+            u64::from_le_bytes(bm_bytes[24..32].try_into().unwrap()),
+        ];
+        let pop: u32 = bitmap.iter().map(|w| w.count_ones()).sum();
+        if pop == 0 || pop as usize > FTS_BLOCK_SIZE {
+            return Err(TreeError::CorruptedData(format!(
+                "Dense compact PostingBlock invalid popcount {pop}"
+            )));
+        }
+        return Ok((
+            tf_enc,
+            PostingBlockPayload::Dense {
+                bitmap,
+                tfs_bytes: &bytes[33..],
+            },
+        ));
+    }
+
+    // Fast path for the dominant cold-term case: sparse `tf == 1` everywhere.
+    if tf_enc == TfEncoding::TfOne {
+        let n = bytes.len() - 1;
+        if n == 0 || n > FTS_BLOCK_SIZE {
+            return Err(TreeError::CorruptedData(format!(
+                "Sparse TfOne PostingBlock invalid count {n}"
+            )));
+        }
+        return Ok((
+            tf_enc,
+            PostingBlockPayload::Sparse {
+                slots: &bytes[1..],
+                tfs_bytes: &[],
+            },
+        ));
+    }
+
+    let (n, tfs_start) = match tf_enc {
+        TfEncoding::U2 | TfEncoding::U4 => {
+            if bytes.len() < 3 {
+                return Err(TreeError::CorruptedData(
+                    "Sparse packed compact PostingBlock truncated".into(),
+                ));
+            }
+            (bytes[1] as usize + 1, 2usize)
+        }
+        TfEncoding::U8 => {
+            let rem = bytes.len() - 1;
+            if rem == 0 || !rem.is_multiple_of(2) {
+                return Err(TreeError::CorruptedData(format!(
+                    "Sparse U8 compact PostingBlock invalid len {}",
+                    bytes.len()
+                )));
+            }
+            (rem / 2, 1usize)
+        }
+        TfEncoding::U16 => {
+            let rem = bytes.len() - 1;
+            if rem == 0 || !rem.is_multiple_of(3) {
+                return Err(TreeError::CorruptedData(format!(
+                    "Sparse U16 compact PostingBlock invalid len {}",
+                    bytes.len()
+                )));
+            }
+            (rem / 3, 1usize)
+        }
+        TfEncoding::U32 => {
+            let rem = bytes.len() - 1;
+            if rem == 0 || !rem.is_multiple_of(5) {
+                return Err(TreeError::CorruptedData(format!(
+                    "Sparse U32 compact PostingBlock invalid len {}",
+                    bytes.len()
+                )));
+            }
+            (rem / 5, 1usize)
+        }
+        TfEncoding::TfOne => unreachable!(),
+    };
+
+    if n == 0 || n > FTS_BLOCK_SIZE {
+        return Err(TreeError::CorruptedData(format!(
+            "Sparse compact PostingBlock invalid count {n}"
+        )));
+    }
+    let tf_bytes_len = tf_enc.payload_len(n);
+    let expected = tfs_start + tf_bytes_len + n;
+    if bytes.len() != expected {
+        return Err(TreeError::CorruptedData(format!(
+            "Sparse compact PostingBlock expected {expected} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let slots_start = tfs_start + tf_bytes_len;
+    Ok((
+        tf_enc,
+        PostingBlockPayload::Sparse {
+            tfs_bytes: &bytes[tfs_start..slots_start],
+            slots: &bytes[slots_start..],
+        },
+    ))
+}
+
 /// Zero-copy view over an encoded posting block (v3 standalone or v4 chunk-compact).
 ///
 /// Used by BM25 SIMD scorers and FTS filter bitmask evaluation without heap allocation.
@@ -120,51 +349,7 @@ impl<'a> PostingBlockView<'a> {
     /// Parse a standalone 12-byte-header v3 posting block.
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
         let header = PostingBlockHeader::parse(bytes)?;
-        let tf_width = header.tf_width();
-        let tf_enc = TfEncoding::from_int_width(tf_width);
-        let wbytes = tf_width.byte_size();
-        let payload = if header.is_dense() {
-            let expected = POSTING_BLOCK_HEADER_LEN + 32 + FTS_BLOCK_SIZE * wbytes;
-            if bytes.len() != expected {
-                return Err(TreeError::CorruptedData(format!(
-                    "Dense PostingBlock expected {expected} bytes, got {}",
-                    bytes.len()
-                )));
-            }
-            let bm_bytes = &bytes[POSTING_BLOCK_HEADER_LEN..POSTING_BLOCK_HEADER_LEN + 32];
-            let bitmap = [
-                u64::from_le_bytes(bm_bytes[0..8].try_into().unwrap()),
-                u64::from_le_bytes(bm_bytes[8..16].try_into().unwrap()),
-                u64::from_le_bytes(bm_bytes[16..24].try_into().unwrap()),
-                u64::from_le_bytes(bm_bytes[24..32].try_into().unwrap()),
-            ];
-            let pop: u32 = bitmap.iter().map(|w| w.count_ones()).sum();
-            if pop != header.count as u32 {
-                return Err(TreeError::CorruptedData(format!(
-                    "Dense PostingBlock bitmap popcount {pop} != header count {}",
-                    header.count
-                )));
-            }
-            PostingBlockPayload::Dense {
-                bitmap,
-                tfs_bytes: &bytes[POSTING_BLOCK_HEADER_LEN + 32..],
-            }
-        } else {
-            let n = header.count as usize;
-            let expected = POSTING_BLOCK_HEADER_LEN + n * wbytes + n;
-            if bytes.len() != expected {
-                return Err(TreeError::CorruptedData(format!(
-                    "Sparse PostingBlock expected {expected} bytes, got {}",
-                    bytes.len()
-                )));
-            }
-            let tfs_start = POSTING_BLOCK_HEADER_LEN;
-            let slots_start = tfs_start + n * wbytes;
-            PostingBlockPayload::Sparse {
-                tfs_bytes: &bytes[tfs_start..slots_start],
-                slots: &bytes[slots_start..],
-            }
-        };
+        let (tf_enc, payload) = parse_standalone_payload(bytes, header)?;
         Ok(Self {
             header: Some(header),
             count: header.count,
@@ -176,134 +361,12 @@ impl<'a> PostingBlockView<'a> {
     /// Parse a compact chunk-embedded v4 posting payload (no duplicated `max_tf` / `min_dl_over_tf`).
     #[inline]
     pub fn parse_compact(bytes: &'a [u8]) -> Result<Self> {
-        if bytes.is_empty() {
-            return Err(TreeError::CorruptedData("empty compact posting block".into()));
-        }
-        let flags = bytes[0];
-        if (flags & !(COMPACT_FLAG_DENSE | COMPACT_TF_MODE_MASK)) != 0 {
-            return Err(TreeError::CorruptedData(format!(
-                "unknown compact posting flag bits: {flags:#04x}"
-            )));
-        }
-        let dense = (flags & COMPACT_FLAG_DENSE) != 0;
-        let tf_enc = TfEncoding::from_tag((flags & COMPACT_TF_MODE_MASK) >> COMPACT_TF_MODE_SHIFT)?;
-
-        if dense {
-            let tf_len = tf_enc.payload_len(FTS_BLOCK_SIZE);
-            let expected = 1 + 32 + tf_len;
-            if bytes.len() != expected {
-                return Err(TreeError::CorruptedData(format!(
-                    "Dense compact PostingBlock expected {expected} bytes, got {}",
-                    bytes.len()
-                )));
-            }
-            let bm_bytes = &bytes[1..33];
-            let bitmap = [
-                u64::from_le_bytes(bm_bytes[0..8].try_into().unwrap()),
-                u64::from_le_bytes(bm_bytes[8..16].try_into().unwrap()),
-                u64::from_le_bytes(bm_bytes[16..24].try_into().unwrap()),
-                u64::from_le_bytes(bm_bytes[24..32].try_into().unwrap()),
-            ];
-            let pop: u32 = bitmap.iter().map(|w| w.count_ones()).sum();
-            if pop == 0 || pop as usize > FTS_BLOCK_SIZE {
-                return Err(TreeError::CorruptedData(format!(
-                    "Dense compact PostingBlock invalid popcount {pop}"
-                )));
-            }
-            return Ok(Self {
-                header: None,
-                count: pop as u16,
-                tf_enc,
-                payload: PostingBlockPayload::Dense {
-                    bitmap,
-                    tfs_bytes: &bytes[33..],
-                },
-            });
-        }
-
-        // Fast path for the dominant cold-term case: sparse `tf == 1` everywhere.
-        if tf_enc == TfEncoding::TfOne {
-            let n = bytes.len() - 1;
-            if n == 0 || n > FTS_BLOCK_SIZE {
-                return Err(TreeError::CorruptedData(format!(
-                    "Sparse TfOne PostingBlock invalid count {n}"
-                )));
-            }
-            return Ok(Self {
-                header: None,
-                count: n as u16,
-                tf_enc,
-                payload: PostingBlockPayload::Sparse {
-                    slots: &bytes[1..],
-                    tfs_bytes: &[],
-                },
-            });
-        }
-
-        let (n, tfs_start) = match tf_enc {
-            TfEncoding::U2 | TfEncoding::U4 => {
-                if bytes.len() < 3 {
-                    return Err(TreeError::CorruptedData(
-                        "Sparse packed compact PostingBlock truncated".into(),
-                    ));
-                }
-                (bytes[1] as usize + 1, 2usize)
-            }
-            TfEncoding::U8 => {
-                let rem = bytes.len() - 1;
-                if rem == 0 || rem % 2 != 0 {
-                    return Err(TreeError::CorruptedData(format!(
-                        "Sparse U8 compact PostingBlock invalid len {}",
-                        bytes.len()
-                    )));
-                }
-                (rem / 2, 1usize)
-            }
-            TfEncoding::U16 => {
-                let rem = bytes.len() - 1;
-                if rem == 0 || rem % 3 != 0 {
-                    return Err(TreeError::CorruptedData(format!(
-                        "Sparse U16 compact PostingBlock invalid len {}",
-                        bytes.len()
-                    )));
-                }
-                (rem / 3, 1usize)
-            }
-            TfEncoding::U32 => {
-                let rem = bytes.len() - 1;
-                if rem == 0 || rem % 5 != 0 {
-                    return Err(TreeError::CorruptedData(format!(
-                        "Sparse U32 compact PostingBlock invalid len {}",
-                        bytes.len()
-                    )));
-                }
-                (rem / 5, 1usize)
-            }
-            TfEncoding::TfOne => unreachable!(),
-        };
-
-        if n == 0 || n > FTS_BLOCK_SIZE {
-            return Err(TreeError::CorruptedData(format!(
-                "Sparse compact PostingBlock invalid count {n}"
-            )));
-        }
-        let tf_bytes_len = tf_enc.payload_len(n);
-        let expected = tfs_start + tf_bytes_len + n;
-        if bytes.len() != expected {
-            return Err(TreeError::CorruptedData(format!(
-                "Sparse compact PostingBlock expected {expected} bytes, got {}",
-                bytes.len()
-            )));
-        }
-        let slots_start = tfs_start + tf_bytes_len;
+        let (tf_enc, payload) = parse_compact_payload(bytes)?;
         Ok(Self {
             header: None,
-            count: n as u16,
+            count: payload_count(&payload),
             tf_enc,
-            payload: PostingBlockPayload::Sparse {
-                tfs_bytes: &bytes[tfs_start..slots_start],
-                slots: &bytes[slots_start..],
-            },
+            payload,
         })
     }
 
@@ -720,18 +783,20 @@ fn encode_compact_slices(
         match tf_enc {
             TfEncoding::TfOne => {}
             TfEncoding::U2 => {
-                for chunk in dense_tfs.chunks_exact(4) {
-                    let a = chunk[0].saturating_sub(1) & 0x03;
-                    let b = chunk[1].saturating_sub(1) & 0x03;
-                    let c = chunk[2].saturating_sub(1) & 0x03;
-                    let d = chunk[3].saturating_sub(1) & 0x03;
+                for chunk in dense_tfs.as_chunks::<4>().0 {
+                    let [a, b, c, d] = *chunk;
+                    let a = a.saturating_sub(1) & 0x03;
+                    let b = b.saturating_sub(1) & 0x03;
+                    let c = c.saturating_sub(1) & 0x03;
+                    let d = d.saturating_sub(1) & 0x03;
                     buf.push((a | (b << 2) | (c << 4) | (d << 6)) as u8);
                 }
             }
             TfEncoding::U4 => {
-                for chunk in dense_tfs.chunks_exact(2) {
-                    let a = chunk[0].saturating_sub(1) & 0x0F;
-                    let b = chunk[1].saturating_sub(1) & 0x0F;
+                for chunk in dense_tfs.as_chunks::<2>().0 {
+                    let [a, b] = *chunk;
+                    let a = a.saturating_sub(1) & 0x0F;
+                    let b = b.saturating_sub(1) & 0x0F;
                     buf.push((a | (b << 4)) as u8);
                 }
             }

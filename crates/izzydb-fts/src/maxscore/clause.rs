@@ -7,7 +7,7 @@ use izzydb_core::config::{
 };
 use izzydb_core::error::Result;
 
-use crate::block::PostingBlockView;
+use crate::block::EncodedPosting;
 use crate::bm25::Bm25TermScorer;
 use crate::simd::{
     SimdTier, merge_add_256, merge_max_256,
@@ -22,20 +22,20 @@ pub(super) enum AccumMode<'m, 't> {
 
 impl AccumMode<'_, '_> {
     #[inline]
-    pub(super) fn apply(
+    pub(super) fn apply_encoded(
         self,
         scorer: &Bm25TermScorer,
         tier: SimdTier,
-        view: &PostingBlockView<'_>,
+        encoded: EncodedPosting<'_>,
         dl_norm: &[f32; FTS_BLOCK_SIZE],
         scores: &mut [f32; FTS_BLOCK_SIZE],
-    ) {
+    ) -> Result<()> {
         match self {
             Self::Unmasked { touched } => {
-                scorer.accumulate_block_simd(tier, view, dl_norm, scores, touched);
+                scorer.accumulate_encoded_simd(tier, encoded, dl_norm, scores, touched)
             }
             Self::Masked { mask } => {
-                scorer.accumulate_block_masked_simd(tier, view, dl_norm, mask, scores);
+                scorer.accumulate_encoded_masked_simd(tier, encoded, dl_norm, mask, scores)
             }
         }
     }

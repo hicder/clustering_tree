@@ -319,6 +319,29 @@ impl RowSet {
         RowSet { segs: out }
     }
 
+    /// Consuming liveness filter that moves bitmaps in place when no tombstones apply.
+    pub fn into_live<L: Liveness + ?Sized>(self, liveness: &L) -> RowSet {
+        let mut out = Vec::with_capacity(self.segs.len());
+        for (seg, mut bm) in self.segs {
+            let Some(row_count) = liveness.segment_row_count(seg) else {
+                continue;
+            };
+            if row_count == 0 {
+                continue;
+            }
+            if let Some(del) = liveness.deleted_bitmap(seg) {
+                bm -= del;
+            }
+            if bm.max().is_some_and(|m| m >= row_count) {
+                bm.remove_range(row_count..);
+            }
+            if !bm.is_empty() {
+                out.push((seg, bm));
+            }
+        }
+        RowSet { segs: out }
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = RowId> + '_ {
         self.segs
             .iter()
@@ -350,6 +373,37 @@ impl RowSet {
             segs: &self.segs,
             idx: 0,
         }
+    }
+}
+
+/// Dense segment-indexed lookup over a [`RowSet`] for repeated [`RowId`] probes.
+///
+/// Avoids the 153-way binary search in [`RowSet::contains`] during leaf-slot masking.
+///
+/// ```text
+/// let lookup = FastRowSetLookup::new(&rowset);
+/// assert!(lookup.contains(RowId::new(7, 42)) == rowset.contains(RowId::new(7, 42)));
+/// ```
+pub struct FastRowSetLookup<'a> {
+    by_seg: Vec<Option<&'a RoaringBitmap>>,
+}
+
+impl<'a> FastRowSetLookup<'a> {
+    pub fn new(rowset: &'a RowSet) -> Self {
+        let max_seg = rowset.segments().last().map_or(0, |(seg, _)| *seg as usize);
+        let mut by_seg = vec![None; max_seg + 1];
+        for (seg, bm) in rowset.segments() {
+            by_seg[*seg as usize] = Some(bm);
+        }
+        Self { by_seg }
+    }
+
+    #[inline]
+    pub fn contains(&self, row: RowId) -> bool {
+        self.by_seg
+            .get(row.seg() as usize)
+            .and_then(|entry| *entry)
+            .is_some_and(|bm| bm.contains(row.local()))
     }
 }
 
@@ -454,7 +508,9 @@ mod tests {
             }
             live_segs.insert(seg, (count, del));
         }
-        let liveness = MockLiveness { segments: live_segs };
+        let liveness = MockLiveness {
+            segments: live_segs,
+        };
 
         for _ in 0..50 {
             let mut m_a = BTreeSet::new();
@@ -488,11 +544,19 @@ mod tests {
                 m_a.difference(&m_b).copied().collect()
             );
 
-            let live_model: BTreeSet<RowId> =
-                m_a.iter().copied().filter(|&r| liveness.is_live(r)).collect();
+            let live_model: BTreeSet<RowId> = m_a
+                .iter()
+                .copied()
+                .filter(|&r| liveness.is_live(r))
+                .collect();
             assert_eq!(rowset_to_model(&rs_a.and_live(&liveness)), live_model);
+            assert_eq!(
+                rowset_to_model(&rs_a.clone().into_live(&liveness)),
+                live_model
+            );
 
             // Check block_mask and cursor
+            let lookup = FastRowSetLookup::new(&rs_a);
             let mut cursor = rs_a.cursor();
             for seg in 0u32..8 {
                 for blk in 0u32..3 {
@@ -502,6 +566,7 @@ mod tests {
                         let bit = ((mask[(slot >> 6) as usize] >> (slot & 63)) & 1) != 0;
                         assert_eq!(bit, m_a.contains(&row));
                         assert_eq!(rs_a.contains(row), m_a.contains(&row));
+                        assert_eq!(lookup.contains(row), m_a.contains(&row));
                         assert_eq!(cursor.contains_sorted(row), m_a.contains(&row));
                     }
                 }

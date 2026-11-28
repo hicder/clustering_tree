@@ -7,34 +7,29 @@ use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
 use izzydb::codec::{
-    SEG_FLAG_HAS_COLUMNS, SEG_FLAG_HAS_VECTORS, SegPosting, SegmentMeta, SegmentState, TAG_BOOL,
-    TAG_PRESENT, ZoneEntry, column_key, decode_row_entries, detached_count_suffix, detached_key,
-    detached_posting_key, doc_id_block_key, encode_doc_id_block, extract_index_keys_for_attr, extract_index_keys_from_entries, make_posting_key, row_key,
-    RowView,
+    RowView, SEG_FLAG_HAS_COLUMNS, SEG_FLAG_HAS_VECTORS, SegPosting, SegmentMeta, SegmentState,
+    TAG_BOOL, TAG_PRESENT, ZoneEntry, column_key, decode_row_entries, detached_count_suffix,
+    detached_key, detached_posting_key, doc_id_block_key, encode_doc_id_block,
+    extract_index_keys_for_attr, extract_index_keys_from_entries, make_posting_key, row_key,
 };
 use izzydb::config::{
-    AttrId, ColumnGen, DocId, LocalId, ROW_BLOCK_SIZE, RowBlock, RowId, SegmentConfig,
-    SegmentId,
+    AttrId, ColumnGen, DocId, LocalId, ROW_BLOCK_SIZE, RowBlock, RowId, SegmentConfig, SegmentId,
 };
 use izzydb::error::Result;
-use izzydb::fts::{
-    AttrFtsStats, DocLenBlock, FtsAnalyzer, ReusableBuffer, TermRecord,
-};
+use izzydb::fts::{AttrFtsStats, DocLenBlock, FtsAnalyzer, ReusableBuffer, TermRecord};
 use izzydb::schema::{
     AttributeType, AttributeValue, CollectionSchema, ColumnStorage, FullTextSearchConfig,
     SchemaEntry,
 };
 use izzydb::storage::{
-    CF_ATTR_POSTINGS, CF_COLUMNS, CF_DETACHED,
-    CF_DETACHED_POSTINGS, CF_FTS_POSITIONS, CF_FTS_SKIPS, CF_FTS_TERMS,
-    CF_ID_MAP, CF_ROW_DOC_IDS, CF_ROWS, CF_VECTORS, cf_options_for, default_sst_block_cache, doc_key,
+    CF_ATTR_POSTINGS, CF_COLUMNS, CF_DETACHED, CF_DETACHED_POSTINGS, CF_FTS_POSITIONS,
+    CF_FTS_SKIPS, CF_FTS_TERMS, CF_ID_MAP, CF_ROW_DOC_IDS, CF_ROWS, CF_VECTORS, cf_options_for,
+    default_sst_block_cache, doc_key,
 };
 use izzydb_storage::column::ColumnBlockBuilder;
 
 use crate::common::parquet_reader::{MappedFile, StagedData, decode_staged_doc, read_doc_id_at};
-use crate::common::sorter::{
-    ExternalSorter, KvItem,
-};
+use crate::common::sorter::{ExternalSorter, KvItem};
 use crate::common::sst::{SstFileInfo, SstSink};
 
 use super::*;
@@ -67,14 +62,20 @@ pub fn emit_segment_range_ssts(
     let block_cache = default_sst_block_cache();
     let n_docs = staged.docs_imported as usize;
     let seal_rows = seg_cfg.seal_rows as usize;
-    let rows_by_doc_id_mmap = MappedFile::open(&staged.rows_by_doc_id_path)?;
+    let rows_by_row_id_path = staged
+        .rows_by_row_id_path
+        .as_deref()
+        .unwrap_or(&staged.rows_by_doc_id_path);
+    let rows_by_row_id_mmap = MappedFile::open(rows_by_row_id_path)?;
 
-    let has_attr_index = schema.entries().iter().any(|e| {
-        e.storage == ColumnStorage::Inline && e.filterable
-    });
-    let has_detached_filter = schema.entries().iter().any(|e| {
-        e.storage == ColumnStorage::Detached && e.filterable
-    });
+    let has_attr_index = schema
+        .entries()
+        .iter()
+        .any(|e| e.storage == ColumnStorage::Inline && e.filterable);
+    let has_detached_filter = schema
+        .entries()
+        .iter()
+        .any(|e| e.storage == ColumnStorage::Detached && e.filterable);
     let has_fts = schema.has_fts();
 
     let mut col_attrs: Vec<(AttrId, AttributeType)> = if seg_cfg.defer_column_build {
@@ -118,6 +119,9 @@ pub fn emit_segment_range_ssts(
     let mut active_sorters = 0usize;
     if has_attr_index {
         active_sorters += 2;
+    }
+    if emit_id_map_sst {
+        active_sorters += 1;
     }
     if staged.has_detached_staging && !detached_entries.is_empty() {
         active_sorters += 1;
@@ -195,7 +199,16 @@ pub fn emit_segment_range_ssts(
         None
     };
 
-    let id_map_opts = cf_options_for(CF_ID_MAP, &block_cache)?;
+    let id_map_sorter = if emit_id_map_sst {
+        Some(ExternalSorter::<KvItem>::new(
+            "id_map",
+            stage_dir.join("runs_id_map"),
+            per_sorter_budget,
+            seg_ranges.len(),
+        )?)
+    } else {
+        None
+    };
     let rows_opts = cf_options_for(CF_ROWS, &block_cache)?;
     let vecs_opts = cf_options_for(CF_VECTORS, &block_cache)?;
     let doc_ids_opts = cf_options_for(CF_ROW_DOC_IDS, &block_cache)?;
@@ -211,17 +224,8 @@ pub fn emit_segment_range_ssts(
                     ..Default::default()
                 };
 
-                let mut id_map_sink = if emit_id_map_sst {
-                    Some(SstSink::new(
-                        bundle_dir.to_path_buf(),
-                        CF_ID_MAP,
-                        &id_map_opts,
-                        target_sst_bytes,
-                        format!("{CF_ID_MAP}/part-{w_idx:02}"),
-                    ))
-                } else {
-                    None
-                };
+                let mut id_map_shard = id_map_sorter.as_ref().map(|sorter| sorter.shard());
+
                 let mut rows_sink = SstSink::new(
                     bundle_dir.to_path_buf(),
                     CF_ROWS,
@@ -287,7 +291,7 @@ pub fn emit_segment_range_ssts(
                     .collect();
                 let mut fts_buf = ReusableBuffer::new();
 
-                let rows_bytes = rows_by_doc_id_mmap.as_bytes();
+                let rows_bytes = rows_by_row_id_mmap.as_bytes();
                 let seg_flags = (if has_vectors { SEG_FLAG_HAS_VECTORS } else { 0 })
                     | (if !seg_cfg.defer_column_build {
                         SEG_FLAG_HAS_COLUMNS
@@ -324,68 +328,67 @@ pub fn emit_segment_range_ssts(
                         vec![[0u32; ROW_BLOCK_SIZE]; fts_attrs.len()];
                     let mut blk_row_count = 0usize;
 
-                    let flush_block = |blk: u32,
-                                       row_cnt: usize,
-                                       doc_id_blk: &mut [DocId; ROW_BLOCK_SIZE],
-                                       col_builders: &mut Vec<ColumnBlockBuilder>,
-                                       det_builders: &mut Vec<ColumnBlockBuilder>,
-                                       dl_arrs: &mut Vec<[u32; ROW_BLOCK_SIZE]>,
-                                       seg_col_blocks: &mut [Vec<(u32, Vec<u8>)>],
-                                       doc_ids_sink: &mut SstSink<'_>,
-                                       det_b_shard: Option<
-                        &mut crate::common::sorter::SorterShard<KvItem>,
-                    >,
-                                       doc_len_blocks: &mut Vec<(AttrId, RowBlock, Vec<u8>)>|
-                     -> Result<()> {
-                        if blk == u32::MAX {
-                            return Ok(());
-                        }
-                        doc_ids_sink.put(
-                            &doc_id_block_key(seg, blk),
-                            &encode_doc_id_block(doc_id_blk),
-                        )?;
-                        doc_id_blk.fill(0);
-
-                        for (idx, &(_, ty)) in col_attrs.iter().enumerate() {
-                            let b = std::mem::replace(
-                                &mut col_builders[idx],
-                                ColumnBlockBuilder::new(ty),
-                            );
-                            if b.present_count() > 0 {
-                                seg_col_blocks[idx].push((blk, b.encode()));
+                    let flush_block =
+                        |blk: u32,
+                         row_cnt: usize,
+                         doc_id_blk: &mut [DocId; ROW_BLOCK_SIZE],
+                         col_builders: &mut Vec<ColumnBlockBuilder>,
+                         det_builders: &mut Vec<ColumnBlockBuilder>,
+                         dl_arrs: &mut Vec<[u32; ROW_BLOCK_SIZE]>,
+                         seg_col_blocks: &mut [Vec<(u32, Vec<u8>)>],
+                         doc_ids_sink: &mut SstSink<'_>,
+                         det_b_shard: Option<&mut crate::common::sorter::SorterShard<KvItem>>,
+                         doc_len_blocks: &mut Vec<(AttrId, RowBlock, Vec<u8>)>|
+                         -> Result<()> {
+                            if blk == u32::MAX {
+                                return Ok(());
                             }
-                        }
+                            doc_ids_sink.put(
+                                &doc_id_block_key(seg, blk),
+                                &encode_doc_id_block(doc_id_blk),
+                            )?;
+                            doc_id_blk.fill(0);
 
-                        if let Some(ds) = det_b_shard {
-                            for (idx, entry) in detached_entries.iter().enumerate() {
+                            for (idx, &(_, ty)) in col_attrs.iter().enumerate() {
                                 let b = std::mem::replace(
-                                    &mut det_builders[idx],
-                                    ColumnBlockBuilder::new(entry.attr_type),
+                                    &mut col_builders[idx],
+                                    ColumnBlockBuilder::new(ty),
                                 );
                                 if b.present_count() > 0 {
-                                    let col_gen =
-                                        detached_gens.get(&entry.id).copied().unwrap_or(0);
-                                    ds.push(KvItem {
-                                        key: detached_key(entry.id, col_gen, seg, blk).to_vec(),
-                                        val: b.encode(),
-                                    })?;
+                                    seg_col_blocks[idx].push((blk, b.encode()));
                                 }
                             }
-                        }
 
-                        for (f_idx, &(aid, _)) in fts_attrs.iter().enumerate() {
-                            let dl_blk = DocLenBlock::from_dls(&dl_arrs[f_idx][..row_cnt]);
-                            if !dl_blk.is_empty() {
-                                doc_len_blocks.push((
-                                    aid,
-                                    RowBlock::new(seg, blk),
-                                    dl_blk.encode(),
-                                ));
+                            if let Some(ds) = det_b_shard {
+                                for (idx, entry) in detached_entries.iter().enumerate() {
+                                    let b = std::mem::replace(
+                                        &mut det_builders[idx],
+                                        ColumnBlockBuilder::new(entry.attr_type),
+                                    );
+                                    if b.present_count() > 0 {
+                                        let col_gen =
+                                            detached_gens.get(&entry.id).copied().unwrap_or(0);
+                                        ds.push(KvItem {
+                                            key: detached_key(entry.id, col_gen, seg, blk).to_vec(),
+                                            val: b.encode(),
+                                        })?;
+                                    }
+                                }
                             }
-                            dl_arrs[f_idx].fill(0);
-                        }
-                        Ok(())
-                    };
+
+                            for (f_idx, &(aid, _)) in fts_attrs.iter().enumerate() {
+                                let dl_blk = DocLenBlock::from_dls(&dl_arrs[f_idx][..row_cnt]);
+                                if !dl_blk.is_empty() {
+                                    doc_len_blocks.push((
+                                        aid,
+                                        RowBlock::new(seg, blk),
+                                        dl_blk.encode(),
+                                    ));
+                                }
+                                dl_arrs[f_idx].fill(0);
+                            }
+                            Ok(())
+                        };
 
                     for (local_usize, ord) in (ord_start..ord_end).enumerate() {
                         let local = local_usize as LocalId;
@@ -416,8 +419,11 @@ pub fn emit_segment_range_ssts(
                         let row_id = RowId::new(seg, local);
 
                         doc_id_blk[slot as usize] = doc_id;
-                        if let Some(ref mut sink) = id_map_sink {
-                            sink.put(&doc_key(doc_id), &row_key(row_id))?;
+                        if let Some(ref mut shard) = id_map_shard {
+                            shard.push(KvItem {
+                                key: doc_key(doc_id).to_vec(),
+                                val: row_key(row_id).to_vec(),
+                            })?;
                         }
 
                         let staged_bytes = read_doc_bytes(docs_idx_mmap, docs_shards, staged_row);
@@ -451,7 +457,9 @@ pub fn emit_segment_range_ssts(
                                     if ak.len() > 3
                                         && tag != TAG_PRESENT
                                         && tag != TAG_BOOL
-                                        && schema.get_by_id(aid).is_some_and(|e| e.attr_type.is_ordered())
+                                        && schema
+                                            .get_by_id(aid)
+                                            .is_some_and(|e| e.attr_type.is_ordered())
                                     {
                                         let z = seg_zones
                                             .entry((aid, tag))
@@ -619,8 +627,8 @@ pub fn emit_segment_range_ssts(
                     s.finish()?;
                 }
 
-                if let Some(sink) = id_map_sink {
-                    accum.id_map_ssts = sink.finish()?;
+                if let Some(shard) = id_map_shard {
+                    shard.finish()?;
                 }
                 accum.rows_ssts = rows_sink.finish()?;
                 if let Some(sink) = vecs_sink {
@@ -642,12 +650,6 @@ pub fn emit_segment_range_ssts(
     let mut merged_fts_stats: BTreeMap<AttrId, AttrFtsStats> = BTreeMap::new();
 
     for w in worker_results {
-        if !w.id_map_ssts.is_empty() {
-            cf_files
-                .entry(CF_ID_MAP.to_owned())
-                .or_default()
-                .extend(w.id_map_ssts);
-        }
         if !w.rows_ssts.is_empty() {
             cf_files
                 .entry(CF_ROWS.to_owned())
@@ -679,6 +681,13 @@ pub fn emit_segment_range_ssts(
             let entry = merged_fts_stats.entry(fts_attrs[i].0).or_default();
             entry.doc_count += st.doc_count;
             entry.total_tokens += st.total_tokens;
+        }
+    }
+
+    if let Some(sorter) = id_map_sorter {
+        let files = emit_sorted_kv_sst(bundle_dir, CF_ID_MAP, target_sst_bytes, sorter)?;
+        if !files.is_empty() {
+            cf_files.insert(CF_ID_MAP.to_owned(), files);
         }
     }
 
@@ -769,8 +778,12 @@ pub fn emit_segment_range_ssts(
 
             let skips_files =
                 emit_sorted_kv_sst(bundle_dir, CF_FTS_SKIPS, target_sst_bytes, skips_sorter)?;
-            let positions_files =
-                emit_sorted_kv_sst(bundle_dir, CF_FTS_POSITIONS, target_sst_bytes, positions_sorter)?;
+            let positions_files = emit_sorted_kv_sst(
+                bundle_dir,
+                CF_FTS_POSITIONS,
+                target_sst_bytes,
+                positions_sorter,
+            )?;
             if !skips_files.is_empty() {
                 cf_files.insert(CF_FTS_SKIPS.to_owned(), skips_files);
             }

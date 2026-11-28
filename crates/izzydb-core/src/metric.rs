@@ -80,6 +80,41 @@ pub fn search_distance(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Compute search distances from `a` to `count` contiguous `dim`-float centroids in `flat`.
+///
+/// Dispatches SIMD CPU-feature detection once per internal node instead of once per child,
+/// and writes `count` distances into `out`.
+#[inline]
+pub fn search_distances_batch(
+    metric: DistanceMetric,
+    a: &[f32],
+    flat: &[f32],
+    dim: usize,
+    out: &mut Vec<f32>,
+) {
+    let count = flat.len().checked_div(dim).unwrap_or(0);
+    out.clear();
+    out.resize(count, 0.0);
+    if count == 0 {
+        return;
+    }
+    match metric {
+        DistanceMetric::L2Squared => simd::l2_squared_batch(a, flat, dim, out),
+        DistanceMetric::Cosine => {
+            simd::dot_product_batch(a, flat, dim, out);
+            for value in out.iter_mut() {
+                *value = (1.0 - *value).max(0.0);
+            }
+        }
+        DistanceMetric::DotProduct => {
+            simd::dot_product_batch(a, flat, dim, out);
+            for value in out.iter_mut() {
+                *value = -*value;
+            }
+        }
+    }
+}
+
 /// Search distance against an unaligned little-endian `f32` byte slice.
 #[inline]
 pub fn search_distance_bytes(metric: DistanceMetric, a: &[f32], b_bytes: &[u8]) -> f32 {
@@ -155,7 +190,12 @@ pub fn compute_weighted_centroid(
 }
 
 /// Compute the unweighted centroid of `count` packed vectors of length `dim` stored contiguously.
-pub fn compute_mean_centroid_flat(vecs: &[f32], count: usize, dim: usize, metric: DistanceMetric) -> Vec<f32> {
+pub fn compute_mean_centroid_flat(
+    vecs: &[f32],
+    count: usize,
+    dim: usize,
+    metric: DistanceMetric,
+) -> Vec<f32> {
     if count == 0 {
         return vec![0.0; dim];
     }

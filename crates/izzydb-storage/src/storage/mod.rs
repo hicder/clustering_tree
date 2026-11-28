@@ -1,5 +1,5 @@
-pub mod batch;
 mod attr_postings;
+pub mod batch;
 mod cf_options;
 mod compaction_filter;
 mod detached;
@@ -7,9 +7,9 @@ mod fts;
 pub mod fts_cursors;
 mod reads;
 mod scans;
+pub mod segments;
 #[cfg(test)]
 mod tests;
-pub mod segments;
 pub mod tx;
 pub mod types;
 
@@ -19,26 +19,25 @@ use std::sync::{Arc, RwLock};
 
 use roaring::RoaringBitmap;
 use rocksdb::{
-    Cache, ColumnFamily, ColumnFamilyDescriptor, DB, DEFAULT_COLUMN_FAMILY_NAME, IngestExternalFileOptions,
-    IteratorMode, Options, WriteBatch,
-    WriteOptions,
+    Cache, ColumnFamily, ColumnFamilyDescriptor, DB, DEFAULT_COLUMN_FAMILY_NAME,
+    IngestExternalFileOptions, IteratorMode, Options, WriteBatch, WriteOptions,
 };
 
-use izzydb_core::config::{
-    AttrId, ColumnGen, DocId, NodeId, ROW_BLOCK_SIZE, RowId, SegmentId,
-};
+use izzydb_core::config::{AttrId, ColumnGen, DocId, NodeId, ROW_BLOCK_SIZE, RowId, SegmentId};
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::schema::CollectionConfig;
 
 use crate::codec::{
-    Manifest, SEG_DELETES_TAG, SEG_META_TAG,
-    SegmentMeta, SegmentState, ZONE_TAG, decode_roaring_bitmap,
+    Manifest, SEG_DELETES_TAG, SEG_META_TAG, SegmentMeta, SegmentState, ZONE_TAG,
+    decode_roaring_bitmap,
 };
 use crate::node::{AnnMeta, PackedLeafNode};
 
 pub use batch::StorageBatch;
-pub use cf_options::{cf_options_for, default_sst_block_cache};
 use cf_options::cf_options_with_filters;
+pub use cf_options::{
+    DEFAULT_BLOCK_CACHE_BYTES, cf_options_for, default_sst_block_cache, sst_block_cache,
+};
 pub use fts_cursors::{RocksDocLenCursor, RocksSkipCursor};
 pub use segments::{SegmentEntry, SegmentTable, SegmentTableSnapshot};
 pub use tx::TxContext;
@@ -93,7 +92,6 @@ pub const ATTR_COUNTS_VERSION_KEY: &[u8] = b"\x01attr_counts_v1";
 pub const DROPPED_SEGMENTS_KEY: &[u8] = b"\x01dropped_segments";
 pub const BULK_IMPORT_MARKER_KEY: &[u8] = b"\x01bulk_import_v3";
 
-const BLOCK_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const DB_WRITE_BUFFER_BYTES: usize = 128 * 1024 * 1024;
 const ATTR_POSTING_PREFIX_LEN: usize = 3;
 const DETACHED_POSTING_PREFIX_LEN: usize = 7;
@@ -156,6 +154,8 @@ pub struct Storage {
     pub(super) dropped_segments: Arc<RwLock<Arc<RoaringBitmap>>>,
     pub(super) retired_detached: Arc<RwLock<Arc<HashMap<AttrId, ColumnGen>>>>,
     pub(super) doc_id_block_cache: RwLock<DocIdBlockCache>,
+    /// Bounded cache of decoded sealed-segment attribute postings.
+    pub(super) attr_posting_cache: RwLock<attr_postings::AttrPostingCache>,
     pub(super) zone_cache: RwLock<Option<ZoneTable>>,
     pub(super) fts_doc_lens_cache: RwLock<HashMap<AttrId, DocLenBlockTable>>,
 }
@@ -168,7 +168,11 @@ impl Storage {
         config: &CollectionConfig,
     ) -> Result<(Self, Manifest, Option<AnnMeta>)> {
         config.validate()?;
-        let block_cache = default_sst_block_cache();
+        let block_cache = sst_block_cache(
+            config
+                .block_cache_bytes
+                .unwrap_or(DEFAULT_BLOCK_CACHE_BYTES),
+        );
         let dim = config.vector.as_ref().map_or(0, |v| v.dim);
         let storage = Self::open_raw(path, dim, &block_cache, config.direct_io)?;
 
@@ -214,7 +218,9 @@ impl Storage {
                 Some(existing)
             }
             (Some(vcfg), None) => {
-                if manifest.total_rows > 0 || storage.get_schema()?.is_some_and(|s| !s.has_vectors()) {
+                if manifest.total_rows > 0
+                    || storage.get_schema()?.is_some_and(|s| !s.has_vectors())
+                {
                     return Err(TreeError::ConfigMismatch {
                         field: "has_vectors",
                         expected: "false".into(),
@@ -308,6 +314,9 @@ impl Storage {
             dropped_segments,
             retired_detached,
             doc_id_block_cache: RwLock::new(DocIdBlockCache::new(DOC_ID_BLOCK_CACHE_CAP)),
+            attr_posting_cache: RwLock::new(attr_postings::AttrPostingCache::new(
+                attr_postings::ATTR_POSTING_CACHE_BYTES,
+            )),
             zone_cache: RwLock::new(None),
             fts_doc_lens_cache: RwLock::new(HashMap::new()),
         })
@@ -318,7 +327,13 @@ impl Storage {
         self.visit_default(&[SEG_META_TAG], |k, v| {
             let seg = decode_u32_key(k)?;
             let meta = SegmentMeta::decode(v)?;
-            entries.insert(seg, SegmentEntry { meta, deleted: None });
+            entries.insert(
+                seg,
+                SegmentEntry {
+                    meta,
+                    deleted: None,
+                },
+            );
             Ok(())
         })?;
         self.visit_default(&[SEG_DELETES_TAG], |k, v| {
@@ -332,7 +347,11 @@ impl Storage {
         self.segments
             .publish(SegmentTableSnapshot::from_entries(entries));
 
-        let dropped = match self.db.get_pinned(DROPPED_SEGMENTS_KEY).map_err(map_db_err)? {
+        let dropped = match self
+            .db
+            .get_pinned(DROPPED_SEGMENTS_KEY)
+            .map_err(map_db_err)?
+        {
             Some(bytes) => decode_roaring_bitmap(&bytes)?,
             None => RoaringBitmap::new(),
         };
@@ -346,7 +365,11 @@ impl Storage {
     /// Open a fresh or empty database path for external SST bulk ingestion.
     pub fn open_for_bulk_ingest(path: impl AsRef<Path>, config: &CollectionConfig) -> Result<Self> {
         config.validate()?;
-        let block_cache = default_sst_block_cache();
+        let block_cache = sst_block_cache(
+            config
+                .block_cache_bytes
+                .unwrap_or(DEFAULT_BLOCK_CACHE_BYTES),
+        );
         let dim = config.vector.as_ref().map_or(0, |v| v.dim);
         let storage = Self::open_raw(path, dim, &block_cache, config.direct_io)?;
 
@@ -369,7 +392,12 @@ impl Storage {
                 continue;
             }
             let cf = storage.cf(cf_name)?;
-            if storage.db.iterator_cf(cf, IteratorMode::Start).next().is_some() {
+            if storage
+                .db
+                .iterator_cf(cf, IteratorMode::Start)
+                .next()
+                .is_some()
+            {
                 return Err(TreeError::InvalidConfig(
                     "bulk import requires an empty collection".into(),
                 ));

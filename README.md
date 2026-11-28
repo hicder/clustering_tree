@@ -8,7 +8,7 @@ An embedded, RocksDB-backed hybrid search engine in Rust for vector, full-text, 
 - **Full-text & hybrid:** Segment-keyed Block-Max MAXSCORE BM25 with unified v4 `FtsChunk` skip+posting chunks (`TfEncoding` compression, inline rare-term postings, segment-parallel MAXSCORE via `fts_parallel_segments`), stemming, phrase matching, and Reciprocal Rank Fusion hybrid search.
 - **Ranking, boosting & sorting:** Composable scoring expressions (filter boosts, saturation and decay attribute signals, additive and multiplicative combinators) and multi-key attribute sorting with index-order top-k early termination.
 - **Faceting:** Exact terms, ranges, stats, and histogram facets over filter, BM25, vector, and hybrid queries, with multi-select (disjunctive) faceting and O(values) unfiltered counts from maintained per-value counters.
-- **Persistent & accelerated:** Atomic RocksDB batch commits, optional `direct_io` (`O_DIRECT`) and opt-in `io-uring` Cargo feature, and runtime-dispatched SIMD (`x86_64` AVX2/AVX-512, `aarch64` NEON).
+- **Persistent & accelerated:** Atomic RocksDB batch commits, per-CF table tuning (partitioned indexes, no Bloom on guaranteed-hit CFs, uncompressed `cf_columns`/`cf_detached`), a configurable shared block cache (`CollectionConfig::with_block_cache_bytes`), optional `direct_io` (`O_DIRECT`) and opt-in `io-uring` Cargo feature, and runtime-dispatched SIMD (`x86_64` AVX2/AVX-512, `aarch64` NEON).
 
 ## Workspace Crates
 

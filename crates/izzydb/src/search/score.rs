@@ -1,7 +1,6 @@
 //! Leaf scoring, candidate finalization, and top-k selection.
 
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use crate::simd::{self, LeafCandidate};
 use izzydb_core::config::{DistanceMetric, NodeId, RowId, TreeConfig};
 use izzydb_core::error::{Result, TreeError};
 use izzydb_core::metric::search_distance_bytes;
@@ -10,8 +9,8 @@ use izzydb_rabitq::{
 };
 use izzydb_storage::node::LeafNodeView;
 use izzydb_storage::{DBPinnableSlice, Storage};
-use crate::simd::{self, LeafCandidate};
-
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, BinaryHeap};
 
 #[allow(dead_code)]
 pub(crate) fn parse_leaf_views<'a>(
@@ -28,7 +27,12 @@ pub(crate) fn parse_leaf_views<'a>(
         let slice = opt_slice.as_ref().ok_or_else(|| {
             TreeError::CorruptedData(format!("missing leaf blob for leaf {leaf_id}"))
         })?;
-        views.push(Some(LeafNodeView::parse(slice, dim, padded_dim, rabitq_words)?));
+        views.push(Some(LeafNodeView::parse(
+            slice,
+            dim,
+            padded_dim,
+            rabitq_words,
+        )?));
     }
     Ok(views)
 }
@@ -196,6 +200,92 @@ pub(crate) fn make_min_heap() -> BinaryHeap<HeapEntry> {
     BinaryHeap::new()
 }
 
+/// Ordered key for a queued leaf centroid.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LeafKey {
+    dist: f32,
+    node_id: NodeId,
+}
+
+impl Eq for LeafKey {}
+
+impl Ord for LeafKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.dist
+            .total_cmp(&other.dist)
+            .then_with(|| self.node_id.cmp(&other.node_id))
+    }
+}
+
+impl PartialOrd for LeafKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Bounded leaf frontier that keeps only the `cap` nearest leaf centroids.
+///
+/// Unlike the shared traversal heap, leaves never compete with internal nodes, and hopeless
+/// leaves are evicted instead of being sifted into an unbounded heap. Backed by an ordered set
+/// so both the nearest and the farthest queued leaf are available in `O(log n)`.
+pub(crate) struct BoundedLeafQueue {
+    set: BTreeSet<LeafKey>,
+    cap: usize,
+}
+
+impl BoundedLeafQueue {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            set: BTreeSet::new(),
+            cap,
+        }
+    }
+
+    pub(crate) fn set_cap(&mut self, cap: usize) {
+        self.cap = cap;
+        while self.set.len() > cap {
+            self.set.pop_last();
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    /// Distance of the nearest queued leaf, if any.
+    #[inline]
+    pub(crate) fn best_dist(&self) -> Option<f32> {
+        self.set.first().map(|entry| entry.dist)
+    }
+
+    pub(crate) fn push(&mut self, entry: HeapEntry) {
+        if self.cap == 0 {
+            return;
+        }
+        if self.set.len() < self.cap {
+            self.set.insert(LeafKey {
+                dist: entry.dist,
+                node_id: entry.node_id,
+            });
+            return;
+        }
+        if let Some(worst) = self.set.last()
+            && entry.dist < worst.dist
+        {
+            self.set.pop_last();
+            self.set.insert(LeafKey {
+                dist: entry.dist,
+                node_id: entry.node_id,
+            });
+        }
+    }
+
+    pub(crate) fn pop_best(&mut self) -> Option<NodeId> {
+        self.set.pop_first().map(|entry| entry.node_id)
+    }
+}
+
 #[inline]
 pub(crate) fn select_top_k<T, F>(items: &mut Vec<T>, limit: usize, cmp: F)
 where
@@ -224,5 +314,7 @@ pub(super) fn cmp_node_dist_id(a: &(NodeId, f32), b: &(NodeId, f32)) -> Ordering
 
 #[inline]
 pub(super) fn cmp_cand_dist_id(a: &LeafCandidate, b: &LeafCandidate) -> Ordering {
-    a.dist.total_cmp(&b.dist).then_with(|| a.doc_id.cmp(&b.doc_id))
+    a.dist
+        .total_cmp(&b.dist)
+        .then_with(|| a.doc_id.cmp(&b.doc_id))
 }

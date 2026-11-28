@@ -2,17 +2,13 @@
 
 use std::sync::Arc;
 
-
-use izzydb_core::config::{
-    AttrId, ColumnGen, LocalId, SegmentId,
-};
+use izzydb_core::config::{AttrId, ColumnGen, LocalId, SegmentId};
 use izzydb_core::error::{Result, TreeError};
 
 use crate::codec::{
     ATTR_COUNT_TAG, DETACHED_COUNT_TAG, DETACHED_OVERWRITTEN_TAG, DetachedMeta, FTS_DOC_LEN_TAG,
-    Manifest, SegPosting, SegmentState, ZONE_TAG, ZoneEntry,
-    detached_count_suffix, detached_gen_bounds, detached_key,
-    encode_roaring_bitmap,
+    Manifest, SegPosting, SegmentState, ZONE_TAG, ZoneEntry, detached_count_suffix,
+    detached_gen_bounds, detached_key, encode_roaring_bitmap,
 };
 use crate::node::AnnMeta;
 
@@ -20,13 +16,13 @@ use crate::storage::batch::StorageBatch;
 use crate::storage::segments::SegmentEntry;
 use crate::storage::types::map_db_err;
 use crate::storage::{
-    CF_ATTR_POSTINGS, CF_COLUMNS, CF_DETACHED, CF_DETACHED_POSTINGS,
-    CF_ROW_DOC_IDS, CF_ROWS, CF_VECTORS,
+    CF_ATTR_POSTINGS, CF_COLUMNS, CF_DETACHED, CF_DETACHED_POSTINGS, CF_ROW_DOC_IDS, CF_ROWS,
+    CF_VECTORS,
 };
 
 use super::*;
 
-impl <'a> TxContext<'a> {
+impl<'a> TxContext<'a> {
     // -----------------------------------------------------------------------
     // Commit
     // -----------------------------------------------------------------------
@@ -543,8 +539,16 @@ impl <'a> TxContext<'a> {
                     .doc_id_block_cache
                     .write()
                     .expect("doc_id_block_cache poisoned");
-                for seg in retired_segs {
+                for &seg in &retired_segs {
                     cache.remove_segment(seg);
+                }
+                let mut posting_cache = self
+                    .storage
+                    .attr_posting_cache
+                    .write()
+                    .expect("attr_posting_cache poisoned");
+                for seg in retired_segs {
+                    posting_cache.remove_segment(seg);
                 }
             }
         }

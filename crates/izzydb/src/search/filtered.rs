@@ -1,22 +1,19 @@
 //! Filtered ANN search regimes.
 
-use std::collections::{BinaryHeap, HashMap};
-use izzydb_core::config::{DistanceMetric, NodeId, RowId, TreeConfig};
-use izzydb_core::error::{Result, TreeError};
-use izzydb_core::filter::Filter;
-use izzydb_core::metric::{prepare_vector_cow, search_distance, search_distance_bytes};
-use izzydb_core::rowset::RowSet;
-use izzydb_core::schema::CollectionSchema;
-use izzydb_rabitq::{
-    QueryScratch, RabitqQuantizer,
-    pack_query_bits_into,
-};
-use izzydb_storage::codec::RowView;
-use izzydb_storage::node::{AnnMeta, LeafNodeView, PackedInternalNode};
-use izzydb_storage::{SegmentTableSnapshot, Storage};
 use crate::filter_plan::{self, ColumnFilter, FilterPlan, FilterPlanTrace, FilteredSearchRegime};
 use crate::fts_index::FtsIndex;
 use crate::simd::LeafCandidate;
+use izzydb_core::config::{DistanceMetric, NodeId, RowId, TreeConfig};
+use izzydb_core::error::{Result, TreeError};
+use izzydb_core::filter::Filter;
+use izzydb_core::metric::{prepare_vector_cow, search_distance_bytes, search_distances_batch};
+use izzydb_core::rowset::{FastRowSetLookup, RowSet};
+use izzydb_core::schema::CollectionSchema;
+use izzydb_rabitq::{QueryScratch, RabitqQuantizer, pack_query_bits_into};
+use izzydb_storage::codec::RowView;
+use izzydb_storage::node::{AnnMeta, LeafNodeView, PackedInternalNode};
+use izzydb_storage::{SegmentTableSnapshot, Storage};
+use std::collections::{BinaryHeap, HashMap};
 
 use super::postings::PostingMembership;
 use super::*;
@@ -72,9 +69,7 @@ pub fn search_filtered_with_trace(
     trace: &mut FilterPlanTrace,
 ) -> Result<Vec<(RowId, f32)>> {
     if opts.beam_width == 0 {
-        return Err(TreeError::InvalidConfig(
-            "beam_width must be >= 1".into(),
-        ));
+        return Err(TreeError::InvalidConfig("beam_width must be >= 1".into()));
     }
     filter.validate(schema)?;
     let q = prepare_vector_cow(query, config.dim, config.metric)?;
@@ -89,7 +84,15 @@ pub fn search_filtered_with_trace(
     match plan {
         FilterPlan::All => {
             trace.regime = Some(FilteredSearchRegime::Unfiltered);
-            search(storage, internal_cache, meta, quantizer, query, opts, config)
+            search(
+                storage,
+                internal_cache,
+                meta,
+                quantizer,
+                query,
+                opts,
+                config,
+            )
         }
         FilterPlan::Empty => {
             trace.regime = Some(FilteredSearchRegime::Empty);
@@ -102,7 +105,14 @@ pub fn search_filtered_with_trace(
             }
             if rowset.len() as usize <= opts.exact_scan_threshold {
                 trace.regime = Some(FilteredSearchRegime::ExactScan);
-                return search_exact_rowset(storage, &q, &rowset, opts.k, config.dim, config.metric);
+                return search_exact_rowset(
+                    storage,
+                    &q,
+                    &rowset,
+                    opts.k,
+                    config.dim,
+                    config.metric,
+                );
             }
             let s = (rowset.len() as f64 / meta.num_vectors.max(1) as f64).clamp(1e-6, 1.0);
             if s <= 0.5 {
@@ -253,13 +263,6 @@ pub(super) fn search_masked_traversal(
     let rabitq_words = quantizer.num_words();
     let inv_sqrt_padded_dim = quantizer.inv_sqrt_padded_dim();
 
-    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
-    heap.push(HeapEntry {
-        dist: 0.0,
-        node_id: meta.root_id,
-        level: meta.root_level,
-    });
-
     let mut scratch = QueryScratch::new(padded_dim, rabitq_words);
     quantizer.rotate_into(q, &mut scratch.rot_q);
     let dot_q_meta = if config.metric == DistanceMetric::DotProduct {
@@ -286,7 +289,9 @@ pub(super) fn search_masked_traversal(
 
     let seg_snap = storage.segment_snapshot();
     let dropped = storage.dropped_segments_snapshot();
-    let need_liveness_resolve = !seg_snap.has_deletes_or_forwarding.is_empty() || !dropped.is_empty();
+    let need_liveness_resolve =
+        !seg_snap.has_deletes_or_forwarding.is_empty() || !dropped.is_empty();
+    let row_lookup = FastRowSetLookup::new(rowset);
 
     let mut probed_leaves = 0usize;
     let mut batch_target = opts.beam_width;
@@ -294,19 +299,23 @@ pub(super) fn search_masked_traversal(
     let mut batch_leaves: Vec<NodeId> = Vec::new();
     let mut mask_buf: Vec<u64> = Vec::new();
     let mut any_forwarded = false;
+    let mut traversal =
+        StagedTraversal::new(meta.root_id, meta.root_level, opts.beam_width, max_expanded);
+    traversal.seed_leaves(internal_cache, q, dim, config.metric)?;
 
-    while probed_leaves < max_expanded && !heap.is_empty() {
-        let take_limit = batch_target.min(max_expanded - probed_leaves);
+    while probed_leaves < max_expanded && !traversal.is_exhausted() {
+        let remaining = max_expanded - probed_leaves;
+        let take_limit = batch_target.min(remaining);
         batch_leaves.clear();
-        while batch_leaves.len() < take_limit
-            && let Some(item) = heap.pop()
-        {
-            if item.level == 0 {
-                batch_leaves.push(item.node_id);
-            } else {
-                expand_internal_node_unpruned(internal_cache, &item, q, dim, config.metric, &mut heap)?;
-            }
-        }
+        traversal.take_leaves(
+            take_limit,
+            remaining,
+            &mut batch_leaves,
+            internal_cache,
+            q,
+            dim,
+            config.metric,
+        )?;
         if batch_leaves.is_empty() {
             break;
         }
@@ -328,7 +337,7 @@ pub(super) fn search_masked_traversal(
                 &seg_snap,
                 &dropped,
                 need_liveness_resolve,
-                Some(rowset),
+                Some(&row_lookup),
                 &mut mask_buf,
             );
             if !any_live {
@@ -339,7 +348,7 @@ pub(super) fn search_masked_traversal(
         }
 
         if (candidates.len() >= target && probed_leaves >= opts.beam_width)
-            || heap.is_empty()
+            || traversal.is_exhausted()
             || probed_leaves >= max_expanded
         {
             break;
@@ -386,13 +395,6 @@ pub(super) fn search_post_filter(
     let rabitq_words = quantizer.num_words();
     let inv_sqrt_padded_dim = quantizer.inv_sqrt_padded_dim();
 
-    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
-    heap.push(HeapEntry {
-        dist: 0.0,
-        node_id: meta.root_id,
-        level: meta.root_level,
-    });
-
     let mut scratch = QueryScratch::new(padded_dim, rabitq_words);
     quantizer.rotate_into(q, &mut scratch.rot_q);
     let dot_q_meta = if config.metric == DistanceMetric::DotProduct {
@@ -420,6 +422,7 @@ pub(super) fn search_post_filter(
     let seg_snap = storage.segment_snapshot();
     let dropped = storage.dropped_segments_snapshot();
     let need_liveness = !seg_snap.has_deletes_or_forwarding.is_empty() || !dropped.is_empty();
+    let seed_lookup = seed.map(FastRowSetLookup::new);
 
     let mut probed_leaves = 0usize;
     let mut batch_target = opts.beam_width;
@@ -432,19 +435,23 @@ pub(super) fn search_post_filter(
     } else {
         None
     };
+    let mut traversal =
+        StagedTraversal::new(meta.root_id, meta.root_level, opts.beam_width, max_expanded);
+    traversal.seed_leaves(internal_cache, q, dim, config.metric)?;
 
-    while probed_leaves < max_expanded && !heap.is_empty() {
-        let take_limit = batch_target.min(max_expanded - probed_leaves);
+    while probed_leaves < max_expanded && !traversal.is_exhausted() {
+        let remaining = max_expanded - probed_leaves;
+        let take_limit = batch_target.min(remaining);
         batch_leaves.clear();
-        while batch_leaves.len() < take_limit
-            && let Some(item) = heap.pop()
-        {
-            if item.level == 0 {
-                batch_leaves.push(item.node_id);
-            } else {
-                expand_internal_node_unpruned(internal_cache, &item, q, dim, config.metric, &mut heap)?;
-            }
-        }
+        traversal.take_leaves(
+            take_limit,
+            remaining,
+            &mut batch_leaves,
+            internal_cache,
+            q,
+            dim,
+            config.metric,
+        )?;
         if batch_leaves.is_empty() {
             break;
         }
@@ -478,7 +485,7 @@ pub(super) fn search_post_filter(
                     &seg_snap,
                     &dropped,
                     need_liveness,
-                    seed,
+                    seed_lookup.as_ref(),
                     &mut mask_buf,
                 );
                 if !any_live {
@@ -561,7 +568,7 @@ pub(super) fn search_post_filter(
         }
 
         if (verified.len() >= target && probed_leaves >= opts.beam_width)
-            || heap.is_empty()
+            || traversal.is_exhausted()
             || probed_leaves >= max_expanded
         {
             break;
@@ -569,7 +576,11 @@ pub(super) fn search_post_filter(
         batch_target = batch_target.saturating_mul(2);
     }
 
-    verified.sort_unstable_by(|a, b| a.doc_id.cmp(&b.doc_id).then_with(|| a.dist.total_cmp(&b.dist)));
+    verified.sort_unstable_by(|a, b| {
+        a.doc_id
+            .cmp(&b.doc_id)
+            .then_with(|| a.dist.total_cmp(&b.dist))
+    });
     verified.dedup_by_key(|c| c.doc_id);
     finalize_candidates(
         storage,
@@ -592,9 +603,8 @@ fn verify_chunk(
     verified: &mut Vec<LeafCandidate>,
 ) -> Result<()> {
     if crate::detached::filter_mentions_detached(schema, res_filter) {
-        let flags = crate::detached::filter_rows_mixed_batch(
-            storage, schema, fts_index, res_filter, rows,
-        )?;
+        let flags =
+            crate::detached::filter_rows_mixed_batch(storage, schema, fts_index, res_filter, rows)?;
         for (&(_, cand), ok) in chunk.iter().zip(flags) {
             if ok {
                 verified.push(cand);
@@ -621,30 +631,195 @@ fn verify_chunk(
     Ok(())
 }
 
-pub(super) fn expand_internal_node_unpruned(
-    internal_cache: &HashMap<NodeId, PackedInternalNode>,
-    item: &HeapEntry,
-    q: &[f32],
-    dim: usize,
-    metric: DistanceMetric,
-    heap: &mut BinaryHeap<HeapEntry>,
-) -> Result<()> {
-    let node = internal_cache.get(&item.node_id).ok_or_else(|| {
-        TreeError::CorruptedData(format!(
-            "missing internal node {} in cache",
-            item.node_id
-        ))
-    })?;
-    let child_level = item.level - 1;
-    for (i, &child_id) in node.child_ids.iter().enumerate() {
-        let d = search_distance(metric, q, node.child_centroid(i, dim));
-        heap.push(HeapEntry {
-            dist: d,
-            node_id: child_id,
-            level: child_level,
-        });
+/// Staged best-first tree traversal that keeps internal-node expansion separate from the
+/// bounded leaf frontier.
+///
+/// The initial pass performs level-by-level beam descent while retaining unexpanded sibling
+/// internal nodes. Fallback expansion then pops the best remaining internal node only when the
+/// leaf frontier lacks candidates or the internal node is closer than the worst queued leaf.
+pub(super) struct StagedTraversal {
+    /// Unexpanded internal nodes, bucketed by tree level (`0` is unused).
+    internal_by_level: Vec<BinaryHeap<HeapEntry>>,
+    /// Bounded frontier of leaf centroids.
+    leaf_queue: BoundedLeafQueue,
+    beam_width: usize,
+    root_id: NodeId,
+    root_level: u8,
+    /// Scratch distance buffer reused across internal-node expansions.
+    dists: Vec<f32>,
+}
+
+impl StagedTraversal {
+    pub(super) fn new(
+        root_id: NodeId,
+        root_level: u8,
+        beam_width: usize,
+        max_expanded: usize,
+    ) -> Self {
+        Self {
+            internal_by_level: (0..=root_level as usize)
+                .map(|_| BinaryHeap::new())
+                .collect(),
+            leaf_queue: BoundedLeafQueue::new(max_expanded),
+            beam_width,
+            root_id,
+            root_level,
+            dists: Vec::new(),
+        }
     }
-    Ok(())
+
+    /// Run the initial level-by-level beam descent, populating the leaf frontier.
+    pub(super) fn seed_leaves(
+        &mut self,
+        internal_cache: &HashMap<NodeId, PackedInternalNode>,
+        q: &[f32],
+        dim: usize,
+        metric: DistanceMetric,
+    ) -> Result<()> {
+        if self.root_level == 0 {
+            self.leaf_queue.push(HeapEntry {
+                dist: 0.0,
+                node_id: self.root_id,
+                level: 0,
+            });
+            return Ok(());
+        }
+
+        let mut frontier: Vec<(NodeId, f32)> = vec![(self.root_id, 0.0)];
+        for child_level in (0..self.root_level).rev() {
+            for &(node_id, _) in &frontier {
+                let node = internal_node(internal_cache, node_id)?;
+                search_distances_batch(metric, q, &node.child_centroids, dim, &mut self.dists);
+                for (&child_id, &dist) in node.child_ids.iter().zip(self.dists.iter()) {
+                    let entry = HeapEntry {
+                        dist,
+                        node_id: child_id,
+                        level: child_level,
+                    };
+                    if child_level == 0 {
+                        self.leaf_queue.push(entry);
+                    } else {
+                        self.internal_by_level[child_level as usize].push(entry);
+                    }
+                }
+            }
+            frontier.clear();
+            let level_heap = &mut self.internal_by_level[child_level as usize];
+            for _ in 0..self.beam_width {
+                match level_heap.pop() {
+                    Some(entry) => frontier.push((entry.node_id, entry.dist)),
+                    None => break,
+                }
+            }
+            if frontier.is_empty() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub(super) fn is_exhausted(&self) -> bool {
+        self.leaf_queue.is_empty() && self.best_internal_dist().is_none()
+    }
+
+    /// Best (smallest) centroid distance among the closest-to-leaf internal level that still has
+    /// candidates. Preferring the lowest level keeps fallback expansion productive: expanding a
+    /// level-1 node yields leaves, while expanding a high-level node only yields more internals.
+    fn best_internal_dist(&self) -> Option<f32> {
+        for heap in self.internal_by_level.iter().skip(1) {
+            if let Some(entry) = heap.peek() {
+                return Some(entry.dist);
+            }
+        }
+        None
+    }
+
+    fn pop_best_internal(&mut self) -> Option<HeapEntry> {
+        for heap in self.internal_by_level.iter_mut().skip(1) {
+            if let Some(entry) = heap.pop() {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
+    /// Expand one retained internal node, pushing children into the leaf frontier or their
+    /// respective internal level.
+    fn expand_one(
+        &mut self,
+        internal_cache: &HashMap<NodeId, PackedInternalNode>,
+        q: &[f32],
+        dim: usize,
+        metric: DistanceMetric,
+    ) -> Result<bool> {
+        let Some(item) = self.pop_best_internal() else {
+            return Ok(false);
+        };
+        debug_assert!(item.level > 0);
+        let child_level = item.level - 1;
+        let node = internal_node(internal_cache, item.node_id)?;
+        search_distances_batch(metric, q, &node.child_centroids, dim, &mut self.dists);
+        for (&child_id, &dist) in node.child_ids.iter().zip(self.dists.iter()) {
+            let entry = HeapEntry {
+                dist,
+                node_id: child_id,
+                level: child_level,
+            };
+            if child_level == 0 {
+                self.leaf_queue.push(entry);
+            } else {
+                self.internal_by_level[child_level as usize].push(entry);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Pull up to `limit` nearest leaves into `out`, expanding promising internal nodes when
+    /// the frontier cannot fill the batch.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn take_leaves(
+        &mut self,
+        limit: usize,
+        remaining_budget: usize,
+        out: &mut Vec<NodeId>,
+        internal_cache: &HashMap<NodeId, PackedInternalNode>,
+        q: &[f32],
+        dim: usize,
+        metric: DistanceMetric,
+    ) -> Result<()> {
+        self.leaf_queue.set_cap(remaining_budget);
+        while out.len() < limit {
+            match (self.leaf_queue.best_dist(), self.best_internal_dist()) {
+                (Some(leaf), Some(internal)) if internal < leaf => {
+                    if !self.expand_one(internal_cache, q, dim, metric)? {
+                        break;
+                    }
+                }
+                (Some(_), _) => match self.leaf_queue.pop_best() {
+                    Some(node_id) => out.push(node_id),
+                    None => break,
+                },
+                (None, Some(_)) => {
+                    if !self.expand_one(internal_cache, q, dim, metric)? {
+                        break;
+                    }
+                }
+                (None, None) => break,
+            }
+        }
+        Ok(())
+    }
+}
+
+#[inline]
+fn internal_node(
+    internal_cache: &HashMap<NodeId, PackedInternalNode>,
+    node_id: NodeId,
+) -> Result<&PackedInternalNode> {
+    internal_cache.get(&node_id).ok_or_else(|| {
+        TreeError::CorruptedData(format!("missing internal node {node_id} in cache"))
+    })
 }
 
 #[inline]
@@ -653,7 +828,7 @@ pub(super) fn build_effective_mask_with_rowset(
     seg_snap: &SegmentTableSnapshot,
     dropped: &roaring::RoaringBitmap,
     need_liveness_resolve: bool,
-    rowset: Option<&RowSet>,
+    row_lookup: Option<&FastRowSetLookup<'_>>,
     mask_buf: &mut Vec<u64>,
 ) -> (bool, bool) {
     view.copy_live_mask_into(mask_buf);
@@ -679,7 +854,7 @@ pub(super) fn build_effective_mask_with_rowset(
                 Some(row)
             };
             match resolved_opt {
-                Some(resolved) if rowset.is_none_or(|rs| rs.contains(resolved)) => {
+                Some(resolved) if row_lookup.is_none_or(|lookup| lookup.contains(resolved)) => {
                     any_live = true;
                     if resolved != row {
                         saw_forwarded = true;
@@ -753,6 +928,10 @@ pub(super) fn resolve_and_dedup_forwarded(
         }
     }
     candidates.truncate(write);
-    candidates.sort_unstable_by(|a, b| a.doc_id.cmp(&b.doc_id).then_with(|| a.dist.total_cmp(&b.dist)));
+    candidates.sort_unstable_by(|a, b| {
+        a.doc_id
+            .cmp(&b.doc_id)
+            .then_with(|| a.dist.total_cmp(&b.dist))
+    });
     candidates.dedup_by_key(|c| c.doc_id);
 }

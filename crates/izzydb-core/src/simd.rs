@@ -119,6 +119,238 @@ pub fn dot_product_bytes(a: &[f32], b_bytes: &[u8]) -> f32 {
     sum
 }
 
+/// Squared Euclidean distance from `a` to each of `count` contiguous `dim`-float vectors in
+/// `bs`, writing `count` results into `out`.
+///
+/// Runtime CPU-feature dispatch happens once per call (not once per centroid), and the AVX-512
+/// path evaluates four centroids at a time while reusing the query registers.
+#[inline]
+pub fn l2_squared_batch(a: &[f32], bs: &[f32], dim: usize, out: &mut [f32]) {
+    if dim == 0 || out.is_empty() {
+        out.fill(0.0);
+        return;
+    }
+    debug_assert_eq!(bs.len(), out.len() * dim);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            // Safety: runtime-checked `avx512f`; `bs.len() == out.len() * dim`.
+            unsafe { l2_squared_batch_avx512(a, bs, dim, out) };
+            return;
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            for (dst, b) in out.iter_mut().zip(bs.chunks_exact(dim)) {
+                // Safety: runtime-checked `avx2` + `fma`; slices have equal length.
+                *dst = unsafe { l2_squared_avx2(a, b) };
+            }
+            return;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if cfg!(target_feature = "neon") || std::arch::is_aarch64_feature_detected!("neon") {
+            for (dst, b) in out.iter_mut().zip(bs.chunks_exact(dim)) {
+                // Safety: checked `neon` at compile/runtime; slices have equal length.
+                *dst = unsafe { l2_squared_neon(a, b) };
+            }
+            return;
+        }
+    }
+    for (dst, b) in out.iter_mut().zip(bs.chunks_exact(dim)) {
+        *dst = l2_squared_scalar(a, b);
+    }
+}
+
+/// Inner product of `a` with each of `count` contiguous `dim`-float vectors in `bs`.
+#[inline]
+pub fn dot_product_batch(a: &[f32], bs: &[f32], dim: usize, out: &mut [f32]) {
+    if dim == 0 || out.is_empty() {
+        out.fill(0.0);
+        return;
+    }
+    debug_assert_eq!(bs.len(), out.len() * dim);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            // Safety: runtime-checked `avx512f`; `bs.len() == out.len() * dim`.
+            unsafe { dot_product_batch_avx512(a, bs, dim, out) };
+            return;
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            for (dst, b) in out.iter_mut().zip(bs.chunks_exact(dim)) {
+                // Safety: runtime-checked `avx2` + `fma`; slices have equal length.
+                *dst = unsafe { dot_product_avx2(a, b) };
+            }
+            return;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if cfg!(target_feature = "neon") || std::arch::is_aarch64_feature_detected!("neon") {
+            for (dst, b) in out.iter_mut().zip(bs.chunks_exact(dim)) {
+                // Safety: checked `neon` at compile/runtime; slices have equal length.
+                *dst = unsafe { dot_product_neon(a, b) };
+            }
+            return;
+        }
+    }
+    for (dst, b) in out.iter_mut().zip(bs.chunks_exact(dim)) {
+        *dst = dot_product_scalar(a, b);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn l2_squared_batch_avx512(a: &[f32], bs: &[f32], dim: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let count = out.len();
+    let ap = a.as_ptr();
+    let bp = bs.as_ptr();
+    let mut c = 0usize;
+    while c + 4 <= count {
+        let b0 = unsafe { bp.add(c * dim) };
+        let b1 = unsafe { bp.add((c + 1) * dim) };
+        let b2 = unsafe { bp.add((c + 2) * dim) };
+        let b3 = unsafe { bp.add((c + 3) * dim) };
+        let mut acc0 = _mm512_setzero_ps();
+        let mut acc1 = _mm512_setzero_ps();
+        let mut acc2 = _mm512_setzero_ps();
+        let mut acc3 = _mm512_setzero_ps();
+        let mut i = 0usize;
+        while i + 16 <= dim {
+            unsafe {
+                let va = _mm512_loadu_ps(ap.add(i));
+                let d0 = _mm512_sub_ps(va, _mm512_loadu_ps(b0.add(i)));
+                let d1 = _mm512_sub_ps(va, _mm512_loadu_ps(b1.add(i)));
+                let d2 = _mm512_sub_ps(va, _mm512_loadu_ps(b2.add(i)));
+                let d3 = _mm512_sub_ps(va, _mm512_loadu_ps(b3.add(i)));
+                acc0 = _mm512_fmadd_ps(d0, d0, acc0);
+                acc1 = _mm512_fmadd_ps(d1, d1, acc1);
+                acc2 = _mm512_fmadd_ps(d2, d2, acc2);
+                acc3 = _mm512_fmadd_ps(d3, d3, acc3);
+            }
+            i += 16;
+        }
+        let mut s0 = _mm512_reduce_add_ps(acc0);
+        let mut s1 = _mm512_reduce_add_ps(acc1);
+        let mut s2 = _mm512_reduce_add_ps(acc2);
+        let mut s3 = _mm512_reduce_add_ps(acc3);
+        while i < dim {
+            unsafe {
+                let x = *ap.add(i);
+                let d0 = x - *b0.add(i);
+                let d1 = x - *b1.add(i);
+                let d2 = x - *b2.add(i);
+                let d3 = x - *b3.add(i);
+                s0 += d0 * d0;
+                s1 += d1 * d1;
+                s2 += d2 * d2;
+                s3 += d3 * d3;
+            }
+            i += 1;
+        }
+        out[c] = s0;
+        out[c + 1] = s1;
+        out[c + 2] = s2;
+        out[c + 3] = s3;
+        c += 4;
+    }
+    while c < count {
+        let b = bs[c * dim..(c + 1) * dim].as_ptr();
+        let mut acc = _mm512_setzero_ps();
+        let mut i = 0usize;
+        while i + 16 <= dim {
+            unsafe {
+                let va = _mm512_loadu_ps(ap.add(i));
+                let d = _mm512_sub_ps(va, _mm512_loadu_ps(b.add(i)));
+                acc = _mm512_fmadd_ps(d, d, acc);
+            }
+            i += 16;
+        }
+        let mut sum = _mm512_reduce_add_ps(acc);
+        while i < dim {
+            unsafe {
+                let d = *ap.add(i) - *b.add(i);
+                sum += d * d;
+            }
+            i += 1;
+        }
+        out[c] = sum;
+        c += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn dot_product_batch_avx512(a: &[f32], bs: &[f32], dim: usize, out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let count = out.len();
+    let ap = a.as_ptr();
+    let bp = bs.as_ptr();
+    let mut c = 0usize;
+    while c + 4 <= count {
+        let b0 = unsafe { bp.add(c * dim) };
+        let b1 = unsafe { bp.add((c + 1) * dim) };
+        let b2 = unsafe { bp.add((c + 2) * dim) };
+        let b3 = unsafe { bp.add((c + 3) * dim) };
+        let mut acc0 = _mm512_setzero_ps();
+        let mut acc1 = _mm512_setzero_ps();
+        let mut acc2 = _mm512_setzero_ps();
+        let mut acc3 = _mm512_setzero_ps();
+        let mut i = 0usize;
+        while i + 16 <= dim {
+            unsafe {
+                let va = _mm512_loadu_ps(ap.add(i));
+                acc0 = _mm512_fmadd_ps(va, _mm512_loadu_ps(b0.add(i)), acc0);
+                acc1 = _mm512_fmadd_ps(va, _mm512_loadu_ps(b1.add(i)), acc1);
+                acc2 = _mm512_fmadd_ps(va, _mm512_loadu_ps(b2.add(i)), acc2);
+                acc3 = _mm512_fmadd_ps(va, _mm512_loadu_ps(b3.add(i)), acc3);
+            }
+            i += 16;
+        }
+        let mut s0 = _mm512_reduce_add_ps(acc0);
+        let mut s1 = _mm512_reduce_add_ps(acc1);
+        let mut s2 = _mm512_reduce_add_ps(acc2);
+        let mut s3 = _mm512_reduce_add_ps(acc3);
+        while i < dim {
+            unsafe {
+                let x = *ap.add(i);
+                s0 += x * *b0.add(i);
+                s1 += x * *b1.add(i);
+                s2 += x * *b2.add(i);
+                s3 += x * *b3.add(i);
+            }
+            i += 1;
+        }
+        out[c] = s0;
+        out[c + 1] = s1;
+        out[c + 2] = s2;
+        out[c + 3] = s3;
+        c += 4;
+    }
+    while c < count {
+        let b = bs[c * dim..(c + 1) * dim].as_ptr();
+        let mut acc = _mm512_setzero_ps();
+        let mut i = 0usize;
+        while i + 16 <= dim {
+            unsafe {
+                let va = _mm512_loadu_ps(ap.add(i));
+                acc = _mm512_fmadd_ps(va, _mm512_loadu_ps(b.add(i)), acc);
+            }
+            i += 16;
+        }
+        let mut sum = _mm512_reduce_add_ps(acc);
+        while i < dim {
+            unsafe {
+                sum += *ap.add(i) * *b.add(i);
+            }
+            i += 1;
+        }
+        out[c] = sum;
+        c += 1;
+    }
+}
+
 #[inline]
 fn l2_squared_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut s0 = 0.0f32;
@@ -495,7 +727,11 @@ unsafe fn neon_reduce_f32<const IS_L2: bool, const UNALIGNED_BYTES: bool>(
 
     while i + 16 <= len {
         unsafe {
-            acc0 = step::<IS_L2>(acc0, vld1q_f32(ap.add(i)), load_b::<UNALIGNED_BYTES>(b_ptr, i));
+            acc0 = step::<IS_L2>(
+                acc0,
+                vld1q_f32(ap.add(i)),
+                load_b::<UNALIGNED_BYTES>(b_ptr, i),
+            );
             acc1 = step::<IS_L2>(
                 acc1,
                 vld1q_f32(ap.add(i + 4)),
@@ -518,7 +754,11 @@ unsafe fn neon_reduce_f32<const IS_L2: bool, const UNALIGNED_BYTES: bool>(
     let mut acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
     while i + 4 <= len {
         unsafe {
-            acc = step::<IS_L2>(acc, vld1q_f32(ap.add(i)), load_b::<UNALIGNED_BYTES>(b_ptr, i));
+            acc = step::<IS_L2>(
+                acc,
+                vld1q_f32(ap.add(i)),
+                load_b::<UNALIGNED_BYTES>(b_ptr, i),
+            );
         }
         i += 4;
     }
@@ -616,7 +856,9 @@ mod tests {
     #[test]
     fn test_simd_distances_match_scalar_across_lengths_and_unaligned_offsets() {
         let mut rng = 0x1234_5678_9abc_def0u64;
-        for len in [0, 1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 31, 32, 33, 64, 128, 384, 1536] {
+        for len in [
+            0, 1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 31, 32, 33, 64, 128, 384, 1536,
+        ] {
             let a: Vec<f32> = (0..len).map(|_| next_f32(&mut rng)).collect();
             let b: Vec<f32> = (0..len).map(|_| next_f32(&mut rng)).collect();
 
@@ -654,6 +896,37 @@ mod tests {
                     (got_dot_b - ref_dot).abs() <= dot_tol,
                     "dot_product_bytes len={len} offset={offset}: got={got_dot_b} vs ref={ref_dot}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn test_batch_distances_match_scalar_across_counts() {
+        let mut rng = 0xdead_beef_cafe_babeu64;
+        for dim in [1usize, 7, 16, 17, 64, 128, 384] {
+            for count in [1usize, 2, 3, 4, 5, 8, 9] {
+                let a: Vec<f32> = (0..dim).map(|_| next_f32(&mut rng)).collect();
+                let flat: Vec<f32> = (0..count * dim).map(|_| next_f32(&mut rng)).collect();
+                let mut l2 = vec![0.0f32; count];
+                let mut dot = vec![0.0f32; count];
+                l2_squared_batch(&a, &flat, dim, &mut l2);
+                dot_product_batch(&a, &flat, dim, &mut dot);
+                for (idx, chunk) in flat.chunks_exact(dim).enumerate() {
+                    let ref_l2 = l2_squared_scalar(&a, chunk);
+                    let ref_dot = dot_product_scalar(&a, chunk);
+                    let l2_tol = 1e-4f32.max(ref_l2.abs() * 1e-5);
+                    let dot_tol = 1e-4f32.max(ref_dot.abs() * 1e-5);
+                    assert!(
+                        (l2[idx] - ref_l2).abs() <= l2_tol,
+                        "batch l2 dim={dim} count={count} idx={idx}: got={} vs ref={ref_l2}",
+                        l2[idx]
+                    );
+                    assert!(
+                        (dot[idx] - ref_dot).abs() <= dot_tol,
+                        "batch dot dim={dim} count={count} idx={idx}: got={} vs ref={ref_dot}",
+                        dot[idx]
+                    );
+                }
             }
         }
     }

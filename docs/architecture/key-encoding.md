@@ -39,20 +39,24 @@ Implementation sources:
 
 | Column Family | Key Format | Value Format | Compression | Notes |
 |---|---|---|---|---|
-| `default` | tagged, see §3 | metadata / bitmaps / counts | Default | point lookups + small scans |
-| `cf_id_map` | `doc_id` (`u64` BE, 8 B) | `row_id` (`u64` BE, 8 B) | Default | Bloom 10 bpk; live docs only (bijection to live `cf_rows`) |
-| `cf_rows` | `row_id` (`u64` BE, 8 B) | `RowView` v3 (inline attrs, §4.1) | Default | Dead rows remain until compaction |
-| `cf_row_doc_ids` | `seg` BE \|\| `block` BE (8 B) | `[u64; 256]` LE `DocId`s (2,048 B) | `None` | Reverse map; liveness decides whether slot holds live `DocId` |
-| `cf_vectors` | `row_id` (`u64` BE, 8 B) | `[f32; dim]` LE | `None` | Absent when `has_vectors == false` or row has no vector |
-| `cf_leaf_entries` | `leaf_id` (`u32` BE, 4 B) | `PackedLeafNode` v3 (§4.3) | `None` | Stores `row_ids` + `stale_hint` |
-| `cf_attr_postings` | `attr_id` BE \|\| `tag` \|\| `encoded_val` \|\| `seg` BE | `SegPosting` (§4.2) | `None` | **Value-major**, prefix extractor 3 B (`attr_id \|\| tag`) |
-| `cf_columns` | `seg` BE \|\| `attr_id` BE \|\| `block` BE (10 B) | `ColumnBlock` (§4.4) | Default | Sealed segments only (inline attrs) |
-| `cf_detached` | `attr_id` BE \|\| `gen` BE \|\| `seg` BE \|\| `block` BE (14 B) | `ColumnBlock` (§4.4) | Default | Active + pending generations |
-| `cf_detached_postings` | `attr_id` BE \|\| `gen` BE \|\| `tag` \|\| `encoded_val` \|\| `seg` BE | `SegPosting` (§4.2) | `None` | Filterable detached columns, prefix 7 B (`attr \|\| gen \|\| tag`) |
-| `cf_fts_terms` | `attr_id` BE \|\| `token_utf8` | `TermRecord` v4 (§4.5) | Default | Prefix 2 B (`attr_id`) |
+| `default` | tagged, see §3 | metadata / bitmaps / counts | Default (Snappy) | point lookups + small scans; Bloom 10 bpk |
+| `cf_id_map` | `doc_id` (`u64` BE, 8 B) | `row_id` (`u64` BE, 8 B) | Default (Snappy) | Bloom 10 bpk; two-level partitioned index/filter; live docs only (bijection to live `cf_rows`) |
+| `cf_rows` | `row_id` (`u64` BE, 8 B) | `RowView` v3 (inline attrs, §4.1) | Default (Snappy) | No Bloom (keys known to exist); two-level index; dead rows remain until compaction |
+| `cf_row_doc_ids` | `seg` BE \|\| `block` BE (8 B) | `[u64; 256]` LE `DocId`s (2,048 B) | `None` | No Bloom; two-level index; reverse map; liveness decides whether slot holds live `DocId` |
+| `cf_vectors` | `row_id` (`u64` BE, 8 B) | `[f32; dim]` LE | `None` | No Bloom; two-level index; 16 KiB data blocks + intra-block hash; absent when `has_vectors == false` or row has no vector |
+| `cf_leaf_entries` | `leaf_id` (`u32` BE, 4 B) | `PackedLeafNode` v3 (§4.3) | `None` | No Bloom; two-level index; 16 KiB data blocks; stores `row_ids` + `stale_hint` |
+| `cf_attr_postings` | `attr_id` BE \|\| `tag` \|\| `encoded_val` \|\| `seg` BE | `SegPosting` (§4.2) | `None` | **Value-major**, Bloom 10 bpk, prefix extractor 3 B (`attr_id \|\| tag`) |
+| `cf_columns` | `seg` BE \|\| `attr_id` BE \|\| `block` BE (10 B) | `ColumnBlock` (§4.4) | `None` | Bloom 10 bpk; two-level partitioned index/filter; 16 KiB blocks + intra-block hash; sealed segments only (inline attrs) |
+| `cf_detached` | `attr_id` BE \|\| `gen` BE \|\| `seg` BE \|\| `block` BE (14 B) | `ColumnBlock` (§4.4) | `None` | Bloom 10 bpk; two-level partitioned index/filter; active + pending generations |
+| `cf_detached_postings` | `attr_id` BE \|\| `gen` BE \|\| `tag` \|\| `encoded_val` \|\| `seg` BE | `SegPosting` (§4.2) | `None` | Filterable detached columns, Bloom 10 bpk, prefix 7 B (`attr \|\| gen \|\| tag`) |
+| `cf_fts_terms` | `attr_id` BE \|\| `token_utf8` | `TermRecord` v4 (§4.5) | Default (Snappy) | Prefix 2 B (`attr_id`), Bloom 10 bpk |
 | `cf_fts_skips` | `term_id` BE \|\| `seg` BE \|\| `chunk` BE (12 B) | `FtsChunk` v4 (§4.5) | `None` | Prefix 4 B (`term_id`); unified skip bounds + compact postings; no Bloom filter |
 | `cf_fts_postings` | `term_id` BE \|\| `seg` BE \|\| `block` BE (12 B) | *(deprecated — empty)* | `None` | Retained empty in v4; postings live inside `FtsChunk` (`cf_fts_skips`) |
-| `cf_fts_positions` | `term_id` BE \|\| `seg` BE \|\| `block` BE (12 B) | `PackedPositionBlock` | Default | Prefix 4 B (`term_id`) |
+| `cf_fts_positions` | `term_id` BE \|\| `seg` BE \|\| `block` BE (12 B) | `PackedPositionBlock` | Default (Snappy) | Prefix 4 B (`term_id`), Bloom 10 bpk |
+
+### RocksDB Table & Block Cache Tuning
+
+Per-CF options live in [`crates/izzydb-storage/src/storage/cf_options.rs`](../../crates/izzydb-storage/src/storage/cf_options.rs). Search hot paths (`cf_vectors`, `cf_leaf_entries`, `cf_rows`, `cf_row_doc_ids`) read keys already known to exist, so they omit Bloom filters and use two-level partitioned indexes that keep metadata reloads small. Large point-lookup CFs with retained Bloom filters (`cf_id_map`, `cf_columns`, `cf_detached`) also partition filters into 4 KiB blocks. `cf_columns` and `cf_detached` store uncompressed blocks because their ~2 KiB fixed-width `ColumnBlock`s inline strings/arrays and Snappy decompression dominated filtered scans. The shared `LRUCache` defaults to 128 MiB and is configurable per collection with `CollectionConfig::with_block_cache_bytes(...)`.
 
 ### Compaction Filters
 

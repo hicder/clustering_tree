@@ -127,6 +127,7 @@ pub fn scan_and_stage(
             docs_idx_path,
             docs_shard_paths: Vec::new(),
             rows_by_doc_id_path,
+            rows_by_row_id_path: None,
             live_rows: Vec::new(),
             has_detached_staging: schema_has_detached,
         });
@@ -192,9 +193,8 @@ pub fn scan_and_stage(
     pool.install(|| -> Result<()> {
         tasks.par_iter().try_for_each(|task| -> Result<()> {
             let path = &parquet_files[task.file_idx];
-            let file = File::open(path).map_err(|e| {
-                TreeError::Storage(format!("open parquet {}: {e}", path.display()))
-            })?;
+            let file = File::open(path)
+                .map_err(|e| TreeError::Storage(format!("open parquet {}: {e}", path.display())))?;
             let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
                 TreeError::CorruptedData(format!("parquet reader {}: {e}", path.display()))
             })?;
@@ -291,7 +291,9 @@ pub fn scan_and_stage(
                 }
             }
         }
-        rows_writer.write_all(&cur.row.to_le_bytes()).map_err(map_io)?;
+        rows_writer
+            .write_all(&cur.row.to_le_bytes())
+            .map_err(map_io)?;
         live_rows.push(cur.row);
         docs_imported += 1;
     }
@@ -306,6 +308,7 @@ pub fn scan_and_stage(
         docs_idx_path,
         docs_shard_paths,
         rows_by_doc_id_path,
+        rows_by_row_id_path: None,
         live_rows,
         has_detached_staging: schema_has_detached,
     })
@@ -398,9 +401,13 @@ pub fn scan_detached_from_parquet(
         projected_indices.dedup();
 
         let mask = ProjectionMask::roots(builder.parquet_schema(), projected_indices);
-        let reader = builder.with_projection(mask).with_batch_size(8192).build().map_err(|e| {
-            TreeError::CorruptedData(format!("build parquet reader {}: {e}", path.display()))
-        })?;
+        let reader = builder
+            .with_projection(mask)
+            .with_batch_size(8192)
+            .build()
+            .map_err(|e| {
+                TreeError::CorruptedData(format!("build parquet reader {}: {e}", path.display()))
+            })?;
 
         let mut file_row = 0usize;
         for batch_res in reader {
@@ -471,14 +478,14 @@ pub(super) fn process_record_batch(
         ))
     })?;
     let vec_col = match vec_cfg {
-        Some((_, _, vector_column)) => Some(
-            batch.column_by_name(vector_column).ok_or_else(|| {
+        Some((_, _, vector_column)) => {
+            Some(batch.column_by_name(vector_column).ok_or_else(|| {
                 TreeError::CorruptedData(format!(
                     "missing projected vector column '{vector_column}' in {}",
                     path.display()
                 ))
-            })?,
-        ),
+            })?)
+        }
         None => None,
     };
 
@@ -503,12 +510,11 @@ pub(super) fn process_record_batch(
         let doc_id = decode_doc_id(path, rg_idx, file_row, id_col, row)?;
         if let (Some((dim, metric, vector_column)), Some(vc)) = (vec_cfg, vec_col) {
             decode_vector_into(path, rg_idx, file_row, vc, row, dim, &mut vec_buf)?;
-            let prepared = prepare_vector(&vec_buf, dim, metric).map_err(|e| {
-                TreeError::InvalidAttribute {
+            let prepared =
+                prepare_vector(&vec_buf, dim, metric).map_err(|e| TreeError::InvalidAttribute {
                     name: vector_column.to_owned(),
                     reason: format!("{}:{rg_idx}:{file_row}: {e}", path.display()),
-                }
-            })?;
+                })?;
             for &f in &prepared {
                 batch_vecs_bytes.extend_from_slice(&f.to_le_bytes());
             }
@@ -529,19 +535,14 @@ pub(super) fn process_record_batch(
                 attrs.insert(binding.schema_attr_name.clone(), val);
             }
         }
-        schema.validate_attributes(&attrs).map_err(|e| {
-            TreeError::InvalidAttribute {
+        schema
+            .validate_attributes(&attrs)
+            .map_err(|e| TreeError::InvalidAttribute {
                 name: String::new(),
                 reason: format!("{}:{rg_idx}:{file_row}: {e}", path.display()),
-            }
-        })?;
+            })?;
 
-        let doc_bytes = encode_staged_doc(
-            schema,
-            &attrs,
-            vec_cfg.is_some(),
-            schema_has_detached,
-        )?;
+        let doc_bytes = encode_staged_doc(schema, &attrs, vec_cfg.is_some(), schema_has_detached)?;
         let offset = doc_writer.offset;
         let len = doc_bytes.len() as u32;
         doc_writer.writer.write_all(&doc_bytes).map_err(map_io)?;
@@ -564,8 +565,11 @@ pub(super) fn process_record_batch(
     }
 
     if let Some(vf) = vectors_file {
-        vf.write_all_at(&batch_vecs_bytes, (global_row_base as u64) * (dim as u64) * 4)
-            .map_err(map_io)?;
+        vf.write_all_at(
+            &batch_vecs_bytes,
+            (global_row_base as u64) * (dim as u64) * 4,
+        )
+        .map_err(map_io)?;
     }
     doc_ids_file
         .write_all_at(&batch_doc_ids_bytes, (global_row_base as u64) * 8)

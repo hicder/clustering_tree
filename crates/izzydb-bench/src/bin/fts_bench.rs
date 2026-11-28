@@ -92,6 +92,7 @@ fn main() {
     let mut runs = 50usize;
     let mut only_terms = None;
     let mut parallel_segments = None;
+    let mut db_dir_arg = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -126,6 +127,12 @@ fn main() {
                         .expect("invalid --parallel-segments integer"),
                 );
             }
+            "--db-dir" => {
+                i += 1;
+                db_dir_arg = Some(PathBuf::from(
+                    args.get(i).expect("missing value for --db-dir"),
+                ));
+            }
             other => panic!("unknown argument: {other}"),
         }
         i += 1;
@@ -143,23 +150,38 @@ fn main() {
     if let Some(n) = parallel_segments {
         cfg = cfg.with_fts_parallel_segments(n);
     }
-    let dir = TempDir::new().unwrap();
-    let db_dir = dir.path().join("db");
-    let work_dir = dir.path().join("work");
-    let bcfg = BulkImportConfig::new(cfg.clone(), "id", "vector", &work_dir);
-
-    // Prepare the collection outside search benchmark measurement.
-    let report = bulk_import(&db_dir, std::slice::from_ref(&parquet_path), bcfg, None).unwrap();
-    let _ = fs::remove_dir_all(&work_dir);
+    // `--db-dir` keeps the imported collection on disk so repeated benchmark passes
+    // (and baseline/candidate binaries) can reuse the exact same index data.
+    let temp_dir;
+    let db_dir = match db_dir_arg {
+        Some(path) => {
+            fs::create_dir_all(&path).unwrap();
+            path
+        }
+        None => {
+            temp_dir = TempDir::new().unwrap();
+            temp_dir.path().join("db")
+        }
+    };
+    let work_dir = db_dir.with_extension("import-work");
+    if db_dir.join("CURRENT").is_file() {
+        println!("Reusing collection at {}", db_dir.display());
+    } else {
+        let bcfg = BulkImportConfig::new(cfg.clone(), "id", "vector", &work_dir);
+        // Prepare the collection outside search benchmark measurement.
+        let report = bulk_import(&db_dir, std::slice::from_ref(&parquet_path), bcfg, None).unwrap();
+        let _ = fs::remove_dir_all(&work_dir);
+        println!(
+            "Prepared collection from {} (docs={}, terms={}, segments={})",
+            parquet_path.display(),
+            report.docs_imported,
+            report.terms,
+            report.segments_created,
+        );
+    }
 
     let col = Collection::open(&db_dir, cfg).unwrap();
-    println!(
-        "Prepared collection from {} (docs={}, terms={}, segments={})",
-        parquet_path.display(),
-        report.docs_imported,
-        report.terms,
-        report.segments_created,
-    );
+    let docs = col.len();
 
-    run_search_benchmark(&col, report.docs_imported, runs, only_terms, parallel_segments);
+    run_search_benchmark(&col, docs, runs, only_terms, parallel_segments);
 }

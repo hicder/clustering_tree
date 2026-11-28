@@ -13,7 +13,7 @@ use crate::analyzer::FtsAnalyzer;
 use crate::block::{FtsMeta, TermRecord};
 use crate::bm25::Bm25TermScorer;
 use super::*;
-use crate::block::{DocLenBlock, PackedPostingBlock, PostingBlockHeader};
+use crate::block::{DocLenBlock, EncodedPosting, PackedPostingBlock, PostingBlockHeader};
 use izzydb_core::config::{DistanceMetric, TreeConfig};
 use izzydb_core::schema::{AttributeType, CollectionConfig};
 use rand::rngs::SmallRng;
@@ -62,6 +62,10 @@ impl FtsSkipCursor for MemSkipCursor {
 
     fn current_posting_bytes(&mut self) -> Result<Option<&[u8]>> {
         Ok(self.inline_posting_bytes())
+    }
+
+    fn current_posting_encoded(&mut self) -> Result<Option<EncodedPosting<'_>>> {
+        Ok(self.inline_posting_bytes().map(EncodedPosting::Standalone))
     }
 
     fn next_block(&mut self) -> Result<()> {

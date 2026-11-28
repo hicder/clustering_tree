@@ -101,7 +101,7 @@ Body:
   payloads:         concatenated compact v4 posting payloads (block_bytes(i))
 ```
 
-`FtsChunkLayout::parse` validates a chunk once when `RocksSkipCursor` steps onto it and yields an `FtsChunkView` for O(1) `next_block()`, `seek_block()`, and `current_posting_view()` calls without re-parsing headers.
+`FtsChunkLayout::parse` validates a chunk once when `RocksSkipCursor` steps onto it and yields an `FtsChunkView` for O(1) `next_block()`, `seek_block()`, and `current_posting_encoded()` / `current_posting_view()` calls without re-parsing headers.
 
 ### 2.5 `DocLenBlock` (FTS document lengths in `default`)
 
@@ -121,7 +121,9 @@ Total size is **260 bytes** (`U8`), **516 bytes** (`U16`), or **1,028 bytes** (`
 
 Posting blocks store **only term frequencies (`tf`)**—never `dl`—and omit per-block `max_tf`/`min_dl_over_tf` when embedded inside `FtsChunk` (because those bounds already live in the `FtsChunk` skip arrays).
 
-#### Compact v4 Chunk-Embedded Payload (`PostingBlockView::parse_compact`)
+On the MAXSCORE hot path, `FtsSkipCursor::current_posting_encoded()` returns a narrow borrowed `EncodedPosting::{Standalone, Compact}` value instead of a fully materialized `PostingBlockView`. `Bm25TermScorer::accumulate_encoded_simd` decodes that slice at the point where it selects the sparse or dense SIMD kernel, so the header, count, and payload enum never cross a stack copy between the storage cursor and the scorer. `PostingBlockView` remains available for filters, predicates, and verification.
+
+#### Compact v4 Chunk-Embedded Payload (`PostingBlockView::parse_compact` / `parse_compact_payload`)
 
 Starts with a 1-byte `flags` prefix:
 - Bit `0` (`0x01`, `COMPACT_FLAG_DENSE`): `0` = Sparse payload, `1` = Dense payload.
@@ -232,7 +234,7 @@ All 256-slot kernels live in [`crates/izzydb-fts/src/simd/mod.rs`](../../crates/
         ▼
   Essential SIMD Accumulation (scores[256] = 0, touched = 0)
     • For each essential clause at (seg, block):
-      current_posting_view() (from active FtsChunk / inline buf) ─► accumulate_block_simd + advance_past
+      current_posting_encoded() (borrowed FtsChunk / inline bytes) ─► accumulate_encoded_simd + advance_past
     • active_mask = touched & allowed_mask (liveness & pushed-down filter RowSet)
     • max_ess = max_score_256(scores, active_mask)
         │
@@ -244,7 +246,7 @@ All 256-slot kernels live in [`crates/izzydb-fts/src/simd/mod.rs`](../../crates/
     • Loop surviving non-essential clauses (descending term_max):
       - active_mask = filter_ge_256(scores, active_mask, prune_theta - rem_ub - tight_eps)
       - if active_mask == [0; 4]: break
-      - current_posting_view() ─► accumulate_block_masked_simd
+      - current_posting_encoded() ─► accumulate_encoded_masked_simd
         │
         ▼
   Top-k Candidate Extraction, Shared Theta & Dynamic Partitioning
@@ -259,10 +261,13 @@ All 256-slot kernels live in [`crates/izzydb-fts/src/simd/mod.rs`](../../crates/
     • Combine shard heaps, resolve DocIds across ties at cutoff, keep top-k by (score DESC, DocId ASC)
 ```
 
+Plans whose live clauses are **all `ClauseKind::Single`** (the common multi-term `RankBy::Bm25` case) run the specialized `run_shard_single` loop. It caches each stream's current block and Block-Max bound in shard-local arrays, finds the next essential block with one linear minimum scan, collects the matching clause indices while summing their bounds, and reuses those indices for the skip, advance, and score passes. Refreshes happen only when a stream advances or seeks. Plans with `PrefixMax`, `MaxBranches`, filters that need general clause evaluation, or empty/prefix-only shapes keep using `run_shard`.
+
 Key execution details:
 
-1. **Unified chunk skip + posting reads:** `TermStream::block_upper_bound` reads `(max_tf, min_dl_over_tf)` directly from the `FtsChunkView` pinned in `RocksSkipCursor` (or an inline `TermRecord`). Surviving blocks decode compact posting payloads straight from `view.block_bytes(entry_idx)` in RAM—zero secondary posting lookups—and `RocksSkipCursor` steps sequentially up to `SEQUENTIAL_CHUNK_STEP_LIMIT = 4` chunks before issuing a RocksDB `seek`.
+1. **Unified chunk skip + posting reads:** `TermStream::block_upper_bound` reads `(max_tf, min_dl_over_tf)` directly from the `FtsChunkView` pinned in `RocksSkipCursor` (or an inline `TermRecord`). Surviving blocks expose compact posting payloads straight from `view.block_bytes(entry_idx)` in RAM—zero secondary posting lookups—and `RocksSkipCursor` steps sequentially up to `SEQUENTIAL_CHUNK_STEP_LIMIT = 4` chunks before issuing a RocksDB `seek`. `current_posting_encoded()` keeps that slice borrowed until the cursor advances; `accumulate_encoded_simd` validates and decodes it at kernel dispatch, preserving the same corruption errors as `PostingBlockView`.
 2. **Single-clause chunk-level skipping:** When `essential_start + 1 == n_clauses` and `ClauseKind::Single`, MAXSCORE checks `chunk_max_tf` / `chunk_min_dl_over_tf` once per `SkipChunk` and skips the entire 256-block chunk via `seek_past_chunk` when it cannot reach `prune_theta`.
-3. **Descending non-essential seek & early exit:** Non-essential clauses are sought in **descending** global `term_max` order using skip bounds only, stopping as soon as `(max_ess + non_ess_block_ub + rem_global)` falls below `prune_theta`.
-4. **Progressive `active_mask` narrowing:** Before each surviving non-essential clause, `filter_ge_256` clears bits in `active_mask` that can no longer reach `prune_theta`, driving masked accumulation into scalar fast paths and terminating early when `active_mask == [0; 4]`.
-5. **Segment-parallel MAXSCORE & exact `DocId` tie eviction:** Pure-lexical queries without `lazy_filter` or `RankModifier` over $\ge 4$ visible segments split visible segments across up to `fts_parallel_segments` (default Rayon thread count) worker shards via `rayon`, sharing a monotonic `AtomicU32` `shared_theta` and resolving `DocId`s for ties at the cutoff (`ensure_theta_tie_doc_ids`, `merge_shard_heaps`) so results match single-threaded execution identically.
+3. **All-single specialized loop:** `run_shard_single` keeps `blocks: [Option<RowBlock>]` and `bounds: [f32]` in lockstep with the term streams, preserving clause order, the essential-set transition, the floating-point pruning slack (`ub_slack`), and ascending `DocId` tie-breaking.
+4. **Descending non-essential seek & early exit:** Non-essential clauses are sought in **descending** global `term_max` order using skip bounds only, stopping as soon as `(max_ess + non_ess_block_ub + rem_global)` falls below `prune_theta`.
+5. **Progressive `active_mask` narrowing:** Before each surviving non-essential clause, `filter_ge_256` clears bits in `active_mask` that can no longer reach `prune_theta`, driving masked accumulation into scalar fast paths and terminating early when `active_mask == [0; 4]`.
+6. **Segment-parallel MAXSCORE & exact `DocId` tie eviction:** Pure-lexical queries without `lazy_filter` or `RankModifier` over $\ge 4$ visible segments split visible segments across up to `fts_parallel_segments` (default Rayon thread count) worker shards via `rayon`, sharing a monotonic `AtomicU32` `shared_theta` and resolving `DocId`s for ties at the cutoff (`ensure_theta_tie_doc_ids`, `merge_shard_heaps`) so results match single-threaded execution identically.

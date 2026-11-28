@@ -166,7 +166,7 @@ fn write_filtered_parquet(path: &Path, n: usize) {
             let attr_bucket = splitmix64(idx as u64) % 100;
             mod100_b.append_value(attr_bucket);
             mod10_b.append_value(attr_bucket % 10);
-            even_b.append_value(attr_bucket % 2 == 0);
+            even_b.append_value(attr_bucket.is_multiple_of(2));
             score_b.append_value(attr_bucket as f64);
         }
 

@@ -32,6 +32,10 @@ use crate::detached::all_detached_gens;
 use crate::segments::RowResolver;
 use crate::tree::{VacuumBudget, VacuumStats, vacuum_ann_storage};
 
+/// `(rel_block_id, max_tf, min_dl_over_tf, compact_block)` postings staged per chunk while
+/// consolidating a compacted segment's inline FTS blocks.
+type ChunkPostingUpdates = Vec<(u8, u32, f32, Vec<u8>)>;
+
 const WRITE_CHUNK_ROWS: usize = 2048;
 
 /// Policy thresholds determining which sealed segments are eligible for compaction.
@@ -724,7 +728,7 @@ where
         }
 
         if !keep_inline {
-            let mut by_chunk: BTreeMap<SkipChunk, Vec<(u8, u32, f32, Vec<u8>)>> = BTreeMap::new();
+            let mut by_chunk: BTreeMap<SkipChunk, ChunkPostingUpdates> = BTreeMap::new();
             for &(blk, ref pblk) in &encoded_blocks {
                 let rb = RowBlock::new(target_seg, blk);
                 by_chunk.entry(rb.chunk()).or_default().push((

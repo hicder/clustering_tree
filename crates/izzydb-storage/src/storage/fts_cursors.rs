@@ -3,7 +3,7 @@ use rocksdb::{DB, DBPinnableSlice, DBRawIteratorWithThreadMode, ReadOptions};
 use izzydb_core::config::{RowBlock, SegmentId, SkipChunk, TermId};
 use izzydb_core::error::{Result, TreeError};
 use izzydb_fts::{
-    FtsChunkLayout, PostingBlockHeader, PostingBlockView,
+    EncodedPosting, FtsChunkLayout, PostingBlockHeader, PostingBlockView,
 };
 
 use crate::codec::{encode_fts_term_id_prefix, fts_chunk_key, fts_chunk_key_coord};
@@ -154,10 +154,10 @@ impl<'a> RocksSkipCursor<'a> {
         }
     }
 
-    /// Parse the [`PostingBlockView`] for `current_block` directly from the inline buffer
-    /// or the cached active chunk slice (zero RocksDB calls).
+    /// Borrow the raw encoded posting payload for `current_block` directly from the inline
+    /// buffer or the cached active chunk slice (zero RocksDB calls, no decoding).
     #[inline]
-    pub fn current_posting_view(&mut self) -> Result<Option<PostingBlockView<'_>>> {
+    pub fn current_posting_encoded(&mut self) -> Result<Option<EncodedPosting<'_>>> {
         if self.current_block.is_none() {
             return Ok(None);
         }
@@ -166,16 +166,27 @@ impl<'a> RocksSkipCursor<'a> {
                 if *exhausted {
                     return Ok(None);
                 }
-                Ok(Some(PostingBlockView::parse(bytes.as_slice())?))
+                Ok(Some(EncodedPosting::Standalone(bytes.as_slice())))
             }
             CursorSource::OutOfLine(state) => {
                 let Some(layout) = state.chunk_layout else {
                     return Ok(None);
                 };
                 let view = layout.view(&state.chunk_buf);
-                let slice = view.block_bytes(state.entry_idx);
-                Ok(Some(PostingBlockView::parse_compact(slice)?))
+                Ok(Some(EncodedPosting::Compact(
+                    view.block_bytes(state.entry_idx),
+                )))
             }
+        }
+    }
+
+    /// Parse the [`PostingBlockView`] for `current_block` directly from the inline buffer
+    /// or the cached active chunk slice (zero RocksDB calls).
+    #[inline]
+    pub fn current_posting_view(&mut self) -> Result<Option<PostingBlockView<'_>>> {
+        match self.current_posting_encoded()? {
+            Some(encoded) => Ok(Some(encoded.parse()?)),
+            None => Ok(None),
         }
     }
 

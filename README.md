@@ -5,10 +5,10 @@ An embedded, RocksDB-backed hybrid search engine in Rust for vector, full-text, 
 - **Segmented storage:** Append-only segments (`RowId = (SegmentId, LocalId)`) with copy-on-write updates, background compaction + rank-based forwarding, lazy ANN vacuuming, and RocksDB compaction filters.
 - **Vector search (optional):** Mutable global clustering tree over `RowId`s with RaBitQ quantization and optional exact reranking — or create a vectorless collection with `CollectionConfig::without_vectors()`.
 - **Attribute filtering & detached columns:** Typed `Inline` and `Detached` attribute schemas with value-major per-segment inverted indexes, exact live counts, per-segment zone maps, zero-copy lazy row evaluation, and lock-free whole-column detached replacement (`> 1M rows/s` build, `< 20 ms` publish).
-- **Full-text & hybrid:** Segment-keyed Block-Max MAXSCORE BM25 with out-of-line skip metadata, inline rare-term postings, stemming, phrase matching, and Reciprocal Rank Fusion hybrid search.
+- **Full-text & hybrid:** Segment-keyed Block-Max MAXSCORE BM25 with unified v4 `FtsChunk` skip+posting chunks (`TfEncoding` compression, inline rare-term postings, segment-parallel MAXSCORE via `fts_parallel_segments`), stemming, phrase matching, and Reciprocal Rank Fusion hybrid search.
 - **Ranking, boosting & sorting:** Composable scoring expressions (filter boosts, saturation and decay attribute signals, additive and multiplicative combinators) and multi-key attribute sorting with index-order top-k early termination.
 - **Faceting:** Exact terms, ranges, stats, and histogram facets over filter, BM25, vector, and hybrid queries, with multi-select (disjunctive) faceting and O(values) unfiltered counts from maintained per-value counters.
-- **Persistent & accelerated:** Atomic RocksDB batch commits and runtime-dispatched SIMD (`x86_64` AVX2/AVX-512, `aarch64` NEON).
+- **Persistent & accelerated:** Atomic RocksDB batch commits, optional `direct_io` (`O_DIRECT`) and opt-in `io-uring` Cargo feature, and runtime-dispatched SIMD (`x86_64` AVX2/AVX-512, `aarch64` NEON).
 
 ## Workspace Crates
 
@@ -30,10 +30,10 @@ Define a schema on `CollectionConfig` (setting `filterable = true` for attribute
 
 ```rust
 use izzydb::{
-    AttributeType, Attributes, Bm25Overrides, Collection, CollectionConfig, DistanceMetric,
-    FacetRange, FacetSort, FacetSpec, Filter, FullTextSearchConfig, HybridFacetScope,
-    HybridSearchOptions, Language, RankBy, SearchOptions, TokenQuery, Tokenizer, TreeConfig,
-    VectorFacetScope,
+    AttributeType, Attributes, Bm25Overrides, Collection, CollectionConfig, DecayMode,
+    DistanceMetric, FacetRange, FacetSort, FacetSpec, Filter, FullTextSearchConfig,
+    HybridFacetScope, HybridSearchOptions, Language, OrderBySpec, RankBy, SearchOptions,
+    TokenQuery, Tokenizer, TreeConfig, VectorFacetScope,
 };
 
 let fts_en = FullTextSearchConfig::default()
@@ -282,14 +282,14 @@ You can also split SST generation and ingestion across machines with `build_ssts
 
 ### Architecture & Performance
 
-- [Key & Binary Encoding](docs/architecture/key-encoding.md) — v3 RocksDB column families, `RowId` / segment keys, `RowView` v3, `ColumnBlock`, `SegPosting`, and RaBitQ leaf layouts.
+- [Key & Binary Encoding](docs/architecture/key-encoding.md) — v3 RocksDB column families, `RowId` / segment keys, `RowView` v3, `ColumnBlock`, `SegPosting`, `FtsChunk` v4, and RaBitQ leaf layouts.
 - [Segments, Compaction & Vacuum](docs/architecture/segments-and-compaction.md) — append-only segment states, CoW updates, rank-based `RowId` forwarding, `vacuum_ann`, and compaction filters.
 - [Detached Columns](docs/architecture/detached-columns.md) — out-of-row generational columnar storage, lock-free `detached_ingest`, atomic `< 20 ms` publish, and `0x14` overwritten sets.
 - [Index Path](docs/architecture/index-path.md) — `SegmentStore`, `AnnIndex`, `AttributeIndex`, and `FtsIndex` atomic write coordination.
-- [Search Path](docs/architecture/search-path.md) — five-regime `FilterPlan` planner (`ExactScan`, `MaskedTraversal`, `PostFilter`), beam traversal, and `RowResolver` output.
+- [Search Path](docs/architecture/search-path.md) — five-regime `FilterPlan` planner (`ExactScan`, `MaskedTraversal`, `PostFilter` with `PostingMembership` & `ColumnFilter`), beam traversal, and `RowResolver` output.
 - [Filtering & Inverted Index](docs/architecture/filtering-and-inverted-index.md) — `Inline`/`Detached` schemas, value-major per-segment postings, `0x06`/`0x07` live counts, `0x12` zone maps, and faceting.
-- [Full-Text Search Architecture](docs/architecture/fts-architecture.md) — segment-keyed `(seg, block)` FTS blocks, `TermRecord` v4, Block-Max MAXSCORE BM25, and hybrid RRF.
-- [SIMD Block-Max MAXSCORE & Data Layout](docs/architecture/blockmax-simd.md) — 256-slot block geometry, `DocLenBlock` & `SkipBlock`, v3 Sparse/Dense posting layouts, and runtime-dispatched SIMD kernels.
+- [Full-Text Search Architecture](docs/architecture/fts-architecture.md) — unified `FtsChunk` v4 `(seg, chunk)` blocks, `TermRecord` v4, segment-parallel Block-Max MAXSCORE BM25, and hybrid RRF.
+- [SIMD Block-Max MAXSCORE & Data Layout](docs/architecture/blockmax-simd.md) — 256-slot block geometry, `DocLenBlock` & `FtsChunk` v4, compact `TfEncoding` / v3 posting layouts, and runtime-dispatched SIMD kernels.
 - [Bulk Import & Append Architecture](docs/architecture/bulk-import.md) — offline Parquet scan, skeleton training, `bulk_import`, `bulk_append`, and `izzydb-import` subcommands.
 - [Segmented Storage v3 Performance Report](docs/perf/2026-11-23-segmented-storage-v3.md) — `master` vs. `segments-v3` release comparison across ANN, filtering, BM25, faceting, bulk import, churn, and detached ingest.
 - [ANN Latency Optimization](docs/perf/2026-11-20-latency-optimization.md) — packed node blobs, internal node cache, single-FWHT query path, and SIMD RaBitQ scoring.

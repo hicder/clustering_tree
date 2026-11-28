@@ -43,7 +43,7 @@ Ties are broken by ascending `DocId`.
 | Builder | Default | Effect |
 |---|---|---|
 | `HybridSearchOptions::new(k, vector_search)` | — | `k` = final results returned; `vector_search` = the `SearchOptions` for the vector leg. Its own `k` is how many vector candidates enter fusion. |
-| `.with_bm25_candidates(n)` | `max(vector_search.k, 2 * k)` | How many BM25 hits enter fusion. |
+| `.with_bm25_candidates(n)` | `max(2 * k, 20)` | How many BM25 hits enter fusion. |
 | `.with_rrf_k(x)` | 60.0 | Damping constant (≥ 0). Larger values flatten the difference between ranks; smaller values reward top ranks more. 60 is the conventional choice. |
 | `.with_weights(v, b)` | 1.0, 1.0 | Weight of the vector and BM25 lists (each ≥ 0). Set `b > v` to favor keyword matches. |
 

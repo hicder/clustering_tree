@@ -49,7 +49,12 @@ let opts = SearchOptions::new(10, 8).with_rerank(100).with_max_expanded_leaves(2
 let hits = col.search(&query, opts, Some(&filter))?;
 ```
 
-The filter is applied **during** the search, not after. Clusters with no matching documents are skipped, and you do not lose results to post-filtering (the failure mode where the top-`k` neighbors all fail the filter and you get back too few hits). When the filter is very selective and matches are scattered across many clusters, the search keeps expanding to further leaves until it finds `k` matches or reaches `max_expanded_leaves`; raise that cap if highly selective filters return fewer than `k` hits that you know exist.
+The planner chooses the cheapest strategy automatically:
+- **Selective filters** ($\le$ `exact_scan_threshold`, default `4,096` vector rows) switch to exact distance scoring (`ExactScan`) for 100% exact recall.
+- **Medium-selectivity filters** prune ANN leaves directly against the matching `RowId` set (`MaskedTraversal`), skipping clusters with no matching documents.
+- **Broad or unselective filters** (`PostFilter`) avoid upfront materialization, checking broad inline equality predicates via cached per-segment posting bitmaps and verifying general scalar filters in distance-ordered chunks from sealed `cf_columns` blocks or row storage, stopping once enough candidates pass inside the top-`k`/rerank distance cutoff.
+
+When a filter is very selective above `exact_scan_threshold` and matches are scattered across many clusters, the search keeps expanding to further leaves until it finds `k` matches or reaches `max_expanded_leaves`; raise that cap if highly selective filters return fewer than `k` hits that you know exist.
 
 See [Filtering](05-filtering.md) for the full predicate language.
 

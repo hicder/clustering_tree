@@ -32,9 +32,16 @@ Unlike v2's per-leaf cluster bitmaps, v3 plans predicates over **`RowSet`** (`BT
 | 2. `Empty` | `FilterPlan::Empty` or 0 matching rows | Immediate empty `Vec::new()` (0 I/O) |
 | 3. `ExactScan` | `FilterPlan::Materialized(rs)` with $\le$ `opts.exact_scan_threshold` (default `4,096`) vector rows | Skips the ANN tree completely: batch-fetches exact `[f32; dim]` vectors from `cf_vectors` in `RowId` order, computes exact `search_distance_bytes`, guarantees **100% exact recall** |
 | 4. `MaskedTraversal` | `FilterPlan::Materialized(rs)` with $> \text{exact\_scan\_threshold}$ rows | Best-first beam traversal (`BinaryHeap`), testing each leaf's physical `row_ids` directly against `rs` (through `SegmentTableSnapshot::resolve_forwarding`), scoring matching live slots via `score_leaf_rabitq_masked`, dynamically expanding up to `max_expanded_leaves.unwrap_or(beam_width * 16)`, then exact rerank |
-| 5. `PostFilter` | `FilterPlan::Lazy { residual, seed }` | Best-first leaf expansion fetching candidate batches, checking optional `seed` `RowSet`, lazily evaluating `residual` against `cf_rows` (`RowView`) / `cf_detached`, then scoring surviving full/quantized candidates up to `k` / expansion limit |
+| 5. `PostFilter` | `FilterPlan::Lazy { residual, seed }` or materialized `> 50%` selectivity | Best-first leaf expansion checking optional `seed` `RowSet`, then verifying `residual` via `PostingMembership` (broad inline equality), or distance-ordered chunks with cutoff pruning using `ColumnFilter` (`cf_columns`) and/or `cf_rows` (`RowView`) / `cf_detached` |
 
 *(Collections created with `CollectionConfig::without_vectors()` reject `Collection::search` with `TreeError::InvalidConfig` and serve FTS, `filter`, `order_by`, and `facet` queries directly over `SegmentStore`.)*
+
+### `PostFilter` Verification Fast Paths
+
+When `search_post_filter` evaluates `residual` over surviving ANN batch candidates:
+1. **Broad inline equality (`PostingMembership`, `search/postings.rs`):** For `Eq`, `NotEq`, and `Not(Eq(..))` on inline attributes (including `ScalarValue::Null` via `TAG_PRESENT`), `PostingMembership` lazily fetches and caches per-segment `SegPosting` bitmaps via batched `multi_get_attr_posting_slices` and filters candidates in memory without reading `cf_rows` or `cf_columns`.
+2. **Distance-ordered chunked verification & cutoff pruning (`search/filtered.rs`):** For general residual filters, candidates in the batch are sorted in ascending estimated distance (`cmp_cand_dist_id`) and verified in adaptive chunks (`clamp(32, 512)` sized from `need / selectivity * 1.2`). Once `verified.len() >= target`, the `target`-th distance cutoff prunes remaining candidates via `partition_point`, skipping lookups past the cutoff.
+3. **Sealed-segment columnar verification (`ColumnFilter`, `filter_plan/columnar.rs`):** When `residual` is a scalar-only expression over inline columnar attributes (`is_columnar() && !is_array()`), `ColumnFilter` batch-reads `cf_columns` blocks on sealed segments (`SEG_FLAG_HAS_COLUMNS`) whenever `blocks * attrs <= candidate_rows`, falling back to `verify_chunk` (`cf_rows` / `cf_detached`) only for open segments, uncolumnar segments, or missing/null values.
 
 ---
 

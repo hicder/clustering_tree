@@ -7,7 +7,7 @@ Implementation sources:
 - Packed ANN node/metadata serialization and zero-copy views: [`crates/izzydb-storage/src/node/mod.rs`](../../crates/izzydb-storage/src/node/mod.rs)
 - `RowView` v3, `SegPosting`, `Manifest`, `SegmentMeta`, `DetachedMeta`, zone maps: [`crates/izzydb-codec/src/lib.rs`](../../crates/izzydb-codec/src/lib.rs)
 - `ColumnBlock` & `ColumnBlockBuilder` (`cf_columns`, `cf_detached`): [`crates/izzydb-storage/src/column/mod.rs`](../../crates/izzydb-storage/src/column/mod.rs)
-- FTS metadata, `TermRecord` v4, `SkipBlock`, `DocLenBlock`, v3 `PackedPostingBlock`, and `PackedPositionBlock`: [`crates/izzydb-fts/src/block/mod.rs`](../../crates/izzydb-fts/src/block/mod.rs)
+- FTS metadata, `TermRecord` v4, `FtsChunk` v4, `DocLenBlock`, compact `TfEncoding` / v3 `PackedPostingBlock`, and `PackedPositionBlock`: [`crates/izzydb-fts/src/block/mod.rs`](../../crates/izzydb-fts/src/block/mod.rs)
 - ID aliases, `RowId`/`RowBlock`/`SkipChunk`, and schema types: [`crates/izzydb-core/src/config.rs`](../../crates/izzydb-core/src/config.rs), [`crates/izzydb-core/src/schema/mod.rs`](../../crates/izzydb-core/src/schema/mod.rs)
 - Structural and index invariants: [`crates/izzydb/src/verify/mod.rs`](../../crates/izzydb/src/verify/mod.rs)
 
@@ -50,13 +50,13 @@ Implementation sources:
 | `cf_detached` | `attr_id` BE \|\| `gen` BE \|\| `seg` BE \|\| `block` BE (14 B) | `ColumnBlock` (§4.4) | Default | Active + pending generations |
 | `cf_detached_postings` | `attr_id` BE \|\| `gen` BE \|\| `tag` \|\| `encoded_val` \|\| `seg` BE | `SegPosting` (§4.2) | `None` | Filterable detached columns, prefix 7 B (`attr \|\| gen \|\| tag`) |
 | `cf_fts_terms` | `attr_id` BE \|\| `token_utf8` | `TermRecord` v4 (§4.5) | Default | Prefix 2 B (`attr_id`) |
-| `cf_fts_skips` | `term_id` BE \|\| `seg` BE \|\| `chunk` BE (12 B) | `SkipBlock` | `None` | Prefix 4 B (`term_id`) |
-| `cf_fts_postings` | `term_id` BE \|\| `seg` BE \|\| `block` BE (12 B) | v3 `PackedPostingBlock` | `None` | Prefix 4 B (`term_id`) |
+| `cf_fts_skips` | `term_id` BE \|\| `seg` BE \|\| `chunk` BE (12 B) | `FtsChunk` v4 (§4.5) | `None` | Prefix 4 B (`term_id`); unified skip bounds + compact postings; no Bloom filter |
+| `cf_fts_postings` | `term_id` BE \|\| `seg` BE \|\| `block` BE (12 B) | *(deprecated — empty)* | `None` | Retained empty in v4; postings live inside `FtsChunk` (`cf_fts_skips`) |
 | `cf_fts_positions` | `term_id` BE \|\| `seg` BE \|\| `block` BE (12 B) | `PackedPositionBlock` | Default | Prefix 4 B (`term_id`) |
 
 ### Compaction Filters
 
-`cf_rows`, `cf_row_doc_ids`, `cf_vectors`, `cf_columns`, `cf_detached`, `cf_attr_postings`, `cf_detached_postings`, `cf_fts_skips`, `cf_fts_postings`, `cf_fts_positions`, and `default[0x05]` install a RocksDB `CompactionFilter` that drops any key whose embedded `SegmentId` belongs to `Storage::dropped_segments` (`Arc<ArcSwap<RoaringBitmap>>`). For `cf_detached`, `cf_detached_postings`, `default[0x07]`, and `default[0x14]`, the filter additionally drops keys whose `ColumnGen < retired_below[attr_id]`. Because segment IDs and generation IDs are never reused, filtering is lock-free and race-free.
+`cf_rows`, `cf_row_doc_ids`, `cf_vectors`, `cf_columns`, `cf_detached`, `cf_attr_postings`, `cf_detached_postings`, `cf_fts_skips`, `cf_fts_positions`, `default[0x05]` (and deprecated `cf_fts_postings`) install a RocksDB `CompactionFilter` that drops any key whose embedded `SegmentId` belongs to `Storage::dropped_segments` (`Arc<ArcSwap<RoaringBitmap>>`). For `cf_detached`, `cf_detached_postings`, `default[0x07]`, and `default[0x14]`, the filter additionally drops keys whose `ColumnGen < retired_below[attr_id]`. Because segment IDs and generation IDs are never reused, filtering is lock-free and race-free.
 
 ---
 
@@ -124,9 +124,10 @@ One attribute for one 256-slot `RowBlock` (`block = local >> 8`):
 - **`present`:** `[u64; 4]` LE (32 B, unless `all_present`).
 - **Payload:** Fixed-width `[T; 256]` slot-indexed (scalars) or `offsets: [u32; 257]` LE + contiguous payloads (strings / arrays).
 
-### 4.5 `TermRecord` v4 (`cf_fts_terms`)
+### 4.5 `TermRecord` v4 (`cf_fts_terms`) & `FtsChunk` v4 (`cf_fts_skips`)
 
-21-byte header (`term_id: u32 LE`, `doc_freq: u64 LE` over **live** rows, `max_tf: u32 LE`, `min_dl_over_tf: f32 LE`, `flags: u8`). When `flags == 0x01` (single-block term with `doc_freq <= 8`), the inline payload appends `seg: u32 LE || block: u32 LE || v3 PackedPostingBlock` (256-slot TF-only posting block). A second distinct `(seg, block)` promotes the term to `cf_fts_postings` + `cf_fts_skips`.
+- **`TermRecord` v4:** 21-byte header (`term_id: u32 LE`, `doc_freq: u64 LE` over **live** rows, `max_tf: u32 LE`, `min_dl_over_tf: f32 LE`, `flags: u8`). When `flags == 0x01` (single-block term with `doc_freq <= 8`), the inline payload appends `seg: u32 LE || block: u32 LE || v3 PackedPostingBlock` (256-slot TF-only posting block). A second distinct `(seg, block)` promotes the term to `cf_fts_skips`.
+- **`FtsChunk` v4 (`cf_fts_skips`):** 12-byte header (`version_flags: u8 = 0x40 | optional 0x01 u16_offsets`, `skip_tf_width: u8`, `count_minus_1: u8`, `reserved: u8 = 0`, `chunk_max_tf: u32 LE`, `chunk_min_dl_over_tf: f32 LE`) followed by per-block `min_dl_over_tfs`, cumulative payload `block_ends` (`u16` or `u32`), `max_tfs`, `rel_block_ids`, and concatenated compact `TfEncoding` posting payloads (see [`blockmax-simd.md`](blockmax-simd.md)).
 
 ### 4.6 `Manifest` (`default[b"\x01manifest"]`, 32 B)
 
@@ -150,4 +151,4 @@ Verified exhaustively by `crates/izzydb/src/verify/mod.rs`:
 3. **ANN Tree (when `has_vectors`):** Every live row with `has_vector` has **exactly one** effective leaf entry across `cf_leaf_entries` (after resolving `Forwarding` segments); every non-effective entry points to a tombstoned/forwarded-dead/dropped row; `AnnMeta.num_vectors == live_vector_rows` and `AnnMeta.stale_rows == physical_entries - effective_entries`. (Vectorless collections have zero ANN keys.)
 4. **Inline Attribute Indexes, Counts & Zones:** `cf_attr_postings` $\cap$ live equals exact keys re-extracted from live `cf_rows`; `0x06` counts equal live-doc counts; `0x12` zones enclose all live values; sealed `cf_columns` match live rows.
 5. **Detached Columns:** `cf_detached`, `cf_detached_postings`, `0x07`, `0x14`, and `0x12` zones at `current_gen` match point-corrected live values; no retired generations leak outside compaction-filter bounds.
-6. **FTS Parity:** `cf_fts_terms`, `cf_fts_skips`, `cf_fts_postings` $\cap$ live, `cf_fts_positions`, `default[0x05]` doc lengths, and `FtsMeta` stats match a full re-analysis of live rows, with sound upper bounds.
+6. **FTS Parity:** `cf_fts_terms`, `cf_fts_skips` (`FtsChunk` v4) $\cap$ live, `cf_fts_positions`, `default[0x05]` doc lengths, and `FtsMeta` stats match a full re-analysis of live rows, with sound upper bounds; deprecated `cf_fts_postings` has zero visible keys.

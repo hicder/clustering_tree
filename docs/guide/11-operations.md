@@ -8,7 +8,7 @@ A collection is a RocksDB directory (`CURRENT`, `MANIFEST`, `.sst` files, `.log`
 
 - `Collection::open(path, config)` loads ANN internal nodes (`default[0x02]`), the `SegmentTable` snapshot, `zone_cache`, and `dropped_segments`.
 - RocksDB holds an exclusive `LOCK` per process. Dropping `Collection` closes it.
-- Reads (`search`, `query`, `query_bm25`, `hybrid_search`, `order_by`, `facet`, `get`, `resolve_filter_doc_ids`, `detached_ingest().build()`) take `&self` and run concurrently.
+- Reads (`search`, `query`, `query_bm25`, `hybrid_search`, `query_ordered`, `order_by`, `facet`, `get`, `resolve_filter_doc_ids`, `detached_ingest().build()`) take `&self` and run concurrently.
 - Writes (`upsert*`, `patch*`, `delete*`, `set_detached*`, `publish_detached`, `seal`, `compact`, `vacuum_ann`, `maintenance`, `compact_fts_stats`) take `&mut self`.
 
 ---
@@ -44,6 +44,11 @@ col.vacuum_ann(VacuumBudget::leaves(128))?;
   - Larger values (`65,536–262,144`) reduce total segment count, minimize per-segment overhead on `SegPosting`s, and match bulk Parquet batch sizes.
 - **`defer_column_build` (default `false`):** Set `true` on latency-sensitive write paths to skip synchronous `cf_columns` generation at seal time and defer it to `maintenance()`.
 
+### I/O & Concurrency Tuning (`CollectionConfig`)
+
+- **`.with_direct_io(true)` (default `false`):** Enables RocksDB `use_direct_reads` and `use_direct_io_for_flush_and_compaction` (`O_DIRECT`) to bypass the OS page cache and rely on RocksDB's block cache instead.
+- **`.with_fts_parallel_segments(n)` (default `None`):** Caps the number of segment shards executed in parallel during FTS Block-Max MAXSCORE queries (`None` uses Rayon's thread count; `1` runs single-threaded; `0` is rejected with `InvalidConfig`).
+
 ---
 
 ## Durability
@@ -56,7 +61,7 @@ Single-call mutations (`upsert`, `patch`, `patch_batch`, `delete`, `delete_batch
 
 ```rust
 let stats = col.verify_invariants()?;
-println!("{} docs across {} segments", stats.num_docs, stats.segments);
+println!("{} docs across {} segments", stats.num_docs, stats.num_segments);
 ```
 
 `verify_invariants` exhaustively checks manifest counters, `SegmentMeta` / tombstones / dropped segments, `cf_id_map <-> cf_rows <-> cf_row_doc_ids` bijection, ANN leaf parity (or emptiness for vectorless collections), inline/detached inverted postings & counts & zone maps, `cf_columns` / `cf_detached`, and FTS parity. Intended for tests, post-import validation, or offline audits.
@@ -81,11 +86,28 @@ See [Segmented Storage v3 Performance Report](../perf/2026-11-23-segmented-stora
 
 ---
 
+## Errors
+
+All fallible calls return `izzydb::Result<T>` (`Result<T, TreeError>`):
+
+| Variant | Typical cause |
+|---|---|
+| `InvalidConfig` / `InvalidSchema` | Out-of-range `TreeConfig` / `SegmentConfig` / `fts_parallel_segments = 0`, vector search on a vectorless collection, or invalid attribute definition |
+| `ConfigMismatch` | Re-opening a collection with a different `dim`, `metric`, `has_vectors`, or existing attribute type/flags |
+| `DimensionMismatch` / `NonFiniteVector` | Embedding or query length mismatch, or `NaN` / `Inf` values |
+| `InvalidAttribute` | Undeclared attribute name, wrong `AttributeValue` variant, or `NaN` float |
+| `InvalidFilter` / `InvalidQuery` | Invalid `Filter`, `RankBy`, `OrderBySpec`, or `FacetSpec` |
+| `DocumentNotFound` | `patch` / `patch_batch` / `set_detached` on a missing `DocId` |
+| `Storage` / `CorruptedData` / `InvariantViolation` | RocksDB I/O failure, incomplete bulk import marker, or storage corruption |
+
+---
+
 ## Cargo features & FAQ
 
-| Feature (crate `izzydb`) | Effect |
-|---|---|
-| `fts-cjk` | Enables `SmartCn`, `Kuromoji`, and `Nori` tokenizers for Chinese, Japanese, and Korean. |
+| Feature | Crates | Effect |
+|---|---|---|
+| `fts-cjk` | `izzydb`, `izzydb-core`, `izzydb-fts` | Enables `SmartCn`, `Kuromoji`, and `Nori` tokenizers for Chinese, Japanese, and Korean. |
+| `io-uring` | `izzydb`, `izzydb-storage`, `izzydb-bulk`, `izzydb-bench` | Enables `rocksdb/io-uring` for async Linux I/O (opt-in; requires `liburing` development headers on Linux). |
 
 - **Can I create a collection without vector embeddings?** Yes: use `CollectionConfig::without_vectors()` and pass `None` as the embedding to `upsert`.
 - **How do I update an attribute across millions of docs without rewriting documents or vectors?** Declare it as a [Detached Column](12-detached-columns.md) (`.with_detached_attribute(...)`) and load updates with `detached_ingest().build()` + `publish_detached()`.

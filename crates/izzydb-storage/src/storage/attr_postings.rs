@@ -1,26 +1,117 @@
 //! Attribute postings, counts, and zone reads.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use rocksdb::{
-    DBPinnableSlice, Direction,
-    IteratorMode, PrefixRange, ReadOptions,
-};
+use rocksdb::{DBPinnableSlice, Direction, IteratorMode, PrefixRange, ReadOptions};
 
-use izzydb_core::config::{
-    AttrId, RowId, SegmentId,
-};
+use izzydb_core::config::{AttrId, RowId, SegmentId};
 use izzydb_core::error::{Result, TreeError};
 
 use crate::codec::{
-    ATTR_COUNT_TAG, SegPosting, ZONE_TAG, ZoneEntry, decode_row_key, encode_attr_prefix, row_key, split_posting_key,
+    ATTR_COUNT_TAG, SegPosting, ZONE_TAG, ZoneEntry, decode_row_key, encode_attr_prefix, row_key,
+    split_posting_key,
 };
-
 
 use super::*;
 
+/// Bounded FIFO cache of immutable sealed-segment attribute postings.
+///
+/// `cf_attr_postings` entries for sealed segments never change, so decoded bitmaps can be
+/// reused across queries. Open-segment postings bypass the cache because they are mutated.
+///
+/// ```text
+/// // ~153 segments × 2 postings/query, keyed by the full posting key (attr value || seg)
+/// cache.get(&make_posting_key(&key, seg))
+/// ```
+pub struct AttrPostingCache {
+    capacity_bytes: usize,
+    used_bytes: usize,
+    map: HashMap<Vec<u8>, Arc<RoaringBitmap>>,
+    order: VecDeque<Vec<u8>>,
+}
+
+impl AttrPostingCache {
+    pub(crate) fn new(capacity_bytes: usize) -> Self {
+        Self {
+            capacity_bytes,
+            used_bytes: 0,
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    #[inline]
+    fn entry_bytes(key: &[u8], bitmap: &RoaringBitmap) -> usize {
+        key.len() + bitmap.serialized_size() + 96
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Arc<RoaringBitmap>> {
+        self.map.get(key).map(Arc::clone)
+    }
+
+    fn insert(&mut self, key: Vec<u8>, bitmap: Arc<RoaringBitmap>) {
+        let bytes = Self::entry_bytes(&key, &bitmap);
+        if bytes > self.capacity_bytes {
+            return;
+        }
+        if let Some(existing) = self.map.get(&key) {
+            self.used_bytes = self
+                .used_bytes
+                .saturating_sub(Self::entry_bytes(&key, existing));
+        }
+        while self.used_bytes + bytes > self.capacity_bytes {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(old_bm) = self.map.remove(&old) {
+                self.used_bytes = self
+                    .used_bytes
+                    .saturating_sub(Self::entry_bytes(&old, &old_bm));
+            }
+        }
+        self.order.push_back(key.clone());
+        self.used_bytes += bytes;
+        self.map.insert(key, bitmap);
+    }
+
+    pub(crate) fn remove_segment(&mut self, seg: SegmentId) {
+        let removed: Vec<Vec<u8>> = self
+            .map
+            .keys()
+            .filter(|key| key.len() >= 4 && key[key.len() - 4..] == seg.to_be_bytes())
+            .cloned()
+            .collect();
+        for key in removed {
+            if let Some(bm) = self.map.remove(&key) {
+                self.used_bytes = self.used_bytes.saturating_sub(Self::entry_bytes(&key, &bm));
+            }
+        }
+        self.order
+            .retain(|key| !(key.len() >= 4 && key[key.len() - 4..] == seg.to_be_bytes()));
+    }
+}
+
+/// Default budget for decoded sealed-segment attribute postings (64 MiB).
+pub const ATTR_POSTING_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
 impl Storage {
+    /// Look up a decoded posting from the bounded cache.
+    pub fn cached_attr_posting(&self, posting_key: &[u8]) -> Option<Arc<RoaringBitmap>> {
+        self.attr_posting_cache
+            .read()
+            .expect("attr_posting_cache poisoned")
+            .get(posting_key)
+    }
+
+    /// Insert a decoded posting into the bounded cache.
+    pub fn cache_attr_posting(&self, posting_key: Vec<u8>, bitmap: Arc<RoaringBitmap>) {
+        self.attr_posting_cache
+            .write()
+            .expect("attr_posting_cache poisoned")
+            .insert(posting_key, bitmap);
+    }
+
     pub fn get_attr_posting(&self, key: &[u8]) -> Result<Option<SegPosting>> {
         let cf = self.cf(CF_ATTR_POSTINGS)?;
         match self.db.get_pinned_cf(cf, key).map_err(map_db_err)? {
@@ -45,6 +136,34 @@ impl Storage {
         Ok(out)
     }
 
+    /// Fetch `cf_attr_postings` entries for one attribute key across ascending `segs` using a
+    /// single flat key scratch buffer (no per-segment `Vec` allocation).
+    pub fn multi_get_attr_posting_slices_for_segs(
+        &self,
+        attr_key: &[u8],
+        sorted_segs: &[SegmentId],
+    ) -> Result<Vec<Option<DBPinnableSlice<'_>>>> {
+        if sorted_segs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let key_len = attr_key.len() + 4;
+        let mut buf = vec![0u8; key_len * sorted_segs.len()];
+        for (idx, &seg) in sorted_segs.iter().enumerate() {
+            let off = idx * key_len;
+            buf[off..off + attr_key.len()].copy_from_slice(attr_key);
+            buf[off + attr_key.len()..off + key_len].copy_from_slice(&seg.to_be_bytes());
+        }
+        let cf = self.cf(CF_ATTR_POSTINGS)?;
+        let results = self
+            .db
+            .batched_multi_get_cf(cf, buf.chunks_exact(key_len), true);
+        let mut out = Vec::with_capacity(sorted_segs.len());
+        for res in results {
+            out.push(res.map_err(map_db_err)?);
+        }
+        Ok(out)
+    }
+
     pub fn visit_attr_postings_for_value(
         &self,
         attr_key: &[u8],
@@ -54,9 +173,9 @@ impl Storage {
         let cf = self.cf(CF_ATTR_POSTINGS)?;
         let mut ro = ReadOptions::default();
         ro.set_prefix_same_as_start(true);
-        let iter = self
-            .db
-            .iterator_cf_opt(cf, ro, IteratorMode::From(attr_key, Direction::Forward));
+        let iter =
+            self.db
+                .iterator_cf_opt(cf, ro, IteratorMode::From(attr_key, Direction::Forward));
         for item in iter {
             let (k, v) = item.map_err(map_db_err)?;
             let (prefix, seg) = split_posting_key(&k)?;
@@ -82,9 +201,9 @@ impl Storage {
         seek_key.extend_from_slice(start_val);
         let mut ro = ReadOptions::default();
         ro.set_prefix_same_as_start(true);
-        let iter = self
-            .db
-            .iterator_cf_opt(cf, ro, IteratorMode::From(&seek_key, Direction::Forward));
+        let iter =
+            self.db
+                .iterator_cf_opt(cf, ro, IteratorMode::From(&seek_key, Direction::Forward));
         for item in iter {
             let (k, v) = item.map_err(map_db_err)?;
             if !k.starts_with(&prefix) {

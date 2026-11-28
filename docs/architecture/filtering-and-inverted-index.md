@@ -54,8 +54,9 @@ While `cf_rows` stores per-row `RowView` v3 directories (fast for multi-attribut
 
 ### 4.1 Column Families & Keys
 
-- **`cf_attr_postings`:** `attr_id (u16 BE) || type_tag (u8) || encoded_val || seg (u32 BE)` $\to$ `SegPosting` (`0x00` Sparse `[u32; len]` LE for `<= 32` locals; `0x01` `RoaringBitmap`). Prefix extractor: 3 B (`attr_id || type_tag`). Uncompressed (`None`).
+- **`cf_attr_postings`:** `attr_id (u16 BE) || type_tag (u8) || encoded_val || seg (u32 BE)` $\to$ `SegPosting` (`0x00` Sparse `[u32; len]` LE for `<= 32` locals; `0x01` `RoaringBitmap`). Prefix extractor: 3 B (`attr_id || type_tag`). Uncompressed (`None`). `SegPostingView` adds zero-allocation `contains(local)` (binary search over sparse/array values, direct container bit tests) and ORs raw serialized containers into a flat `SegBitsetAccum` for `In` / range / `Or` unions.
 - **`cf_detached_postings`:** `attr_id (u16 BE) || gen (u32 BE) || type_tag (u8) || encoded_val || seg (u32 BE)` $\to$ `SegPosting`. Prefix extractor: 7 B (`attr_id || gen || type_tag`). Uncompressed.
+- **Sealed posting cache:** `Storage::attr_posting_cache` is a bounded 64 MiB FIFO of decoded sealed-segment bitmaps keyed by the full `(attr_key, seg)` posting key. Entries are immutable and dropped only when the segment retires; open-segment postings bypass the cache.
 - **`default[0x06]` / `default[0x07]`:** Global live-doc counts (`u64` LE; deleted at `0`) keyed identically to `(attr_id, [gen], type_tag, encoded_val)`. Gives $O(1)$ cardinality estimation for `FilterPlan`, `"global"`/`"complement"` facets, and exact `TotalHits` without scanning postings.
 - **`default[0x12]` (`ZoneEntry`):** `0x12 || seg (u32 BE) || attr_id (u16 BE) || type_tag (u8)` $\to$ `(min_bytes, max_bytes)` for ordered scalar attributes. Cached in `Storage::zone_cache` to prune segments with zero posting I/O on range predicates.
 - **`default[0x14]` (detached overwritten set):** `0x14 || attr_id BE || gen BE || seg BE` $\to$ `RoaringBitmap<LocalId>` marking rows mutated via `set_detached` after bulk generation build so scans over immutable `cf_detached_postings` stay 100% exact.

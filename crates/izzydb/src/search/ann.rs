@@ -1,16 +1,13 @@
 //! Unfiltered ANN search.
 
-use std::collections::HashMap;
+use crate::simd::LeafCandidate;
 use izzydb_core::config::{DistanceMetric, NodeId, RowId, TreeConfig};
 use izzydb_core::error::{Result, TreeError};
-use izzydb_core::metric::{prepare_vector_cow, search_distance};
-use izzydb_rabitq::{
-    QueryScratch, RabitqQuantizer,
-    pack_query_bits_into,
-};
-use izzydb_storage::node::{AnnMeta, LeafNodeView, PackedInternalNode};
+use izzydb_core::metric::{prepare_vector_cow, search_distances_batch};
+use izzydb_rabitq::{QueryScratch, RabitqQuantizer, pack_query_bits_into};
 use izzydb_storage::Storage;
-use crate::simd::LeafCandidate;
+use izzydb_storage::node::{AnnMeta, LeafNodeView, PackedInternalNode};
+use std::collections::HashMap;
 
 use super::*;
 
@@ -27,9 +24,7 @@ pub fn search(
     config: &TreeConfig,
 ) -> Result<Vec<(RowId, f32)>> {
     if opts.beam_width == 0 {
-        return Err(TreeError::InvalidConfig(
-            "beam_width must be >= 1".into(),
-        ));
+        return Err(TreeError::InvalidConfig("beam_width must be >= 1".into()));
     }
     let q = prepare_vector_cow(query, config.dim, config.metric)?;
     if opts.k == 0 || meta.num_vectors == 0 {
@@ -44,6 +39,7 @@ pub fn search(
     let mut frontier: Vec<(NodeId, f32)> = Vec::with_capacity(opts.beam_width);
     frontier.push((meta.root_id, 0.0));
     let mut next: Vec<(NodeId, f32)> = Vec::new();
+    let mut dists: Vec<f32> = Vec::new();
     let mut level = meta.root_level;
 
     while level > 0 {
@@ -52,10 +48,8 @@ pub fn search(
             let node = internal_cache.get(&node_id).ok_or_else(|| {
                 TreeError::CorruptedData(format!("missing internal node {node_id} in cache"))
             })?;
-            for (i, &child_id) in node.child_ids.iter().enumerate() {
-                let d = search_distance(config.metric, &q, node.child_centroid(i, dim));
-                next.push((child_id, d));
-            }
+            search_distances_batch(config.metric, &q, &node.child_centroids, dim, &mut dists);
+            next.extend(node.child_ids.iter().copied().zip(dists.iter().copied()));
         }
         select_top_k(&mut next, opts.beam_width, cmp_node_dist_id);
         if next.is_empty() {

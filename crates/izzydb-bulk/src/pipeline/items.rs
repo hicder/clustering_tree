@@ -3,24 +3,17 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 
-
-use izzydb::codec::{
-    Manifest, SegmentMeta, ZoneEntry,
-};
-use izzydb::config::{
-    AttrId, RowBlock,
-    SegmentId,
-};
+use izzydb::codec::{Manifest, SegmentMeta, ZoneEntry};
+use izzydb::config::{AttrId, RowBlock, SegmentId};
 use izzydb::fts::AttrFtsStats;
 use izzydb::node::AnnMeta;
 
 use crate::common::parquet_reader::MappedFile;
 use crate::common::sorter::{
-    SortItem, read_bytes_lp, read_bytes_req, read_u16_opt, read_u32_req,
-    write_bytes_lp, write_u16, write_u32, write_u64,
+    SortItem, read_bytes_lp, read_bytes_req, read_u16_opt, read_u32_req, write_bytes_lp, write_u16,
+    write_u32, write_u64,
 };
 use crate::common::sst::SstFileInfo;
-
 
 pub(super) struct CountDeltaItem {
     pub(super) key: Vec<u8>,
@@ -152,7 +145,6 @@ pub struct FtsTermAppendDelta {
 
 #[derive(Default)]
 pub(super) struct WorkerSegAccum {
-    pub(super) id_map_ssts: Vec<SstFileInfo>,
     pub(super) rows_ssts: Vec<SstFileInfo>,
     pub(super) vecs_ssts: Vec<SstFileInfo>,
     pub(super) doc_ids_ssts: Vec<SstFileInfo>,
@@ -164,7 +156,11 @@ pub(super) struct WorkerSegAccum {
 }
 
 #[inline]
-pub(super) fn read_doc_bytes<'a>(docs_idx: &[u8], docs_shards: &'a [MappedFile], row: u32) -> &'a [u8] {
+pub(super) fn read_doc_bytes<'a>(
+    docs_idx: &[u8],
+    docs_shards: &'a [MappedFile],
+    row: u32,
+) -> &'a [u8] {
     let off = (row as usize) * crate::common::parquet_reader::DocIndexEntry::SIZE;
     let entry = crate::common::parquet_reader::DocIndexEntry::decode(
         &docs_idx[off..off + crate::common::parquet_reader::DocIndexEntry::SIZE],

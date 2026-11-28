@@ -9,16 +9,14 @@ use izzydb_core::error::{Result, TreeError};
 use izzydb_core::rowset::{Liveness, RowSet};
 use izzydb_core::schema::{CollectionSchema, ColumnStorage, ScalarValue, SchemaEntry};
 use izzydb_storage::codec::{
-    SegPostingView, ZoneEntry, encode_f64_ordered,
-    encode_i64_ordered, encode_str_ordered,
-    ordered_type_tag,
+    SegBitsetAccum, SegPostingView, ZoneEntry, encode_f64_ordered, encode_i64_ordered,
+    encode_str_ordered, ordered_type_tag,
 };
 use izzydb_storage::{SegmentTableSnapshot, Storage};
 
 use crate::detached::{
     apply_overwritten_correction_for_filter, block_slot_matches_any_encoded, current_detached_gen,
 };
-
 
 use super::*;
 
@@ -89,10 +87,11 @@ pub(super) fn load_postings_for_keys(
         )?;
         Ok(finalize_seg_map(snap, by_seg))
     } else {
+        let mut accum: BTreeMap<SegmentId, SegBitsetAccum> = BTreeMap::new();
         for key in attr_keys {
-            merge_postings_for_key(storage, snap, key, &mut by_seg)?;
+            merge_postings_for_key(storage, snap, key, &mut accum)?;
         }
-        Ok(finalize_seg_map(snap, by_seg))
+        Ok(finalize_accum_map(snap, accum))
     }
 }
 
@@ -100,14 +99,15 @@ pub(super) fn merge_postings_for_key(
     storage: &Storage,
     snap: &SegmentTableSnapshot,
     attr_key: &[u8],
-    by_seg: &mut BTreeMap<SegmentId, RoaringBitmap>,
+    by_seg: &mut BTreeMap<SegmentId, SegBitsetAccum>,
 ) -> Result<()> {
     storage.visit_attr_postings_for_value(attr_key, |seg, bytes| {
         if !snap.is_visible_segment(seg) {
             return Ok(());
         }
-        let dst = by_seg.entry(seg).or_default();
-        SegPostingView::parse(bytes)?.or_into(dst)?;
+        let view = SegPostingView::parse(bytes)?;
+        let acc = by_seg.entry(seg).or_default();
+        view.or_into_accum(acc)?;
         Ok(())
     })
 }
@@ -117,7 +117,18 @@ pub(super) fn finalize_seg_map(
     by_seg: BTreeMap<SegmentId, RoaringBitmap>,
 ) -> RowSet {
     let pairs: Vec<(SegmentId, RoaringBitmap)> = by_seg.into_iter().collect();
-    RowSet::from_sorted_segs(pairs).and_live(snap)
+    RowSet::from_sorted_segs(pairs).into_live(snap)
+}
+
+pub(super) fn finalize_accum_map(
+    snap: &SegmentTableSnapshot,
+    by_seg: BTreeMap<SegmentId, SegBitsetAccum>,
+) -> RowSet {
+    let pairs: Vec<(SegmentId, RoaringBitmap)> = by_seg
+        .into_iter()
+        .map(|(seg, acc)| (seg, acc.into_roaring()))
+        .collect();
+    RowSet::from_sorted_segs(pairs).into_live(snap)
 }
 
 pub(super) type EncodedBounds = (AttrId, u8, Option<(Vec<u8>, bool)>, Option<(Vec<u8>, bool)>);
@@ -228,14 +239,12 @@ pub(super) fn load_postings_range(
             start_val,
             |val_bytes, seg, bytes| {
                 if let Some((lo_b, lo_incl)) = lo
-                    && (val_bytes < lo_b.as_slice()
-                        || (!*lo_incl && val_bytes == lo_b.as_slice()))
+                    && (val_bytes < lo_b.as_slice() || (!*lo_incl && val_bytes == lo_b.as_slice()))
                 {
                     return Ok(true);
                 }
                 if let Some((hi_b, hi_incl)) = hi
-                    && (val_bytes > hi_b.as_slice()
-                        || (!*hi_incl && val_bytes == hi_b.as_slice()))
+                    && (val_bytes > hi_b.as_slice() || (!*hi_incl && val_bytes == hi_b.as_slice()))
                 {
                     return Ok(false);
                 }
@@ -272,17 +281,19 @@ pub(super) fn load_postings_range(
             },
         )?;
     } else {
-        ctx.storage
-            .visit_attr_postings_range(attr_id, tag, start_val, |val_bytes, seg, bytes| {
+        let mut accum: BTreeMap<SegmentId, SegBitsetAccum> = BTreeMap::new();
+        ctx.storage.visit_attr_postings_range(
+            attr_id,
+            tag,
+            start_val,
+            |val_bytes, seg, bytes| {
                 if let Some((lo_b, lo_incl)) = lo
-                    && (val_bytes < lo_b.as_slice()
-                        || (!*lo_incl && val_bytes == lo_b.as_slice()))
+                    && (val_bytes < lo_b.as_slice() || (!*lo_incl && val_bytes == lo_b.as_slice()))
                 {
                     return Ok(true);
                 }
                 if let Some((hi_b, hi_incl)) = hi
-                    && (val_bytes > hi_b.as_slice()
-                        || (!*hi_incl && val_bytes == hi_b.as_slice()))
+                    && (val_bytes > hi_b.as_slice() || (!*hi_incl && val_bytes == hi_b.as_slice()))
                 {
                     return Ok(false);
                 }
@@ -290,10 +301,14 @@ pub(super) fn load_postings_range(
                     return Ok(true);
                 }
                 visited_segs.insert(seg);
-                let dst = by_seg.entry(seg).or_default();
-                SegPostingView::parse(bytes)?.or_into(dst)?;
+                let view = SegPostingView::parse(bytes)?;
+                let acc = accum.entry(seg).or_default();
+                view.or_into_accum(acc)?;
                 Ok(true)
-            })?;
+            },
+        )?;
+        ctx.trace.range_segments_visited += visited_segs.len() as usize;
+        return Ok(finalize_accum_map(ctx.snap, accum));
     }
 
     ctx.trace.range_segments_visited += visited_segs.len() as usize;

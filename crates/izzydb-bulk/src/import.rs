@@ -80,9 +80,11 @@ pub(super) fn build_ssts_timed(
     let bundle_dir = config.work_dir.join("ssts");
     for d in [&stage_dir, &bundle_dir] {
         if d.exists() {
-            fs::remove_dir_all(d).map_err(|e| TreeError::Storage(format!("clean {}: {e}", d.display())))?;
+            fs::remove_dir_all(d)
+                .map_err(|e| TreeError::Storage(format!("clean {}: {e}", d.display())))?;
         }
-        fs::create_dir_all(d).map_err(|e| TreeError::Storage(format!("create {}: {e}", d.display())))?;
+        fs::create_dir_all(d)
+            .map_err(|e| TreeError::Storage(format!("create {}: {e}", d.display())))?;
     }
     timings.push(("prepare", t0.elapsed()));
 
@@ -94,7 +96,7 @@ pub(super) fn build_ssts_timed(
         .vector
         .as_ref()
         .map(|v| (v.dim, v.metric, config.vector_column.as_deref().unwrap()));
-    let staged = scan_and_stage(
+    let mut staged = scan_and_stage(
         parquet_files,
         &schema,
         vec_scan_cfg,
@@ -106,7 +108,12 @@ pub(super) fn build_ssts_timed(
         &pool,
     )?;
     timings.push(("scan_and_stage", t1.elapsed()));
-    report_progress(progress, "scan_and_stage", staged.docs_imported, Some(staged.rows_read));
+    report_progress(
+        progress,
+        "scan_and_stage",
+        staged.docs_imported,
+        Some(staged.rows_read),
+    );
 
     let vectors_mmap = MappedFile::open(&staged.vectors_path)?;
     let doc_ids_mmap = MappedFile::open(&staged.doc_ids_by_row_path)?;
@@ -125,7 +132,7 @@ pub(super) fn build_ssts_timed(
         .vector
         .as_ref()
         .map(|v| RabitqQuantizer::new(v.dim, rabitq_seed));
-    let built_tree = if let Some(ref vcfg) = config.collection.vector {
+    let mut built_tree = if let Some(ref vcfg) = config.collection.vector {
         report_progress(progress, "build_tree", 0, Some(staged.docs_imported));
         let seal_rows = config.collection.segment.seal_rows as usize;
         let rb_bytes = rows_by_doc_id_mmap.as_bytes();
@@ -149,12 +156,43 @@ pub(super) fn build_ssts_timed(
             rabitq_seed,
             &pool,
         )?;
-        report_progress(progress, "build_tree", staged.docs_imported, Some(staged.docs_imported));
+        report_progress(
+            progress,
+            "build_tree",
+            staged.docs_imported,
+            Some(staged.docs_imported),
+        );
         Some(bt)
     } else {
         None
     };
     timings.push(("build_tree", t2.elapsed()));
+
+    // Phase 4: assign dense cluster-contiguous `RowId`s in DFS leaf order so sibling leaves
+    // share segments and 256-row blocks. `rows_by_row_id` maps the new dense position back to
+    // the staged Parquet row used by every SST emitter.
+    if let Some(tree) = built_tree.as_mut() {
+        let n_docs = staged.docs_imported as usize;
+        let seal_rows = config.collection.segment.seal_rows as usize;
+        let mut rows_by_row_id = Vec::with_capacity(n_docs);
+        let mut pos = 0usize;
+        for leaf in &mut tree.leaves {
+            for entry in &mut leaf.entries {
+                entry.row_id =
+                    RowId::new((pos / seal_rows) as SegmentId, (pos % seal_rows) as LocalId);
+                rows_by_row_id.push(entry.vec_idx);
+                pos += 1;
+            }
+        }
+        debug_assert_eq!(pos, n_docs);
+        let path = stage_dir.join("rows_by_row_id.bin");
+        let mut buf = Vec::with_capacity(n_docs * 4);
+        for staged_row in rows_by_row_id {
+            buf.extend_from_slice(&staged_row.to_le_bytes());
+        }
+        fs::write(&path, &buf).map_err(map_io)?;
+        staged.rows_by_row_id_path = Some(path);
+    }
 
     // Phases 4, 5, 6: Emit SSTs.
     report_progress(progress, "emit_ssts", 0, Some(staged.docs_imported));
@@ -178,7 +216,12 @@ pub(super) fn build_ssts_timed(
         &pool,
     )?;
     timings.push(("emit_ssts", t3.elapsed()));
-    report_progress(progress, "emit_ssts", staged.docs_imported, Some(staged.docs_imported));
+    report_progress(
+        progress,
+        "emit_ssts",
+        staged.docs_imported,
+        Some(staged.docs_imported),
+    );
 
     drop(vectors_mmap);
     drop(doc_ids_mmap);
@@ -194,7 +237,10 @@ pub(super) fn build_ssts_timed(
     let mut sst_bytes = 0u64;
     for (cf, infos) in emitted_files {
         let mut names = Vec::with_capacity(infos.len());
-        for SstFileInfo { rel_path, bytes, .. } in infos {
+        for SstFileInfo {
+            rel_path, bytes, ..
+        } in infos
+        {
             sst_files += 1;
             sst_bytes += bytes;
             names.push(rel_path);

@@ -1,41 +1,86 @@
 //! Columnar block filter evaluation.
 
-use std::collections::HashMap;
 use std::ops::Range;
 
 use roaring::RoaringBitmap;
 
 use izzydb_core::config::{AttrId, RowId, SegmentId, for_each_set_bit_256};
-use izzydb_core::error::{Result, TreeError};
+use izzydb_core::error::Result;
 use izzydb_core::filter::Filter;
-use izzydb_core::schema::{CollectionSchema, ColumnStorage, ScalarValue};
-use izzydb_storage::codec::{
-    SEG_FLAG_HAS_COLUMNS, SegmentState,
-};
+use izzydb_core::schema::{AttributeType, CollectionSchema, ColumnStorage, ScalarValue};
+use izzydb_storage::codec::{SEG_FLAG_HAS_COLUMNS, SegmentState};
 use izzydb_storage::column::ColumnBlockView;
 use izzydb_storage::{SegmentTableSnapshot, Storage};
 
 use crate::columns::force_row_fallback_enabled;
 
-pub(crate) struct ColumnFilter<'a> {
-    schema: &'a CollectionSchema,
-    filter: &'a Filter,
+/// A filter compiled for direct evaluation against `cf_columns` blocks.
+///
+/// Attribute names are resolved to dense `attr_slot` indices once, and scalar operands are
+/// normalized to typed Rust primitives, so per-row evaluation performs no name lookup,
+/// `HashMap` probe, or `ScalarValue` allocation.
+///
+/// ```text
+/// Filter::Lt("score".into(), 60.0.into())
+///   -> ColumnPredicate::Cmp(0, CmpOp::Lt, ColRhs::Float(60.0))
+/// ```
+pub(crate) struct CompiledColumnFilter {
     attrs: Vec<AttrId>,
+    predicate: ColumnPredicate,
 }
 
-impl<'a> ColumnFilter<'a> {
-    pub(crate) fn new(schema: &'a CollectionSchema, filter: &'a Filter) -> Option<Self> {
+impl CompiledColumnFilter {
+    /// Compile `filter` against `schema`, returning `None` when the filter is not a pure
+    /// columnar scalar predicate or row fallback is forced.
+    pub(crate) fn compile(schema: &CollectionSchema, filter: &Filter) -> Option<Self> {
         if force_row_fallback_enabled() || !filter_is_columnar_scalar_only(schema, filter) {
             return None;
         }
         let mut attrs = Vec::new();
         collect_filter_attr_ids(schema, filter, &mut attrs);
         attrs.sort_unstable();
-        (!attrs.is_empty()).then_some(Self {
-            schema,
-            filter,
-            attrs,
+        if attrs.is_empty() {
+            return None;
+        }
+        let predicate = compile_predicate(schema, &attrs, filter);
+        Some(Self { attrs, predicate })
+    }
+
+    #[inline]
+    fn attrs(&self) -> &[AttrId] {
+        &self.attrs
+    }
+
+    /// Evaluate the compiled predicate at `slot` against block views aligned with
+    /// [`Self::attrs`](Self::attrs).
+    #[inline]
+    pub(crate) fn eval(&self, views: &[Option<ColumnBlockView<'_>>], slot: u8) -> bool {
+        debug_assert_eq!(views.len(), self.attrs.len());
+        self.predicate.eval(views, slot)
+    }
+}
+
+/// Query-local column filter that batches `cf_columns` lookups for sorted candidate rows.
+pub(crate) struct ColumnFilter<'a> {
+    compiled: CompiledColumnFilter,
+    _filter: &'a Filter,
+}
+
+impl<'a> ColumnFilter<'a> {
+    pub(crate) fn new(schema: &'a CollectionSchema, filter: &'a Filter) -> Option<Self> {
+        Some(Self {
+            compiled: CompiledColumnFilter::compile(schema, filter)?,
+            _filter: filter,
         })
+    }
+
+    pub(crate) fn attrs(&self) -> &[AttrId] {
+        self.compiled.attrs()
+    }
+
+    #[inline]
+    pub(crate) fn eval(&self, views: &[Option<ColumnBlockView<'_>>], slot: u8) -> bool {
+        self.compiled.eval(views, slot)
     }
 
     /// Evaluate candidates sorted by RowId. Missing results need row-store verification.
@@ -69,47 +114,267 @@ impl<'a> ColumnFilter<'a> {
         }
 
         // One row lookup supplies all attributes. Compare logical key counts before choosing columns.
-        let key_count = blocks.len() * self.attrs.len();
+        let attrs = self.attrs();
+        let key_count = blocks.len() * attrs.len();
         if key_count == 0 || key_count > column_rows {
             return Ok(None);
         }
         let keys: Vec<_> = blocks
             .iter()
-            .flat_map(|&(seg, block, _)| self.attrs.iter().map(move |&attr| (seg, attr, block)))
+            .flat_map(|&(seg, block, _)| attrs.iter().map(move |&attr| (seg, attr, block)))
             .collect();
-        let slices = storage.multi_get_column_blocks_pinned(&keys, self.attrs.len() == 1)?;
+        let slices = storage.multi_get_column_blocks_pinned(&keys, attrs.len() == 1)?;
         let mut matches = vec![None; rows.len()];
-        let mut views = HashMap::with_capacity(self.attrs.len());
+        let mut views: Vec<Option<ColumnBlockView<'_>>> = vec![None; attrs.len()];
         for ((_, _, indices), block_slices) in
-            blocks.into_iter().zip(slices.chunks_exact(self.attrs.len()))
+            blocks.into_iter().zip(slices.chunks_exact(attrs.len()))
         {
-            for (&attr, slice) in self.attrs.iter().zip(block_slices) {
-                let view = slice
+            for (view, slice) in views.iter_mut().zip(block_slices) {
+                *view = slice
                     .as_ref()
                     .map(|s| ColumnBlockView::parse(s))
                     .transpose()?;
-                views.insert(attr, view);
             }
             for i in indices {
-                matches[i] = Some(eval_column_filter_block(
-                    self.schema,
-                    self.filter,
-                    &views,
-                    rows[i].slot(),
-                )?);
+                matches[i] = Some(self.eval(&views, rows[i].slot()));
             }
         }
         Ok(Some(matches))
     }
 }
 
+/// Comparison operator for compiled ordered predicates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CmpOp {
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+}
+
+/// Pre-normalized right-hand side of a compiled column predicate.
+#[derive(Debug, Clone)]
+enum ColRhs {
+    Bool(bool),
+    Int(i64),
+    Uint(u64),
+    Float(f64),
+    Str(Vec<u8>),
+}
+
+/// A predicate referencing dense attribute slots and pre-normalized operands.
+#[derive(Debug, Clone)]
+enum ColumnPredicate {
+    True,
+    False,
+    And(Vec<Self>),
+    Or(Vec<Self>),
+    Not(Box<Self>),
+    IsNull(usize),
+    IsNotNull(usize),
+    Eq(usize, ColRhs),
+    NotEq(usize, ColRhs),
+    In(usize, Vec<ColRhs>),
+    Cmp(usize, CmpOp, ColRhs),
+}
+
+impl ColumnPredicate {
+    fn eval(&self, views: &[Option<ColumnBlockView<'_>>], slot: u8) -> bool {
+        match self {
+            Self::True => true,
+            Self::False => false,
+            Self::And(children) => children.iter().all(|c| c.eval(views, slot)),
+            Self::Or(children) => children.iter().any(|c| c.eval(views, slot)),
+            Self::Not(child) => !child.eval(views, slot),
+            Self::IsNull(idx) => view_at(views, *idx).is_none_or(|v| !v.is_present(slot)),
+            Self::IsNotNull(idx) => view_at(views, *idx).is_some_and(|v| v.is_present(slot)),
+            Self::Eq(idx, rhs) => rhs_eq(views, *idx, slot, rhs),
+            Self::NotEq(idx, rhs) => !rhs_eq(views, *idx, slot, rhs),
+            Self::In(idx, vals) => vals.iter().any(|rhs| rhs_eq(views, *idx, slot, rhs)),
+            Self::Cmp(idx, op, rhs) => {
+                rhs_cmp(views, *idx, slot, rhs).is_some_and(|ord| match op {
+                    CmpOp::Lt => ord == std::cmp::Ordering::Less,
+                    CmpOp::Lte => ord != std::cmp::Ordering::Greater,
+                    CmpOp::Gt => ord == std::cmp::Ordering::Greater,
+                    CmpOp::Gte => ord != std::cmp::Ordering::Less,
+                })
+            }
+        }
+    }
+}
+
+#[inline]
+fn view_at<'v, 'a>(
+    views: &'v [Option<ColumnBlockView<'a>>],
+    idx: usize,
+) -> Option<&'v ColumnBlockView<'a>> {
+    views.get(idx).and_then(|v| v.as_ref())
+}
+
+/// Resolve `attr` to its dense slot and declared type.
+fn slot_for(
+    schema: &CollectionSchema,
+    attrs: &[AttrId],
+    attr: &str,
+) -> Option<(usize, AttributeType)> {
+    let entry = schema.get_by_name(attr)?;
+    let idx = attrs.iter().position(|&id| id == entry.id)?;
+    Some((idx, entry.attr_type))
+}
+
+/// Normalize a non-null [`ScalarValue`] to `ty`, returning `None` on a type mismatch.
+fn normalize_rhs(value: &ScalarValue, ty: AttributeType) -> Option<ColRhs> {
+    match (ty, value) {
+        (AttributeType::Bool, ScalarValue::Bool(v)) => Some(ColRhs::Bool(*v)),
+        (AttributeType::Int, ScalarValue::Int(v)) => Some(ColRhs::Int(*v)),
+        (AttributeType::Uint, ScalarValue::Uint(v)) => Some(ColRhs::Uint(*v)),
+        (AttributeType::Float, ScalarValue::Float(v)) => Some(ColRhs::Float(*v)),
+        (AttributeType::String, ScalarValue::String(v)) => Some(ColRhs::Str(v.as_bytes().to_vec())),
+        _ => None,
+    }
+}
+
+fn compile_predicate(
+    schema: &CollectionSchema,
+    attrs: &[AttrId],
+    filter: &Filter,
+) -> ColumnPredicate {
+    match filter {
+        Filter::And(children) => ColumnPredicate::And(
+            children
+                .iter()
+                .map(|c| compile_predicate(schema, attrs, c))
+                .collect(),
+        ),
+        Filter::Or(children) => ColumnPredicate::Or(
+            children
+                .iter()
+                .map(|c| compile_predicate(schema, attrs, c))
+                .collect(),
+        ),
+        Filter::Not(child) => {
+            ColumnPredicate::Not(Box::new(compile_predicate(schema, attrs, child)))
+        }
+        Filter::IsNull(attr) => slot_for(schema, attrs, attr)
+            .map_or(ColumnPredicate::False, |(idx, _)| {
+                ColumnPredicate::IsNull(idx)
+            }),
+        Filter::IsNotNull(attr) => slot_for(schema, attrs, attr)
+            .map_or(ColumnPredicate::False, |(idx, _)| {
+                ColumnPredicate::IsNotNull(idx)
+            }),
+        Filter::Eq(attr, rhs) | Filter::NotEq(attr, rhs) => {
+            let is_not = matches!(filter, Filter::NotEq(_, _));
+            let Some((idx, ty)) = slot_for(schema, attrs, attr) else {
+                return ColumnPredicate::False;
+            };
+            if matches!(rhs, ScalarValue::Null) {
+                return if is_not {
+                    ColumnPredicate::IsNotNull(idx)
+                } else {
+                    ColumnPredicate::IsNull(idx)
+                };
+            }
+            match normalize_rhs(rhs, ty) {
+                Some(rhs) if is_not => ColumnPredicate::NotEq(idx, rhs),
+                Some(rhs) => ColumnPredicate::Eq(idx, rhs),
+                // A type-mismatched operand can never compare equal; `NotEq` is then always true.
+                None if is_not => ColumnPredicate::True,
+                None => ColumnPredicate::False,
+            }
+        }
+        Filter::In(attr, values) | Filter::NotIn(attr, values) => {
+            let is_not = matches!(filter, Filter::NotIn(_, _));
+            let Some((idx, ty)) = slot_for(schema, attrs, attr) else {
+                return ColumnPredicate::False;
+            };
+            let has_null = values.iter().any(|v| matches!(v, ScalarValue::Null));
+            let normalized: Vec<ColRhs> = values
+                .iter()
+                .filter(|v| !matches!(v, ScalarValue::Null))
+                .filter_map(|v| normalize_rhs(v, ty))
+                .collect();
+            let pred = if has_null {
+                ColumnPredicate::Or(vec![
+                    ColumnPredicate::IsNull(idx),
+                    ColumnPredicate::In(idx, normalized),
+                ])
+            } else {
+                ColumnPredicate::In(idx, normalized)
+            };
+            if is_not {
+                ColumnPredicate::Not(Box::new(pred))
+            } else {
+                pred
+            }
+        }
+        Filter::Lt(attr, rhs)
+        | Filter::Lte(attr, rhs)
+        | Filter::Gt(attr, rhs)
+        | Filter::Gte(attr, rhs) => {
+            let op = match filter {
+                Filter::Lt(..) => CmpOp::Lt,
+                Filter::Lte(..) => CmpOp::Lte,
+                Filter::Gt(..) => CmpOp::Gt,
+                _ => CmpOp::Gte,
+            };
+            let Some((idx, ty)) = slot_for(schema, attrs, attr) else {
+                return ColumnPredicate::False;
+            };
+            normalize_rhs(rhs, ty).map_or(ColumnPredicate::False, |rhs| {
+                ColumnPredicate::Cmp(idx, op, rhs)
+            })
+        }
+        _ => ColumnPredicate::False,
+    }
+}
+
+#[inline]
+fn rhs_eq(views: &[Option<ColumnBlockView<'_>>], idx: usize, slot: u8, rhs: &ColRhs) -> bool {
+    let Some(view) = view_at(views, idx) else {
+        return false;
+    };
+    match rhs {
+        ColRhs::Bool(r) => view.get_bool(slot) == Some(*r),
+        ColRhs::Int(r) => view.get_i64(slot) == Some(*r),
+        ColRhs::Uint(r) => view.get_u64(slot) == Some(*r),
+        ColRhs::Float(r) => view
+            .get_f64(slot)
+            .is_some_and(|v| !v.is_nan() && !r.is_nan() && v == *r),
+        ColRhs::Str(r) => view.get_str(slot) == Some(r.as_slice()),
+    }
+}
+
+#[inline]
+fn rhs_cmp(
+    views: &[Option<ColumnBlockView<'_>>],
+    idx: usize,
+    slot: u8,
+    rhs: &ColRhs,
+) -> Option<std::cmp::Ordering> {
+    let view = view_at(views, idx)?;
+    match rhs {
+        ColRhs::Int(r) => view.get_i64(slot).map(|v| v.cmp(r)),
+        ColRhs::Uint(r) => view.get_u64(slot).map(|v| v.cmp(r)),
+        ColRhs::Float(r) => {
+            let v = view.get_f64(slot)?;
+            if v.is_nan() || r.is_nan() {
+                None
+            } else {
+                let vn = if v == 0.0 { 0.0 } else { v };
+                let rn = if *r == 0.0 { 0.0 } else { *r };
+                Some(vn.total_cmp(&rn))
+            }
+        }
+        ColRhs::Str(r) => view.get_str(slot).map(|v| v.cmp(r.as_slice())),
+        ColRhs::Bool(_) => None,
+    }
+}
 
 pub(super) fn filter_is_columnar_scalar_only(schema: &CollectionSchema, filter: &Filter) -> bool {
     let is_col_scalar = |attr: &str| {
         schema.get_by_name(attr).is_some_and(|e| {
-            e.storage == ColumnStorage::Inline
-                && e.is_columnar()
-                && !e.attr_type.is_array()
+            e.storage == ColumnStorage::Inline && e.is_columnar() && !e.attr_type.is_array()
         })
     };
     match filter {
@@ -131,7 +396,11 @@ pub(super) fn filter_is_columnar_scalar_only(schema: &CollectionSchema, filter: 
     }
 }
 
-pub(super) fn collect_filter_attr_ids(schema: &CollectionSchema, filter: &Filter, out: &mut Vec<AttrId>) {
+pub(super) fn collect_filter_attr_ids(
+    schema: &CollectionSchema,
+    filter: &Filter,
+    out: &mut Vec<AttrId>,
+) {
     let push_attr = |attr: &str, out: &mut Vec<AttrId>| {
         if let Some(e) = schema.get_by_name(attr)
             && !out.contains(&e.id)
@@ -160,120 +429,6 @@ pub(super) fn collect_filter_attr_ids(schema: &CollectionSchema, filter: &Filter
     }
 }
 
-pub(super) fn col_scalars_eq(a: &ScalarValue, b: &ScalarValue) -> bool {
-    match (a, b) {
-        (ScalarValue::Null, ScalarValue::Null) => true,
-        (ScalarValue::Bool(x), ScalarValue::Bool(y)) => x == y,
-        (ScalarValue::Int(x), ScalarValue::Int(y)) => x == y,
-        (ScalarValue::Uint(x), ScalarValue::Uint(y)) => x == y,
-        (ScalarValue::Float(x), ScalarValue::Float(y)) => !x.is_nan() && !y.is_nan() && x == y,
-        (ScalarValue::String(x), ScalarValue::String(y)) => x == y,
-        _ => false,
-    }
-}
-
-pub(super) fn col_cmp_ordered(a: &ScalarValue, b: &ScalarValue) -> Option<std::cmp::Ordering> {
-    match (a, b) {
-        (ScalarValue::Int(x), ScalarValue::Int(y)) => Some(x.cmp(y)),
-        (ScalarValue::Uint(x), ScalarValue::Uint(y)) => Some(x.cmp(y)),
-        (ScalarValue::Float(x), ScalarValue::Float(y)) => {
-            if x.is_nan() || y.is_nan() {
-                None
-            } else {
-                let xn = if *x == 0.0 { 0.0 } else { *x };
-                let yn = if *y == 0.0 { 0.0 } else { *y };
-                Some(xn.total_cmp(&yn))
-            }
-        }
-        (ScalarValue::String(x), ScalarValue::String(y)) => Some(x.cmp(y)),
-        _ => None,
-    }
-}
-
-pub(super) fn eval_column_filter_block(
-    schema: &CollectionSchema,
-    filter: &Filter,
-    views: &HashMap<AttrId, Option<ColumnBlockView<'_>>>,
-    slot: u8,
-) -> Result<bool> {
-    let read_val = |attr: &str| -> Result<Option<ScalarValue>> {
-        let Some(entry) = schema.get_by_name(attr) else {
-            return Ok(None);
-        };
-        match views.get(&entry.id).and_then(|o| o.as_ref()) {
-            Some(v) => {
-                let s = v.get_scalar(slot)?;
-                Ok((!matches!(s, ScalarValue::Null)).then_some(s))
-            }
-            None => Ok(None),
-        }
-    };
-    Ok(match filter {
-        Filter::And(ch) => {
-            for c in ch {
-                if !eval_column_filter_block(schema, c, views, slot)? {
-                    return Ok(false);
-                }
-            }
-            true
-        }
-        Filter::Or(ch) => {
-            for c in ch {
-                if eval_column_filter_block(schema, c, views, slot)? {
-                    return Ok(true);
-                }
-            }
-            false
-        }
-        Filter::Not(c) => !eval_column_filter_block(schema, c, views, slot)?,
-        Filter::IsNull(a) => read_val(a)?.is_none(),
-        Filter::IsNotNull(a) => read_val(a)?.is_some(),
-        Filter::Eq(a, rhs) => {
-            if matches!(rhs, ScalarValue::Null) {
-                read_val(a)?.is_none()
-            } else {
-                read_val(a)?.is_some_and(|v| col_scalars_eq(&v, rhs))
-            }
-        }
-        Filter::NotEq(a, rhs) => {
-            if matches!(rhs, ScalarValue::Null) {
-                read_val(a)?.is_some()
-            } else {
-                !read_val(a)?.is_some_and(|v| col_scalars_eq(&v, rhs))
-            }
-        }
-        Filter::In(a, vals) => {
-            let v = read_val(a)?;
-            vals.iter().any(|rhs| match (v.as_ref(), rhs) {
-                (None, ScalarValue::Null) => true,
-                (Some(s), _) => col_scalars_eq(s, rhs),
-                _ => false,
-            })
-        }
-        Filter::NotIn(a, vals) => {
-            let v = read_val(a)?;
-            !vals.iter().any(|rhs| match (v.as_ref(), rhs) {
-                (None, ScalarValue::Null) => true,
-                (Some(s), _) => col_scalars_eq(s, rhs),
-                _ => false,
-            })
-        }
-        Filter::Gt(a, rhs) => read_val(a)?
-            .and_then(|v| col_cmp_ordered(&v, rhs))
-            .is_some_and(|o| o == std::cmp::Ordering::Greater),
-        Filter::Gte(a, rhs) => read_val(a)?
-            .and_then(|v| col_cmp_ordered(&v, rhs))
-            .is_some_and(|o| o != std::cmp::Ordering::Less),
-        Filter::Lt(a, rhs) => read_val(a)?
-            .and_then(|v| col_cmp_ordered(&v, rhs))
-            .is_some_and(|o| o == std::cmp::Ordering::Less),
-        Filter::Lte(a, rhs) => read_val(a)?
-            .and_then(|v| col_cmp_ordered(&v, rhs))
-            .is_some_and(|o| o != std::cmp::Ordering::Greater),
-        _ => unreachable!(),
-    })
-}
-
 pub(super) fn try_eval_column_filter_segment(
     storage: &Storage,
     schema: &CollectionSchema,
@@ -294,10 +449,10 @@ pub(super) fn try_eval_column_filter_segment(
     {
         return Ok(None);
     }
-
-    let mut attrs = Vec::new();
-    collect_filter_attr_ids(schema, filter, &mut attrs);
-    attrs.sort_unstable();
+    let Some(compiled) = CompiledColumnFilter::compile(schema, filter) else {
+        return Ok(None);
+    };
+    let attrs = compiled.attrs();
 
     let mut by_block: Vec<(u32, [u64; 4])> = Vec::new();
     for local in cand_bm.iter() {
@@ -316,44 +471,30 @@ pub(super) fn try_eval_column_filter_segment(
 
     let mut keys: Vec<(SegmentId, AttrId, u32)> =
         Vec::with_capacity(by_block.len() * attrs.len().max(1));
-    for &attr in &attrs {
+    for &attr in attrs {
         for &(blk, _) in &by_block {
             keys.push((seg, attr, blk));
         }
     }
-    let slices = storage.multi_get_column_blocks_pinned(&keys, true)?;
+    let slices = storage.multi_get_column_blocks_pinned(&keys, attrs.len() == 1)?;
 
     let num_blocks = by_block.len();
     let mut out = RoaringBitmap::new();
-    let mut views: HashMap<AttrId, Option<ColumnBlockView<'_>>> =
-        HashMap::with_capacity(attrs.len());
+    let mut views: Vec<Option<ColumnBlockView<'_>>> = vec![None; attrs.len()];
 
     for (bi, &(blk, mask)) in by_block.iter().enumerate() {
-        views.clear();
-        for (ai, &attr) in attrs.iter().enumerate() {
+        for (ai, view) in views.iter_mut().enumerate() {
             let opt_slice = &slices[ai * num_blocks + bi];
-            let parsed = opt_slice
+            *view = opt_slice
                 .as_ref()
                 .map(|s| ColumnBlockView::parse(s))
                 .transpose()?;
-            views.insert(attr, parsed);
         }
-        let mut block_err: Option<TreeError> = None;
         for_each_set_bit_256(&mask, |slot| {
-            if block_err.is_some() {
-                return;
-            }
-            match eval_column_filter_block(schema, filter, &views, slot) {
-                Ok(true) => {
-                    out.insert((blk << 8) | (slot as u32));
-                }
-                Ok(false) => {}
-                Err(e) => block_err = Some(e),
+            if compiled.eval(&views, slot) {
+                out.insert((blk << 8) | (slot as u32));
             }
         });
-        if let Some(e) = block_err {
-            return Err(e);
-        }
     }
 
     Ok(Some(out))

@@ -1,8 +1,8 @@
 //! Column storage mode and attribute/collection configuration.
 
-use std::collections::HashSet;
 use crate::config::{AttrId, SegmentConfig, TreeConfig};
 use crate::error::{Result, TreeError};
+use std::collections::HashSet;
 
 use super::*;
 
@@ -106,6 +106,12 @@ pub struct CollectionConfig {
     /// Maximum number of segment shards executed in parallel during FTS MAXSCORE queries
     /// (`None` uses all Rayon threads; `Some(1)` runs single-threaded across all segments).
     pub fts_parallel_segments: Option<usize>,
+    /// Shared RocksDB block cache capacity in bytes (`None` uses the 128 MiB default).
+    ///
+    /// ```text
+    /// let cfg = CollectionConfig::new(tree).with_block_cache_bytes(512 * 1024 * 1024);
+    /// ```
+    pub block_cache_bytes: Option<usize>,
 }
 
 impl CollectionConfig {
@@ -116,6 +122,7 @@ impl CollectionConfig {
             attributes: Vec::new(),
             direct_io: false,
             fts_parallel_segments: None,
+            block_cache_bytes: None,
         }
     }
 
@@ -126,7 +133,14 @@ impl CollectionConfig {
             attributes: Vec::new(),
             direct_io: false,
             fts_parallel_segments: None,
+            block_cache_bytes: None,
         }
+    }
+
+    /// Set the shared RocksDB block cache capacity in bytes.
+    pub fn with_block_cache_bytes(mut self, bytes: usize) -> Self {
+        self.block_cache_bytes = Some(bytes);
+        self
     }
 
     pub fn with_direct_io(mut self, direct_io: bool) -> Self {
@@ -235,6 +249,11 @@ impl CollectionConfig {
         if self.fts_parallel_segments == Some(0) {
             return Err(TreeError::InvalidConfig(
                 "fts_parallel_segments must be >= 1".into(),
+            ));
+        }
+        if self.block_cache_bytes == Some(0) {
+            return Err(TreeError::InvalidConfig(
+                "block_cache_bytes must be >= 1".into(),
             ));
         }
         let mut seen = HashSet::with_capacity(self.attributes.len());

@@ -19,9 +19,7 @@ use memmap2::Mmap;
 use izzydb::config::DocId;
 use izzydb::error::{Result, TreeError};
 
-use crate::common::sorter::{
-    SortItem, read_u32_req, read_u64_opt, write_u32, write_u64,
-};
+use crate::common::sorter::{SortItem, read_u32_req, read_u64_opt, write_u32, write_u64};
 
 /// Wrapper around `memmap2::Mmap` that handles empty (0-byte) files cleanly.
 pub enum MappedFile {
@@ -124,6 +122,9 @@ pub struct StagedData {
     pub docs_idx_path: PathBuf,
     pub docs_shard_paths: Vec<PathBuf>,
     pub rows_by_doc_id_path: PathBuf,
+    /// Dense `RowId` order -> staged Parquet row index (`4 * docs_imported` bytes), when bulk
+    /// import assigns cluster-ordered [`RowId`](izzydb_core::config::RowId)s.
+    pub rows_by_row_id_path: Option<PathBuf>,
     pub live_rows: Vec<u32>,
     pub has_detached_staging: bool,
 }

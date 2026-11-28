@@ -100,6 +100,19 @@ pub(super) fn cf_tuning(cf_name: &str) -> CfTuning {
             tuning.block_size = LARGE_CF_BLOCK_SIZE;
             tuning.uncompressed = true;
         }
+        CF_NODE_SUMMARIES => {
+            tuning.bloom = false;
+            tuning.two_level_index = true;
+            tuning.block_size = LARGE_CF_BLOCK_SIZE;
+            tuning.uncompressed = true;
+        }
+        CF_BSI => {
+            tuning.bloom = false;
+            tuning.two_level_index = true;
+            tuning.block_size = LARGE_CF_BLOCK_SIZE;
+            tuning.uncompressed = true;
+            tuning.data_block_hash = true;
+        }
         CF_ROW_DOC_IDS => {
             tuning.bloom = false;
             tuning.two_level_index = true;
@@ -142,7 +155,9 @@ pub(super) fn cf_options_with_filters(
         | CF_DETACHED
         | CF_ROW_DOC_IDS
         | CF_VECTORS
-        | CF_LEAF_ENTRIES => point_lookup_cf_opts(block_cache, cf_tuning(cf_name)),
+        | CF_LEAF_ENTRIES
+        | CF_NODE_SUMMARIES
+        | CF_BSI => point_lookup_cf_opts(block_cache, cf_tuning(cf_name)),
         CF_ATTR_POSTINGS => prefix_cf_opts(block_cache, ATTR_POSTING_PREFIX_LEN, true),
         CF_DETACHED_POSTINGS => prefix_cf_opts(block_cache, DETACHED_POSTING_PREFIX_LEN, true),
         CF_FTS_TERMS => prefix_cf_opts(block_cache, 2, false),
@@ -162,6 +177,7 @@ pub(super) fn cf_options_with_filters(
                 Some(OrphanFilterKind::LeadingSeg)
             }
             CF_ATTR_POSTINGS => Some(OrphanFilterKind::AttrPostings),
+            CF_BSI => Some(OrphanFilterKind::LeadingSeg),
             CF_DETACHED => Some(OrphanFilterKind::DetachedBlocks),
             CF_DETACHED_POSTINGS => Some(OrphanFilterKind::DetachedPostings),
             CF_FTS_SKIPS | CF_FTS_POSTINGS | CF_FTS_POSITIONS => Some(OrphanFilterKind::FtsTermSeg),

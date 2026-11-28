@@ -20,6 +20,15 @@ Unlike v2's per-leaf cluster bitmaps, v3 plans predicates over **`RowSet`** (`BT
    - Broad predicates (or large negations / unselective ranges exceeding `materialize_limit`) produce `FilterPlan::Lazy { residual, seed }`, deferring exact evaluation to zero-copy `RowView::matches_filter` (plus `cf_detached` fallback when detached attributes appear) on surviving ANN candidates.
    - `Empty` short-circuits immediately with zero ANN or vector reads.
 
+### 1a. Leaf-Colocated Scalar Fast Path (Phase 5)
+
+When the whole filter is a scalar expression over fixed-width inline `Bool`/`Int`/`Uint`/`Float` attributes, `search_filtered_with_trace` bypasses posting materialization:
+
+1. `LeafAttrFilter::compile` builds a dense predicate over the storage leaf-attribute spec list.
+2. `filter_plan::estimate_filter_with_trace` still populates cardinality/zone trace statistics without loading `cf_attr_postings`.
+3. Estimates at or below `opts.exact_scan_threshold` keep the existing exact-scan behavior (postings + `cf_vectors`). Larger estimates choose `MaskedTraversal` (≤ 50%) or `PostFilter` (> 50%).
+4. `StagedTraversal` can consult `cf_node_summaries` (dense in-RAM cache loaded at open) to prune whole subtrees before centroid distance math or leaf I/O when `SearchOptions::with_summary_pruning(true)` is set; surviving leaves intersect their exact trailing scalar mask with liveness/seed masks before RaBitQ scoring. Missing scalar blocks on non-empty leaves are treated as corruption, not as "match everything".
+
 ---
 
 ## 2. Five Filtered Vector Search Regimes (`FilteredSearchRegime`)

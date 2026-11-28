@@ -78,7 +78,7 @@ Every mutation (`upsert`, `patch`, `delete`, and `*_batch`) executes inside one 
   2. Reads `old_row` from `cf_rows` (`RowView`) to decrement `default[0x06]` live attribute counts and FTS `TermRecord.doc_freq` + `FtsMeta` stats; never modifies sealed `cf_attr_postings`, `0x12` zone maps, or sealed `cf_fts_skips` chunks.
   3. If the collection has vectors and the old row had one, marks it stale by incrementing `AnnMeta.stale_rows` (deferred leaf vacuum; the vector is only deleted from the ANN tree eagerly if the old leaf happens to split/repack or when `vacuum_ann` scans it).
 - **Append new row (on `upsert` or `patch`):**
-  1. Allocates a fresh `new_row = (open_seg, local)` via `SegmentStore::alloc_row`, seals `open_seg` if `row_count >= seal_rows` (building `cf_columns` unless `defer_column_build` is true).
+  1. Allocates a fresh `new_row = (open_seg, local)` via `SegmentStore::alloc_row`, seals `open_seg` if `row_count >= seal_rows` (building `cf_columns` unless `defer_column_build` is true, plus `cf_bsi` planes when `bit_sliced_index` is enabled).
   2. Writes `cf_rows[new_row]`, `cf_id_map[doc_id] = new_row`, `cf_row_doc_ids`, optional `cf_vectors[new_row]`, inline `cf_attr_postings` + `0x06` counts + `0x12` zone widening, FTS blocks, and (on `patch`) carries over per-row detached attribute values from `old_row` to `new_row` (`upsert` does **not** carry over unmentioned detached columns).
   3. Routes into the global ANN tree (`ClusteringTree`), inserting `(new_row, quant_code)` (and reusing/evicting any dead slot in the target leaf).
 
@@ -115,7 +115,7 @@ Over time, tombstones accumulate in sealed segments and sparse deletions leave u
 ## 6. Combined Maintenance (`Collection::maintenance`)
 
 `Collection::maintenance(MaintenanceOptions)` runs one bounded housekeeping cycle:
-1. Materializes `cf_columns` for any `Sealed` segment missing `SEG_FLAG_HAS_COLUMNS` (when `defer_column_build` was set).
+1. Materializes `cf_columns` for any `Sealed` segment missing `SEG_FLAG_HAS_COLUMNS` (when `defer_column_build` was set) and builds any missing `cf_bsi` planes.
 2. Runs `vacuum_ann` when `stale_rows / (num_vectors + stale_rows) > vacuum_stale_ratio` (default `0.2`).
 3. Runs `compact` (unless a detached column build has `pending_gen != 0`, preventing races) and tightens FTS `TermRecord` upper bounds if segments were forwarded or retired.
 4. Rebuilds detached columns whose `0x14` overwritten sets accumulated significant churn.

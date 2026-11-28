@@ -4,7 +4,7 @@ An embedded, RocksDB-backed hybrid search engine in Rust for vector, full-text, 
 
 - **Segmented storage:** Append-only segments (`RowId = (SegmentId, LocalId)`) with copy-on-write updates, background compaction + rank-based forwarding, lazy ANN vacuuming, and RocksDB compaction filters.
 - **Vector search (optional):** Mutable global clustering tree over `RowId`s with RaBitQ quantization and optional exact reranking — or create a vectorless collection with `CollectionConfig::without_vectors()`.
-- **Attribute filtering & detached columns:** Typed `Inline` and `Detached` attribute schemas with value-major per-segment inverted indexes, exact live counts, per-segment zone maps, zero-copy lazy row evaluation, and lock-free whole-column detached replacement (`> 1M rows/s` build, `< 20 ms` publish).
+- **Attribute filtering & detached columns:** Typed `Inline` and `Detached` attribute schemas with value-major per-segment inverted indexes, exact live counts, per-segment zone maps, leaf-colocated fixed-width filterable scalars with in-memory per-leaf/internal summaries, per-segment bit-sliced indexes for high-cardinality numeric ranges, zero-copy lazy row evaluation, and lock-free whole-column detached replacement (`> 1M rows/s` build, `< 20 ms` publish).
 - **Full-text & hybrid:** Segment-keyed Block-Max MAXSCORE BM25 with unified v4 `FtsChunk` skip+posting chunks (`TfEncoding` compression, inline rare-term postings, segment-parallel MAXSCORE via `fts_parallel_segments`), stemming, phrase matching, and Reciprocal Rank Fusion hybrid search.
 - **Ranking, boosting & sorting:** Composable scoring expressions (filter boosts, saturation and decay attribute signals, additive and multiplicative combinators) and multi-key attribute sorting with index-order top-k early termination.
 - **Faceting:** Exact terms, ranges, stats, and histogram facets over filter, BM25, vector, and hybrid queries, with multi-select (disjunctive) faceting and O(values) unfiltered counts from maintained per-value counters.
@@ -309,6 +309,7 @@ You can also split SST generation and ingestion across machines with `build_ssts
 cargo test --workspace
 cargo run --release -p izzydb-bench --bin recall_bench
 cargo run --release -p izzydb-bench --bin filtered_bench
+cargo run --release -p izzydb-bench --bin bsi_bench
 cargo run --release -p izzydb-bench --bin fts_bench
 cargo run --release -p izzydb-bench --bin rank_bench
 cargo run --release -p izzydb-bench --bin facet_bench

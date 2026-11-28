@@ -4,12 +4,14 @@
 mod columnar;
 mod compile;
 mod estimate;
+mod leaf;
 mod postings;
 
 use columnar::*;
 pub(crate) use columnar::ColumnFilter;
 use compile::*;
 use estimate::*;
+pub(crate) use leaf::LeafAttrFilter;
 use postings::*;
 
 
@@ -21,7 +23,7 @@ use izzydb_core::filter::Filter;
 use izzydb_core::rowset::{Liveness, RowSet};
 use izzydb_core::schema::CollectionSchema;
 use izzydb_storage::codec::RowView;
-use izzydb_storage::{SegmentTableSnapshot, Storage};
+use izzydb_storage::{SegmentTableSnapshot, Storage, ZoneTable};
 
 use crate::detached::{
     filter_mentions_detached, filter_rows_mixed_batch,
@@ -104,8 +106,10 @@ pub(crate) fn plan_filter_with_trace(
     filter: &Filter,
     fts: &FtsIndex,
     trace: &mut FilterPlanTrace,
-) -> Result<FilterPlan> {
-    filter.validate(schema)?;
+) -> Result<FilterPlan> {    filter.validate(schema)?;
+    trace.range_zones_checked = 0;
+    trace.range_segments_pruned = 0;
+    trace.range_segments_visited = 0;
     let snap = storage.segment_snapshot();
     let live_rows = total_live_rows(&snap);
     let materialize_limit = default_materialize_limit(live_rows);
@@ -146,6 +150,83 @@ pub(crate) fn plan_filter_with_trace(
         FilterPlan::All => {}
     }
     Ok(plan)
+}
+
+/// Estimate the cardinality of `filter` without materializing any posting lists.
+///
+/// Used by the leaf-colocated attribute path to choose between masked traversal and
+/// post-filter without paying the cost of loading value-major postings.
+pub(crate) fn estimate_filter_with_trace(
+    storage: &Storage,
+    schema: &CollectionSchema,
+    filter: &Filter,
+    fts: &FtsIndex,
+    trace: &mut FilterPlanTrace,
+) -> Result<u64> {
+    filter.validate(schema)?;
+    let snap = storage.segment_snapshot();
+    let live_rows = total_live_rows(&snap);
+    let materialize_limit = default_materialize_limit(live_rows);
+    trace.materialize_limit = materialize_limit;
+    if live_rows == 0 {
+        trace.estimated_cardinality = 0;
+        return Ok(0);
+    }
+    let zones = storage.get_zones_cached()?;
+    let compiled = compile_expr(filter)?;
+    trace_range_zones(&compiled, &snap, &zones, schema, trace)?;
+    let ctx = PlanCtx {
+        storage,
+        schema,
+        fts,
+        snap: &snap,
+        zones: &zones,
+        live_rows,
+        materialize_limit,
+        trace,
+    };
+    let est = estimate_node(&ctx, &compiled)?;
+    ctx.trace.estimated_cardinality = est;
+    Ok(est)
+}
+
+/// Count zone-map pruning for every range node, mirroring the value-major posting path so
+/// callers that use the leaf-column fast path still report range trace statistics.
+fn trace_range_zones(
+    compiled: &CompiledNode,
+    snap: &SegmentTableSnapshot,
+    zones: &ZoneTable,
+    schema: &CollectionSchema,
+    trace: &mut FilterPlanTrace,
+) -> Result<()> {
+    match compiled {
+        CompiledNode::Range { attr, lo, hi, .. } => {
+            let (attr_id, tag, lo_b, hi_b) =
+                encode_range_bounds(schema, attr, lo.as_ref(), hi.as_ref())?;
+            let seg_zones = zones.get(&(attr_id, tag));
+            for seg in snap.visible_segments() {
+                trace.range_zones_checked += 1;
+                let overlaps = seg_zones
+                    .and_then(|m| m.get(&seg))
+                    .is_some_and(|z| zone_overlaps(z, lo_b.as_ref(), hi_b.as_ref()));
+                if overlaps {
+                    trace.range_segments_visited += 1;
+                } else {
+                    trace.range_segments_pruned += 1;
+                }
+            }
+        }
+        CompiledNode::And(children, _) | CompiledNode::Or(children, _) => {
+            for child in children {
+                trace_range_zones(child, snap, zones, schema, trace)?;
+            }
+        }
+        CompiledNode::Not(child, _) => {
+            trace_range_zones(child, snap, zones, schema, trace)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Fully materialize `filter` into an exact live [`RowSet`] (used by `resolve_filter_doc_ids`,

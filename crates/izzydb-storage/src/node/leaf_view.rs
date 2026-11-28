@@ -23,6 +23,8 @@ pub struct LeafNodeView<'a> {
     pub centroid_bytes: &'a [u8],
     pub rotated_centroid_bytes: &'a [u8],
     pub code_popcounts_bytes: &'a [u8],
+    /// Encoded colocated scalar attribute block (empty when the leaf has no eligible attrs).
+    pub attr_bytes: &'a [u8],
 }
 
 impl<'a> LeafNodeView<'a> {
@@ -52,6 +54,14 @@ impl<'a> LeafNodeView<'a> {
         let slot_cap = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
         let live_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
         let stale_hint = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        if bytes[20] != LEAF_FORMAT_VERSION {
+            return Err(TreeError::CorruptedData(format!(
+                "unsupported PackedLeafNode format version {} (expected {LEAF_FORMAT_VERSION}); recreate the collection",
+                bytes[20]
+            )));
+        }
+        let attr_len =
+            u32::from_le_bytes([bytes[21], bytes[22], bytes[23], 0]) as usize;
         if mask_words != slot_cap.div_ceil(64) || live_count > slot_cap {
             return Err(TreeError::CorruptedData(format!(
                 "invalid PackedLeafNode header: slot_cap={slot_cap}, live_count={live_count}, mask_words={mask_words}"
@@ -64,7 +74,8 @@ impl<'a> LeafNodeView<'a> {
             + mask_words * 8
             + padded_slots * (8 + rabitq_words * 8 + 8)
             + (dim + padded_dim) * 4
-            + pop_bytes;
+            + pop_bytes
+            + attr_len;
         if bytes.len() != expected {
             return Err(TreeError::CorruptedData(format!(
                 "PackedLeafNode expected {expected} bytes, got {}",
@@ -88,6 +99,8 @@ impl<'a> LeafNodeView<'a> {
         let rotated_centroid_bytes = &bytes[off..off + padded_dim * 4];
         off += padded_dim * 4;
         let code_popcounts_bytes = &bytes[off..off + pop_bytes];
+        off += pop_bytes;
+        let attr_bytes = &bytes[off..off + attr_len];
 
         Ok(Self {
             parent_id,
@@ -104,6 +117,7 @@ impl<'a> LeafNodeView<'a> {
             centroid_bytes,
             rotated_centroid_bytes,
             code_popcounts_bytes,
+            attr_bytes,
         })
     }
 

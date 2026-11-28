@@ -25,12 +25,13 @@ use rocksdb::{
 
 use izzydb_core::config::{AttrId, ColumnGen, DocId, NodeId, ROW_BLOCK_SIZE, RowId, SegmentId};
 use izzydb_core::error::{Result, TreeError};
-use izzydb_core::schema::CollectionConfig;
+use izzydb_core::schema::{CollectionConfig, ColumnStorage};
 
 use crate::codec::{
     Manifest, SEG_DELETES_TAG, SEG_META_TAG, SegmentMeta, SegmentState, ZONE_TAG,
     decode_roaring_bitmap,
 };
+use crate::leaf_attrs::{LeafAttrSpec, NodeSummary};
 use crate::node::{AnnMeta, PackedLeafNode};
 
 pub use batch::StorageBatch;
@@ -67,15 +68,19 @@ pub const CF_FTS_TERMS: &str = "cf_fts_terms";
 pub const CF_FTS_SKIPS: &str = "cf_fts_skips";
 pub const CF_FTS_POSTINGS: &str = "cf_fts_postings";
 pub const CF_FTS_POSITIONS: &str = "cf_fts_positions";
+pub const CF_NODE_SUMMARIES: &str = "cf_node_summaries";
+pub const CF_BSI: &str = "cf_bsi";
 
-pub const ALL_DATA_CF_NAMES: [&str; 13] = [
+pub const ALL_DATA_CF_NAMES: [&str; 15] = [
     CF_ID_MAP,
     CF_ROWS,
     CF_ROW_DOC_IDS,
     CF_VECTORS,
     CF_LEAF_ENTRIES,
+    CF_NODE_SUMMARIES,
     CF_ATTR_POSTINGS,
     CF_COLUMNS,
+    CF_BSI,
     CF_DETACHED,
     CF_DETACHED_POSTINGS,
     CF_FTS_TERMS,
@@ -158,6 +163,52 @@ pub struct Storage {
     pub(super) attr_posting_cache: RwLock<attr_postings::AttrPostingCache>,
     pub(super) zone_cache: RwLock<Option<ZoneTable>>,
     pub(super) fts_doc_lens_cache: RwLock<HashMap<AttrId, DocLenBlockTable>>,
+    /// Fixed-width inline scalar attributes colocated with leaf slots.
+    pub(super) leaf_attr_specs: RwLock<Vec<LeafAttrSpec>>,
+    /// In-memory leaf/internal filter summaries loaded at open and updated at commit.
+    pub(super) node_summaries: RwLock<NodeSummaryCache>,
+}
+
+/// Dense `NodeId`-indexed cache of leaf/internal filter summaries.
+///
+/// ```text
+/// summaries.get(42) // O(1), no hashing or summary cloning on the traversal hot path
+/// ```
+#[derive(Debug, Default)]
+pub struct NodeSummaryCache {
+    entries: Vec<Option<Arc<NodeSummary>>>,
+}
+
+impl NodeSummaryCache {
+    /// Look up a summary by node id.
+    #[inline]
+    pub fn get(&self, node_id: NodeId) -> Option<Arc<NodeSummary>> {
+        self.entries
+            .get(node_id as usize)
+            .and_then(|entry| entry.as_ref().map(Arc::clone))
+    }
+
+    /// Borrow a summary by node id without touching an atomic refcount.
+    #[inline]
+    pub fn get_ref(&self, node_id: NodeId) -> Option<&NodeSummary> {
+        self.entries.get(node_id as usize).and_then(|e| e.as_deref())
+    }
+
+    /// Insert or replace a summary.
+    pub fn insert(&mut self, node_id: NodeId, summary: NodeSummary) {
+        let idx = node_id as usize;
+        if idx >= self.entries.len() {
+            self.entries.resize_with(idx + 1, || None);
+        }
+        self.entries[idx] = Some(Arc::new(summary));
+    }
+
+    /// Remove a summary.
+    pub fn remove(&mut self, node_id: NodeId) {
+        if let Some(entry) = self.entries.get_mut(node_id as usize) {
+            *entry = None;
+        }
+    }
 }
 
 impl Storage {
@@ -174,7 +225,7 @@ impl Storage {
                 .unwrap_or(DEFAULT_BLOCK_CACHE_BYTES),
         );
         let dim = config.vector.as_ref().map_or(0, |v| v.dim);
-        let storage = Self::open_raw(path, dim, &block_cache, config.direct_io)?;
+        let storage = Self::open_raw(path, dim, &block_cache, config)?;
 
         if storage.has_bulk_import_marker()? {
             return Err(TreeError::CorruptedData(
@@ -267,8 +318,9 @@ impl Storage {
         path: impl AsRef<Path>,
         dim: usize,
         block_cache: &Cache,
-        direct_io: bool,
+        config: &CollectionConfig,
     ) -> Result<Self> {
+        let direct_io = config.direct_io;
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
@@ -304,7 +356,8 @@ impl Storage {
             dim.next_power_of_two().max(64)
         };
         let rabitq_words = padded_dim / 64;
-        Ok(Self {
+        let leaf_attr_specs = Self::derive_leaf_attr_specs(config);
+        let storage = Self {
             db,
             _block_cache: block_cache.clone(),
             dim,
@@ -319,7 +372,48 @@ impl Storage {
             )),
             zone_cache: RwLock::new(None),
             fts_doc_lens_cache: RwLock::new(HashMap::new()),
-        })
+            leaf_attr_specs: RwLock::new(leaf_attr_specs),
+            node_summaries: RwLock::new(NodeSummaryCache::default()),
+        };
+        storage.load_node_summaries()?;
+        Ok(storage)
+    }
+
+    fn derive_leaf_attr_specs(config: &CollectionConfig) -> Vec<LeafAttrSpec> {
+        let mut specs: Vec<LeafAttrSpec> = config
+            .attributes
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| {
+                a.storage == ColumnStorage::Inline
+                    && a.filterable
+                    && LeafAttrSpec::is_supported(a.attr_type)
+            })
+            .map(|(idx, a)| LeafAttrSpec {
+                attr_id: idx as AttrId,
+                attr_type: a.attr_type,
+            })
+            .collect();
+        specs.sort_unstable_by_key(|s| s.attr_id);
+        specs
+    }
+
+    fn load_node_summaries(&self) -> Result<()> {
+        let cf = self.cf(CF_NODE_SUMMARIES)?;
+        let mut cache = NodeSummaryCache::default();
+        for item in self.db.iterator_cf(cf, IteratorMode::Start) {
+            let (k, v) = item.map_err(map_db_err)?;
+            if k.len() != 4 {
+                return Err(TreeError::CorruptedData(format!(
+                    "cf_node_summaries key expected 4 bytes, got {}",
+                    k.len()
+                )));
+            }
+            let node_id = NodeId::from_be_bytes(k.as_ref().try_into().unwrap());
+            cache.insert(node_id, NodeSummary::decode(&v)?);
+        }
+        *self.node_summaries.write().expect("node_summaries poisoned") = cache;
+        Ok(())
     }
 
     fn load_segment_state(&self) -> Result<()> {
@@ -371,7 +465,7 @@ impl Storage {
                 .unwrap_or(DEFAULT_BLOCK_CACHE_BYTES),
         );
         let dim = config.vector.as_ref().map_or(0, |v| v.dim);
-        let storage = Self::open_raw(path, dim, &block_cache, config.direct_io)?;
+        let storage = Self::open_raw(path, dim, &block_cache, config)?;
 
         if storage.has_bulk_import_marker()? {
             return Err(TreeError::CorruptedData(
@@ -597,7 +691,7 @@ impl Storage {
             if let Some(next_seg) = seg.checked_add(1) {
                 let lo = seg.to_be_bytes();
                 let hi = next_seg.to_be_bytes();
-                for cf_name in [CF_ROWS, CF_ROW_DOC_IDS, CF_VECTORS, CF_COLUMNS] {
+                for cf_name in [CF_ROWS, CF_ROW_DOC_IDS, CF_VECTORS, CF_COLUMNS, CF_BSI] {
                     batch.delete_range_cf(cf_name, &lo, &hi);
                 }
                 let mut zlo = [0u8; 5];

@@ -7,7 +7,7 @@ Implementation sources:
 - Parallel Parquet scanner & detached scanner: [`crates/izzydb-bulk/src/common/parquet_reader/mod.rs`](../../crates/izzydb-bulk/src/common/parquet_reader/mod.rs)
 - Segment SST emitters: [`crates/izzydb-bulk/src/pipeline/mod.rs`](../../crates/izzydb-bulk/src/pipeline/mod.rs)
 - ANN tree builder over `RowId`s: [`crates/izzydb-bulk/src/tree_builder/mod.rs`](../../crates/izzydb-bulk/src/tree_builder/mod.rs)
-- SST bundle manifest v2 (`SST_BUNDLE_FORMAT_VERSION = 2`): [`crates/izzydb-bulk/src/common/sst.rs`](../../crates/izzydb-bulk/src/common/sst.rs)
+- SST bundle manifest v3 (`SST_BUNDLE_FORMAT_VERSION = 3`): [`crates/izzydb-bulk/src/common/sst.rs`](../../crates/izzydb-bulk/src/common/sst.rs)
 - CLI (`izzydb-import import | append | columns`): [`crates/izzydb-bulk/src/bin/izzydb-import.rs`](../../crates/izzydb-bulk/src/bin/izzydb-import.rs)
 
 ---
@@ -23,7 +23,7 @@ Because v3 rows live in independent sealed segments and secondary indexes use `R
 3. **Phase 2 (Optional ANN Build):** When `has_vectors` is true, trains the clustering skeleton via `balanced_two_means`, routes all vectors in parallel, assigns BFS `NodeId`s, and records `VecEntry { row_id, vec_idx }` directly into `PackedLeafNode` v3 leaves (`cf_leaf_entries`) and internal nodes (`default[0x02]`).
    - **Cluster-ordered `RowId` assignment (Phase 4 of the filtered-search plan):** after the tree is built, `izzydb-bulk` walks `built_tree.leaves` in BFS leaf order (so sibling leaves under one parent receive adjacent ids) and overwrites each entry with a dense sequential `RowId::new(pos / seal_rows, pos % seal_rows)`. A staged `rows_by_row_id.bin` maps the new dense position back to the Parquet row so every CF emitter stays cluster-contiguous. Vectorless collections keep the `DocId`-ordered assignment.
 4. **Phase 3 (Emit Segment SSTs):** Streams sorted SSTs directly in segment/column-family order:
-   - `cf_rows`, `cf_row_doc_ids`, `cf_vectors`, `cf_columns` (sealed inline columnar blocks built directly), `cf_id_map` (emitted through an external `DocId` sorter so the SST stays strictly ascending even when `RowId`s are cluster-ordered), `cf_attr_postings` (`SegPosting`, value-major), `cf_detached` / `cf_detached_postings`, FTS CFs (`cf_fts_terms` v4, `cf_fts_skips` `FtsChunk` v4, `cf_fts_positions`), and `default` (`\x01schema` v4, `\x01manifest`, `\x01ann_meta`, `\x01fts_meta` v4, `0x02`, `0x05`, `0x06`, `0x07`, `0x11` sealed `SegmentMeta`, `0x12` zones, `0x13` `DetachedMeta`).
+   - `cf_rows`, `cf_row_doc_ids`, `cf_vectors`, `cf_columns` (sealed inline columnar blocks built directly), trailing `PackedLeafNode` scalar columns + `cf_node_summaries` (bottom-up leaf/internal filter summaries), `cf_bsi` (per-segment ordered numeric bit-slices), `cf_id_map` (emitted through an external `DocId` sorter so the SST stays strictly ascending even when `RowId`s are cluster-ordered), `cf_attr_postings` (`SegPosting`, value-major), `cf_detached` / `cf_detached_postings`, FTS CFs (`cf_fts_terms` v4, `cf_fts_skips` `FtsChunk` v4, `cf_fts_positions`), and `default` (`\x01schema` v4, `\x01manifest`, `\x01ann_meta`, `\x01fts_meta` v4, `0x02`, `0x05`, `0x06`, `0x07`, `0x11` sealed `SegmentMeta`, `0x12` zones, `0x13` `DetachedMeta`).
 5. **Phase 4 (Crash-Safe Ingest):** Brackets multi-CF `ingest_external_file_cf_opts` with `default[b"\x01bulk_import_v3"]` (`sync = true`), ingesting all data CFs before `default`, then clearing the marker.
 
 ---

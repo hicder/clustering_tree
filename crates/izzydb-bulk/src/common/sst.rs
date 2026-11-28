@@ -12,7 +12,7 @@ use izzydb::codec::Manifest;
 use rocksdb::{Options, SstFileWriter};
 use serde::{Deserialize, Serialize};
 
-pub const SST_BUNDLE_FORMAT_VERSION: u32 = 2;
+pub const SST_BUNDLE_FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManifestAnnMeta {

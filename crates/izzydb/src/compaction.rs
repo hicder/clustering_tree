@@ -24,6 +24,7 @@ use izzydb_storage::codec::{
     extract_index_keys_from_entries, make_posting_key,
 };
 use izzydb_storage::column::ColumnBlockBuilder;
+use izzydb_storage::bsi::{BSI_CHUNK_ROWS, BsiChunkBuilder, ordered_value};
 use izzydb_storage::{ColumnBlockView, SegmentTableSnapshot, TxContext};
 
 use crate::collection::Collection;
@@ -306,6 +307,21 @@ where
         .cloned()
         .collect();
     let detached_gens = all_detached_gens(&coll.storage)?;
+    let bsi_specs: Vec<(AttrId, izzydb_core::schema::AttributeType)> = schema
+        .entries()
+        .iter()
+        .filter(|e| {
+            e.storage == ColumnStorage::Inline
+                && e.filterable
+                && matches!(
+                    e.attr_type,
+                    izzydb_core::schema::AttributeType::Int
+                        | izzydb_core::schema::AttributeType::Uint
+                        | izzydb_core::schema::AttributeType::Float
+                )
+        })
+        .map(|e| (e.id, e.attr_type))
+        .collect();
 
     let fts_entries: Vec<SchemaEntry> = schema.fts_entries().cloned().collect();
     let fts_analyzers: Vec<FtsAnalyzer> = fts_entries
@@ -315,6 +331,9 @@ where
     let mut fts_buf = ReusableBuffer::new();
 
     let mut dst_local: LocalId = 0;
+    let mut bsi_chunk = u32::MAX;
+    let mut bsi_builders: Vec<BsiChunkBuilder> = Vec::new();
+    let mut bsi_planes: BTreeMap<(AttrId, u32, u8), Vec<u8>> = BTreeMap::new();
     let mut base_by_seg: Vec<(SegmentId, LocalId)> = Vec::with_capacity(group.len());
     let mut id_map_updates: Vec<(DocId, RowId)> = Vec::with_capacity(total_live as usize);
     let mut bytes_copied = 0u64;
@@ -478,6 +497,23 @@ where
             let view = RowView::parse(raw_bytes)?;
             let entries = decode_row_entries(raw_bytes)?;
 
+            if !bsi_specs.is_empty() {
+                let row_chunk = dst_local / BSI_CHUNK_ROWS;
+                if row_chunk != bsi_chunk {
+                    flush_bsi_planes(&mut bsi_planes, bsi_chunk, &mut bsi_builders, &bsi_specs);
+                    bsi_chunk = row_chunk;
+                    bsi_builders.clear();
+                    bsi_builders.resize_with(bsi_specs.len(), BsiChunkBuilder::new);
+                }
+                let in_chunk = dst_local % BSI_CHUNK_ROWS;
+                for (idx, &(aid, _)) in bsi_specs.iter().enumerate() {
+                    let value = view.get_scalar(aid)?;
+                    if let Some(ordered) = ordered_value(&value) {
+                        bsi_builders[idx].insert(in_chunk, ordered);
+                    }
+                }
+            }
+
             // Inline attribute postings + zones
             let keys = extract_index_keys_from_entries(&schema, &entries)?;
             for ak in keys {
@@ -613,6 +649,10 @@ where
             let pkey = detached_posting_key(entry.id, col_gen, ak[2], &ak[3..], target_seg);
             stage_batch.put_detached_posting(&pkey, &SegPosting::from_bitmap(bm).encode()?);
         }
+    }
+    flush_bsi_planes(&mut bsi_planes, bsi_chunk, &mut bsi_builders, &bsi_specs);
+    for ((aid, chunk, plane), bytes) in bsi_planes {
+        stage_batch.put_bsi_plane(target_seg, aid, chunk, plane, &bytes);
     }
     coll.storage.write_batch_sync(stage_batch)?;
 
@@ -829,4 +869,22 @@ pub(crate) fn retire_eligible_forwarding_segments(coll: &mut Collection) -> Resu
     coll.manifest = m;
     coll.ann_meta = am;
     Ok(eligible.len())
+}
+
+/// Encode one accumulated BSI chunk into deterministic `(attr, chunk, plane)` keys.
+fn flush_bsi_planes(
+    planes: &mut BTreeMap<(AttrId, u32, u8), Vec<u8>>,
+    chunk: u32,
+    builders: &mut [BsiChunkBuilder],
+    specs: &[(AttrId, izzydb_core::schema::AttributeType)],
+) {
+    if chunk == u32::MAX {
+        return;
+    }
+    for (&(attr_id, _), builder) in specs.iter().zip(builders.iter_mut()) {
+        for (plane, bytes) in builder.encode_planes() {
+            planes.insert((attr_id, chunk, plane), bytes);
+        }
+        *builder = BsiChunkBuilder::new();
+    }
 }

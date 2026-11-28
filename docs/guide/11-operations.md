@@ -43,6 +43,7 @@ col.vacuum_ann(VacuumBudget::leaves(128))?;
   - Smaller values (`4,096–16,384`) reduce open-segment scan work, tighten `0x12` zone-map bounds, and accelerate sealed `cf_columns` builds/compactions at high write churn.
   - Larger values (`65,536–262,144`) reduce total segment count, minimize per-segment overhead on `SegPosting`s, and match bulk Parquet batch sizes.
 - **`defer_column_build` (default `false`):** Set `true` on latency-sensitive write paths to skip synchronous `cf_columns` generation at seal time and defer it to `maintenance()`.
+- **`.with_bit_sliced_index(bool)` (default `false`):** Enables `cf_bsi` bit-sliced planes for ordered numeric (`Int`/`Uint`/`Float`) filterable attributes. When enabled, large ranges (>= 1,024 distinct values) use the BSI and fall back per segment to value-major postings otherwise. The Phase 6 measurement gate found no win on uniform `f64` ranges, so it is opt-in.
 
 ### I/O & Concurrency Tuning (`CollectionConfig`)
 

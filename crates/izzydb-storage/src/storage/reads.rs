@@ -19,6 +19,7 @@ use crate::codec::{
     SegmentMeta, column_key, decode_doc_id_block, decode_roaring_bitmap,
     doc_id_block_key, row_key,
 };
+use crate::leaf_attrs::{LeafAttrSpec, NodeSummary};
 use crate::node::{AnnMeta, PackedInternalNode, PackedLeafNode, decode_f32_slice};
 
 
@@ -347,5 +348,77 @@ impl Storage {
             out.push(res.map_err(map_db_err)?);
         }
         Ok(out)
+    }
+
+    /// Fixed-width inline scalar attributes colocated with leaf slots.
+    #[inline]
+    pub fn leaf_attr_specs(&self) -> Vec<LeafAttrSpec> {
+        self.leaf_attr_specs
+            .read()
+            .expect("leaf_attr_specs poisoned")
+            .clone()
+    }
+
+    /// Replace the leaf-colocated attribute specification list (after schema reconciliation).
+    pub fn set_leaf_attr_specs(&self, specs: Vec<LeafAttrSpec>) {
+        *self
+            .leaf_attr_specs
+            .write()
+            .expect("leaf_attr_specs poisoned") = specs;
+    }
+
+    /// Look up the cached filter summary for `node_id`.
+    #[inline]
+    pub fn get_node_summary(&self, node_id: NodeId) -> Option<std::sync::Arc<NodeSummary>> {
+        self.node_summaries
+            .read()
+            .expect("node_summaries poisoned")
+            .get(node_id)
+    }
+
+    /// Hold a read guard over the dense summary cache for one search traversal.
+    #[inline]
+    pub fn node_summaries_guard(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, super::NodeSummaryCache> {
+        self.node_summaries
+            .read()
+            .expect("node_summaries poisoned")
+    }
+
+    /// Batch pinned `multi_get` against `cf_bsi` for `seg(4) || attr(2) || chunk(4) || plane(1)`
+    /// keys in ascending order.
+    pub fn multi_get_bsi_planes_pinned(
+        &self,
+        keys: &[(SegmentId, AttrId, u32, u8)],
+    ) -> Result<Vec<Option<DBPinnableSlice<'_>>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cf = self.cf(CF_BSI)?;
+        let raw_keys: Vec<[u8; 11]> = keys
+            .iter()
+            .map(|&(seg, attr_id, chunk, plane)| crate::bsi::bsi_key(seg, attr_id, chunk, plane))
+            .collect();
+        let results = self.db.batched_multi_get_cf(cf, raw_keys.iter(), true);
+        let mut out = Vec::with_capacity(keys.len());
+        for res in results {
+            out.push(res.map_err(map_db_err)?);
+        }
+        Ok(out)
+    }
+
+    /// Read one BSI plane.
+    pub fn get_bsi_plane(
+        &self,
+        seg: SegmentId,
+        attr_id: AttrId,
+        chunk: u32,
+        plane: u8,
+    ) -> Result<Option<Vec<u8>>> {
+        let cf = self.cf(CF_BSI)?;
+        self.db
+            .get_cf(cf, crate::bsi::bsi_key(seg, attr_id, chunk, plane))
+            .map_err(map_db_err)
     }
 }

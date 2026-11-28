@@ -1,6 +1,8 @@
 //! Filtered ANN search regimes.
 
-use crate::filter_plan::{self, ColumnFilter, FilterPlan, FilterPlanTrace, FilteredSearchRegime};
+use crate::filter_plan::{
+    self, ColumnFilter, FilterPlan, FilterPlanTrace, FilteredSearchRegime, LeafAttrFilter,
+};
 use crate::fts_index::FtsIndex;
 use crate::simd::LeafCandidate;
 use izzydb_core::config::{DistanceMetric, NodeId, RowId, TreeConfig};
@@ -12,7 +14,8 @@ use izzydb_core::schema::CollectionSchema;
 use izzydb_rabitq::{QueryScratch, RabitqQuantizer, pack_query_bits_into};
 use izzydb_storage::codec::RowView;
 use izzydb_storage::node::{AnnMeta, LeafNodeView, PackedInternalNode};
-use izzydb_storage::{SegmentTableSnapshot, Storage};
+use izzydb_storage::storage::NodeSummaryCache;
+use izzydb_storage::{LeafAttrView, SegmentTableSnapshot, Storage};
 use std::collections::{BinaryHeap, HashMap};
 
 use super::postings::PostingMembership;
@@ -78,8 +81,73 @@ pub fn search_filtered_with_trace(
         return Ok(Vec::new());
     }
 
-    let plan = filter_plan::plan_filter_with_trace(storage, schema, filter, fts_index, trace)?;
     let total_leaves = leaf_parent.len().max(1);
+
+    // Fixed-width inline scalar filters no longer need `cf_columns` or value-major postings on
+    // the traversal path: evaluate the compiled predicate over each leaf's colocated columns and
+    // prune subtrees whose in-memory summaries cannot match.
+    let specs = storage.leaf_attr_specs();
+    if let Some(leaf_filter) = LeafAttrFilter::new(schema, specs, filter) {
+        let est = filter_plan::estimate_filter_with_trace(storage, schema, filter, fts_index, trace)?;
+        if est == 0 {
+            trace.regime = Some(FilteredSearchRegime::Empty);
+            return Ok(Vec::new());
+        }
+        if (est as usize) <= opts.exact_scan_threshold
+            && let FilterPlan::Materialized(rowset) =
+                filter_plan::plan_filter_with_trace(storage, schema, filter, fts_index, trace)?
+        {
+            if rowset.is_empty() {
+                trace.regime = Some(FilteredSearchRegime::Empty);
+                return Ok(Vec::new());
+            }
+            trace.regime = Some(FilteredSearchRegime::ExactScan);
+            return search_exact_rowset(
+                storage,
+                &q,
+                &rowset,
+                opts.k,
+                config.dim,
+                config.metric,
+            );
+        }
+        let s = (est as f64 / meta.num_vectors.max(1) as f64).clamp(1e-4, 1.0);
+        if s <= 0.5 {
+            trace.regime = Some(FilteredSearchRegime::MaskedTraversal);
+            return search_masked_traversal(
+                storage,
+                internal_cache,
+                meta,
+                quantizer,
+                &q,
+                opts,
+                None,
+                Some(&leaf_filter),
+                s,
+                total_leaves,
+                config,
+            );
+        }
+        trace.regime = Some(FilteredSearchRegime::PostFilter);
+        return search_post_filter(
+            storage,
+            internal_cache,
+            meta,
+            quantizer,
+            schema,
+            fts_index,
+            &q,
+            opts,
+            None,
+            None,
+            Some(&leaf_filter),
+            s,
+            total_leaves,
+            config,
+        );
+    }
+
+    let plan = filter_plan::plan_filter_with_trace(storage, schema, filter, fts_index, trace)?;
 
     match plan {
         FilterPlan::All => {
@@ -124,7 +192,8 @@ pub fn search_filtered_with_trace(
                     quantizer,
                     &q,
                     opts,
-                    &rowset,
+                    Some(&rowset),
+                    None,
                     s,
                     total_leaves,
                     config,
@@ -142,6 +211,7 @@ pub fn search_filtered_with_trace(
                     opts,
                     None,
                     Some(&rowset),
+                    None,
                     s,
                     total_leaves,
                     config,
@@ -189,6 +259,7 @@ pub fn search_filtered_with_trace(
                 opts,
                 Some(&residual),
                 seed.as_ref(),
+                None,
                 s,
                 total_leaves,
                 config,
@@ -253,7 +324,8 @@ pub(super) fn search_masked_traversal(
     quantizer: &RabitqQuantizer,
     q: &[f32],
     opts: SearchOptions,
-    rowset: &RowSet,
+    rowset: Option<&RowSet>,
+    leaf_filter: Option<&LeafAttrFilter>,
     selectivity: f64,
     total_leaves: usize,
     config: &TreeConfig,
@@ -291,7 +363,9 @@ pub(super) fn search_masked_traversal(
     let dropped = storage.dropped_segments_snapshot();
     let need_liveness_resolve =
         !seg_snap.has_deletes_or_forwarding.is_empty() || !dropped.is_empty();
-    let row_lookup = FastRowSetLookup::new(rowset);
+    let row_lookup = rowset.map(FastRowSetLookup::new);
+    let pruner = leaf_filter.filter(|f| opts.summary_pruning && f.can_prune_summaries());
+    let summary_guard = storage.node_summaries_guard();
 
     let mut probed_leaves = 0usize;
     let mut batch_target = opts.beam_width;
@@ -301,7 +375,14 @@ pub(super) fn search_masked_traversal(
     let mut any_forwarded = false;
     let mut traversal =
         StagedTraversal::new(meta.root_id, meta.root_level, opts.beam_width, max_expanded);
-    traversal.seed_leaves(internal_cache, q, dim, config.metric)?;
+    traversal.seed_leaves(
+        &summary_guard,
+        internal_cache,
+        q,
+        dim,
+        config.metric,
+        pruner,
+    )?;
 
     while probed_leaves < max_expanded && !traversal.is_exhausted() {
         let remaining = max_expanded - probed_leaves;
@@ -311,10 +392,12 @@ pub(super) fn search_masked_traversal(
             take_limit,
             remaining,
             &mut batch_leaves,
+            &summary_guard,
             internal_cache,
             q,
             dim,
             config.metric,
+            pruner,
         )?;
         if batch_leaves.is_empty() {
             break;
@@ -337,11 +420,17 @@ pub(super) fn search_masked_traversal(
                 &seg_snap,
                 &dropped,
                 need_liveness_resolve,
-                Some(&row_lookup),
+                row_lookup.as_ref(),
                 &mut mask_buf,
             );
             if !any_live {
                 continue;
+            }
+            if let Some(filter) = leaf_filter {
+                let attr_view = LeafAttrView::parse(view.attr_bytes)?;
+                if !and_leaf_attr_mask(&attr_view, filter, &mut mask_buf) {
+                    continue;
+                }
             }
             any_forwarded |= leaf_forwarded;
             score_leaf_view(&view, Some(&mask_buf), &mut score_ctx, &mut candidates);
@@ -382,10 +471,12 @@ pub(super) fn search_post_filter(
     opts: SearchOptions,
     residual: Option<&Filter>,
     seed: Option<&RowSet>,
+    leaf_filter: Option<&LeafAttrFilter>,
     selectivity: f64,
     total_leaves: usize,
     config: &TreeConfig,
 ) -> Result<Vec<(RowId, f32)>> {
+    let residual = residual.filter(|_| leaf_filter.is_none());
     let mut posting_membership = match residual {
         Some(filter) => PostingMembership::for_filter(schema, filter)?,
         None => None,
@@ -423,6 +514,8 @@ pub(super) fn search_post_filter(
     let dropped = storage.dropped_segments_snapshot();
     let need_liveness = !seg_snap.has_deletes_or_forwarding.is_empty() || !dropped.is_empty();
     let seed_lookup = seed.map(FastRowSetLookup::new);
+    let pruner = leaf_filter.filter(|f| opts.summary_pruning && f.can_prune_summaries());
+    let summary_guard = storage.node_summaries_guard();
 
     let mut probed_leaves = 0usize;
     let mut batch_target = opts.beam_width;
@@ -437,7 +530,14 @@ pub(super) fn search_post_filter(
     };
     let mut traversal =
         StagedTraversal::new(meta.root_id, meta.root_level, opts.beam_width, max_expanded);
-    traversal.seed_leaves(internal_cache, q, dim, config.metric)?;
+    traversal.seed_leaves(
+        &summary_guard,
+        internal_cache,
+        q,
+        dim,
+        config.metric,
+        pruner,
+    )?;
 
     while probed_leaves < max_expanded && !traversal.is_exhausted() {
         let remaining = max_expanded - probed_leaves;
@@ -447,10 +547,12 @@ pub(super) fn search_post_filter(
             take_limit,
             remaining,
             &mut batch_leaves,
+            &summary_guard,
             internal_cache,
             q,
             dim,
             config.metric,
+            pruner,
         )?;
         if batch_leaves.is_empty() {
             break;
@@ -471,7 +573,7 @@ pub(super) fn search_post_filter(
             if view.live_count == 0 {
                 continue;
             }
-            if !need_liveness && seed.is_none() {
+            if leaf_filter.is_none() && !need_liveness && seed.is_none() {
                 let allowed_slots = if view.has_tombstones() {
                     view.copy_live_mask_into(&mut mask_buf);
                     Some(mask_buf.as_slice())
@@ -490,6 +592,12 @@ pub(super) fn search_post_filter(
                 );
                 if !any_live {
                     continue;
+                }
+                if let Some(filter) = leaf_filter {
+                    let attr_view = LeafAttrView::parse(view.attr_bytes)?;
+                    if !and_leaf_attr_mask(&attr_view, filter, &mut mask_buf) {
+                        continue;
+                    }
                 }
                 batch_forwarded |= leaf_forwarded;
                 score_leaf_view(&view, Some(&mask_buf), &mut score_ctx, &mut batch_cands);
@@ -669,12 +777,15 @@ impl StagedTraversal {
     }
 
     /// Run the initial level-by-level beam descent, populating the leaf frontier.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn seed_leaves(
         &mut self,
+        summaries: &NodeSummaryCache,
         internal_cache: &HashMap<NodeId, PackedInternalNode>,
         q: &[f32],
         dim: usize,
         metric: DistanceMetric,
+        pruner: Option<&LeafAttrFilter>,
     ) -> Result<()> {
         if self.root_level == 0 {
             self.leaf_queue.push(HeapEntry {
@@ -691,6 +802,9 @@ impl StagedTraversal {
                 let node = internal_node(internal_cache, node_id)?;
                 search_distances_batch(metric, q, &node.child_centroids, dim, &mut self.dists);
                 for (&child_id, &dist) in node.child_ids.iter().zip(self.dists.iter()) {
+                    if pruned_child(summaries, pruner, child_id) {
+                        continue;
+                    }
                     let entry = HeapEntry {
                         dist,
                         node_id: child_id,
@@ -746,12 +860,15 @@ impl StagedTraversal {
 
     /// Expand one retained internal node, pushing children into the leaf frontier or their
     /// respective internal level.
+    #[allow(clippy::too_many_arguments)]
     fn expand_one(
         &mut self,
+        summaries: &NodeSummaryCache,
         internal_cache: &HashMap<NodeId, PackedInternalNode>,
         q: &[f32],
         dim: usize,
         metric: DistanceMetric,
+        pruner: Option<&LeafAttrFilter>,
     ) -> Result<bool> {
         let Some(item) = self.pop_best_internal() else {
             return Ok(false);
@@ -761,6 +878,9 @@ impl StagedTraversal {
         let node = internal_node(internal_cache, item.node_id)?;
         search_distances_batch(metric, q, &node.child_centroids, dim, &mut self.dists);
         for (&child_id, &dist) in node.child_ids.iter().zip(self.dists.iter()) {
+            if pruned_child(summaries, pruner, child_id) {
+                continue;
+            }
             let entry = HeapEntry {
                 dist,
                 node_id: child_id,
@@ -783,16 +903,18 @@ impl StagedTraversal {
         limit: usize,
         remaining_budget: usize,
         out: &mut Vec<NodeId>,
+        summaries: &NodeSummaryCache,
         internal_cache: &HashMap<NodeId, PackedInternalNode>,
         q: &[f32],
         dim: usize,
         metric: DistanceMetric,
+        pruner: Option<&LeafAttrFilter>,
     ) -> Result<()> {
         self.leaf_queue.set_cap(remaining_budget);
         while out.len() < limit {
             match (self.leaf_queue.best_dist(), self.best_internal_dist()) {
                 (Some(leaf), Some(internal)) if internal < leaf => {
-                    if !self.expand_one(internal_cache, q, dim, metric)? {
+                    if !self.expand_one(summaries, internal_cache, q, dim, metric, pruner)? {
                         break;
                     }
                 }
@@ -801,7 +923,7 @@ impl StagedTraversal {
                     None => break,
                 },
                 (None, Some(_)) => {
-                    if !self.expand_one(internal_cache, q, dim, metric)? {
+                    if !self.expand_one(summaries, internal_cache, q, dim, metric, pruner)? {
                         break;
                     }
                 }
@@ -810,6 +932,48 @@ impl StagedTraversal {
         }
         Ok(())
     }
+}
+
+/// Return `true` when an in-memory subtree summary proves the child cannot match.
+#[inline]
+fn pruned_child(
+    summaries: &NodeSummaryCache,
+    pruner: Option<&LeafAttrFilter>,
+    child_id: NodeId,
+) -> bool {
+    let Some(filter) = pruner else {
+        return false;
+    };
+    match summaries.get_ref(child_id) {
+        Some(summary) => !filter.may_match(summary),
+        None => false,
+    }
+}
+
+/// Intersect `mask_buf` with the leaf's colocated scalar predicate. Returns `true` when any
+/// slot survives.
+pub(super) fn and_leaf_attr_mask(
+    view: &LeafAttrView<'_>,
+    filter: &LeafAttrFilter,
+    mask_buf: &mut [u64],
+) -> bool {
+    let mut any = false;
+    let slot_cap = view.slot_cap();
+    for (w_idx, word_ref) in mask_buf.iter_mut().enumerate() {
+        let mut bits = *word_ref;
+        let mut out = 0u64;
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let slot = (w_idx << 6) | bit;
+            if slot < slot_cap && filter.eval(view, slot) {
+                out |= 1u64 << bit;
+                any = true;
+            }
+        }
+        *word_ref = out;
+    }
+    any
 }
 
 #[inline]

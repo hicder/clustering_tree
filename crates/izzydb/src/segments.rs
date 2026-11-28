@@ -33,16 +33,25 @@ pub(crate) trait RowIndexHook {
 }
 
 /// Write-path manager for append-only segments, id map, and tombstones.
+///
+/// ```text
+/// SegmentStore { seal_rows: 65_536, defer_column_build: false, bit_sliced_index: true }
+/// ```
 pub(crate) struct SegmentStore {
+    /// Maximum rows in an open segment before it is sealed.
     pub(crate) seal_rows: u32,
+    /// Skip synchronous `cf_columns` construction at seal time.
     pub(crate) defer_column_build: bool,
+    /// Build `cf_bsi` planes for ordered numeric filterable attributes at seal time.
+    pub(crate) bit_sliced_index: bool,
 }
 
 impl SegmentStore {
-    pub(crate) fn new(seal_rows: u32, defer_column_build: bool) -> Self {
+    pub(crate) fn new(seal_rows: u32, defer_column_build: bool, bit_sliced_index: bool) -> Self {
         Self {
             seal_rows,
             defer_column_build,
+            bit_sliced_index,
         }
     }
 
@@ -158,6 +167,9 @@ impl SegmentStore {
         tx.manifest_mut().open_segment = None;
         if !self.defer_column_build {
             crate::columns::build_segment_columns_in_tx(tx, schema, seg)?;
+        }
+        if self.bit_sliced_index {
+            crate::bsi::build_segment_bsi_in_tx(tx, schema, seg)?;
         }
         for hook in hooks {
             hook.on_seal(tx, seg)?;

@@ -77,7 +77,25 @@ impl Collection {
         };
 
         let storage = Arc::new(storage);
-        let segments = SegmentStore::new(config.segment.seal_rows, config.segment.defer_column_build);
+        let leaf_specs: Vec<izzydb_storage::LeafAttrSpec> = schema
+            .entries()
+            .iter()
+            .filter(|e| {
+                e.storage == izzydb_core::schema::ColumnStorage::Inline
+                    && e.filterable
+                    && izzydb_storage::LeafAttrSpec::is_supported(e.attr_type)
+            })
+            .map(|e| izzydb_storage::LeafAttrSpec {
+                attr_id: e.id,
+                attr_type: e.attr_type,
+            })
+            .collect();
+        storage.set_leaf_attr_specs(leaf_specs);
+        let segments = SegmentStore::new(
+            config.segment.seal_rows,
+            config.segment.defer_column_build,
+            config.bit_sliced_index,
+        );
         let (ann, internal_cache, leaf_parent) = match (&config.vector, &ann_meta) {
             (Some(vcfg), Some(meta)) => {
                 let ann = AnnIndex::new(vcfg.clone(), meta.rabitq_seed)?;

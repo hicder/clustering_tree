@@ -16,9 +16,9 @@ use izzydb::node::{PackedInternalNode, PackedLeafNode};
 use izzydb::rabitq::RabitqQuantizer;
 use izzydb::schema::CollectionSchema;
 use izzydb::storage::{
-    ANN_META_KEY, ATTR_COUNTS_VERSION_KEY, CF_LEAF_ENTRIES, DEFAULT_CF_NAME,
-    FTS_META_KEY, MANIFEST_KEY, SCHEMA_KEY, cf_options_for, default_sst_block_cache,
-    node_key, tagged_vec,
+    ANN_META_KEY, ATTR_COUNTS_VERSION_KEY, CF_LEAF_ENTRIES, CF_NODE_SUMMARIES, DEFAULT_CF_NAME,
+    FTS_META_KEY, MANIFEST_KEY, SCHEMA_KEY, cf_options_for, default_sst_block_cache, node_key,
+    tagged_vec,
 };
 
 use crate::common::parquet_reader::{MappedFile, StagedData};
@@ -44,6 +44,7 @@ pub fn emit_empty_import_ssts(
     docs_shards: &[MappedFile],
     target_sst_bytes: u64,
     memory_budget_bytes: usize,
+    bit_sliced_index: bool,
     pool: &rayon::ThreadPool,
 ) -> Result<EmptyImportEmitResult> {
     let block_cache = default_sst_block_cache();
@@ -110,16 +111,25 @@ pub fn emit_empty_import_ssts(
 
     // Emit CF_LEAF_ENTRIES in parallel if vectors are enabled.
     if let (Some(tree), Some(vcfg), Some(q)) = (built_tree, vec_cfg, quantizer) {
-        let leaf_ssts = emit_ann_leaf_ssts(
+        let out = emit_ann_leaf_ssts(
             bundle_dir,
             tree,
             vcfg.dim,
             q,
             vectors_mmap,
+            docs_idx_mmap,
+            docs_shards,
+            staged.has_detached_staging,
+            schema,
             target_sst_bytes,
             pool,
         )?;
-        cf_files.insert(CF_LEAF_ENTRIES.to_owned(), leaf_ssts);
+        if !out.leaf_ssts.is_empty() {
+            cf_files.insert(CF_LEAF_ENTRIES.to_owned(), out.leaf_ssts);
+        }
+        if !out.summary_ssts.is_empty() {
+            cf_files.insert(CF_NODE_SUMMARIES.to_owned(), out.summary_ssts);
+        }
     }
 
     let num_segs = n_docs.div_ceil(seal_rows) as u32;
@@ -147,6 +157,7 @@ pub fn emit_empty_import_ssts(
         docs_shards,
         target_sst_bytes,
         memory_budget_bytes,
+        bit_sliced_index,
         pool,
     )?;
 

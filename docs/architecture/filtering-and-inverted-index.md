@@ -50,6 +50,18 @@ While `cf_rows` stores per-row `RowView` v3 directories (fast for multi-attribut
 
 ---
 
+## 3b. Leaf-Colocated Scalars, Summaries & Bit-Sliced Ranges
+
+Two search-path accelerators sit alongside the value-major index without changing its semantics:
+
+- **Trailing `LeafAttrBlock` (Phase 5):** Every `PackedLeafNode` appends fixed-width `Bool`/`Int`/`Uint`/`Float` values for inline `filterable` attributes, aligned `0..slot_cap`. `LeafAttrFilter` compiles a scalar filter once into dense predicate nodes and evaluates it directly on each leaf blob the traversal already fetched, so `MaskedTraversal` / `PostFilter` avoid `cf_columns` and posting reads for these predicates. Missing attributes and explicit nulls are absent bits in the column's presence mask. Floats narrow to `f32` when every present value round-trips losslessly. Strings, arrays, and detached columns are never colocated.
+- **`cf_node_summaries` (Phase 5):** Each leaf and internal node has a conservative `(min, max, present_count, value-bloom)` rollup per eligible attribute. `StagedTraversal` can test a child's cached summary before computing its centroid distance or reading `cf_leaf_entries`, and leaf scoring re-checks the exact trailing scalar mask. `complete = false` summaries disable pruning. Summary checks are opt-in (`SearchOptions::with_summary_pruning(true)`) because they help correlated attributes but cost more than they save on uncorrelated ones.
+- **`cf_bsi` (Phase 6, opt-in):** Ordered numeric (`Int`/`Uint`/`Float`) segments may store a per-`(seg, attr, 65,536-row chunk)` bit-sliced index of `value - base`. `load_postings_range` uses it only when the query range spans at least 1,024 distinct values and a complete base/presence record exists; otherwise it falls back to value-major postings. This turns large `Lt`/`Lte`/`Gt`/`Gte` unions into a bounded number of plane intersections. Online construction happens at seal time (`SegmentStore::seal`, or `maintenance()` for deferred columns); bulk import emits the planes directly. `CollectionConfig::with_bit_sliced_index(true)` enables new BSI construction (default off after the Phase 6 measurement gate).
+
+The colocated scalar block and `cf_node_summaries` are maintained automatically by `TxContext::commit`: every dirty leaf is rebuilt in one pass from its stored `RowId`s (`cf_rows`), its scalar block is embedded into the leaf blob, its summary is written to `cf_node_summaries`, and ancestor summaries are rolled up in level order. `Collection::verify_invariants` re-decodes every leaf slot against `cf_rows` and checks every leaf/internal summary against the child rollup.
+
+---
+
 ## 4. Inverted Keyspaces & Binary Encodings
 
 ### 4.1 Column Families & Keys

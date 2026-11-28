@@ -6,6 +6,7 @@ use std::path::Path;
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 
+use izzydb::bsi_codec::{BSI_CHUNK_ROWS, BsiChunkBuilder, bsi_key, ordered_value};
 use izzydb::codec::{
     RowView, SEG_FLAG_HAS_COLUMNS, SEG_FLAG_HAS_VECTORS, SegPosting, SegmentMeta, SegmentState,
     TAG_BOOL, TAG_PRESENT, ZoneEntry, column_key, decode_row_entries, detached_count_suffix,
@@ -22,7 +23,7 @@ use izzydb::schema::{
     SchemaEntry,
 };
 use izzydb::storage::{
-    CF_ATTR_POSTINGS, CF_COLUMNS, CF_DETACHED, CF_DETACHED_POSTINGS, CF_FTS_POSITIONS,
+    CF_ATTR_POSTINGS, CF_BSI, CF_COLUMNS, CF_DETACHED, CF_DETACHED_POSTINGS, CF_FTS_POSITIONS,
     CF_FTS_SKIPS, CF_FTS_TERMS, CF_ID_MAP, CF_ROW_DOC_IDS, CF_ROWS, CF_VECTORS, cf_options_for,
     default_sst_block_cache, doc_key,
 };
@@ -57,6 +58,7 @@ pub fn emit_segment_range_ssts(
     docs_shards: &[MappedFile],
     target_sst_bytes: u64,
     memory_budget_bytes: usize,
+    bit_sliced_index: bool,
     pool: &rayon::ThreadPool,
 ) -> Result<SegmentPassOutputs> {
     let block_cache = default_sst_block_cache();
@@ -77,6 +79,23 @@ pub fn emit_segment_range_ssts(
         .iter()
         .any(|e| e.storage == ColumnStorage::Detached && e.filterable);
     let has_fts = schema.has_fts();
+    let bsi_specs: Vec<(AttrId, AttributeType)> = if bit_sliced_index {
+        schema
+            .entries()
+            .iter()
+            .filter(|e| {
+                e.storage == ColumnStorage::Inline
+                    && e.filterable
+                    && matches!(
+                        e.attr_type,
+                        AttributeType::Int | AttributeType::Uint | AttributeType::Float
+                    )
+            })
+            .map(|e| (e.id, e.attr_type))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let mut col_attrs: Vec<(AttrId, AttributeType)> = if seg_cfg.defer_column_build {
         Vec::new()
@@ -213,6 +232,7 @@ pub fn emit_segment_range_ssts(
     let vecs_opts = cf_options_for(CF_VECTORS, &block_cache)?;
     let doc_ids_opts = cf_options_for(CF_ROW_DOC_IDS, &block_cache)?;
     let cols_opts = cf_options_for(CF_COLUMNS, &block_cache)?;
+    let bsi_opts = cf_options_for(CF_BSI, &block_cache)?;
 
     let worker_results: Vec<WorkerSegAccum> = pool.install(|| -> Result<Vec<_>> {
         seg_ranges
@@ -258,6 +278,17 @@ pub fn emit_segment_range_ssts(
                         &cols_opts,
                         target_sst_bytes,
                         format!("{CF_COLUMNS}/part-{w_idx:02}"),
+                    ))
+                } else {
+                    None
+                };
+                let mut bsi_sink = if !bsi_specs.is_empty() {
+                    Some(SstSink::new(
+                        bundle_dir.to_path_buf(),
+                        CF_BSI,
+                        &bsi_opts,
+                        target_sst_bytes,
+                        format!("{CF_BSI}/part-{w_idx:02}"),
                     ))
                 } else {
                     None
@@ -327,6 +358,10 @@ pub fn emit_segment_range_ssts(
                     let mut dl_arrs: Vec<[u32; ROW_BLOCK_SIZE]> =
                         vec![[0u32; ROW_BLOCK_SIZE]; fts_attrs.len()];
                     let mut blk_row_count = 0usize;
+
+                    let mut bsi_chunk = u32::MAX;
+                    let mut bsi_builders: Vec<BsiChunkBuilder> = Vec::new();
+                    let mut bsi_planes: BTreeMap<(AttrId, u32, u8), Vec<u8>> = BTreeMap::new();
 
                     let flush_block =
                         |blk: u32,
@@ -437,6 +472,27 @@ pub fn emit_segment_range_ssts(
                         }
 
                         let view = RowView::parse(inline_bytes)?;
+                        if !bsi_specs.is_empty() {
+                            let row_chunk = local / BSI_CHUNK_ROWS;
+                            if row_chunk != bsi_chunk {
+                                flush_bsi_chunk(
+                                    &mut bsi_planes,
+                                    bsi_chunk,
+                                    &mut bsi_builders,
+                                    &bsi_specs,
+                                );
+                                bsi_chunk = row_chunk;
+                                bsi_builders.clear();
+                                bsi_builders.resize_with(bsi_specs.len(), BsiChunkBuilder::new);
+                            }
+                            let in_chunk = local % BSI_CHUNK_ROWS;
+                            for (idx, &(aid, _)) in bsi_specs.iter().enumerate() {
+                                let value = view.get_scalar(aid)?;
+                                if let Some(ordered) = ordered_value(&value) {
+                                    bsi_builders[idx].insert(in_chunk, ordered);
+                                }
+                            }
+                        }
                         if !col_attrs.is_empty() {
                             for i in 0..view.len() {
                                 let (aid, _, _, _) = view.dir_entry(i);
@@ -542,6 +598,13 @@ pub fn emit_segment_range_ssts(
                         &mut accum.doc_len_blocks,
                     )?;
 
+                    flush_bsi_chunk(&mut bsi_planes, bsi_chunk, &mut bsi_builders, &bsi_specs);
+                    if let Some(ref mut sink) = bsi_sink {
+                        for ((aid, chunk, plane), bytes) in std::mem::take(&mut bsi_planes) {
+                            sink.put(&bsi_key(seg, aid, chunk, plane), &bytes)?;
+                        }
+                    }
+
                     if let Some(ref mut sink) = cols_sink {
                         for (c_idx, &(aid, _)) in col_attrs.iter().enumerate() {
                             for (blk, bytes) in &seg_col_blocks[c_idx] {
@@ -638,6 +701,9 @@ pub fn emit_segment_range_ssts(
                 if let Some(sink) = cols_sink {
                     accum.cols_ssts = sink.finish()?;
                 }
+                if let Some(sink) = bsi_sink {
+                    accum.bsi_ssts = sink.finish()?;
+                }
                 Ok(accum)
             })
             .collect::<Result<Vec<_>>>()
@@ -673,6 +739,12 @@ pub fn emit_segment_range_ssts(
                 .entry(CF_COLUMNS.to_owned())
                 .or_default()
                 .extend(w.cols_ssts);
+        }
+        if !w.bsi_ssts.is_empty() {
+            cf_files
+                .entry(CF_BSI.to_owned())
+                .or_default()
+                .extend(w.bsi_ssts);
         }
         seg_metas.extend(w.seg_metas);
         zones.extend(w.zones);
@@ -860,4 +932,22 @@ pub fn emit_segment_range_ssts(
         updated_fts_terms,
         next_fts_term_id,
     })
+}
+
+/// Encode the current bit-slice chunk into deterministic `(attr, chunk, plane)` keys.
+fn flush_bsi_chunk(
+    planes: &mut BTreeMap<(AttrId, u32, u8), Vec<u8>>,
+    chunk: u32,
+    builders: &mut [BsiChunkBuilder],
+    specs: &[(AttrId, AttributeType)],
+) {
+    if chunk == u32::MAX {
+        return;
+    }
+    for (&(attr_id, _), builder) in specs.iter().zip(builders.iter_mut()) {
+        for (plane, bytes) in builder.encode_planes() {
+            planes.insert((attr_id, chunk, plane), bytes);
+        }
+        *builder = BsiChunkBuilder::new();
+    }
 }

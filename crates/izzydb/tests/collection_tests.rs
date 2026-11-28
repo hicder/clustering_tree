@@ -1199,7 +1199,14 @@ fn test_broad_equality_search_with_missing_values_and_replaced_rows() {
                 &mut trace,
             )
             .unwrap();
-        assert!(trace.is_lazy);
+        assert!(
+            trace.is_lazy
+                || matches!(
+                    trace.regime,
+                    Some(FilteredSearchRegime::MaskedTraversal)
+                        | Some(FilteredSearchRegime::PostFilter)
+                )
+        );
         assert_eq!(hits.iter().map(|hit| hit.id).collect::<Vec<_>>(), expected);
     }
 }

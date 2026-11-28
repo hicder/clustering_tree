@@ -76,6 +76,8 @@ use izzydb::{AttributeConfig, AttributeType, CollectionConfig, FullTextSearchCon
 let config = CollectionConfig::new(TreeConfig::new(128, DistanceMetric::Cosine))
     // (name, type, filterable)
     .with_attribute("category", AttributeType::String, true)
+    // (name, type, filterable, column) — opt non-filterable String/arrays into sealed cf_columns
+    .with_column_attribute("url", AttributeType::String, false, true)
     // (name, type, filterable, full-text config)
     .with_fts_attribute("title", AttributeType::String, false, FullTextSearchConfig::default())
     // Equivalent explicit form
@@ -85,6 +87,8 @@ let config = CollectionConfig::new(TreeConfig::new(128, DistanceMetric::Cosine))
             .full_text_search(FullTextSearchConfig::default()),
     );
 ```
+
+For workloads that only need filtering, faceting, sorting, or BM25 without embeddings, use `CollectionConfig::without_vectors()`. See [Operations & Troubleshooting](11-operations.md#io--concurrency-tuning-collectionconfig) for I/O (`with_direct_io`) and FTS parallelism (`with_fts_parallel_segments`) settings.
 
 Each attribute has two independent switches:
 
@@ -107,20 +111,21 @@ let mut col = Collection::open("./my_collection", config)?;
 
 - **Path does not exist:** it is created and the schema is stored in the database.
 - **Path exists:** the stored schema is compared with your `CollectionConfig`:
-  - every attribute you declare that already exists must have the **same type, same `filterable` flag, and same full-text config**, otherwise `Collection::open` fails with `TreeError::ConfigMismatch { field, expected, actual }`;
+  - every attribute you declare that already exists must have the **same type, `filterable` flag, storage mode (`Inline`/`Detached`), `column` flag, and full-text config**, otherwise `Collection::open` fails with `TreeError::ConfigMismatch { field, expected, actual }`;
   - **new attributes are added.** Old documents simply read as missing for them. If a new attribute is full-text indexed, existing documents are back-filled into the FTS index during `open`.
 - Attributes that are in the database but **not** in your config are kept as-is. Still, pass your complete schema every time so the config in your code stays the source of truth.
-- Vector `dim` and `metric` must match the stored values.
+- Vector `dim` and `metric` (and `has_vectors`) must match the stored values.
 
-Things you **cannot** do in place: change an attribute's type, toggle `filterable`, change its full-text settings, or change `dim`/`metric`. To make such a change, create a new collection and re-ingest (see [Bulk Import](10-bulk-import.md)).
+Things you **cannot** do in place: change an attribute's type, toggle `filterable`, change its `Inline`/`Detached` storage or `column` flag, change its full-text settings, or change `dim`/`metric`. To make such a change, create a new collection and re-ingest (see [Bulk Import](10-bulk-import.md)).
 
 ## Inspecting a collection
 
 ```rust
-col.len();            // number of documents (u64)
+col.len();                // number of documents (u64)
 col.is_empty();
-col.config();         // &TreeConfig
-col.schema();         // &CollectionSchema: iterate col.schema().entries()
+col.collection_config();  // &CollectionConfig
+col.vector_config();      // Option<&TreeConfig>
+col.schema();             // &CollectionSchema: iterate col.schema().entries()
 ```
 
 [`CollectionConfig`]: ../../crates/izzydb-core/src/schema/mod.rs

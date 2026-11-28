@@ -30,6 +30,7 @@ Each `AttributeConfig` declares:
 - `attr_type: AttributeType` (`String`, `Int`, `Uint`, `Float`, `Bool`, `StringArray`, `IntArray`, `UintArray`)
 - `filterable: bool` (enables inverted index keys in `cf_attr_postings`/`cf_detached_postings`, live counts `0x06`/`0x07`, zone maps `0x12`, `Filter` predicates, and facets)
 - `storage: ColumnStorage` (`Inline` stored in `cf_rows` + sealed `cf_columns`; `Detached` stored exclusively in `cf_detached` + `cf_detached_postings`, see [detached-columns.md](detached-columns.md))
+- `column: bool` (optional `.with_column(true)` / `.with_column_attribute(...)` to opt non-filterable `Inline` string/array attributes into sealed `cf_columns`; `filterable` attributes and scalar `Bool`/`Int`/`Uint`/`Float` are automatically columnar on seal via `SchemaEntry::is_columnar()`)
 - Optional `FullTextSearchConfig` (`Inline` string/string-array attributes only)
 
 Validation rules (`Filter::validate` & `CollectionSchema`):
@@ -45,7 +46,7 @@ Validation rules (`Filter::validate` & `CollectionSchema`):
 While `cf_rows` stores per-row `RowView` v3 directories (fast for multi-attribute point `get` and `RowView::matches_filter`), reading one attribute across many rows uses 256-slot columnar `ColumnBlock`s:
 - **`cf_columns` (`seg BE || attr_id BE || block BE`, 10 B):** built for `Inline` attributes when a segment is sealed (or deferred to `maintenance()`).
 - **`cf_detached` (`attr_id BE || gen BE || seg BE || block BE`, 14 B):** always columnar across all segments.
-- `AttrReader` abstracts over `cf_columns` (sealed inline), `cf_detached` (detached), and `cf_rows` (open-segment inline or deferred-column segments), accelerating `OrderBy`, `RankBy` modifier rescoring, and `"docs"` facet passes.
+- `AttrReader` abstracts over `cf_columns` (sealed inline), `cf_detached` (detached), and `cf_rows` (open-segment inline or deferred-column segments), accelerating `OrderBy`, `RankBy` modifier rescoring, `"docs"` facet passes, and `ColumnFilter` residual verification during ANN `PostFilter` search.
 
 ---
 

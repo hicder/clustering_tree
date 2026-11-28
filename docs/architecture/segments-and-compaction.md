@@ -26,7 +26,7 @@ SkipChunk:    (SegmentId, chunk = block >> 8)   // 256 blocks = 65,536 rows
 - **`SegmentId`s are strictly monotonic** (`Manifest.next_segment_id`) and **never reused**.
 - **`LocalId`s are dense and append-only** inside a segment (`0..row_count`, max `MAX_SEGMENT_ROWS = 1 << 20`).
 
-Because every `RowId` is immutable until compaction retires its segment, sealed-segment inverted postings (`cf_attr_postings`), FTS postings (`cf_fts_postings`), columnar blocks (`cf_columns`), and detached blocks (`cf_detached`) are **write-once** for sealed rows.
+Because every `RowId` is immutable until compaction retires its segment, sealed-segment inverted postings (`cf_attr_postings`), FTS chunks (`cf_fts_skips`), columnar blocks (`cf_columns`), and detached blocks (`cf_detached`) are **write-once** for sealed rows.
 
 ---
 
@@ -75,7 +75,7 @@ Every mutation (`upsert`, `patch`, `delete`, and `*_batch`) executes inside one 
 
 - **Tombstone old row (on `delete` or existing `upsert`/`patch`):**
   1. Adds `old_row.local()` to `default[0x10 || old_seg]` (incrementing `SegmentMeta.deleted_count` and decrementing `Manifest.live_rows`).
-  2. Reads `old_row` from `cf_rows` (`RowView`) to decrement `default[0x06]` live attribute counts and FTS `TermRecord.doc_freq` + `FtsMeta` stats; never modifies sealed `cf_attr_postings`, `0x12` zone maps, or `cf_fts_postings` blocks.
+  2. Reads `old_row` from `cf_rows` (`RowView`) to decrement `default[0x06]` live attribute counts and FTS `TermRecord.doc_freq` + `FtsMeta` stats; never modifies sealed `cf_attr_postings`, `0x12` zone maps, or sealed `cf_fts_skips` chunks.
   3. If the collection has vectors and the old row had one, marks it stale by incrementing `AnnMeta.stale_rows` (deferred leaf vacuum; the vector is only deleted from the ANN tree eagerly if the old leaf happens to split/repack or when `vacuum_ann` scans it).
 - **Append new row (on `upsert` or `patch`):**
   1. Allocates a fresh `new_row = (open_seg, local)` via `SegmentStore::alloc_row`, seals `open_seg` if `row_count >= seal_rows` (building `cf_columns` unless `defer_column_build` is true).
@@ -96,7 +96,7 @@ Over time, tombstones accumulate in sealed segments and sparse deletions leave u
    - Commits Step A so `Building` rows exist durably while source segments are still live.
 3. **Step B (Atomic cutover):**
    - Atomically switches `target` from `Building -> Sealed`, updates `cf_id_map` for every moved `DocId`, marks source segments as `SegmentState::Forwarding { forward_target, forward_base, forwarded_at_epoch }` (or deletes vectorless segments immediately), and deletes `0x10` tombstones / `0x12` zones on forwarded sources.
-   - Note: `cf_attr_postings` (`0x12` excluded), FTS postings, and row bytes for `Forwarding` sources are dropped once retired.
+   - Note: `cf_attr_postings` (`0x12` excluded), FTS chunks (`cf_fts_skips`), and row bytes for `Forwarding` sources are dropped once retired.
 4. **Rank-Based Forwarding Without Per-Row Map:**
    - Because live rows in source segment $S$ were copied in dense ascending `LocalId` order into $[B, B + L)$ inside target $T$, any old `RowId(S, l)` maps in $O(\log |\text{deleted}_S|)$ via `deleted_bitmap_S.rank(l)`:
      $$\text{new\_local} = \text{forward\_base} + (l - \text{deleted}_S.\text{rank}(l))$$
@@ -110,7 +110,7 @@ Over time, tombstones accumulate in sealed segments and sparse deletions leave u
   - Resolves every `RowId` in each leaf through forwarding chains: drops dead/retired entries, rewrites forwarded `RowId`s to their current target `(T, new_local)`, re-packs `PackedLeafNode`, merges underflowing leaves, and decrements `AnnMeta.stale_rows`.
   - When `vacuum_cursor` wraps around `next_node_id`, it increments `AnnMeta.vacuum_epoch += 1` (`completed_pass = true`).
 - **Retiring `Forwarding` segments:** Once `AnnMeta.vacuum_epoch > seg_meta.forwarded_at_epoch`, **no** ANN leaf anywhere in the tree can still hold a reference to that `Forwarding` segment. Compaction/vacuum immediately transitions it to `dropped_segments` (`\x01dropped_segments`), issues bounded `delete_range`s, and lets the RocksDB compaction filter finish physical key reclamation.
-- **RocksDB Compaction Filter:** Installed on `cf_rows`, `cf_row_doc_ids`, `cf_vectors`, `cf_columns`, `cf_detached`, `cf_attr_postings`, `cf_detached_postings`, `cf_fts_skips`, `cf_fts_postings`, `cf_fts_positions`, and `default[0x05]`. Each filter shares an `Arc<ArcSwap<RoaringBitmap>>` of `dropped_segments` (plus retired detached generations) and drops keys belonging to dead segments/generations during normal RocksDB SST compaction—race-free because segment IDs and generation IDs are never reused.
+- **RocksDB Compaction Filter:** Installed on `cf_rows`, `cf_row_doc_ids`, `cf_vectors`, `cf_columns`, `cf_detached`, `cf_attr_postings`, `cf_detached_postings`, `cf_fts_skips`, `cf_fts_positions`, `default[0x05]` (and deprecated `cf_fts_postings`). Each filter shares an `Arc<ArcSwap<RoaringBitmap>>` of `dropped_segments` (plus retired detached generations) and drops keys belonging to dead segments/generations during normal RocksDB SST compaction—race-free because segment IDs and generation IDs are never reused.
 
 ## 6. Combined Maintenance (`Collection::maintenance`)
 

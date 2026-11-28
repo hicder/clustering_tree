@@ -19,7 +19,7 @@ Implementation sources:
 
 1. **`SegmentStore`:** Appends new rows to `Manifest.open_segment` (`RowId = (seg, local)`), writes `cf_rows` (`RowView` v3), `cf_id_map[doc_id] = row_id`, `cf_row_doc_ids`, and optional `cf_vectors[row_id]`. Seals segments at `SegmentConfig.seal_rows` (building `cf_columns` unless `defer_column_build = true`).
 2. **`AttributeIndex`** (`RowIndexHook`): Inserts segment-scoped `SegPosting` entries (`cf_attr_postings`), updates live `default[0x06]` counts, and widens `default[0x12]` per-segment zone maps. On delete/replace, decrements `0x06` only (`cf_attr_postings` and zones are never shrunk in place).
-3. **`FtsIndex`** (`RowIndexHook`): Analyzes FTS-enabled attributes directly into `(seg, block)`-keyed `cf_fts_postings` / `cf_fts_skips` / `cf_fts_positions` / `default[0x05]` doc lens. On delete/replace, decrements `TermRecord.doc_freq` and `FtsMeta` stats without touching sealed posting blocks.
+3. **`FtsIndex`** (`RowIndexHook`): Analyzes FTS-enabled attributes directly into `(seg, chunk)`-keyed `cf_fts_skips` (`FtsChunk` v4), `cf_fts_terms` (inline rare terms), `cf_fts_positions`, and `default[0x05]` doc lens. On delete/replace, decrements `TermRecord.doc_freq` and `FtsMeta` stats without touching sealed chunks.
 4. **`AnnIndex` (`ClusteringTree`, when `has_vectors`):** Inserts new `(RowId, quantized_code)` entries into `cf_leaf_entries` and updates internal nodes (`default[0x02]`). Stale entries left behind by deleted/replaced rows increment `AnnMeta.stale_rows` and are cleaned up opportunistically on leaf split/re-encode or incrementally via `vacuum_ann`.
 
 ---

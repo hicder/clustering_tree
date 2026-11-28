@@ -147,10 +147,11 @@ let hits = col.query_bm25(&rank_by, Some(&filter), 10)?;
 
 The filter can include token predicates over other full-text attributes too.
 
-## Index maintenance
+## Index maintenance & parallelism
 
 - Inserting, updating, and deleting documents keep the index current automatically. An update that doesn't change any full-text attribute skips re-indexing.
 - BM25 corpus statistics (document counts and average length) are maintained incrementally.
+- **Segment-parallel queries:** On collections with $\ge 4$ visible segments, pure-lexical `query_bm25` / `query` queries automatically execute Block-Max MAXSCORE in parallel across disjoint segment ranges using Rayon. Configure `CollectionConfig::with_fts_parallel_segments(n)` to cap shard concurrency (`1` runs single-threaded; omitting it uses all Rayon threads).
 - After a lot of deletes/updates, run `col.compact_fts_stats()` to tighten internal score bounds (see [Documents](03-documents.md#compact_fts_stats)). It affects speed only, never results.
 
 ## Errors

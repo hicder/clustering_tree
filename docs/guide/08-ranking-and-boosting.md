@@ -72,7 +72,7 @@ let hot = col.query(&RankBy::saturate("views", 10_000.0), Some(&filter), 20)?;
 
 A single monotone score over a `filterable` attribute (`attribute`, `saturate`, `decay` in `Forward` / `Backward` mode, optionally scaled by a constant) reads the index in order and stops after about `top_k` entries. Other attribute-only expressions evaluate every document that passes the filter, so give them a selective `filter` on big collections.
 
-## Sorting by attributes (`query_ordered`)
+## Sorting by attributes (`query_ordered` / `order_by`)
 
 ```rust
 use izzydb::{NullsOrder, OrderBySpec};
@@ -85,6 +85,7 @@ let hits = col.query_ordered(
     Some(&Filter::Eq("category".into(), "shoes".into())),
     20,
 )?;
+// `col.order_by(...)` is an alias for `col.query_ordered(...)`.
 // Vec<OrderedResult { id, sort_values }>
 ```
 

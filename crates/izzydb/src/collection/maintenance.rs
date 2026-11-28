@@ -89,6 +89,9 @@ impl Collection {
             );
             for seg in pending_column_segs {
                 crate::columns::build_segment_columns_in_tx(&mut tx, &self.schema, seg)?;
+                if self.config.bit_sliced_index {
+                    crate::bsi::build_segment_bsi_in_tx(&mut tx, &self.schema, seg)?;
+                }
                 stats.columns_built += 1;
             }
             let (manifest, ann_meta) = tx.commit()?;

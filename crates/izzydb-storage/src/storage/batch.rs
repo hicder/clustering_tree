@@ -13,10 +13,10 @@ use crate::codec::{
 use crate::node::{AnnMeta, PackedInternalNode, PackedLeafNode, encode_f32_slice};
 
 use super::{
-    ANN_META_KEY, CF_ATTR_POSTINGS, CF_COLUMNS, CF_DETACHED, CF_DETACHED_POSTINGS,
+    ANN_META_KEY, CF_ATTR_POSTINGS, CF_BSI, CF_COLUMNS, CF_DETACHED, CF_DETACHED_POSTINGS,
     CF_FTS_POSITIONS, CF_FTS_POSTINGS, CF_FTS_SKIPS, CF_FTS_TERMS, CF_ID_MAP, CF_LEAF_ENTRIES,
-    CF_ROW_DOC_IDS, CF_ROWS, CF_VECTORS, DROPPED_SEGMENTS_KEY, FTS_META_KEY, MANIFEST_KEY,
-    SCHEMA_KEY, Storage, doc_key, node_key, tagged_key,
+    CF_NODE_SUMMARIES, CF_ROW_DOC_IDS, CF_ROWS, CF_VECTORS, DROPPED_SEGMENTS_KEY, FTS_META_KEY,
+    MANIFEST_KEY, SCHEMA_KEY, Storage, doc_key, node_key, tagged_key,
 };
 
 /// Typed wrapper around `rocksdb::WriteBatch` for atomic v3 storage mutations.
@@ -136,6 +136,29 @@ impl<'a> StorageBatch<'a> {
 
     pub fn delete_leaf_node(&mut self, leaf_id: NodeId) {
         self.delete_cf(CF_LEAF_ENTRIES, &node_key(leaf_id));
+    }
+
+    pub fn put_node_summary(&mut self, node_id: NodeId, summary: &crate::leaf_attrs::NodeSummary) {
+        self.put_cf(CF_NODE_SUMMARIES, &node_key(node_id), &summary.encode());
+    }
+
+    pub fn delete_node_summary(&mut self, node_id: NodeId) {
+        self.delete_cf(CF_NODE_SUMMARIES, &node_key(node_id));
+    }
+
+    pub fn put_bsi_plane(
+        &mut self,
+        seg: SegmentId,
+        attr_id: AttrId,
+        chunk: u32,
+        plane: u8,
+        bytes: &[u8],
+    ) {
+        self.put_cf(
+            CF_BSI,
+            &crate::bsi::bsi_key(seg, attr_id, chunk, plane),
+            bytes,
+        );
     }
 
     pub fn put_id_map(&mut self, doc_id: DocId, row_id: RowId) {

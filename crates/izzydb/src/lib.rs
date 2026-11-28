@@ -3,6 +3,8 @@
 pub use izzydb_core::{config, error, facet as facet_types, filter, kmeans, metric, rank, rowset, schema};
 pub use izzydb_fts as fts;
 pub use izzydb_rabitq as rabitq;
+pub use izzydb_storage::bsi as bsi_codec;
+pub use izzydb_storage::leaf_attrs;
 pub use izzydb_storage::{codec, node, storage};
 
 /// High-level `Collection` coordinating segments and secondary indexes.
@@ -14,6 +16,8 @@ pub mod segments;
 pub(crate) mod attr_reader;
 /// Per-segment inverted attribute index.
 pub mod attr_index;
+/// Seal-time per-segment bit-sliced index construction (`cf_bsi`).
+pub(crate) mod bsi;
 /// Seal-time and maintenance transposition into `cf_columns`.
 pub(crate) mod columns;
 /// Segment compaction, forwarding remap, and orphan retirement.

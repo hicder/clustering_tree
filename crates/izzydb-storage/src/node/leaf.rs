@@ -25,6 +25,8 @@ pub struct PackedLeafNode {
     pub res_norm_sqs: Vec<f32>,
     pub scales: Vec<f32>,
     pub codes: Vec<u64>,
+    /// Encoded [`LeafAttrBlock`](crate::leaf_attrs::LeafAttrBlock) slot-aligned inline scalars.
+    pub attr_block: Vec<u8>,
 }
 
 impl PackedLeafNode {
@@ -64,6 +66,7 @@ impl PackedLeafNode {
             res_norm_sqs: Vec::new(),
             scales: Vec::new(),
             codes: Vec::new(),
+            attr_block: Vec::new(),
         }
     }
 
@@ -210,6 +213,7 @@ impl PackedLeafNode {
         self.res_norm_sqs[slot] = res_norm_sq;
         self.scales[slot] = scale;
         self.write_slot_code(slot, code, popcnt, rabitq_words);
+        self.attr_block.clear();
         slot as LocalId
     }
 
@@ -222,6 +226,7 @@ impl PackedLeafNode {
         self.live_mask[s >> 6] |= 1u64 << (s & 63);
         self.live_count += 1;
         self.row_ids[s] = row_id.raw();
+        self.attr_block.clear();
         s as LocalId
     }
 
@@ -249,6 +254,7 @@ impl PackedLeafNode {
         }
         self.live_mask[slot >> 6] &= !(1u64 << (slot & 63));
         self.live_count -= 1;
+        self.attr_block.clear();
         self.row_ids[slot] = 0;
         self.res_norm_sqs[slot] = 0.0;
         self.scales[slot] = 0.0;
@@ -315,6 +321,7 @@ impl PackedLeafNode {
 
         self.live_count = n;
         self.stale_hint = 0;
+        self.attr_block.clear();
         self.ensure_slot_storage(n, words);
         for (i, &rid) in row_ids.iter().enumerate() {
             self.live_mask[i >> 6] |= 1u64 << (i & 63);
@@ -344,11 +351,13 @@ impl PackedLeafNode {
         debug_assert_eq!(self.scales.len(), padded_slots);
         debug_assert_eq!(self.codes.len(), padded_slots * rabitq_words);
 
+        let attr_len = self.attr_block.len();
         let total = LEAF_HEADER_LEN
             + mask_words * 8
             + padded_slots * (8 + rabitq_words * 8 + 8)
             + (dim + padded_dim) * 4
-            + pop_bytes;
+            + pop_bytes
+            + attr_len;
         let mut buf = Vec::with_capacity(total);
         match self.parent_id {
             Some(pid) => {
@@ -368,7 +377,8 @@ impl PackedLeafNode {
         }
         buf.extend_from_slice(&(self.live_count as u32).to_le_bytes());
         buf.extend_from_slice(&self.stale_hint.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.push(LEAF_FORMAT_VERSION);
+        buf.extend_from_slice(&(attr_len as u32).to_le_bytes()[0..3]);
         write_u64_le(&self.live_mask, &mut buf);
         write_u64_le(&self.row_ids, &mut buf);
         write_u64_le(&self.codes, &mut buf);
@@ -383,6 +393,7 @@ impl PackedLeafNode {
                 buf.extend_from_slice(&(p as u16).to_le_bytes());
             }
         }
+        buf.extend_from_slice(&self.attr_block);
         buf
     }
 
@@ -413,6 +424,7 @@ impl PackedLeafNode {
             res_norm_sqs: read_f32_le(view.res_norm_sqs_bytes, padded_slots)?,
             scales: read_f32_le(view.scales_bytes, padded_slots)?,
             codes: read_u64_le(view.codes_bytes, padded_slots * rabitq_words)?,
+            attr_block: view.attr_bytes.to_vec(),
         })
     }
 

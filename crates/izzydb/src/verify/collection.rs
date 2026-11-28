@@ -351,6 +351,11 @@ pub fn verify_collection_invariants(
         }
     }
 
+    // 3b. Leaf-colocated scalar columns and cached leaf/internal filter summaries.
+    if config.vector.is_some() {
+        verify_leaf_attrs(storage, mem_schema)?;
+    }
+
     // 4. Attribute postings, counts (0x06), zones (0x12), and cf_columns.
     let mut expected_zones: HashMap<(SegmentId, AttrId, u8), ZoneEntry> = HashMap::new();
     let num_posting_bitmaps = verify_inline_attributes_and_columns(

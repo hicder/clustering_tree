@@ -112,6 +112,9 @@ pub struct CollectionConfig {
     /// let cfg = CollectionConfig::new(tree).with_block_cache_bytes(512 * 1024 * 1024);
     /// ```
     pub block_cache_bytes: Option<usize>,
+    /// Build per-segment bit-sliced indexes for ordered numeric filterable attributes
+    /// (opt-in; default `false` after the Phase 6 measurement showed no win for uniform `f64`).
+    pub bit_sliced_index: bool,
 }
 
 impl CollectionConfig {
@@ -123,6 +126,7 @@ impl CollectionConfig {
             direct_io: false,
             fts_parallel_segments: None,
             block_cache_bytes: None,
+            bit_sliced_index: false,
         }
     }
 
@@ -134,6 +138,7 @@ impl CollectionConfig {
             direct_io: false,
             fts_parallel_segments: None,
             block_cache_bytes: None,
+            bit_sliced_index: false,
         }
     }
 
@@ -145,6 +150,12 @@ impl CollectionConfig {
 
     pub fn with_direct_io(mut self, direct_io: bool) -> Self {
         self.direct_io = direct_io;
+        self
+    }
+
+    /// Enable or disable per-segment bit-sliced indexes for ordered numeric range filters.
+    pub fn with_bit_sliced_index(mut self, enabled: bool) -> Self {
+        self.bit_sliced_index = enabled;
         self
     }
 

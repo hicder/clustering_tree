@@ -92,4 +92,16 @@ impl <'a> TxContext<'a> {
         self.leaf_nodes.insert(leaf_id, None);
         self.dirty_leaf.insert(leaf_id);
     }
+
+    /// Stage one BSI plane (`seg || attr || chunk || plane`) inside this transaction.
+    pub fn put_bsi_plane_bytes(
+        &mut self,
+        seg: izzydb_core::config::SegmentId,
+        attr_id: izzydb_core::config::AttrId,
+        chunk: u32,
+        plane: u8,
+        bytes: Vec<u8>,
+    ) {
+        self.dirty_bsi.insert((attr_id, seg, chunk, plane), Some(bytes));
+    }
 }

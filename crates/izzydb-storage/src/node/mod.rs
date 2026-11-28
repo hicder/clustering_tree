@@ -16,3 +16,9 @@ pub use meta::*;
 const META_LEN: usize = 51;
 const INTERNAL_HEADER_LEN: usize = 24;
 const LEAF_HEADER_LEN: usize = 24;
+
+/// On-disk version of [`PackedLeafNode`](crate::node::PackedLeafNode).
+pub const LEAF_FORMAT_VERSION: u8 = 3;
+
+/// On-disk version of [`PackedInternalNode`](crate::node::PackedInternalNode).
+pub const INTERNAL_FORMAT_VERSION: u8 = 2;

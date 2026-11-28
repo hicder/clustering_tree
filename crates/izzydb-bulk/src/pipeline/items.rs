@@ -143,15 +143,30 @@ pub struct FtsTermAppendDelta {
     pub min_dl_over_tf: f32,
 }
 
+/// Accumulated SST outputs and metadata for one segment-emission worker shard.
+///
+/// ```text
+/// WorkerSegAccum { rows_ssts: [...], cols_ssts: [...], bsi_ssts: [...] }
+/// ```
 #[derive(Default)]
 pub(super) struct WorkerSegAccum {
+    /// `cf_rows` SST parts.
     pub(super) rows_ssts: Vec<SstFileInfo>,
+    /// `cf_vectors` SST parts.
     pub(super) vecs_ssts: Vec<SstFileInfo>,
+    /// `cf_row_doc_ids` SST parts.
     pub(super) doc_ids_ssts: Vec<SstFileInfo>,
+    /// `cf_columns` SST parts.
     pub(super) cols_ssts: Vec<SstFileInfo>,
+    /// `cf_bsi` SST parts.
+    pub(super) bsi_ssts: Vec<SstFileInfo>,
+    /// Sealed segment metadata rows.
     pub(super) seg_metas: Vec<(SegmentId, SegmentMeta)>,
+    /// Zone-map entries.
     pub(super) zones: Vec<(SegmentId, AttrId, u8, ZoneEntry)>,
+    /// FTS document-length blocks.
     pub(super) doc_len_blocks: Vec<(AttrId, RowBlock, Vec<u8>)>,
+    /// Per-attribute FTS statistics.
     pub(super) fts_stats: Vec<AttrFtsStats>,
 }
 

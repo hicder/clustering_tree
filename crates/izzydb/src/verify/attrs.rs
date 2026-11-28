@@ -13,6 +13,9 @@ use izzydb_storage::codec::{
     TAG_PRESENT, ZoneEntry, decode_row_entries, extract_index_keys_from_entries, make_posting_key, split_posting_key, RowView,
 };
 use izzydb_storage::column::ColumnBlockView;
+use izzydb_storage::leaf_attrs::{
+    LeafAttrSpec, LeafAttrValue, LeafAttrView, NodeSummary,
+};
 use izzydb_storage::{
     CF_ATTR_POSTINGS, CF_COLUMNS, Storage,
 };
@@ -172,4 +175,129 @@ pub(super) fn verify_inline_attributes_and_columns(
     }
 
     Ok(visible_disk_postings.len())
+}
+
+/// Verify leaf-colocated scalar columns and the in-memory leaf/internal filter summaries.
+///
+/// For every leaf slot, the value stored in the trailing leaf scalar block must equal the value
+/// decoded from `cf_rows`, and every cached summary must equal the rollup of its children.
+pub(super) fn verify_leaf_attrs(storage: &Storage, schema: &CollectionSchema) -> Result<()> {
+    let specs: Vec<LeafAttrSpec> = schema
+        .entries()
+        .iter()
+        .filter(|e| {
+            e.storage == ColumnStorage::Inline
+                && e.filterable
+                && LeafAttrSpec::is_supported(e.attr_type)
+        })
+        .map(|e| LeafAttrSpec {
+            attr_id: e.id,
+            attr_type: e.attr_type,
+        })
+        .collect();
+    if specs.is_empty() {
+        return Ok(());
+    }
+
+    let leaves = storage.all_leaf_nodes()?;
+    let seg_snap = storage.segment_snapshot();
+    for (leaf_id, leaf) in &leaves {
+        if leaf.slot_cap == 0 {
+            continue;
+        }
+        if leaf.attr_block.is_empty() {
+            return Err(TreeError::InvariantViolation(format!(
+                "missing colocated attr block for non-empty leaf {leaf_id}"
+            )));
+        }
+        let block = izzydb_storage::leaf_attrs::LeafAttrBlock::decode(&leaf.attr_block)?;
+        for spec in &specs {
+            let Some(col) = block.column(spec.attr_id) else {
+                // Older leaves may predate a newly declared attribute; treat it as absent.
+                continue;
+            };
+            for slot in 0..leaf.slot_cap {
+                if !leaf.is_live(slot) {
+                    continue;
+                }
+                let row = leaf.row_id(slot);
+                let resolved = seg_snap.resolve_row(row).unwrap_or(row);
+                let expected = match storage.get_row_bytes(resolved)? {
+                    Some(row_bytes) => {
+                        let view = RowView::parse(&row_bytes)?;
+                        view.decode_field(spec.attr_id)?
+                    }
+                    None => None,
+                };
+                let actual = col.value_at(slot);
+                let matches = match (&expected, actual) {
+                    (None, None) => true,
+                    (Some(izzydb_core::schema::AttributeValue::Bool(v)), Some(LeafAttrValue::Bool(a))) => {
+                        *v == a
+                    }
+                    (Some(izzydb_core::schema::AttributeValue::Int(v)), Some(LeafAttrValue::Int(a))) => {
+                        *v == a
+                    }
+                    (Some(izzydb_core::schema::AttributeValue::Uint(v)), Some(LeafAttrValue::Uint(a))) => {
+                        *v == a
+                    }
+                    (Some(izzydb_core::schema::AttributeValue::Float(v)), Some(LeafAttrValue::Float(a))) => {
+                        !v.is_nan() && !a.is_nan() && *v == a
+                    }
+                    _ => false,
+                };
+                if !matches {
+                    return Err(TreeError::InvariantViolation(format!(
+                        "leaf scalar mismatch at leaf {leaf_id} slot {slot} attr {}: row={expected:?} leaf={actual:?}",
+                        spec.attr_id
+                    )));
+                }
+            }
+        }
+
+        let view = LeafAttrView::parse(&leaf.attr_block)?;
+        let expected_summary = NodeSummary::from_leaf(&view, leaf.slot_cap as u32);
+        match storage.get_node_summary(*leaf_id) {
+            Some(actual) if actual.as_ref() == &expected_summary => {}
+            Some(actual) => {
+                return Err(TreeError::InvariantViolation(format!(
+                    "leaf {leaf_id} summary mismatch: cached={actual:?} expected={expected_summary:?}"
+                )));
+            }
+            None => {
+                return Err(TreeError::InvariantViolation(format!(
+                    "missing node summary for leaf {leaf_id} (parent={:?}, slot_cap={}, live={})",
+                    leaf.parent_id, leaf.slot_cap, leaf.live_count
+                )));
+            }
+        }
+    }
+
+    for (node_id, node) in storage.all_internal_nodes()? {
+        let mut expected = NodeSummary {
+            row_count: 0,
+            attrs: Vec::new(),
+            complete: true,
+        };
+        for &child in &node.child_ids {
+            match storage.get_node_summary(child) {
+                Some(child_summary) => expected.merge_child(&child_summary),
+                None => expected.complete = false,
+            }
+        }
+        match storage.get_node_summary(node_id) {
+            Some(actual) if actual.as_ref() == &expected => {}
+            Some(actual) => {
+                return Err(TreeError::InvariantViolation(format!(
+                    "internal node {node_id} summary mismatch: cached={actual:?} expected={expected:?}"
+                )));
+            }
+            None => {
+                return Err(TreeError::InvariantViolation(format!(
+                    "missing node summary for internal node {node_id}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }

@@ -36,7 +36,7 @@ fn test_sst_ingest_and_bulk_import_marker() {
 
     {
         let block_cache = default_sst_block_cache();
-        let raw = Storage::open_raw(dir.path(), 4, &block_cache, false).unwrap();
+        let raw = Storage::open_raw(dir.path(), 4, &block_cache, &cfg).unwrap();
         raw.clear_bulk_import_marker().unwrap();
     }
     let (reopened, _manifest, _ann) = Storage::open(dir.path(), &cfg).unwrap();

@@ -130,14 +130,14 @@ impl PackedInternalNode {
                 buf.extend_from_slice(&0u16.to_le_bytes());
                 buf.extend_from_slice(&(n as u32).to_le_bytes());
                 buf.extend_from_slice(&pid.to_le_bytes());
-                buf.extend_from_slice(&0u32.to_le_bytes());
+                buf.extend_from_slice(&[INTERNAL_FORMAT_VERSION, 0, 0, 0]);
             }
             None => {
                 buf.push(0);
                 buf.extend_from_slice(&0u16.to_le_bytes());
                 buf.extend_from_slice(&(n as u32).to_le_bytes());
                 buf.extend_from_slice(&0u32.to_le_bytes());
-                buf.extend_from_slice(&0u32.to_le_bytes());
+                buf.extend_from_slice(&[INTERNAL_FORMAT_VERSION, 0, 0, 0]);
             }
         }
         buf.extend_from_slice(&self.subtree_count.to_le_bytes());
@@ -159,6 +159,17 @@ impl PackedInternalNode {
         let parent_id = decode_parent_flag(bytes[1], &bytes[8..12])?;
         let n = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
         let subtree_count = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        if bytes[12] != INTERNAL_FORMAT_VERSION {
+            return Err(TreeError::CorruptedData(format!(
+                "unsupported PackedInternalNode format version {} (expected {INTERNAL_FORMAT_VERSION}); recreate the collection",
+                bytes[12]
+            )));
+        }
+        if bytes[13] != 0 || bytes[14] != 0 || bytes[15] != 0 {
+            return Err(TreeError::CorruptedData(
+                "invalid PackedInternalNode reserved bytes".into(),
+            ));
+        }
 
         let expected = INTERNAL_HEADER_LEN + n * 12 + (1 + n) * dim * 4;
         if bytes.len() != expected {

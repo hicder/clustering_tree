@@ -213,6 +213,7 @@ pub(super) fn build_ssts_timed(
         &docs_shards,
         config.target_sst_bytes,
         config.memory_budget_bytes,
+        config.collection.bit_sliced_index,
         &pool,
     )?;
     timings.push(("emit_ssts", t3.elapsed()));

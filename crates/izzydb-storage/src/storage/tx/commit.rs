@@ -2,25 +2,32 @@
 
 use std::sync::Arc;
 
-use izzydb_core::config::{AttrId, ColumnGen, LocalId, SegmentId};
+use izzydb_core::config::{AttrId, ColumnGen, LocalId, NodeId, SegmentId};
 use izzydb_core::error::{Result, TreeError};
 
 use crate::codec::{
     ATTR_COUNT_TAG, DETACHED_COUNT_TAG, DETACHED_OVERWRITTEN_TAG, DetachedMeta, FTS_DOC_LEN_TAG,
-    Manifest, SegPosting, SegmentState, ZONE_TAG, ZoneEntry, detached_count_suffix,
+    Manifest, RowView, SegPosting, SegmentState, ZONE_TAG, ZoneEntry, detached_count_suffix,
     detached_gen_bounds, detached_key, encode_roaring_bitmap,
 };
+use crate::leaf_attrs::{LeafAttrBlockBuilder, LeafAttrView, NodeSummary};
 use crate::node::AnnMeta;
 
 use crate::storage::batch::StorageBatch;
 use crate::storage::segments::SegmentEntry;
 use crate::storage::types::map_db_err;
 use crate::storage::{
-    CF_ATTR_POSTINGS, CF_COLUMNS, CF_DETACHED, CF_DETACHED_POSTINGS, CF_ROW_DOC_IDS, CF_ROWS,
-    CF_VECTORS,
+    CF_ATTR_POSTINGS, CF_BSI, CF_COLUMNS, CF_DETACHED, CF_DETACHED_POSTINGS, CF_ROW_DOC_IDS,
+    CF_ROWS, CF_VECTORS,
 };
 
 use super::*;
+
+/// Leaf attribute blocks and node summary cache updates produced for one commit.
+type LeafAttrStage = (
+    Vec<(NodeId, Option<NodeSummary>)>,
+    std::collections::HashMap<NodeId, Vec<u8>>,
+);
 
 impl<'a> TxContext<'a> {
     // -----------------------------------------------------------------------
@@ -121,18 +128,191 @@ impl<'a> TxContext<'a> {
 
     pub fn commit(mut self) -> Result<(Manifest, Option<AnnMeta>)> {
         let mut batch = self.storage.new_batch();
+        let (summary_updates, leaf_attrs) = self.stage_leaf_attributes(&mut batch)?;
         self.stage_manifest_and_segments(&mut batch)?;
-        self.stage_rows_and_tree(&mut batch);
+        self.stage_rows_and_tree(&mut batch, &leaf_attrs);
         self.stage_postings_and_zones(&mut batch)?;
         self.stage_attr_counts(&mut batch)?;
         self.stage_fts_writes(&mut batch);
         self.stage_columns(&mut batch);
+        self.stage_bsi(&mut batch);
         self.stage_detached(&mut batch)?;
 
         self.storage.write_batch(batch)?;
 
         self.flush_caches_after_commit();
+        if !summary_updates.is_empty() {
+            let mut cache = self
+                .storage
+                .node_summaries
+                .write()
+                .expect("node_summaries poisoned");
+            for (node_id, summary) in summary_updates {
+                match summary {
+                    Some(summary) => {
+                        cache.insert(node_id, summary);
+                    }
+                    None => {
+                        cache.remove(node_id);
+                    }
+                }
+            }
+        }
         Ok((self.manifest, self.ann_meta))
+    }
+
+    /// Recompute leaf attribute blocks and leaf/internal filter summaries for every dirty leaf
+    /// and its ancestors. Returns the summary cache updates to apply after the batch is written.
+    fn stage_leaf_attributes(
+        &self,
+        batch: &mut StorageBatch<'_>,
+    ) -> Result<LeafAttrStage> {
+        let specs = self.storage.leaf_attr_specs();
+        if specs.is_empty() {
+            return Ok((Vec::new(), std::collections::HashMap::new()));
+        }
+        if self.dirty_leaf.is_empty() && self.dirty_internal.is_empty() {
+            return Ok((Vec::new(), std::collections::HashMap::new()));
+        }
+
+        let mut updates: std::collections::HashMap<NodeId, Option<NodeSummary>> =
+            std::collections::HashMap::new();
+        let mut affected_internals: std::collections::HashSet<NodeId> =
+            std::collections::HashSet::new();
+        let mut leaf_attrs: std::collections::HashMap<NodeId, Vec<u8>> =
+            std::collections::HashMap::new();
+
+        let mut dirty_leaf_ids: Vec<NodeId> = self.dirty_leaf.iter().copied().collect();
+        dirty_leaf_ids.sort_unstable();
+
+        for leaf_id in dirty_leaf_ids {
+            let parent = match self.leaf_nodes.get(&leaf_id).and_then(|o| o.as_ref()) {
+                Some(leaf) => {
+                    let mut builder = LeafAttrBlockBuilder::new(&specs, leaf.slot_cap);
+                    for slot in 0..leaf.slot_cap {
+                        if !leaf.is_live(slot) {
+                            continue;
+                        }
+                        let row = leaf.row_id(slot);
+                        let resolved = self.resolve_row(row).unwrap_or(row);
+                        let Some(bytes) = self.get_row_bytes(resolved)? else {
+                            continue;
+                        };
+                        let view = RowView::parse(&bytes)?;
+                        builder.set_from_row_view(slot, &view)?;
+                    }
+                    let block = builder.finish();
+                    let bytes = block.encode();
+                    let view = LeafAttrView::parse(&bytes)?;
+                    let summary = NodeSummary::from_leaf(&view, leaf.slot_cap as u32);
+                    batch.put_node_summary(leaf_id, &summary);
+                    leaf_attrs.insert(leaf_id, bytes);
+                    updates.insert(leaf_id, Some(summary));
+                    leaf.parent_id
+                }
+                None => {
+                    batch.delete_node_summary(leaf_id);
+                    updates.insert(leaf_id, None);
+                    self.leaf_parent.get(&leaf_id).copied()
+                }
+            };
+            let mut p = parent;
+            while let Some(pid) = p {
+                affected_internals.insert(pid);
+                p = self.internal_node_parent(pid);
+            }
+        }
+
+        for &node_id in &self.dirty_internal {
+            affected_internals.insert(node_id);
+            let mut p = self.internal_node_parent(node_id);
+            while let Some(pid) = p {
+                affected_internals.insert(pid);
+                p = self.internal_node_parent(pid);
+            }
+        }
+
+        if affected_internals.is_empty() {
+            return Ok((updates.into_iter().collect(), leaf_attrs));
+        }
+
+        let mut internals: Vec<(u8, NodeId)> = affected_internals
+            .into_iter()
+            .map(|id| {
+                let level = self
+                    .internal_node_parent_and_level(id)
+                    .map_or(0, |(_, level)| level);
+                (level, id)
+            })
+            .collect();
+        internals.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        for (_, node_id) in internals {
+            let node_opt = match self.internal_nodes.get(&node_id) {
+                Some(opt) => opt.as_ref(),
+                None => self.internal_cache.get(&node_id),
+            };
+            let Some(node) = node_opt else {
+                // A rebuilt tree may reuse an old internal node id for a new leaf. Node
+                // summaries share one keyspace, so keep the leaf summary in that case.
+                if self
+                    .leaf_nodes
+                    .get(&node_id)
+                    .is_some_and(|opt| opt.is_some())
+                {
+                    continue;
+                }
+                batch.delete_node_summary(node_id);
+                updates.insert(node_id, None);
+                continue;
+            };
+            let mut summary = NodeSummary {
+                row_count: 0,
+                attrs: Vec::new(),
+                complete: true,
+            };
+            for &child_id in &node.child_ids {
+                if let Some(Some(child)) = updates.get(&child_id) {
+                    summary.merge_child(child);
+                    continue;
+                }
+                if updates.get(&child_id).is_some_and(Option::is_none) {
+                    summary.complete = false;
+                    continue;
+                }
+                if let Some(child) = self.storage.get_node_summary(child_id) {
+                    summary.merge_child(child.as_ref());
+                } else {
+                    summary.complete = false;
+                }
+            }
+            batch.put_node_summary(node_id, &summary);
+            updates.insert(node_id, Some(summary));
+        }
+
+        Ok((updates.into_iter().collect(), leaf_attrs))
+    }
+
+    fn internal_node_parent(&self, node_id: NodeId) -> Option<NodeId> {
+        self.internal_node_parent_and_level(node_id)
+            .and_then(|(parent, _)| parent)
+    }
+
+    fn internal_node_parent_and_level(&self, node_id: NodeId) -> Option<(Option<NodeId>, u8)> {
+        if let Some(opt) = self.internal_nodes.get(&node_id) {
+            return opt.as_ref().map(|n| (n.parent_id, n.level));
+        }
+        self.internal_cache
+            .get(&node_id)
+            .map(|n| (n.parent_id, n.level))
+    }
+
+    fn stage_bsi(&self, batch: &mut StorageBatch<'_>) {
+        for (&(attr_id, seg, chunk, plane), opt) in &self.dirty_bsi {
+            if let Some(bytes) = opt {
+                batch.put_bsi_plane(seg, attr_id, chunk, plane, bytes);
+            }
+        }
     }
 
     fn stage_manifest_and_segments(&self, batch: &mut StorageBatch<'_>) -> Result<()> {
@@ -158,7 +338,11 @@ impl<'a> TxContext<'a> {
         Ok(())
     }
 
-    fn stage_rows_and_tree(&self, batch: &mut StorageBatch<'_>) {
+    fn stage_rows_and_tree(
+        &self,
+        batch: &mut StorageBatch<'_>,
+        leaf_attrs: &std::collections::HashMap<NodeId, Vec<u8>>,
+    ) {
         if self.ann_meta_dirty
             && let Some(ref meta) = self.ann_meta
         {
@@ -172,7 +356,13 @@ impl<'a> TxContext<'a> {
         }
         for &leaf_id in &self.dirty_leaf {
             match self.leaf_nodes.get(&leaf_id).and_then(|o| o.as_ref()) {
-                Some(leaf) => batch.put_leaf_node(leaf_id, leaf),
+                Some(leaf) => {
+                    let mut leaf = leaf.clone();
+                    if let Some(bytes) = leaf_attrs.get(&leaf_id) {
+                        leaf.attr_block = bytes.clone();
+                    }
+                    batch.put_leaf_node(leaf_id, &leaf);
+                }
                 None => batch.delete_leaf_node(leaf_id),
             }
         }
@@ -418,7 +608,7 @@ impl<'a> TxContext<'a> {
             if let Some(next_seg) = seg.checked_add(1) {
                 let lo = seg.to_be_bytes();
                 let hi = next_seg.to_be_bytes();
-                for cf_name in [CF_ROWS, CF_ROW_DOC_IDS, CF_VECTORS, CF_COLUMNS] {
+                for cf_name in [CF_ROWS, CF_ROW_DOC_IDS, CF_VECTORS, CF_COLUMNS, CF_BSI] {
                     batch.delete_range_cf(cf_name, &lo, &hi);
                 }
                 let mut zlo = [0u8; 5];

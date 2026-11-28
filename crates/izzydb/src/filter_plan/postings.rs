@@ -12,6 +12,10 @@ use izzydb_storage::codec::{
     SegBitsetAccum, SegPostingView, ZoneEntry, encode_f64_ordered, encode_i64_ordered,
     encode_str_ordered, ordered_type_tag,
 };
+use izzydb_storage::bsi::{
+    BSI_BASE_PLANE, BSI_CHUNK_ROWS, BSI_PRESENT_PLANE, BSI_WORDS, BsiChunk, decode_base,
+    decode_plane,
+};
 use izzydb_storage::{SegmentTableSnapshot, Storage};
 
 use crate::detached::{
@@ -226,8 +230,31 @@ pub(super) fn load_postings_range(
         return Ok(RowSet::empty());
     }
 
-    let start_val = lo.map_or(&[][..], |(b, _)| b.as_slice());
     let mut by_seg: BTreeMap<SegmentId, RoaringBitmap> = BTreeMap::new();
+
+    // Bit-sliced index fast path: only worthwhile when the range spans enough distinct
+    // values that unioning value-major postings would dominate the plane reads.
+    let mut resolved_segs = RoaringBitmap::new();
+    if entry.storage == ColumnStorage::Inline
+        && matches!(
+            entry.attr_type,
+            izzydb_core::schema::AttributeType::Int
+                | izzydb_core::schema::AttributeType::Uint
+                | izzydb_core::schema::AttributeType::Float
+        )
+        && bsi_worth_using(ctx, attr_id, tag, lo, hi)?
+    {
+        for seg in eligible_segs.iter() {
+            if let Some(bm) = load_bsi_segment(ctx.storage, ctx.snap, seg, attr_id, lo, hi)? {
+                resolved_segs.insert(seg);
+                if !bm.is_empty() {
+                    by_seg.insert(seg, bm);
+                }
+            }
+        }
+    }
+
+    let start_val = lo.map_or(&[][..], |(b, _)| b.as_slice());
     let mut visited_segs = RoaringBitmap::new();
 
     if entry.storage == ColumnStorage::Detached {
@@ -297,7 +324,7 @@ pub(super) fn load_postings_range(
                 {
                     return Ok(false);
                 }
-                if !eligible_segs.contains(seg) {
+                if !eligible_segs.contains(seg) || resolved_segs.contains(seg) {
                     return Ok(true);
                 }
                 visited_segs.insert(seg);
@@ -307,10 +334,132 @@ pub(super) fn load_postings_range(
                 Ok(true)
             },
         )?;
-        ctx.trace.range_segments_visited += visited_segs.len() as usize;
-        return Ok(finalize_accum_map(ctx.snap, accum));
+        for (seg, acc) in accum {
+            let rb = acc.into_roaring();
+            let entry = by_seg.entry(seg).or_default();
+            *entry |= rb;
+        }
     }
 
     ctx.trace.range_segments_visited += visited_segs.len() as usize;
-    Ok(finalize_seg_map(ctx.snap, by_seg))
+    let pairs: Vec<(SegmentId, RoaringBitmap)> = by_seg.into_iter().collect();
+    Ok(RowSet::from_sorted_segs(pairs).into_live(ctx.snap))
+}
+
+/// Minimum number of distinct values a range must span before BSI plane reads beat a
+/// value-major posting union.
+const BSI_MIN_DISTINCT_VALUES: usize = 1_024;
+
+/// Probe the value counts cheaply and decide whether the bit-sliced index is worthwhile.
+fn bsi_worth_using(
+    ctx: &PlanCtx<'_>,
+    attr_id: AttrId,
+    tag: u8,
+    lo: Option<&(Vec<u8>, bool)>,
+    hi: Option<&(Vec<u8>, bool)>,
+) -> Result<bool> {
+    let start_val = lo.map_or(&[][..], |(b, _)| b.as_slice());
+    let mut distinct = 0usize;
+    let mut reached_threshold = false;
+    ctx.storage
+        .visit_attr_counts(attr_id, tag, start_val, |val_bytes, _cnt| -> Result<bool> {
+            if let Some((lo_b, lo_incl)) = lo
+                && (val_bytes < lo_b.as_slice() || (!*lo_incl && val_bytes == lo_b.as_slice()))
+            {
+                return Ok(true);
+            }
+            if let Some((hi_b, hi_incl)) = hi
+                && (val_bytes > hi_b.as_slice() || (!*hi_incl && val_bytes == hi_b.as_slice()))
+            {
+                return Ok(false);
+            }
+            distinct += 1;
+            if distinct >= BSI_MIN_DISTINCT_VALUES {
+                reached_threshold = true;
+                return Ok(false);
+            }
+            Ok(true)
+        })?;
+    Ok(reached_threshold)
+}
+
+/// Load and evaluate the bit-sliced index for one segment.
+///
+/// Returns `None` when the segment has no complete BSI for `attr_id`, in which case the caller
+/// falls back to value-major postings.
+fn load_bsi_segment(
+    storage: &Storage,
+    snap: &SegmentTableSnapshot,
+    seg: SegmentId,
+    attr_id: AttrId,
+    lo: Option<&(Vec<u8>, bool)>,
+    hi: Option<&(Vec<u8>, bool)>,
+) -> Result<Option<RoaringBitmap>> {
+    let ordered_bound = |bound: &Option<&(Vec<u8>, bool)>| -> Option<Option<(u64, bool)>> {
+        match bound {
+            None => Some(None),
+            Some((bytes, incl)) if bytes.len() == 8 => {
+                Some(Some((u64::from_be_bytes(bytes.as_slice().try_into().unwrap()), *incl)))
+            }
+            Some(_) => None,
+        }
+    };
+    let Some(lo_bound) = ordered_bound(&lo) else {
+        return Ok(None);
+    };
+    let Some(hi_bound) = ordered_bound(&hi) else {
+        return Ok(None);
+    };
+    let row_count = snap.segment_row_count(seg).unwrap_or(0);
+    if row_count == 0 {
+        return Ok(Some(RoaringBitmap::new()));
+    }
+    let chunks = row_count.div_ceil(BSI_CHUNK_ROWS);
+    let mut out = RoaringBitmap::new();
+    for chunk in 0..chunks {
+        let Some(base_bytes) = storage.get_bsi_plane(seg, attr_id, chunk, BSI_BASE_PLANE)? else {
+            return Ok(None);
+        };
+        let Some(present_bytes) = storage.get_bsi_plane(seg, attr_id, chunk, BSI_PRESENT_PLANE)?
+        else {
+            return Ok(None);
+        };
+        let Some((base, width)) = decode_base(&base_bytes) else {
+            return Err(TreeError::CorruptedData(format!(
+                "invalid cf_bsi base record for seg {seg} attr {attr_id} chunk {chunk}"
+            )));
+        };
+        let Some(present) = decode_plane(&present_bytes) else {
+            return Err(TreeError::CorruptedData(format!(
+                "invalid cf_bsi presence plane for seg {seg} attr {attr_id} chunk {chunk}"
+            )));
+        };
+        let keys: Vec<(SegmentId, AttrId, u32, u8)> =
+            (0..width).map(|plane| (seg, attr_id, chunk, plane)).collect();
+        let slices = storage.multi_get_bsi_planes_pinned(&keys)?;
+        let planes: Vec<(u8, Option<Box<[u64; BSI_WORDS]>>)> = keys
+            .iter()
+            .zip(slices.iter())
+            .map(|(&(_, _, _, plane), slice)| {
+                let decoded = slice.as_ref().and_then(|bytes| decode_plane(bytes));
+                (plane, decoded)
+            })
+            .collect();
+        let chunk_bsi = BsiChunk::new(base, width, present, planes);
+        let mut mask = match lo_bound {
+            Some((lo, true)) => chunk_bsi.greater_equal(lo),
+            Some((lo, false)) => chunk_bsi.greater_than(lo),
+            None => *chunk_bsi.present,
+        };
+        if let Some((hi, incl)) = hi_bound {
+            let hi_mask = if incl {
+                chunk_bsi.less_equal(hi)
+            } else {
+                chunk_bsi.less_than(hi)
+            };
+            BsiChunk::intersect(&mut mask, &hi_mask);
+        }
+        BsiChunk::to_bitmap(&mask, chunk, &mut out);
+    }
+    Ok(Some(out))
 }

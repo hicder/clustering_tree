@@ -35,7 +35,7 @@ Implementation sources:
 
 ---
 
-## 2. RocksDB Column Families (14 CFs)
+## 2. RocksDB Column Families (16 CFs)
 
 | Column Family | Key Format | Value Format | Compression | Notes |
 |---|---|---|---|---|
@@ -44,23 +44,25 @@ Implementation sources:
 | `cf_rows` | `row_id` (`u64` BE, 8 B) | `RowView` v3 (inline attrs, §4.1) | Default (Snappy) | No Bloom (keys known to exist); two-level index; dead rows remain until compaction |
 | `cf_row_doc_ids` | `seg` BE \|\| `block` BE (8 B) | `[u64; 256]` LE `DocId`s (2,048 B) | `None` | No Bloom; two-level index; reverse map; liveness decides whether slot holds live `DocId` |
 | `cf_vectors` | `row_id` (`u64` BE, 8 B) | `[f32; dim]` LE | `None` | No Bloom; two-level index; 16 KiB data blocks + intra-block hash; absent when `has_vectors == false` or row has no vector |
-| `cf_leaf_entries` | `leaf_id` (`u32` BE, 4 B) | `PackedLeafNode` v3 (§4.3) | `None` | No Bloom; two-level index; 16 KiB data blocks; stores `row_ids` + `stale_hint` |
+| `cf_leaf_entries` | `leaf_id` (`u32` BE, 4 B) | `PackedLeafNode` v2 (§4.3) | `None` | No Bloom; two-level index; 16 KiB data blocks; stores `row_ids` + `stale_hint` |
+| `cf_node_summaries` | `node_id` (`u32` BE, 4 B) | `NodeSummary` v1 (§4.9) | `None` | Leaf and internal min/max/presence/equality-bitset rollups; loaded into RAM at open |
+| `cf_bsi` | `seg` BE \|\| `attr_id` BE \|\| `chunk` BE \|\| `plane` (11 B) | `[u64; 1024]` LE (8,192 B) or base record | `None` | Per-segment bit-sliced ordered numeric ranges; plane `0xFE` = base+width, `0xFF` = presence |
 | `cf_attr_postings` | `attr_id` BE \|\| `tag` \|\| `encoded_val` \|\| `seg` BE | `SegPosting` (§4.2) | `None` | **Value-major**, Bloom 10 bpk, prefix extractor 3 B (`attr_id \|\| tag`) |
 | `cf_columns` | `seg` BE \|\| `attr_id` BE \|\| `block` BE (10 B) | `ColumnBlock` (§4.4) | `None` | Bloom 10 bpk; two-level partitioned index/filter; 16 KiB blocks + intra-block hash; sealed segments only (inline attrs) |
 | `cf_detached` | `attr_id` BE \|\| `gen` BE \|\| `seg` BE \|\| `block` BE (14 B) | `ColumnBlock` (§4.4) | `None` | Bloom 10 bpk; two-level partitioned index/filter; active + pending generations |
 | `cf_detached_postings` | `attr_id` BE \|\| `gen` BE \|\| `tag` \|\| `encoded_val` \|\| `seg` BE | `SegPosting` (§4.2) | `None` | Filterable detached columns, Bloom 10 bpk, prefix 7 B (`attr \|\| gen \|\| tag`) |
 | `cf_fts_terms` | `attr_id` BE \|\| `token_utf8` | `TermRecord` v4 (§4.5) | Default (Snappy) | Prefix 2 B (`attr_id`), Bloom 10 bpk |
 | `cf_fts_skips` | `term_id` BE \|\| `seg` BE \|\| `chunk` BE (12 B) | `FtsChunk` v4 (§4.5) | `None` | Prefix 4 B (`term_id`); unified skip bounds + compact postings; no Bloom filter |
-| `cf_fts_postings` | `term_id` BE \|\| `seg` BE \|\| `block` BE (12 B) | *(deprecated — empty)* | `None` | Retained empty in v4; postings live inside `FtsChunk` (`cf_fts_skips`) |
+| `cf_fts_postings` | `term_id` BE \|\| `seg` BE \|\| `chunk` BE (12 B) | *(deprecated — empty)* | `None` | Retained empty in v4; postings live inside `FtsChunk` (`cf_fts_skips`) |
 | `cf_fts_positions` | `term_id` BE \|\| `seg` BE \|\| `block` BE (12 B) | `PackedPositionBlock` | Default (Snappy) | Prefix 4 B (`term_id`), Bloom 10 bpk |
 
 ### RocksDB Table & Block Cache Tuning
 
-Per-CF options live in [`crates/izzydb-storage/src/storage/cf_options.rs`](../../crates/izzydb-storage/src/storage/cf_options.rs). Search hot paths (`cf_vectors`, `cf_leaf_entries`, `cf_rows`, `cf_row_doc_ids`) read keys already known to exist, so they omit Bloom filters and use two-level partitioned indexes that keep metadata reloads small. Large point-lookup CFs with retained Bloom filters (`cf_id_map`, `cf_columns`, `cf_detached`) also partition filters into 4 KiB blocks. `cf_columns` and `cf_detached` store uncompressed blocks because their ~2 KiB fixed-width `ColumnBlock`s inline strings/arrays and Snappy decompression dominated filtered scans. The shared `LRUCache` defaults to 128 MiB and is configurable per collection with `CollectionConfig::with_block_cache_bytes(...)`.
+Per-CF options live in [`crates/izzydb-storage/src/storage/cf_options.rs`](../../crates/izzydb-storage/src/storage/cf_options.rs). Search hot paths (`cf_vectors`, `cf_leaf_entries`, `cf_node_summaries`, `cf_bsi`, `cf_rows`, `cf_row_doc_ids`) read keys already known to exist, so they omit Bloom filters and use two-level partitioned indexes that keep metadata reloads small. `cf_bsi` is uncompressed with 16 KiB blocks + intra-block hash because every plane value is an 8 KiB bitset. Large point-lookup CFs with retained Bloom filters (`cf_id_map`, `cf_columns`, `cf_detached`) also partition filters into 4 KiB blocks. `cf_columns` and `cf_detached` store uncompressed blocks because their ~2 KiB fixed-width `ColumnBlock`s inline strings/arrays and Snappy decompression dominated filtered scans. The shared `LRUCache` defaults to 128 MiB and is configurable per collection with `CollectionConfig::with_block_cache_bytes(...)`.
 
 ### Compaction Filters
 
-`cf_rows`, `cf_row_doc_ids`, `cf_vectors`, `cf_columns`, `cf_detached`, `cf_attr_postings`, `cf_detached_postings`, `cf_fts_skips`, `cf_fts_positions`, `default[0x05]` (and deprecated `cf_fts_postings`) install a RocksDB `CompactionFilter` that drops any key whose embedded `SegmentId` belongs to `Storage::dropped_segments` (`Arc<ArcSwap<RoaringBitmap>>`). For `cf_detached`, `cf_detached_postings`, `default[0x07]`, and `default[0x14]`, the filter additionally drops keys whose `ColumnGen < retired_below[attr_id]`. Because segment IDs and generation IDs are never reused, filtering is lock-free and race-free.
+`cf_rows`, `cf_row_doc_ids`, `cf_vectors`, `cf_columns`, `cf_bsi`, `cf_detached`, `cf_attr_postings`, `cf_detached_postings`, `cf_fts_skips`, `cf_fts_positions`, `default[0x05]` (and deprecated `cf_fts_postings`) install a RocksDB `CompactionFilter` that drops any key whose embedded `SegmentId` belongs to `Storage::dropped_segments` (`Arc<ArcSwap<RoaringBitmap>>`). For `cf_detached`, `cf_detached_postings`, `default[0x07]`, and `default[0x14]`, the filter additionally drops keys whose `ColumnGen < retired_below[attr_id]`. `cf_node_summaries` is node-keyed and is deleted explicitly when a leaf or internal node is removed. Because segment IDs and generation IDs are never reused, filtering is lock-free and race-free.
 
 ---
 
@@ -111,12 +113,13 @@ Postings in sealed segments may include dead `LocalId`s from later tombstones; r
 
 Order-preserving `type_tag` / `encoded_val` rules (`0x00 TAG_PRESENT`, `0x01 Bool`, `0x02 Int` sign-flipped BE, `0x03 Uint` BE, `0x04 Float` IEEE-ordered BE with `-0.0 -> +0.0`, `0x05 String` `0x00`-escaped UTF-8 terminated by `0x00 0x00`) are documented in [filtering-and-inverted-index.md](filtering-and-inverted-index.md#42-order-preserving-inverted-key-encoding).
 
-### 4.3 `PackedLeafNode` v3 (`cf_leaf_entries`)
+### 4.3 `PackedLeafNode` v2 (`cf_leaf_entries`)
 
 Slot-indexed RaBitQ leaf layout (`LEAF_HEADER_LEN = 24` B):
 - Replaces v2 `doc_ids: [u64; padded_slots]` with `row_ids: [u64; padded_slots]` LE holding `RowId`s.
-- Header bytes `16..24` store `stale_hint: u32 LE` + `reserved: u32` (hint of stale entries at last write).
+- Header bytes `16..20` store `stale_hint: u32 LE`; byte `20` stores `LEAF_FORMAT_VERSION = 3` and bytes `21..24` store the trailing `LeafAttrBlock` length (`u24 LE`).
 - A slot is **effective** iff `live_mask[slot]` is set and `liveness.is_live(resolve(row_ids[slot]))` after resolving forwarding segments.
+- `PackedInternalNode` headers carry `INTERNAL_FORMAT_VERSION = 2` at byte `12`; older collections fail clearly on open instead of being misread.
 
 ### 4.4 `ColumnBlock` (`cf_columns`, `cf_detached`)
 
@@ -145,6 +148,32 @@ One attribute for one 256-slot `RowBlock` (`block = local >> 8`):
 
 `[version: u8][state: u8][reserved: u16][current_gen: u32 LE][pending_gen: u32 LE][retired_below: u32 LE][built_against_watermark: u64 LE (RowId)]`.
 
+### 4.9 Trailing `LeafAttrBlock` v2 (`cf_leaf_entries`) & `NodeSummary` v1 (`cf_node_summaries`)
+
+Each `PackedLeafNode` appends a slot-aligned scalar block for every eligible inline filterable attribute (`Bool`, `Int`, `Uint`, `Float`; strings, arrays, and detached columns stay in their existing stores). Fetching the leaf for RaBitQ also fetches all filter values, so filtered traversal needs no second column-family read:
+
+- **Header (7 B):** `[version: u8 = 2][slot_cap: u32 LE][attr_count: u16 LE]`.
+- **Per column (8 B header):** `[attr_id: u16 LE][attr_type: u8][encoding: u8][payload_len: u32 LE]`, then `present: ceil(slot_cap / 64) * 8 B` followed by:
+  - `Bool`: `ceil(slot_cap / 64) * 8 B` value mask.
+  - `Int` / `Uint`: frame-of-reference `[base: u64 LE][width: u8][slot_cap * width B]` deltas (`width` in `0/1/2/4/8`).
+  - `Float`: `[f64; slot_cap]` or `[f32; slot_cap]` when every present value round-trips losslessly (`encoding = 1`).
+
+`cf_node_summaries[node_id]` stores a conservative rollup for every leaf and internal node:
+
+- **Header (8 B):** `[version: u8 = 1][complete: u8][row_count: u32 LE][attr_count: u16 LE]`.
+- **Per attribute (32 B):** `[attr_id: u16 LE][attr_type: u8][present_count: u32 LE][has_values: u8][min: u64 LE][max: u64 LE][bits: u64 LE]`.
+- `min`/`max`/`bits` use the unsigned order-preserving encoding (Int sign-flip, Uint verbatim, Float IEEE total order with `-0.0 -> +0.0`). `bits` is a 64-bit hash bloom over values and may only produce false positives. Internal summaries are the union of child summaries; `complete = false` disables pruning for that subtree.
+
+### 4.10 Bit-Sliced Index (`cf_bsi`)
+
+Key: `seg (u32 BE) || attr_id (u16 BE) || chunk (u32 BE) || plane (u8)`, where `chunk = local / 65,536` and values are `[u64; 1024]` LE (8,192 B):
+
+- `plane 0xFE`: frame-of-reference record `[base: u64 LE][width: u8]`.
+- `plane 0xFF`: presence bitmap.
+- `plane 0..width-1`: bit-slices of `value - base` using the same unsigned order-preserving encoding.
+
+Range evaluation starts from the presence bitmap and applies wordwise `&`/`|`/`!` over only the stored planes, then intersects with segment liveness (`RowSet::into_live`). Segments without a complete BSI fall back to value-major postings.
+
 ---
 
 ## 5. Consistency Invariants (`Collection::verify_invariants`)
@@ -154,5 +183,6 @@ Verified exhaustively by `crates/izzydb/src/verify/mod.rs`:
 2. **Row / DocId Bijection:** For every non-dropped segment, `cf_rows` keys equal `0..row_count`; `cf_id_map` is an exact bijection onto live `(RowId, DocId)` entries mirrored in `cf_row_doc_ids`.
 3. **ANN Tree (when `has_vectors`):** Every live row with `has_vector` has **exactly one** effective leaf entry across `cf_leaf_entries` (after resolving `Forwarding` segments); every non-effective entry points to a tombstoned/forwarded-dead/dropped row; `AnnMeta.num_vectors == live_vector_rows` and `AnnMeta.stale_rows == physical_entries - effective_entries`. (Vectorless collections have zero ANN keys.)
 4. **Inline Attribute Indexes, Counts & Zones:** `cf_attr_postings` $\cap$ live equals exact keys re-extracted from live `cf_rows`; `0x06` counts equal live-doc counts; `0x12` zones enclose all live values; sealed `cf_columns` match live rows.
-5. **Detached Columns:** `cf_detached`, `cf_detached_postings`, `0x07`, `0x14`, and `0x12` zones at `current_gen` match point-corrected live values; no retired generations leak outside compaction-filter bounds.
-6. **FTS Parity:** `cf_fts_terms`, `cf_fts_skips` (`FtsChunk` v4) $\cap$ live, `cf_fts_positions`, `default[0x05]` doc lengths, and `FtsMeta` stats match a full re-analysis of live rows, with sound upper bounds; deprecated `cf_fts_postings` has zero visible keys.
+5. **Leaf-Colocated Scalars & Summaries (when `has_vectors`):** every live leaf slot's trailing `LeafAttrBlock` value equals the resolved row's `cf_rows` value for each eligible attribute; each leaf summary equals its `LeafAttrView` rollup; every internal summary equals the merge of its children (or is marked incomplete).
+6. **Detached Columns:** `cf_detached`, `cf_detached_postings`, `0x07`, `0x14`, and `0x12` zones at `current_gen` match point-corrected live values; no retired generations leak outside compaction-filter bounds.
+7. **FTS Parity:** `cf_fts_terms`, `cf_fts_skips` (`FtsChunk` v4) $\cap$ live, `cf_fts_positions`, `default[0x05]` doc lengths, and `FtsMeta` stats match a full re-analysis of live rows, with sound upper bounds; deprecated `cf_fts_postings` has zero visible keys.
